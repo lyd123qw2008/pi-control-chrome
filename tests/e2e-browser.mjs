@@ -10,12 +10,12 @@ import WebSocket from "ws";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const bridge = join(root, "bridge", "server.mjs");
 const extension = join(root, "extension");
-const edge = process.env.PI_CONTROL_CHROME_EDGE || "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const browserExecutable = process.env.PI_CONTROL_CHROME_BROWSER || "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const bridgePort = 17318;
 const pagePort = 18180;
 
-if (!existsSync(edge)) {
-  console.log(`SKIP: Edge executable not found: ${edge}`);
+if (!existsSync(browserExecutable)) {
+  console.log(`SKIP: browser executable not found: ${browserExecutable}`);
   process.exit(0);
 }
 
@@ -64,7 +64,7 @@ try {
     await sleep(100);
   }
 
-  edgeProcess = spawnProcess(edge, [
+  edgeProcess = spawnProcess(browserExecutable, [
     `--user-data-dir=${profile}`,
     `--disable-extensions-except=${extension}`,
     `--load-extension=${extension}`,

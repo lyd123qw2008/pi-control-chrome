@@ -2,12 +2,12 @@
 
 这是一个面向 Pi 的 Chrome/Edge 浏览器控制方案设计仓库，目标是尽可能对齐 Codex `control-chrome` 的体验和能力。
 
-当前阶段只有：
+当前阶段包含：
 
 - 功能对齐清单；
 - 中文架构说明；
 - 第一版验收范围；
-- 暂不包含实际实现代码。
+- 第一阶段 Bridge、浏览器扩展和 Pi Extension 核心实现。
 
 ## 文档
 
@@ -65,6 +65,53 @@
 
 功能范围已经按 Codex 默认行为确定，具体见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)。后续开发继续按阶段实现，不再缩减核心浏览器控制能力。
 
+## 第一阶段本地使用
+
+安装依赖：
+
+```powershell
+cd D:\liuyongdan\code\pi-control-chrome
+npm install
+```
+
+安装 Pi Package：
+
+```powershell
+pi install D:\liuyongdan\code\pi-control-chrome
+```
+
+加载 Chrome/Edge 扩展：
+
+1. 打开 `chrome://extensions` 或 `edge://extensions`；
+2. 开启 Developer mode；
+3. 选择 Load unpacked；
+4. 选择：
+   ```text
+   D:\liuyongdan\code\pi-control-chrome\extension
+   ```
+5. 重启 Pi。
+
+在 Pi 中检查：
+
+```text
+/chrome status
+/chrome tabs
+```
+
+运行测试：
+
+```powershell
+npm test
+npm run smoke:e2e
+```
+
+`smoke:e2e` 默认使用 Edge，也可以指定 Chrome for Testing：
+
+```powershell
+$env:PI_CONTROL_CHROME_BROWSER = "C:\Users\liuyd\AppData\Local\ms-playwright\chromium-1224\chrome-win64\chrome.exe"
+npm run smoke:e2e
+```
+
 ## 对齐基线
 
 当前以本机 Codex Chrome 插件的以下资料作为行为参考：
@@ -85,7 +132,7 @@ C:/Users/liuyd/.codex/plugins/cache/openai-bundled/chrome/26.810.52044/
 
 ## 当前仓库状态
 
-当前仓库只记录设计，不会修改：
+仓库内包含第一阶段实现代码；安装和运行时不会自动修改以下用户资源：
 
 - Pi 全局配置；
 - Chrome/Edge 配置；
