@@ -16,6 +16,7 @@
 - [项目决策](./DECISIONS.zh-CN.md)
 - [中文架构说明](./ARCHITECTURE.zh-CN.md)
 - [英文架构说明](./ARCHITECTURE.md)
+- [变更记录](./CHANGELOG.md)
 
 ## 重点目标
 
