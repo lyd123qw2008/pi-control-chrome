@@ -1,96 +1,146 @@
 # pi-control-chrome
 
-Pi 的 Chromium 浏览器控制方案，目标是尽可能对齐 Codex `control-chrome` 的用户体验和能力。
+[English](./README.md) · [简体中文](./README.zh-CN.md)
 
-> 阶段 1/2 核心实现已完成；后续继续按 Codex 行为补齐扩展能力。
+Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's existing Chromium profile through a local WebSocket Bridge and a Manifest V3 extension.
 
-## 目标
+> The Stage 1/2 core implementation is complete. Later-stage capabilities remain tracked separately in [`FEATURES.md`](./FEATURES.md).
 
-安装一次 Chrome/Edge 扩展后，让 Pi 能够通过本地 Bridge 无需每个动作重复授权地使用用户日常浏览器：
+## What it provides
 
-- 复用现有 Chrome/Edge Profile、登录状态、Cookie 和扩展；
-- 读取和接管用户明确选择的现有标签页；
-- 将 Agent 创建的标签页放入独立浏览器分组；
-- 会话结束时释放或清理 Agent 创建的标签页；
-- 支持 DOM、可访问性树、Playwright 风格定位器、坐标操作和原生 CDP；
-- 对齐 Codex 的标签页 claim/release、handoff 和 deliverable 语义。
+- Reuses the current Chrome or Edge profile, login state, cookies, extensions, and tabs.
+- Lets Pi inspect and claim explicitly selected existing tabs without moving them by default.
+- Places Agent-created tabs in a dedicated blue `Pi` tab group.
+- Tracks Agent ownership, sessions, `handoff`, and `deliverable` lifecycle states.
+- Cleans up temporary Agent tabs at the end of a session while preserving user and handoff tabs.
+- Provides DOM, accessibility, locator, coordinate, and native CDP controls.
+- Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text.
+- Includes a reusable `pi-control-chrome` Skill and a fast CLI for common browser workflows.
 
-## 对齐基线
-
-本项目以本机 Codex Chrome 插件版本作为行为基线：
-
-```text
-C:/Users/liuyd/.codex/plugins/cache/openai-bundled/chrome/26.810.52044/
-```
-
-重点参考：
+## Architecture
 
 ```text
-skills/control-chrome/SKILL.md
-docs/api.json
-docs/tab-claiming-chrome.md
-docs/tab-cleanup-chrome.md
-docs/browser-safety.md
-docs/confirmations.md
-docs/file-uploads.md
-docs/chrome-file-upload-troubleshooting.md
-docs/visibility.md
-docs/webmcp.md
+Pi Extension
+     ↕ WebSocket
+127.0.0.1 Local Bridge
+     ↕ WebSocket
+Chrome / Edge Manifest V3 Extension
+     ↕
+Current Chromium Profile
 ```
 
-中文入口见 [`README.zh-CN.md`](./README.zh-CN.md)。完整待确认功能清单见 [`FEATURES.md`](./FEATURES.md)，Codex 默认行为对齐说明见 [`CODEX-ALIGNMENT.zh-CN.md`](./CODEX-ALIGNMENT.zh-CN.md)，项目决策见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)，中文架构说明见 [`ARCHITECTURE.zh-CN.md`](./ARCHITECTURE.zh-CN.md)，英文架构说明见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
+The Bridge binds to loopback and requires a local pairing token. Installing the extension and completing local pairing are the trust boundary; normal browser operations do not request repeated per-action authorization.
 
-项目同时包含 [`pi-control-chrome` Skill](./skills/pi-control-chrome/SKILL.md)。该 Skill 指导 Pi 优先使用本项目的 `browser_*` 工具控制已连接的 Chrome/Edge，并遵循标签页 ownership、handoff 和 cleanup 规则。
+## Installation
 
-## 安装方式
-
-开发中的本地路径：
-
-```powershell
-pi install D:\liuyongdan\code\pi-control-chrome
-```
-
-发布到 npm 后：
+### From npm (recommended)
 
 ```powershell
 pi install npm:pi-control-chrome
 ```
 
-也可以直接从 GitHub 安装：
+### From GitHub
 
 ```powershell
 pi install git:github.com/lyd123qw2008/pi-control-chrome
 ```
 
-## 设计原则
+### From a local checkout
 
-1. **一次安装、低摩擦使用**：安装扩展和首次配对是唯一的用户授权步骤，正常浏览器操作不逐次弹 Pi shell 或浏览器动作确认。
-2. **浏览器扩展是信任边界**：Chrome/Edge 扩展负责用户 Profile、标签页和页面能力；Pi 只通过本地 Bridge 调用。
-3. **用户标签页默认不被移动**：claim 只建立控制权，不把用户标签页强制移动到 Agent 分组。
-4. **Agent 标签页可回收**：Agent 创建的标签页、窗口和分组带有 ownership/session 标记，结束时按策略释放或关闭。
-5. **信任本地运行模式**：第一版不增加浏览器专用的动作确认、逐会话授权或审计策略；安装扩展并完成本地配对即视为用户信任边界，后续按 Pi 的整体信任模型运行。
-6. **Chrome 和 Edge 共用一套扩展代码**：使用 Chromium Manifest V3 和能力检测，不维护两套业务逻辑。
-7. **不复制 Codex 私有运行时代码**：对齐公开可观察行为和 API 语义，Pi 侧使用自己的 Extension API 和 Bridge 协议。
+```powershell
+pi install D:\liuyongdan\code\pi-control-chrome
+```
 
-## 当前状态
+The package registers the Pi extension and the bundled Skill through its `package.json` `pi` manifest. It requires Node.js 22 or newer.
 
-- [x] 创建独立仓库
-- [x] 完成功能对齐清单初稿
-- [x] 完成 Bridge/扩展/Pi Extension 架构草案
-- [x] 按 Codex 默认行为确定第一版范围
-- [x] 实现阶段 1/2 核心 Bridge、扩展和 Pi 工具
-- [x] 通过真实 Edge + Chrome for Testing + Extension + Bridge 高覆盖 E2E 测试
-- [x] 完成 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和生命周期清理
-- [x] 添加 Skill 快速脚本及实时 Bridge 集成测试
-- [x] 整理为可发布的 Pi Package，包含许可证、CI 和发布元数据
+## Load the browser extension
 
-## 当前后续范围
+Pi cannot install an unpacked browser extension automatically. Load the shared `extension/` directory once in Chrome or Edge:
 
-以下能力仍按第三阶段排期，不阻塞当前核心闭环：
+1. Open `chrome://extensions` or `edge://extensions`.
+2. Enable **Developer mode**.
+3. Select **Load unpacked**.
+4. Choose the repository or installed package's `extension/` directory.
+5. Start or reload Pi.
 
-- 多 Profile 并行控制；
-- WebMCP、GSuite 导出和浏览历史；
-- 媒体下载专用接口；
-- Capability discovery；
-- Chrome Web Store/Edge Add-ons 发布包；
-- Brave/Chromium 专项验收。
+Check the connection in Pi:
+
+```text
+/chrome status
+/chrome tabs
+```
+
+The extension is shared by Chrome and Edge and uses Chromium Manifest V3 capability detection rather than separate browser-specific implementations.
+
+## Skill CLI
+
+The bundled Skill provides a fast CLI for common workflows without generating temporary Bridge code:
+
+```powershell
+node skills/pi-control-chrome/scripts/browser.mjs status
+node skills/pi-control-chrome/scripts/browser.mjs tabs --json
+node skills/pi-control-chrome/scripts/browser.mjs group --json
+node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --screenshot C:\Temp\example.png
+node skills/pi-control-chrome/scripts/browser.mjs cleanup --session <session-id>
+```
+
+The CLI reuses the currently connected browser and supports these environment variables:
+
+```text
+PI_CONTROL_CHROME_BRIDGE_HOST
+PI_CONTROL_CHROME_BRIDGE_PORT
+PI_CONTROL_CHROME_TOKEN_FILE
+```
+
+Use the `browser_*` Pi tools for complex interactions, locators, CUA, CDP, dialogs, uploads, downloads, and other page-specific controls.
+
+## Development and tests
+
+```powershell
+cd D:\liuyongdan\code\pi-control-chrome
+npm install
+npm run check
+npm test
+npm run test:skill
+npm run pack:check
+```
+
+`npm run test:skill` requires a connected Chrome or Edge profile and the local Bridge. The high-coverage browser smoke test is:
+
+```powershell
+npm run smoke:e2e
+```
+
+## Design principles
+
+1. **Install once, operate with low friction.** Extension installation and local pairing are the user-facing trust steps.
+2. **The extension is the browser capability boundary.** Pi communicates with it only through the local Bridge.
+3. **User tabs are preserved by default.** Claiming a tab establishes control ownership; it does not move the tab into the Agent group.
+4. **Agent tabs are reclaimable.** Agent-created tabs carry ownership and session metadata and are cleaned up according to lifecycle policy.
+5. **Chrome and Edge share one implementation.** The extension uses Manifest V3 and capability detection.
+6. **Observable behavior is aligned without copying private Codex runtime code.** Pi uses its own Bridge protocol and Extension API.
+
+## Documentation
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — English architecture documentation.
+- [`README.zh-CN.md`](./README.zh-CN.md) — Simplified Chinese guide.
+- [`FEATURES.md`](./FEATURES.md) — feature scope and future work.
+- [`CODEX-ALIGNMENT.zh-CN.md`](./CODEX-ALIGNMENT.zh-CN.md) — Codex behavior alignment notes.
+- [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md) — project decisions.
+- [`skills/pi-control-chrome/SKILL.md`](./skills/pi-control-chrome/SKILL.md) — bundled Pi Skill.
+- [`CHANGELOG.md`](./CHANGELOG.md) — release history.
+
+## Current future scope
+
+The following items are planned for later stages and do not block the current browser-control loop:
+
+- Parallel control of multiple browser profiles.
+- WebMCP, GSuite export, and browsing history APIs.
+- Dedicated media-download interfaces.
+- Capability discovery.
+- Chrome Web Store and Edge Add-ons release packages.
+- Dedicated Brave and Chromium acceptance coverage.
+
+## License
+
+MIT. See [`LICENSE`](./LICENSE).

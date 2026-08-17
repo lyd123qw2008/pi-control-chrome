@@ -1,5 +1,7 @@
 # pi-control-chrome
 
+[English](./README.md) · 简体中文
+
 这是一个面向 Pi 的 Chrome/Edge 浏览器控制方案设计仓库，目标是尽可能对齐 Codex `control-chrome` 的体验和能力。
 
 当前阶段包含：

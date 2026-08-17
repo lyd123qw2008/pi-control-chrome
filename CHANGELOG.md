@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 - 2026-08-17
+
+- Made the default `README.md` English for international Pi and npm users.
+- Added an explicit English/Chinese language switch at the top of both README files.
+
 ## 0.2.2 - 2026-08-17
 
 - Fixed Agent-created tabs not actually moving into the existing Pi tab group when a Pi group already existed.
