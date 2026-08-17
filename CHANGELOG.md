@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4 - 2026-08-17
+
+- Renamed the Chinese README filename so npm and Pi consistently select the English `README.md` as the default package documentation.
+
 ## 0.2.3 - 2026-08-17
 
 - Made the default `README.md` English for international Pi and npm users.

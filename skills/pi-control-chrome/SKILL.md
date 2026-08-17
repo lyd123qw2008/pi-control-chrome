@@ -159,7 +159,7 @@ Then retry the browser action.
 
 ## Project References
 
-- [Chinese project guide](../../README.zh-CN.md)
+- [Chinese project guide](../../README-zh-CN.md)
 - [Feature matrix](../../FEATURES.md)
 - [Codex alignment](../../CODEX-ALIGNMENT.zh-CN.md)
 - [Architecture](../../ARCHITECTURE.zh-CN.md)

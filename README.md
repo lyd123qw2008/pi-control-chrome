@@ -1,6 +1,6 @@
 # pi-control-chrome
 
-[English](./README.md) · [简体中文](./README.zh-CN.md)
+[English](./README.md) · [简体中文](./README-zh-CN.md)
 
 Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's existing Chromium profile through a local WebSocket Bridge and a Manifest V3 extension.
 
@@ -123,7 +123,7 @@ npm run smoke:e2e
 ## Documentation
 
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — English architecture documentation.
-- [`README.zh-CN.md`](./README.zh-CN.md) — Simplified Chinese guide.
+- [`README-zh-CN.md`](./README-zh-CN.md) — Simplified Chinese guide.
 - [`FEATURES.md`](./FEATURES.md) — feature scope and future work.
 - [`CODEX-ALIGNMENT.zh-CN.md`](./CODEX-ALIGNMENT.zh-CN.md) — Codex behavior alignment notes.
 - [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md) — project decisions.
