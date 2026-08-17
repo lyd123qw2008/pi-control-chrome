@@ -327,15 +327,17 @@
 
 ## 需要用户确认的关键问题
 
-请优先确认以下问题，再开始开发：
+## 当前默认决策
 
-1. P0 是否包含完整 Locator/Playwright 风格 API，还是第一版先使用 accessibility snapshot + 基本操作？
-2. P0 是否必须包含原生 CDP、Network、Console、上传和下载？
-3. Agent 新建页面是否默认移动到 `Pi` 分组？分组名称和颜色是什么？
-4. 用户现有页面 claim 后，是否允许导航、点击和输入？
-5. Agent 创建的页面在每个 turn 结束时关闭，还是只在 Pi session 结束时关闭？
-6. `handoff` 和 `deliverable` 是否按 Codex 的语义保留？
-7. Chrome/Edge 是否需要同时支持多个 Profile？
-8. **已决定**：Chrome 扩展首次安装/配对一次，后续不再逐次授权。
-9. **已决定**：第一版不实现浏览器专用 action-time confirmation，按 Pi 的本地信任模式运行。
-10. 第一版是否包含 WebMCP、GSuite 导出、历史记录和下载媒体等 P2 能力？
+剩余功能点不再逐项询问，统一采用 Codex 当前行为作为默认基线，具体决策记录见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)。
+
+- **已决定**：第一版包含 Locator/Playwright 风格 API、DOM CUA、坐标 CUA 和原生 CDP。
+- **已决定**：Network、Console、Dialog、Upload、Download 和 Clipboard 按 Codex API 对齐。
+- **已决定**：Agent 页面默认进入 `Pi` 蓝色分组。
+- **已决定**：claim 后允许用户授权的页面继续导航、点击和输入；release 时不关闭。
+- **已决定**：普通 Agent 页面按 Codex 语义在 turn 结束时清理。
+- **已决定**：`handoff` 和 `deliverable` 按 Codex 语义保留。
+- **已决定**：Chrome 和 Edge 第一版同时支持；多 Profile 排在后续阶段。
+- **已决定**：扩展安装/配对一次，后续不逐次授权。
+- **已决定**：第一版采用 Trusted Local Mode，不实现浏览器专用 action-time confirmation。
+- **决定**：WebMCP、GSuite 导出、历史记录、媒体下载和 Brave/Chromium 先作为后续扩展能力，不阻塞核心版本。
