@@ -117,9 +117,13 @@ Pi 侧使用通用 `browser_*` 命名，避免把实现绑定到 Chrome：
 browser_status
 browser_tabs
 browser_selected
+browser_claim_tab
 browser_select_tab
 browser_new_tab
 browser_snapshot
+browser_back
+browser_forward
+browser_reload
 browser_navigate
 browser_back
 browser_forward

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Pi Control Chrome",
+  "version": "0.1.0",
+  "description": "Local Chrome/Edge bridge for Pi browser control.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "tabGroups",
+    "debugger",
+    "downloads",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:17318 ws://127.0.0.1:17318"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Pi Control Chrome"
+  }
+}

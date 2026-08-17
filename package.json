@@ -1,0 +1,33 @@
+{
+  "name": "pi-control-chrome",
+  "version": "0.1.0",
+  "description": "Codex-aligned Chrome and Edge browser control for Pi",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "chrome",
+    "edge",
+    "browser-automation",
+    "cdp"
+  ],
+  "scripts": {
+    "test": "node --test tests/bridge.test.mjs",
+    "bridge": "node bridge/server.mjs",
+    "smoke:e2e": "node tests/e2e-browser.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/index.ts"
+    ]
+  }
+}

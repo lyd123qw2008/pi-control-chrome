@@ -52,10 +52,18 @@
 ```text
 功能清单：已完成初稿
 中文架构：已完成初稿
-实现代码：尚未开始
+第一阶段核心代码：已实现并通过 Edge E2E 冒烟测试
 ```
 
-请先查看 [`FEATURES.md`](./FEATURES.md)，确认哪些功能属于第一版 P0，哪些可以放到 P1/P2。确认完成后再开始编码。
+第一阶段当前包含：
+
+- `extension/`：Manifest V3 Chrome/Edge 扩展；
+- `bridge/`：本地 WebSocket Bridge；
+- `pi-extension/`：Pi 原生浏览器工具和 `/chrome` 命令；
+- `tests/bridge.test.mjs`：Bridge 单元/协议测试；
+- `tests/e2e-browser.mjs`：真实 Edge + 扩展 + Bridge + Pi 协议冒烟测试。
+
+功能范围已经按 Codex 默认行为确定，具体见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)。后续开发继续按阶段实现，不再缩减核心浏览器控制能力。
 
 ## 对齐基线
 

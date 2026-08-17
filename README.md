@@ -55,8 +55,10 @@ docs/webmcp.md
 - [x] 创建独立仓库
 - [x] 完成功能对齐清单初稿
 - [x] 完成 Bridge/扩展/Pi Extension 架构草案
-- [ ] 用户确认 P0/P1/P2 功能范围
-- [ ] 开始实现
+- [x] 按 Codex 默认行为确定第一版范围
+- [x] 实现第一阶段核心 Bridge、扩展和 Pi 工具
+- [x] 通过真实 Edge + Extension + Bridge 冒烟测试
+- [ ] 完成第一阶段剩余 Codex 核心能力
 
 ## 暂不实现
 
