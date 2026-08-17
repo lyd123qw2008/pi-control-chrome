@@ -38,7 +38,7 @@ docs/visibility.md
 docs/webmcp.md
 ```
 
-完整待确认功能清单见 [`FEATURES.md`](./FEATURES.md)，拟议架构见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
+中文入口见 [`README.zh-CN.md`](./README.zh-CN.md)。完整待确认功能清单见 [`FEATURES.md`](./FEATURES.md)，中文架构说明见 [`ARCHITECTURE.zh-CN.md`](./ARCHITECTURE.zh-CN.md)，英文架构说明见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
 
 ## 设计原则
 
