@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+coverage/
+*.log
+*.tmp
+.env
+.env.*
+credentials/
+secrets/
+.pi/sessions/
+.pi/chrome-screenshots/
