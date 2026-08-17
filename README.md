@@ -13,7 +13,7 @@ Pi 的 Chromium 浏览器控制方案，目标是尽可能对齐 Codex `control-
 - 将 Agent 创建的标签页放入独立浏览器分组；
 - 会话结束时释放或清理 Agent 创建的标签页；
 - 支持 DOM、可访问性树、Playwright 风格定位器、坐标操作和原生 CDP；
-- 对齐 Codex 的标签页 claim/release、handoff、deliverable 和安全确认语义。
+- 对齐 Codex 的标签页 claim/release、handoff 和 deliverable 语义。
 
 ## 对齐基线
 
@@ -42,11 +42,11 @@ docs/webmcp.md
 
 ## 设计原则
 
-1. **一次安装、低摩擦使用**：安装扩展和首次配对是授权边界，正常浏览器操作不逐次弹 Pi shell 授权。
+1. **一次安装、低摩擦使用**：安装扩展和首次配对是唯一的用户授权步骤，正常浏览器操作不逐次弹 Pi shell 或浏览器动作确认。
 2. **浏览器扩展是信任边界**：Chrome/Edge 扩展负责用户 Profile、标签页和页面能力；Pi 只通过本地 Bridge 调用。
 3. **用户标签页默认不被移动**：claim 只建立控制权，不把用户标签页强制移动到 Agent 分组。
 4. **Agent 标签页可回收**：Agent 创建的标签页、窗口和分组带有 ownership/session 标记，结束时按策略释放或关闭。
-5. **读写分级**：读取、截图和页面快照低摩擦；提交表单、发送消息、上传、下载、删除、权限变更等动作保留确认机制。
+5. **信任本地运行模式**：第一版不增加浏览器专用的动作确认、逐会话授权或审计策略；安装扩展并完成本地配对即视为用户信任边界，后续按 Pi 的整体信任模型运行。
 6. **Chrome 和 Edge 共用一套扩展代码**：使用 Chromium Manifest V3 和能力检测，不维护两套业务逻辑。
 7. **不复制 Codex 私有运行时代码**：对齐公开可观察行为和 API 语义，Pi 侧使用自己的 Extension API 和 Bridge 协议。
 

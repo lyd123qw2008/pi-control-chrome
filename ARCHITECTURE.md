@@ -62,20 +62,13 @@ interface TabHandle {
 
 Every Agent-created window, tab and group should carry a session ownership record. User tabs are never silently moved to the Agent group. Claiming a user tab grants control without changing its physical browser placement.
 
-## Authorization model
+## Trusted local mode (v1)
 
-The initial extension installation and local pairing are the permission boundary. Normal read and interaction calls reuse the paired session and do not ask for shell authorization.
+The initial extension installation and local pairing are the only user-facing trust boundary. Normal browser operations reuse the paired session and do not ask for shell authorization or browser-action confirmation.
 
-Sensitive actions remain confirmable:
+Version 1 intentionally does not add per-session authorization, per-call confirmation, sensitive-action confirmation, audit policy, or site-level permission policy. This follows Pi's trusted local execution model.
 
-- external side effects;
-- sensitive data transmission;
-- file uploads;
-- cookies/storage/password/OTP access;
-- raw JavaScript/CDP;
-- extension installation or permission changes.
-
-The Bridge must reject requests without a valid local session token and must not expose a remotely reachable unauthenticated endpoint.
+The Bridge still needs two mechanical protocol protections: bind to loopback by default and reject requests without the paired local session token. It must not expose a remotely reachable unauthenticated endpoint.
 
 ## Protocol principles
 
@@ -85,7 +78,7 @@ The Bridge must reject requests without a valid local session token and must not
 - Stale handles fail closed and require a fresh tab snapshot.
 - Tab/group cleanup is ownership-aware and idempotent.
 - Screenshots can be returned as Pi image content plus a saved path.
-- CDP commands are capability-discovered and auditable.
+- CDP commands are capability-discovered; auditing is optional and deferred beyond the trusted-local v1 mode.
 
 ## First implementation slice
 

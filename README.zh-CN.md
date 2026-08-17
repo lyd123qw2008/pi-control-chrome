@@ -21,7 +21,7 @@
 
 - Chrome 和 Edge 共用一套 Manifest V3 扩展；
 - 复用当前用户的浏览器 Profile、登录状态和标签页；
-- 安装和配对一次后，正常操作不重复请求授权；
+- 安装和配对一次后，正常操作不重复请求授权或浏览器动作确认；
 - 支持 Pi、Bridge 和浏览器扩展之间的自动重连。
 
 ### 标签页管理
@@ -71,7 +71,7 @@ C:/Users/liuyd/.codex/plugins/cache/openai-bundled/chrome/26.810.52044/
 - Agent 标签页分组和清理；
 - 原生 CDP；
 - 截图、上传、下载、Console、Network；
-- handoff、deliverable 和安全确认。
+- handoff、deliverable 和标签页清理。
 
 ## 当前仓库状态
 
