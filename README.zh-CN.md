@@ -12,6 +12,7 @@
 ## 文档
 
 - [功能对齐清单](./FEATURES.md)
+- [Codex 默认行为对齐说明](./CODEX-ALIGNMENT.zh-CN.md)
 - [中文架构说明](./ARCHITECTURE.zh-CN.md)
 - [英文架构说明](./ARCHITECTURE.md)
 
