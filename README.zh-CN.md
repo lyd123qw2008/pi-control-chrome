@@ -17,6 +17,7 @@
 - [中文架构说明](./ARCHITECTURE.zh-CN.md)
 - [英文架构说明](./ARCHITECTURE.md)
 - [变更记录](./CHANGELOG.md)
+- [Pi Skill](./skills/pi-control-chrome/SKILL.md)
 
 ## 重点目标
 
@@ -62,6 +63,7 @@
 - `bridge/`：本地 WebSocket Bridge；
 - `pi-extension/`：Pi 原生浏览器工具和 `/chrome` 命令；
 - `tests/bridge.test.mjs`：Bridge 单元/协议测试；
+- `tests/skill-script.test.mjs`：Skill 快速脚本的实时 Bridge 集成测试；
 - `tests/e2e-browser.mjs`：真实 Edge/Chrome for Testing + 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。
 
 功能范围已经按 Codex 默认行为确定，具体见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)。后续开发继续按阶段实现，不再缩减核心浏览器控制能力。
@@ -77,9 +79,25 @@ npm install
 
 安装 Pi Package：
 
+开发中的本地路径：
+
 ```powershell
 pi install D:\liuyongdan\code\pi-control-chrome
 ```
+
+发布到 npm 后：
+
+```powershell
+pi install npm:pi-control-chrome
+```
+
+也可以直接从 GitHub 安装：
+
+```powershell
+pi install git:github.com/lyd123qw2008/pi-control-chrome
+```
+
+项目同时包含 `skills/pi-control-chrome/SKILL.md`。该 Skill 会指导 Pi 优先使用本项目的 `browser_*` 工具控制已连接的 Chrome/Edge，并遵循标签页 ownership、handoff 和 cleanup 规则。
 
 加载 Chrome/Edge 扩展：
 
@@ -102,7 +120,11 @@ pi install D:\liuyongdan\code\pi-control-chrome
 运行测试：
 
 ```powershell
+npm run check
 npm test
+npm run test:skill
+npm run test:all
+npm run pack:check
 npm run smoke:e2e
 ```
 

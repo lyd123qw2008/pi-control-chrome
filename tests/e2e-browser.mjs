@@ -235,6 +235,12 @@ try {
   await request("mark_handoff", { tabId: created.tab.id });
   const temporary = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-session" });
   await sleep(300);
+  const temporaryListed = await request("list_tabs");
+  const temporaryOwned = temporaryListed.tabs.find((tab) => tab.id === temporary.tab.id);
+  const temporaryGroup = temporaryListed.groups.find((item) => item.id === temporaryOwned.groupId);
+  assert.equal(temporaryOwned.groupId, group.id);
+  assert.equal(temporaryGroup.title, "Pi");
+  assert.equal(temporaryGroup.color, "blue");
   const cleanup = await request("cleanup", { sessionId: "e2e-session" });
   assert.equal(cleanup.removed.includes(created.tab.id), false);
   assert.equal(cleanup.removed.includes(temporary.tab.id), true);

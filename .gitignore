@@ -4,6 +4,8 @@ build/
 coverage/
 *.log
 *.tmp
+*.tgz
+npm-debug.log*
 .env
 .env.*
 credentials/

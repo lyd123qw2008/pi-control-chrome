@@ -347,7 +347,9 @@ async function findOrCreatePiGroup(windowId) {
 async function putInPiGroup(tab) {
   if (!chrome.tabs.group || !chrome.tabGroups?.update || tab.id === undefined) return undefined;
   const existingGroupId = await findOrCreatePiGroup(tab.windowId);
-  const groupId = existingGroupId ?? await chrome.tabs.group({ tabIds: [tab.id] });
+  const groupId = await chrome.tabs.group(existingGroupId === undefined
+    ? { tabIds: [tab.id] }
+    : { tabIds: [tab.id], groupId: existingGroupId });
   await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR, collapsed: false });
   return groupId;
 }
@@ -751,9 +753,6 @@ async function waitForTabState(tabId, params = {}) {
 async function createTab(params) {
   const tab = await chrome.tabs.create({ url: params.url || "about:blank", active: params.active === true });
   const groupId = await putInPiGroup(tab);
-  if (groupId !== undefined) {
-    try { await chrome.tabs.update(tab.id, { groupId }); } catch {}
-  }
   await recordOwnedTab({ ...tab, groupId }, params.sessionId, "agent", "temporary");
   return { tab: (await listTabs()).tabs.find((entry) => entry.id === tab.id), groupId };
 }

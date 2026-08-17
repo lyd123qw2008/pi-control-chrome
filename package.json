@@ -1,22 +1,61 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Codex-aligned Chrome and Edge browser control for Pi",
-  "private": true,
   "type": "module",
   "license": "MIT",
+  "author": "lyd123qw2008",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lyd123qw2008/pi-control-chrome.git"
+  },
+  "homepage": "https://github.com/lyd123qw2008/pi-control-chrome",
+  "bugs": {
+    "url": "https://github.com/lyd123qw2008/pi-control-chrome/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "keywords": [
     "pi-package",
     "pi",
     "chrome",
     "edge",
+    "chromium",
     "browser-automation",
+    "browser-control",
+    "manifest-v3",
     "cdp"
   ],
+  "files": [
+    "ARCHITECTURE.md",
+    "ARCHITECTURE.zh-CN.md",
+    "CHANGELOG.md",
+    "CODEX-ALIGNMENT.zh-CN.md",
+    "CONTRIBUTING.md",
+    "DECISIONS.zh-CN.md",
+    "FEATURES.md",
+    "LICENSE",
+    "README.md",
+    "README.zh-CN.md",
+    "SECURITY.md",
+    "bridge",
+    "extension",
+    "pi-extension",
+    "skills",
+    "tests"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
+    "check": "node --check bridge/server.mjs && node --check extension/background.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
     "test": "node --test tests/bridge.test.mjs",
+    "test:skill": "node --test tests/skill-script.test.mjs",
+    "test:all": "npm test && npm run test:skill",
     "bridge": "node bridge/server.mjs",
-    "smoke:e2e": "node tests/e2e-browser.mjs"
+    "smoke:e2e": "node tests/e2e-browser.mjs",
+    "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
     "ws": "^8.18.0"
@@ -28,6 +67,9 @@
   "pi": {
     "extensions": [
       "./pi-extension/index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   }
 }

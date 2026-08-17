@@ -1,7 +1,18 @@
 # Changelog
 
+## 0.2.2 - 2026-08-17
+
+- Fixed Agent-created tabs not actually moving into the existing Pi tab group when a Pi group already existed.
+- Added the fast `skills/pi-control-chrome/scripts/browser.mjs` CLI for status, tabs, groups, open/view, extraction, screenshots, close and cleanup workflows.
+
+## 0.2.1 - 2026-08-17
+
+- Fixed MV3 Bridge reconnects after the Service Worker goes idle by declaring the `alarms` permission used by the periodic reconnect logic.
+
 ## 0.2.0 - 2026-08-17
 
+- Added the bundled `pi-control-chrome` Skill with browser tool selection, tab ownership, cleanup, safety and troubleshooting guidance.
+- Added the package `pi.skills` manifest entry for automatic Skill discovery.
 - Added Playwright-style locator operations (`css`, role, text, label, placeholder and test id) with count, filtering, indexing, text/attribute/state queries and actions.
 - Added accessibility-oriented page snapshots, bounded Markdown/plain-text extraction, viewport/selection metadata and frame-tree information.
 - Added DOM CUA and coordinate CUA for mouse, keyboard, scrolling, dragging and text input.

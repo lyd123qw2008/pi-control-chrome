@@ -40,6 +40,28 @@ docs/webmcp.md
 
 中文入口见 [`README.zh-CN.md`](./README.zh-CN.md)。完整待确认功能清单见 [`FEATURES.md`](./FEATURES.md)，Codex 默认行为对齐说明见 [`CODEX-ALIGNMENT.zh-CN.md`](./CODEX-ALIGNMENT.zh-CN.md)，项目决策见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)，中文架构说明见 [`ARCHITECTURE.zh-CN.md`](./ARCHITECTURE.zh-CN.md)，英文架构说明见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
 
+项目同时包含 [`pi-control-chrome` Skill](./skills/pi-control-chrome/SKILL.md)。该 Skill 指导 Pi 优先使用本项目的 `browser_*` 工具控制已连接的 Chrome/Edge，并遵循标签页 ownership、handoff 和 cleanup 规则。
+
+## 安装方式
+
+开发中的本地路径：
+
+```powershell
+pi install D:\liuyongdan\code\pi-control-chrome
+```
+
+发布到 npm 后：
+
+```powershell
+pi install npm:pi-control-chrome
+```
+
+也可以直接从 GitHub 安装：
+
+```powershell
+pi install git:github.com/lyd123qw2008/pi-control-chrome
+```
+
 ## 设计原则
 
 1. **一次安装、低摩擦使用**：安装扩展和首次配对是唯一的用户授权步骤，正常浏览器操作不逐次弹 Pi shell 或浏览器动作确认。
@@ -59,6 +81,8 @@ docs/webmcp.md
 - [x] 实现阶段 1/2 核心 Bridge、扩展和 Pi 工具
 - [x] 通过真实 Edge + Chrome for Testing + Extension + Bridge 高覆盖 E2E 测试
 - [x] 完成 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和生命周期清理
+- [x] 添加 Skill 快速脚本及实时 Bridge 集成测试
+- [x] 整理为可发布的 Pi Package，包含许可证、CI 和发布元数据
 
 ## 当前后续范围
 

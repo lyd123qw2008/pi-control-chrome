@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Control Chrome",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Local Chrome/Edge bridge for Pi browser control.",
   "permissions": [
     "tabs",
@@ -12,7 +12,8 @@
     "downloads",
     "clipboardRead",
     "clipboardWrite",
-    "webNavigation"
+    "webNavigation",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"
