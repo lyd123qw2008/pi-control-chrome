@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import WebSocket from "ws";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -12,6 +13,7 @@ const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17318;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 const SESSION_ID = randomUUID();
+let paused = false;
 
 function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
   return new Promise((resolve, reject) => {
@@ -56,6 +58,12 @@ class BridgeClient {
     this.socket = undefined;
     // The bridge is intentionally left alive so a newly reloaded Pi session can
     // reconnect without restarting Chrome or the extension.
+  }
+
+  async health(): Promise<any> {
+    const response = await localJsonRequest("/health", 1500);
+    if (response.statusCode !== 200) throw new Error(`Bridge health failed: HTTP ${response.statusCode}`);
+    return response.value;
   }
 
   async request(method: string, params: Record<string, unknown> = {}): Promise<any> {
@@ -176,7 +184,14 @@ function errorResult(error: unknown) {
 }
 
 async function call(method: string, params: Record<string, unknown> = {}) {
-  return bridge.request(method, { ...params, sessionId: SESSION_ID });
+  if (paused && !["status", "list_tabs", "selected_tab", "cleanup"].includes(method)) {
+    throw new Error("Pi browser control is paused; run /chrome resume first");
+  }
+  const result = await bridge.request(method, { ...params, sessionId: SESSION_ID });
+  if (method === "status") {
+    try { return { ...result, bridgeHealth: await bridge.health() }; } catch { return result; }
+  }
+  return result;
 }
 
 function registerBrowserTools(pi: ExtensionAPI) {
@@ -216,6 +231,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Claim an existing user tab using its current tab id and optional title/URL snapshot. Fails if the snapshot changed.",
     parameters: Type.Object({
       tabId: Type.Number(),
+      windowId: Type.Optional(Type.Number()),
       title: Type.Optional(Type.String()),
       url: Type.Optional(Type.String()),
     }),
@@ -258,12 +274,81 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "browser_extract",
+    label: "Extract Browser Page",
+    description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper.",
+    parameters: Type.Object({ tabId: TAB_ID }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("extract", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_accessibility_snapshot",
+    label: "Browser Accessibility Snapshot",
+    description: "Return the accessibility-oriented semantic tree included in the current page snapshot.",
+    parameters: Type.Object({ tabId: TAB_ID }),
+    async execute(_toolCallId, params) {
+      try {
+        const result = await call("snapshot", params) as { snapshot?: { accessibility?: unknown } };
+        return textResult(result.snapshot?.accessibility ?? result);
+      } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_locator",
+    label: "Browser Locator",
+    description: "Playwright-style locator operations: css, role, text, label, placeholder and testid strategies plus count, first, last, nth, text, attributes and actions.",
+    parameters: Type.Object({
+      tabId: TAB_ID,
+      action: Type.String(),
+      strategy: Type.Optional(Type.String()),
+      selector: SELECTOR,
+      value: Type.Optional(Type.Unknown()),
+      exact: Type.Optional(Type.Boolean()),
+      name: Type.Optional(Type.String()),
+      index: Type.Optional(Type.Number()),
+      hasText: Type.Optional(Type.String()),
+      hasSelector: Type.Optional(Type.String()),
+      other: Type.Optional(Type.Unknown()),
+      attribute: Type.Optional(Type.String()),
+      key: Type.Optional(Type.String()),
+      timeoutMs: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params) {
+      try {
+        const locator = {
+          strategy: params.strategy || (params.selector ? "css" : "css"),
+          value: params.value ?? params.selector ?? "*",
+          exact: params.exact,
+          name: params.name,
+          index: params.index,
+          hasText: params.hasText,
+          hasSelector: params.hasSelector,
+        };
+        return textResult(await call("locator", { ...params, locator }));
+      } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
     name: "browser_navigate",
     label: "Navigate Browser",
-    description: "Navigate a selected or specified browser tab to a URL.",
-    parameters: Type.Object({ tabId: TAB_ID, url: Type.String() }),
+    description: "Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete.",
+    parameters: Type.Object({ tabId: TAB_ID, url: Type.String(), wait: Type.Optional(Type.Boolean()), timeoutMs: Type.Optional(Type.Number()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("navigate", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_wait",
+    label: "Wait for Browser Page",
+    description: "Wait for a selected browser tab to finish loading or reach a URL/URL fragment.",
+    parameters: Type.Object({ tabId: TAB_ID, state: Type.Optional(Type.String()), url: Type.Optional(Type.String()), urlIncludes: Type.Optional(Type.String()), timeoutMs: Type.Optional(Type.Number()) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("wait", params)); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -271,7 +356,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_click",
     label: "Click Browser Element",
     description: "Click an element by an eN ref from browser_snapshot or by CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, ref: Type.Optional(Type.String()), selector: SELECTOR }),
+    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "click" })); } catch (error) { return errorResult(error); }
     },
@@ -281,7 +366,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_double_click",
     label: "Double Click Browser Element",
     description: "Double-click an element by an eN ref or CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, ref: Type.Optional(Type.String()), selector: SELECTOR }),
+    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "double_click" })); } catch (error) { return errorResult(error); }
     },
@@ -291,7 +376,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_fill",
     label: "Fill Browser Field",
     description: "Fill an input, textarea or contenteditable element by eN ref or CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, ref: Type.Optional(Type.String()), selector: SELECTOR, value: Type.String() }),
+    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, value: Type.String() }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "fill" })); } catch (error) { return errorResult(error); }
     },
@@ -301,7 +386,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_type",
     label: "Type Browser Text",
     description: "Type or append text into a focused browser field.",
-    parameters: Type.Object({ tabId: TAB_ID, ref: Type.Optional(Type.String()), selector: SELECTOR, value: Type.String() }),
+    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, value: Type.String() }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "type" })); } catch (error) { return errorResult(error); }
     },
@@ -311,7 +396,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_press_key",
     label: "Press Browser Key",
     description: "Dispatch a keyboard key to an eN ref or CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, ref: Type.Optional(Type.String()), selector: SELECTOR, key: Type.String() }),
+    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, key: Type.String() }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "press" })); } catch (error) { return errorResult(error); }
     },
@@ -328,21 +413,135 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "browser_dom_cua",
+    label: "Browser DOM CUA",
+    description: "Use visible DOM node ids for click, double-click, type, keypress and scroll operations.",
+    parameters: Type.Object({
+      tabId: TAB_ID,
+      action: Type.String(),
+      nodeId: Type.Optional(Type.String()),
+      value: Type.Optional(Type.String()),
+      key: Type.Optional(Type.String()),
+      deltaX: Type.Optional(Type.Number()),
+      deltaY: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("dom_cua", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_cua",
+    label: "Browser Coordinate CUA",
+    description: "Use native CDP mouse and keyboard input at viewport coordinates, including click, move, scroll, drag, type and keypress.",
+    parameters: Type.Object({
+      tabId: TAB_ID,
+      action: Type.String(),
+      x: Type.Optional(Type.Number()),
+      y: Type.Optional(Type.Number()),
+      toX: Type.Optional(Type.Number()),
+      toY: Type.Optional(Type.Number()),
+      path: Type.Optional(Type.Array(Type.Object({ x: Type.Number(), y: Type.Number() }))),
+      deltaX: Type.Optional(Type.Number()),
+      deltaY: Type.Optional(Type.Number()),
+      text: Type.Optional(Type.String()),
+      key: Type.Optional(Type.String()),
+      button: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("cua", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
     name: "browser_screenshot",
     label: "Browser Screenshot",
     description: "Capture the selected browser tab and return it as an image.",
-    parameters: Type.Object({ tabId: TAB_ID, fullPage: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: TAB_ID, fullPage: Type.Optional(Type.Boolean()), path: Type.Optional(Type.String()) }),
     async execute(_toolCallId, params) {
       try {
         const result = await call("screenshot", params) as { data: string; mimeType?: string; tabId?: number };
+        let savedPath: string | undefined;
+        if (params.path) {
+          savedPath = resolve(String(params.path));
+          await mkdir(dirname(savedPath), { recursive: true });
+          await writeFile(savedPath, Buffer.from(result.data, "base64"));
+        }
         return {
           content: [
-            { type: "text", text: `Screenshot captured for tab ${result.tabId ?? "selected"}.` },
+            { type: "text", text: `Screenshot captured for tab ${result.tabId ?? "selected"}${savedPath ? ` and saved to ${savedPath}` : ""}.` },
             { type: "image", data: result.data, mimeType: result.mimeType || "image/png" },
           ],
-          details: result,
+          details: { ...result, path: savedPath },
         };
       } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_console",
+    label: "Browser Console",
+    description: "Enable and read Runtime console and Log entries captured from a browser tab.",
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
+    async execute(_toolCallId, params) {
+      try {
+        if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Runtime", "Log"] }));
+        return textResult(await call("console_logs", params));
+      } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_network",
+    label: "Browser Network",
+    description: "Enable and read Network request/response events and response bodies from a browser tab.",
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()), timeoutMs: Type.Optional(Type.Number()) }),
+    async execute(_toolCallId, params) {
+      try {
+        if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Network", "Page"] }));
+        if (params.action === "response_body") return textResult(await call("network_response_body", params));
+        return textResult(await call("network_requests", params));
+      } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_dialog",
+    label: "Browser JavaScript Dialog",
+    description: "Inspect and accept or dismiss alert, confirm and prompt dialogs using native CDP.",
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), promptText: Type.Optional(Type.String()) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("dialog", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_upload",
+    label: "Browser File Upload",
+    description: "Set local files on a page file input using native CDP DOM.setFileInputFiles in Trusted Local Mode.",
+    parameters: Type.Object({ tabId: TAB_ID, selector: SELECTOR, nodeId: Type.Optional(Type.Number()), files: Type.Union([Type.String(), Type.Array(Type.String())]) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("upload", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_clipboard",
+    label: "Browser Clipboard",
+    description: "Read or write plain text through the selected tab's browser clipboard.",
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), text: Type.Optional(Type.String()) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("clipboard", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_download",
+    label: "Browser Download",
+    description: "Start, wait for, list, cancel or erase browser downloads and return their paths/status.",
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: Type.Optional(Type.Number()) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("download", params)); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -445,8 +644,36 @@ export default function piControlChrome(pi: ExtensionAPI): void {
       try {
         if (action === "status") {
           const result = await call("status");
-          updateStatus(ctx, result.extensionConnected ? "chrome: connected" : "chrome: bridge only");
+          const connected = result.bridgeHealth?.extensionConnected === true;
+          updateStatus(ctx, connected ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
+          return;
+        }
+        if (action === "connect") {
+          paused = false;
+          await bridge.start();
+          const result = await call("status");
+          updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
+          ctx.ui.notify(JSON.stringify(result), "info");
+          return;
+        }
+        if (action === "disconnect") {
+          await bridge.stop();
+          updateStatus(ctx, "chrome: disconnected");
+          ctx.ui.notify("Pi browser bridge disconnected; the local Bridge remains available for a later /chrome connect.", "info");
+          return;
+        }
+        if (action === "pause") {
+          paused = true;
+          updateStatus(ctx, "chrome: paused");
+          ctx.ui.notify("Pi browser control paused. Run /chrome resume to continue.", "info");
+          return;
+        }
+        if (action === "resume") {
+          paused = false;
+          const result = await call("status");
+          updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
+          ctx.ui.notify("Pi browser control resumed.", "info");
           return;
         }
         if (action === "tabs") {
@@ -461,11 +688,21 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           ctx.ui.notify(JSON.stringify(await call("release", { tabId: Number(rest[0]) })), "info");
           return;
         }
-        if (action === "setup") {
-          ctx.ui.notify("Load extension/ as an unpacked Chrome/Edge extension, then run /chrome status.", "info");
+        if (action === "profile") {
+          const result = await call("status");
+          ctx.ui.notify(JSON.stringify({ browser: result.browser, userAgent: result.userAgent, extensionVersion: result.extensionVersion }, null, 2), "info");
           return;
         }
-        ctx.ui.notify("用法：/chrome status|tabs|setup|cleanup|release <tabId>", "warning");
+        if (action === "group") {
+          const result = await call("list_tabs");
+          ctx.ui.notify(JSON.stringify(result.groups || [], null, 2), "info");
+          return;
+        }
+        if (action === "setup") {
+          ctx.ui.notify("Load extension/ as an unpacked Chrome/Edge extension, then run /chrome connect and /chrome status.", "info");
+          return;
+        }
+        ctx.ui.notify("用法：/chrome status|connect|disconnect|pause|resume|tabs|profile|group|setup|cleanup|release <tabId>", "warning");
       } catch (error) {
         updateStatus(ctx, "chrome: offline");
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
@@ -477,7 +714,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     try {
       await bridge.start();
       const status = await call("status");
-      updateStatus(ctx, status.extensionConnected ? "chrome: connected" : "chrome: bridge only");
+      updateStatus(ctx, status.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
     } catch (error) {
       updateStatus(ctx, "chrome: offline");
       ctx.ui.notify(`Pi browser bridge is not connected: ${error instanceof Error ? error.message : String(error)}`, "warning");

@@ -7,7 +7,7 @@
 - 功能对齐清单；
 - 中文架构说明；
 - 第一版验收范围；
-- 第一阶段 Bridge、浏览器扩展和 Pi Extension 核心实现。
+- 第一、二阶段 Bridge、浏览器扩展和 Pi Extension 核心实现。
 
 ## 文档
 
@@ -51,21 +51,21 @@
 
 ```text
 功能清单：已完成初稿
-中文架构：已完成初稿
-第一阶段核心代码：已实现并通过 Edge E2E 冒烟测试
+中文架构：已更新实现状态
+阶段 1/2 核心代码：已实现并通过 Edge + Chrome for Testing 高覆盖 E2E 测试
 ```
 
-第一阶段当前包含：
+当前实现包含：
 
 - `extension/`：Manifest V3 Chrome/Edge 扩展；
 - `bridge/`：本地 WebSocket Bridge；
 - `pi-extension/`：Pi 原生浏览器工具和 `/chrome` 命令；
 - `tests/bridge.test.mjs`：Bridge 单元/协议测试；
-- `tests/e2e-browser.mjs`：真实 Edge + 扩展 + Bridge + Pi 协议冒烟测试。
+- `tests/e2e-browser.mjs`：真实 Edge/Chrome for Testing + 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。
 
 功能范围已经按 Codex 默认行为确定，具体见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)。后续开发继续按阶段实现，不再缩减核心浏览器控制能力。
 
-## 第一阶段本地使用
+## 本地使用
 
 安装依赖：
 

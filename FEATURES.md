@@ -8,6 +8,8 @@
 
 用户可以直接修改复选框、调整优先级或添加备注。
 
+> 实现状态（2026-08-17）：阶段 1/2 核心代码已经完成。当前仓库已实现并验证 Chrome/Edge 扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。以下清单保留原始产品范围；第三阶段能力（多 Profile、WebMCP、GSuite、历史记录、发布包等）仍未实现。
+
 ---
 
 ## A. 浏览器连接与生命周期

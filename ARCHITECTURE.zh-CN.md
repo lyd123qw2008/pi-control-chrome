@@ -81,7 +81,7 @@ Bridge 只监听本机回环地址：
 
 Pi Extension 负责把浏览器能力注册成 Pi 原生工具和命令。
 
-计划提供的工具：
+当前已提供的工具（阶段 1/2）：
 
 ```text
 browser_tabs
@@ -434,28 +434,11 @@ Browser session 和 Pi session 绑定，但 Tab Handle 不能只依赖数字 tab
 
 ## 十一、第一版建议实现顺序
 
-### 第 1 阶段：连接和基础读取
+### 第 1/2 阶段：连接、读取和基础交互（已完成）
 
-1. Chrome/Edge 扩展；
-2. 本地 Bridge；
-3. Pi Extension；
-4. 一次性配对；
-5. `browser_status`；
-6. `browser_tabs`；
-7. `browser_snapshot`。
+已完成 Chrome/Edge 扩展、本地 Bridge、Pi Extension、一次性配对、状态/标签页、claim/release、Pi 分组、snapshot、Locator、DOM/坐标 CUA、导航和页面交互、截图、Clipboard、Upload/Download、Dialog、Console/Network、原生 CDP 以及 session/turn 清理。
 
-### 第 2 阶段：基础交互
-
-1. claim/release；
-2. 新建标签页；
-3. Pi 标签页分组；
-4. navigate；
-5. click；
-6. fill；
-7. screenshot；
-8. Agent 页面清理。
-
-### 第 3 阶段：原生 CDP
+### 第 3 阶段：扩展能力
 
 1. `Runtime.evaluate`；
 2. Console；

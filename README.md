@@ -2,7 +2,7 @@
 
 Pi 的 Chromium 浏览器控制方案，目标是尽可能对齐 Codex `control-chrome` 的用户体验和能力。
 
-> 当前仓库处于**功能对齐和架构确认阶段**，暂不开始实现代码。
+> 阶段 1/2 核心实现已完成；后续继续按 Codex 行为补齐扩展能力。
 
 ## 目标
 
@@ -56,16 +56,17 @@ docs/webmcp.md
 - [x] 完成功能对齐清单初稿
 - [x] 完成 Bridge/扩展/Pi Extension 架构草案
 - [x] 按 Codex 默认行为确定第一版范围
-- [x] 实现第一阶段核心 Bridge、扩展和 Pi 工具
-- [x] 通过真实 Edge + Extension + Bridge 冒烟测试
-- [ ] 完成第一阶段剩余 Codex 核心能力
+- [x] 实现阶段 1/2 核心 Bridge、扩展和 Pi 工具
+- [x] 通过真实 Edge + Chrome for Testing + Extension + Bridge 高覆盖 E2E 测试
+- [x] 完成 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和生命周期清理
 
-## 暂不实现
+## 当前后续范围
 
-在功能清单确认前，暂不：
+以下能力仍按第三阶段排期，不阻塞当前核心闭环：
 
-- 安装 Chrome/Edge 扩展；
-- 修改 Pi 全局配置；
-- 打开远程调试端口；
-- 编写 Bridge 或 Pi 工具代码；
-- 接管用户当前浏览器标签页。
+- 多 Profile 并行控制；
+- WebMCP、GSuite 导出和浏览历史；
+- 媒体下载专用接口；
+- Capability discovery；
+- Chrome Web Store/Edge Add-ons 发布包；
+- Brave/Chromium 专项验收。

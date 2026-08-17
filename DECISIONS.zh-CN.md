@@ -121,6 +121,12 @@ browser_claim_tab
 browser_select_tab
 browser_new_tab
 browser_snapshot
+browser_extract
+browser_accessibility_snapshot
+browser_locator
+browser_dom_cua
+browser_cua
+browser_wait
 browser_back
 browser_forward
 browser_reload
@@ -139,6 +145,7 @@ browser_evaluate
 browser_cdp
 browser_console
 browser_network
+browser_dialog
 browser_upload
 browser_download
 browser_clipboard
@@ -152,8 +159,14 @@ browser_cleanup
 
 ```text
 /chrome status
+/chrome connect
+/chrome disconnect
+/chrome pause
+/chrome resume
 /chrome setup
 /chrome tabs
+/chrome profile
+/chrome group
 /chrome cleanup
 ```
 
