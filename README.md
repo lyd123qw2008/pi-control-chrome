@@ -53,6 +53,12 @@ pi install D:\liuyongdan\code\pi-control-chrome
 
 The package registers the Pi extension and the bundled Skill through its `package.json` `pi` manifest. It requires Node.js 22 or newer.
 
+### DSH integration
+
+This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, copy its `config/cordis.patch.yml.example`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
+
+The DSH package reuses this project's Bridge and Manifest V3 extension. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+
 ## Load the browser extension
 
 Pi cannot install an unpacked browser extension automatically. Load the shared `extension/` directory once in Chrome or Edge:

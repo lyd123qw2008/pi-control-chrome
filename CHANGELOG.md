@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added the standalone `@lyd123qw2008/dsh-tool-control-chrome` package with the full `browser_*` tool surface, local Bridge reuse, DSH Agent session ownership, screenshot attachment output and real Loader lifecycle coverage.
+
 ## 0.2.4 - 2026-08-17
 
 - Renamed the Chinese README filename so npm and Pi consistently select the English `README.md` as the default package documentation.

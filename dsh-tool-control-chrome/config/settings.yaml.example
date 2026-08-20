@@ -1,0 +1,8 @@
+# Copy this section to <DSH_HOME>/settings.yaml.
+# Keep the pairing token in the referenced file; never paste the token here.
+control-chrome:
+  bridgeHost: 127.0.0.1
+  bridgePort: 17318
+  tokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.token
+  autoStartBridge: true
+  requestTimeoutMs: 120000
