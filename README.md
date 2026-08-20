@@ -48,7 +48,7 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 ### From a local checkout
 
 ```powershell
-pi install D:\liuyongdan\code\pi-control-chrome
+pi install <path-to>/pi-control-chrome
 ```
 
 The package registers the Pi extension and the bundled Skill through its `package.json` `pi` manifest. It requires Node.js 22 or newer.
@@ -86,7 +86,7 @@ The bundled Skill provides a fast CLI for common workflows without generating te
 node skills/pi-control-chrome/scripts/browser.mjs status
 node skills/pi-control-chrome/scripts/browser.mjs tabs --json
 node skills/pi-control-chrome/scripts/browser.mjs group --json
-node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --screenshot C:\Temp\example.png
+node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --screenshot "$env:TEMP\example.png"
 node skills/pi-control-chrome/scripts/browser.mjs cleanup --session <session-id>
 ```
 
@@ -103,7 +103,7 @@ Use the `browser_*` Pi tools for complex interactions, locators, CUA, CDP, dialo
 ## Development and tests
 
 ```powershell
-cd D:\liuyongdan\code\pi-control-chrome
+cd <path-to>/pi-control-chrome
 npm install
 npm run check
 npm test

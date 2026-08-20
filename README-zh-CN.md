@@ -75,7 +75,7 @@
 安装依赖：
 
 ```powershell
-cd D:\liuyongdan\code\pi-control-chrome
+cd <path-to>/pi-control-chrome
 npm install
 ```
 
@@ -84,7 +84,7 @@ npm install
 开发中的本地路径：
 
 ```powershell
-pi install D:\liuyongdan\code\pi-control-chrome
+pi install <path-to>/pi-control-chrome
 ```
 
 发布到 npm 后：
@@ -114,7 +114,7 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 3. 选择 Load unpacked；
 4. 选择：
    ```text
-   D:\liuyongdan\code\pi-control-chrome\extension
+   <path-to>\pi-control-chrome\extension
    ```
 5. 重启 Pi。
 
@@ -139,7 +139,7 @@ npm run smoke:e2e
 `smoke:e2e` 默认使用 Edge，也可以指定 Chrome for Testing：
 
 ```powershell
-$env:PI_CONTROL_CHROME_BROWSER = "C:\Users\liuyd\AppData\Local\ms-playwright\chromium-1224\chrome-win64\chrome.exe"
+$env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
 npm run smoke:e2e
 ```
 
@@ -148,7 +148,7 @@ npm run smoke:e2e
 当前以本机 Codex Chrome 插件的以下资料作为行为参考：
 
 ```text
-C:/Users/liuyd/.codex/plugins/cache/openai-bundled/chrome/26.810.52044/
+<CODEX_HOME>/plugins/cache/openai-bundled/chrome/<version>/
 ```
 
 重点包括：

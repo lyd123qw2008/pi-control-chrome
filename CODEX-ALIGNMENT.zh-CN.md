@@ -5,7 +5,7 @@
 基线目录：
 
 ```text
-C:/Users/liuyd/.codex/plugins/cache/openai-bundled/chrome/26.810.52044/
+<CODEX_HOME>/plugins/cache/openai-bundled/chrome/<version>/
 ```
 
 参考内容：
