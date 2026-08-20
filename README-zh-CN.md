@@ -101,6 +101,12 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 
 项目同时包含 `skills/pi-control-chrome/SKILL.md`。该 Skill 会指导 Pi 优先使用本项目的 `browser_*` 工具控制已连接的 Chrome/Edge，并遵循标签页 ownership、handoff 和 cleanup 规则。
 
+## DSH 集成
+
+仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。它把本项目的完整 `browser_*` 能力注册成 DeepSeek Harness 的模型工具，并通过现有本地 Bridge 控制 Chrome/Edge。
+
+在 DSH Profile 中安装该包，复制它的 `config/cordis.patch.yml.example`，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
+
 加载 Chrome/Edge 扩展：
 
 1. 打开 `chrome://extensions` 或 `edge://extensions`；

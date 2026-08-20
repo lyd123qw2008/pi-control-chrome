@@ -5,6 +5,7 @@ coverage/
 *.log
 *.tmp
 *.tgz
+dsh-tool-control-chrome/lib/
 npm-debug.log*
 .env
 .env.*
