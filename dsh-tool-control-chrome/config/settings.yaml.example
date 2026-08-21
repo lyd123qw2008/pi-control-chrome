@@ -4,5 +4,6 @@ control-chrome:
   bridgeHost: 127.0.0.1
   bridgePort: 17318
   tokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.token
+  ownerTokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.owner
   autoStartBridge: true
   requestTimeoutMs: 120000

@@ -27,6 +27,7 @@ export const Config: z<Config> = z.object({
   bridgeHost: z.string().default('127.0.0.1'),
   bridgePort: z.number().step(1).min(1).max(65_535).default(17_318),
   tokenFile: z.string(),
+  ownerTokenFile: z.string(),
   autoStartBridge: z.boolean().default(true),
   requestTimeoutMs: z.number().step(1).min(1).default(120_000),
   bridgeScript: z.string(),

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added instance, owner, and capability metadata to Bridge health and pairing handshakes.
+- Added authenticated cooperative Bridge restart for the owning Pi or DSH host, with instance-race and in-use checks; unknown legacy Bridges are never taken over by port or PID.
+- Added the explicit Pi `/chrome restart` command and kept browser tabs untouched during Bridge restart.
 - Added `browser_doctor` and browser target stability checks to the DSH plugin.
 - Added an extension identity handshake and atomic Bridge validation for `expectedBrowserId`, preventing a request from crossing an Edge/Chrome replacement.
 - The DSH plugin now rejects an older running Bridge that cannot expose the active browser identity needed for atomic target routing.

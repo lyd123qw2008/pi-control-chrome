@@ -66,6 +66,9 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
   try {
     const health = await waitHealth(port);
     assert.equal(health.extensionConnected, false);
+     assert.equal(health.managedBy, "unknown");
+     assert.equal(health.capabilities.cooperativeRestart, false);
+     assert.equal(health.restart.available, false);
     const pair = await getJson(port, "/pair");
     assert.equal(pair.status, 200);
     assert.equal(pair.body.token, readFileSync(tokenFile, "utf8").trim());
@@ -221,6 +224,69 @@ test("bridge atomically rejects requests for a replaced browser target", async (
     first?.close();
     second?.close();
     stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("bridge allows an owner to cooperatively restart its instance", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-restart-test-"));
+  const tokenFile = join(temp, "token");
+  const ownerTokenFile = join(temp, "owner");
+  const args = [serverPath, "--port", String(port), "--token-file", tokenFile, "--managed-by", "dsh", "--owner-token-file", ownerTokenFile];
+  const child = spawn(process.execPath, args, { stdio: "ignore", windowsHide: true });
+  let pi;
+  let extension;
+  let replacement;
+  try {
+    const initialHealth = await waitHealth(port);
+    assert.equal(initialHealth.managedBy, "dsh");
+    assert.equal(initialHealth.capabilities.cooperativeRestart, true);
+    assert.equal(initialHealth.restart.available, true);
+    const pair = await getJson(port, "/pair");
+    const connect = (role) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    extension = await connect("extension");
+    pi = await connect("pi");
+    const restartId = "restart-owner";
+    const piClosed = new Promise((resolve) => pi.once("close", resolve));
+    const extensionClosed = new Promise((resolve) => extension.once("close", resolve));
+    const response = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("restart response timed out")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== restartId) return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({
+        type: "request",
+        id: restartId,
+        method: "bridge_restart",
+        params: {
+          expectedInstanceId: initialHealth.instanceId,
+          managedBy: "dsh",
+          ownerToken: readFileSync(ownerTokenFile, "utf8").trim(),
+        },
+      }));
+    });
+    assert.deepEqual(response.result, { ok: true, restarting: true, instanceId: initialHealth.instanceId, managedBy: "dsh" });
+    await Promise.all([piClosed, extensionClosed]);
+
+    replacement = spawn(process.execPath, args, { stdio: "ignore", windowsHide: true });
+    const replacementHealth = await waitHealth(port);
+    assert.notEqual(replacementHealth.instanceId, initialHealth.instanceId);
+  } finally {
+    pi?.close();
+    extension?.close();
+    stopProcess(child);
+    stopProcess(replacement);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }

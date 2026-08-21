@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.2.2
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.2.3
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.2.0"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.2.3"
   }
 }
 ```
@@ -33,7 +33,7 @@ The DSH package cannot install a browser extension automatically. Install `pi-co
 3. Choose **Load unpacked**.
 4. Select the installed `pi-control-chrome/extension/` directory.
 
-The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, and Chrome/Edge competition. Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. The plugin also checks that the running Bridge exposes the active browser identity; an older Bridge is rejected with a restart instruction. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.2.4 provides them and 0.2.5 additionally sends an identity handshake.
+The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, Chrome/Edge competition, and Bridge recovery metadata (`recovery.available`, `recovery.ownership`, `recovery.method`, and `recovery.requiresUserConfirmation`). Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. If `browser_doctor` reports an older Bridge without active browser identity, the DSH host can recover only a DSH-owned instance through the cooperative owner control; it should not ask the user to find a hidden Bridge terminal. A matching script, port, or token-file command line does not prove ownership, so an unknown legacy or user-owned listener is left untouched. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.2.6 sends the identity handshake and Bridge lifecycle metadata.
 
 ## Configuration
 
@@ -44,11 +44,12 @@ control-chrome:
   bridgeHost: 127.0.0.1
   bridgePort: 17318
   tokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.token
+  ownerTokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.owner
   autoStartBridge: true
   requestTimeoutMs: 120000
 ```
 
-`tokenFile` is a path, not a token. The plugin never logs or exposes its contents. The default host is loopback; non-loopback hosts are rejected.
+`tokenFile` is a path, not a token. The plugin never logs or exposes its contents. The default host is loopback; non-loopback hosts are rejected. `autoStartBridge` starts the configured Bridge when the port is offline. It does not terminate an unknown healthy listener; stale replacement requires a Bridge supervisor or cooperative owner contract, not a port or command-line fingerprint alone.
 
 The plugin uses the active DSH Agent session id as the browser ownership session id. `browser_cleanup` therefore only handles tabs created or claimed by that Agent session.
 

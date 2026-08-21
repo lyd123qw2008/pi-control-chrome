@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,9 @@ const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17318;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 const SESSION_ID = randomUUID();
+const OWNER_TOKEN_FILE = join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.owner");
+const BRIDGE_WAIT_ATTEMPTS = 30;
+const BRIDGE_WAIT_DELAY_MS = 100;
 let paused = false;
 
 function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
@@ -32,6 +35,17 @@ function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode
     request.on("error", reject);
     request.end();
   });
+}
+
+async function ensureOwnerToken(): Promise<string> {
+  try {
+    const existing = (await readFile(OWNER_TOKEN_FILE, "utf8")).trim();
+    if (existing) return existing;
+  } catch {}
+  const token = randomBytes(32).toString("hex");
+  await mkdir(dirname(OWNER_TOKEN_FILE), { recursive: true });
+  await writeFile(OWNER_TOKEN_FILE, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  return token;
 }
 
 const TAB_ID = Type.Optional(Type.Number({ description: "Chrome/Edge tab id. Omit to use the active tab." }));
@@ -66,6 +80,25 @@ class BridgeClient {
     return response.value;
   }
 
+  async restart(): Promise<any> {
+    const health = await this.health();
+    const instanceId = typeof health.instanceId === "string" ? health.instanceId : undefined;
+    if (!instanceId || health.managedBy !== "pi" || health.capabilities?.cooperativeRestart !== true) {
+      throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge is not a Pi-owned cooperative instance");
+    }
+    const ownerToken = await ensureOwnerToken();
+    const control = await this.request("bridge_restart", {
+      expectedInstanceId: instanceId,
+      managedBy: "pi",
+      ownerToken,
+    });
+    await this.waitForOffline();
+    await this.startBridgeProcess();
+    const next = await this.waitForHealth();
+    if (next.instanceId === instanceId) throw new Error("BRIDGE_INSTANCE_CHANGED: Bridge restart reused the previous instance");
+    return { ok: true, restarted: true, recovery: "cooperative_restart", previousInstanceId: instanceId, control, bridgeHealth: next };
+  }
+
   async request(method: string, params: Record<string, unknown> = {}): Promise<any> {
     await this.connect();
     const socket = this.socket;
@@ -83,18 +116,44 @@ class BridgeClient {
 
   private async ensureBridgeProcess(): Promise<void> {
     if (await this.isHealthy()) return;
+    await this.startBridgeProcess();
+    await this.waitForHealth();
+  }
+
+  private async startBridgeProcess(): Promise<void> {
     const bridgePath = fileURLToPath(new URL("../bridge/server.mjs", import.meta.url));
     if (!existsSync(bridgePath)) throw new Error(`Missing Pi browser bridge: ${bridgePath}`);
     const tokenFile = join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.token");
-    this.bridgeProcess = spawn(process.execPath, [bridgePath, "--port", String(BRIDGE_PORT), "--token-file", tokenFile], {
+    await ensureOwnerToken();
+    this.bridgeProcess = spawn(process.execPath, [
+      bridgePath,
+      "--port", String(BRIDGE_PORT),
+      "--token-file", tokenFile,
+      "--managed-by", "pi",
+      "--owner-token-file", OWNER_TOKEN_FILE,
+    ], {
       stdio: "ignore",
       windowsHide: true,
     });
-    // Keep the local bridge reusable across Pi reloads without keeping the Pi
-    // process alive after its session shuts down.
     this.bridgeProcess.unref();
-    await this.waitForHealth();
   }
+
+  private async waitForHealth(): Promise<any> {
+    for (let i = 0; i < BRIDGE_WAIT_ATTEMPTS; i += 1) {
+      if (await this.isHealthy()) return await this.health();
+      await new Promise((resolve) => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS));
+    }
+    throw new Error("Timed out starting the Pi browser bridge");
+  }
+
+  private async waitForOffline(): Promise<void> {
+    for (let i = 0; i < BRIDGE_WAIT_ATTEMPTS; i += 1) {
+      if (!(await this.isHealthy())) return;
+      await new Promise((resolve) => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS));
+    }
+    throw new Error("Timed out stopping the Pi browser bridge");
+  }
+
 
   private async isHealthy(): Promise<boolean> {
     try {
@@ -105,13 +164,6 @@ class BridgeClient {
     }
   }
 
-  private async waitForHealth(): Promise<void> {
-    for (let i = 0; i < 30; i += 1) {
-      if (await this.isHealthy()) return;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error("Timed out starting the Pi browser bridge");
-  }
 
   private async connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return;
@@ -657,6 +709,12 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           ctx.ui.notify(JSON.stringify(result), "info");
           return;
         }
+        if (action === "restart") {
+          const result = await bridge.restart();
+          updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
+          ctx.ui.notify(JSON.stringify(result), "info");
+          return;
+        }
         if (action === "disconnect") {
           await bridge.stop();
           updateStatus(ctx, "chrome: disconnected");
@@ -702,7 +760,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           ctx.ui.notify("Load extension/ as an unpacked Chrome/Edge extension, then run /chrome connect and /chrome status.", "info");
           return;
         }
-        ctx.ui.notify("用法：/chrome status|connect|disconnect|pause|resume|tabs|profile|group|setup|cleanup|release <tabId>", "warning");
+        ctx.ui.notify("用法：/chrome status|connect|restart|disconnect|pause|resume|tabs|profile|group|setup|cleanup|release <tabId>", "warning");
       } catch (error) {
         updateStatus(ctx, "chrome: offline");
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");

@@ -579,10 +579,23 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function bridgeRecovery(health: Record<string, unknown>): Record<string, unknown> {
+  const restart = isRecord(health.restart) ? health.restart : undefined
+  const capabilities = isRecord(health.capabilities) ? health.capabilities : undefined
+  const ownership = health.managedBy === 'dsh' || health.managedBy === 'pi' ? health.managedBy : 'unknown'
+  const available = ownership === 'dsh' && restart?.available === true && capabilities?.cooperativeRestart === true
+  return {
+    available,
+    ownership,
+    method: available ? 'cooperative_restart' : 'unavailable',
+    requiresUserConfirmation: !available,
+  }
+}
+
 async function bridgeTargetHealth(bridge: BrowserBridgeClient, target: BrowserTarget): Promise<Record<string, unknown>> {
   const health = await bridge.health()
   if (health.browserId !== target.browserId) {
-    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; restart the Bridge with pi-control-chrome 0.2.5 or newer')
+    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor to inspect recovery ownership')
   }
   return health
 }
@@ -618,6 +631,7 @@ async function browserDoctor(
       ok: false,
       recommendation: 'check_bridge',
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
+       recovery: { available: false, ownership: 'unknown', method: 'unavailable', requiresUserConfirmation: true },
     })
   }
   if (bridgeHealth.extensionConnected !== true) {
@@ -625,7 +639,8 @@ async function browserDoctor(
       ok: false,
       recommendation: 'enable_or_reload_extension',
       bridgeHealth,
-      issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
+      recovery: bridgeRecovery(bridgeHealth),
+       issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
     })
   }
 
@@ -637,6 +652,7 @@ async function browserDoctor(
       ok: false,
       recommendation: 'reconnect_extension',
       bridgeHealth,
+      recovery: bridgeRecovery(bridgeHealth),
       issues: [{ code: 'browser_status_unavailable', message: errorText(error) }],
     })
   }
@@ -654,6 +670,7 @@ async function browserDoctor(
       bridgeHealth,
       targetStability,
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
+       recovery: { available: false, ownership: 'unknown', method: 'unavailable', requiresUserConfirmation: true },
       notices: [],
     })
   }
@@ -669,7 +686,7 @@ async function browserDoctor(
       message: `The active browser changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}).`,
     })
   } else if (bridgeBrowserId === undefined) {
-    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity. Restart it with pi-control-chrome 0.2.5 or newer.' })
+    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity required for atomic target routing.' })
   } else if (target !== undefined && target.browserId !== bridgeBrowserId) {
     issues.push({
       code: 'bridge_browser_target_changed',
@@ -694,6 +711,7 @@ async function browserDoctor(
     recommendation,
     bridgeHealth,
     targetStability,
+    recovery: bridgeRecovery(bridgeHealth),
     issues,
     notices,
   })

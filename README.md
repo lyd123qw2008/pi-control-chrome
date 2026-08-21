@@ -29,7 +29,7 @@ Chrome / Edge Manifest V3 Extension
 Current Chromium Profile
 ```
 
-The Bridge binds to loopback and requires a local pairing token. Installing the extension and completing local pairing are the trust boundary; normal browser operations do not request repeated per-action authorization.
+The Bridge binds to loopback and requires a local pairing token. Host-managed Bridge instances also expose a non-secret instance id, owner, and capability list; only the owning host can request a cooperative restart. Unknown legacy instances are left untouched. Installing the extension and completing local pairing are the trust boundary; normal browser operations do not request repeated per-action authorization.
 
 ## Installation
 
