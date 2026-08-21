@@ -61,23 +61,23 @@ Do not keep retrying a page action while the two extensions are competing for th
 **Symptoms:** `browser_doctor` reports `recommendation: restart_bridge`, `bridge_target_routing_unavailable`, or a healthy Bridge without an active `browserId`.
 
 1. Stop browser actions and run `browser_doctor` once.
-2. Inspect `recovery.available`, `recovery.ownership`, `recovery.method`, and `recovery.requiresUserConfirmation`.
-3. When the current host owns the Bridge and exposes its lifecycle action, invoke the host's cooperative restart action (Pi exposes `/chrome restart`). It validates the instance id and owner contract, closes the Bridge cleanly, starts the latest managed Bridge, and leaves browser tabs untouched.
+2. Inspect `recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`.
+3. When the Bridge exposes cooperative restart, invoke the explicit host command (`/chrome restart` in Pi or DSH). The Bridge validates the instance id, rejects pending browser work, serializes concurrent restart requests, and leaves browser tabs untouched.
 4. Do not terminate a port owner based on the port alone, a PID lookup, or a command-line match, and do not start a second Bridge while the existing one is healthy.
 5. Run `browser_doctor` again, then call `browser_status` before retrying the requested operation.
-6. Ask the user for host-level help only when the owner action is unavailable or the listener is an unknown legacy/user-owned Bridge. The user should not be asked to find a hidden Bridge terminal as the default recovery path.
+6. Ask the user for host-level help only when the Bridge is legacy or lacks cooperative restart capability. The user should not be asked to find a hidden Bridge terminal as the default recovery path.
 
 ### Bridge or extension is offline
 
 **Symptoms:** `browser_status` fails, `extensionConnected` is false, or the request reports `EXTENSION_OFFLINE`.
 
 1. Run `browser_doctor` when available; use `/chrome status` or `browser_status` to separate Bridge failure from extension failure.
-2. When the current host owns the Bridge, invoke its managed startup or cooperative restart action. Pi uses `/chrome connect` for startup and `/chrome restart` for an owned Bridge.
+2. When the Bridge is offline, invoke `/chrome connect` in Pi or use the DSH browser client; either Host may start the local-user Bridge.
 3. Check `http://127.0.0.1:17318/health` through the available browser or host diagnostic tool.
 4. If the Bridge is healthy, confirm the unpacked extension is enabled in the requested browser's extension page.
 5. Run `/chrome connect`, then check `/chrome status` again.
 6. Reload the unpacked extension only after the previous checks fail.
-7. Ask the user for help only when host recovery is unavailable or the extension must be installed or enabled.
+7. Ask the user for help only when cooperative recovery is unavailable or the extension must be installed or enabled.
 
 Do not start a second Bridge on port `17318` while the daily Bridge is running. A port collision can make an isolated test look like an installed-extension failure.
 

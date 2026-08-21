@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { WebSocketServer } from "ws";
@@ -18,6 +18,7 @@ const BRIDGE_SERVICE = "pi-control-chrome";
 const BRIDGE_CAPABILITIES = Object.freeze({
   browserIdentity: true,
   atomicTargetRouting: true,
+  cooperativeRestart: true,
 });
 const BRIDGE_VERSION = (() => {
   try {
@@ -34,33 +35,10 @@ function argValue(name, fallback) {
 
 const port = Number(argValue("--port", DEFAULT_PORT));
 const tokenFile = argValue("--token-file", DEFAULT_TOKEN_FILE);
-const managedByValue = argValue("--managed-by", "unknown");
-const managedBy = managedByValue === "dsh" || managedByValue === "pi" ? managedByValue : "unknown";
-const ownerTokenFile = managedBy === "unknown"
-  ? undefined
-  : argValue("--owner-token-file", join(dirname(tokenFile), "pi-control-chrome.owner"));
+const startedByValue = argValue("--started-by", argValue("--managed-by", "unknown"));
+const startedBy = startedByValue === "dsh" || startedByValue === "pi" ? startedByValue : "unknown";
 
-function ensureOwnerToken() {
-  if (ownerTokenFile === undefined) return undefined;
-  if (existsSync(ownerTokenFile)) {
-    const existing = readFileSync(ownerTokenFile, "utf8").trim();
-    if (existing) return existing;
-  }
-  mkdirSync(dirname(ownerTokenFile), { recursive: true });
-  const ownerToken = randomBytes(32).toString("hex");
-  writeFileSync(ownerTokenFile, `${ownerToken}\n`, { encoding: "utf8", mode: 0o600 });
-  return ownerToken;
-}
-
-const ownerToken = ensureOwnerToken();
 const instanceId = randomUUID();
-
-function sameSecret(left, right) {
-  if (typeof left !== "string" || typeof right !== "string") return false;
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.length > 0 && leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
-}
 
 function ensureToken() {
   if (existsSync(tokenFile)) {
@@ -124,32 +102,26 @@ function handleBridgeRestart(client, id, message) {
     sendError(client, id, "BRIDGE_IN_USE", "The Bridge is already restarting.");
     return;
   }
-  if (managedBy === "unknown" || ownerToken === undefined) {
-    sendError(client, id, "BRIDGE_RESTART_UNSUPPORTED", "This Bridge has no cooperative restart owner.");
-    return;
-  }
   const params = requestParams(message);
   if (params.expectedInstanceId !== instanceId) {
     sendError(client, id, "BRIDGE_INSTANCE_CHANGED", "The Bridge instance changed before the restart request was accepted.");
     return;
   }
-  if (params.managedBy !== managedBy || !sameSecret(params.ownerToken, ownerToken)) {
-    sendError(client, id, "BRIDGE_NOT_OWNER", "The requester does not own this Bridge instance.");
-    return;
-  }
-  if (activePiClients().length !== 1 || pending.size !== 0) {
-    sendError(client, id, "BRIDGE_IN_USE", "The Bridge has another active Pi client or a pending browser request.");
+  if (pending.size !== 0) {
+    sendError(client, id, "BRIDGE_IN_USE", "The Bridge has a pending browser request.");
     return;
   }
   restarting = true;
+  const requester = nonEmptyString(params.requester) ?? "unknown";
   if (!send(client, {
     type: "response",
     id,
-    result: { ok: true, restarting: true, instanceId, managedBy },
+    result: { ok: true, restarting: true, instanceId, startedBy, controlDomain: "local_user", requester },
   })) {
     restarting = false;
     return;
   }
+  broadcast({ type: "event", event: "restarting", instanceId, requester });
   setTimeout(shutdown, 25).unref();
 }
 
@@ -284,11 +256,13 @@ const server = createServer((req, res) => {
       service: BRIDGE_SERVICE,
       bridgeVersion: BRIDGE_VERSION,
       instanceId,
-      managedBy,
-      capabilities: { ...BRIDGE_CAPABILITIES, cooperativeRestart: managedBy !== "unknown" },
+      startedBy,
+      controlDomain: "local_user",
+      capabilities: BRIDGE_CAPABILITIES,
       restart: {
-        available: managedBy !== "unknown" && ownerToken !== undefined,
-        managedBy,
+        available: true,
+        method: "cooperative_restart",
+        controlDomain: "local_user",
       },
       port,
       extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
@@ -337,8 +311,9 @@ wss.on("connection", (client, request) => {
     service: BRIDGE_SERVICE,
     bridgeVersion: BRIDGE_VERSION,
     instanceId,
-    managedBy,
-    capabilities: { ...BRIDGE_CAPABILITIES, cooperativeRestart: managedBy !== "unknown" },
+    startedBy,
+    controlDomain: "local_user",
+    capabilities: BRIDGE_CAPABILITIES,
     extensionConnected: Boolean(extensionClient),
   });
   broadcast({ type: "event", event: "connection", role, connected: true });

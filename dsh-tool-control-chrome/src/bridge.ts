@@ -1,12 +1,11 @@
 /** Local Bridge client shared by the DSH browser tools. */
 
 import { createRequire } from 'node:module'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
-import { join, dirname, resolve as resolvePath } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import WebSocket from 'ws'
 import type { Config, ResolvedConfig } from './types.js'
 
@@ -14,7 +13,6 @@ const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 17318
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_TOKEN_FILE = join(homedir(), '.pi', 'agent', 'pi-control-chrome.token')
-const DEFAULT_OWNER_TOKEN_FILE = join(homedir(), '.pi', 'agent', 'pi-control-chrome.owner')
 const BRIDGE_WAIT_ATTEMPTS = 30
 const BRIDGE_WAIT_DELAY_MS = 100
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
@@ -50,7 +48,6 @@ export function resolveConfig(config: Config): ResolvedConfig {
     bridgeHost,
     bridgePort,
     tokenFile: config.tokenFile ?? DEFAULT_TOKEN_FILE,
-    ownerTokenFile: config.ownerTokenFile ?? DEFAULT_OWNER_TOKEN_FILE,
     autoStartBridge: config.autoStartBridge ?? true,
     requestTimeoutMs,
     ...(config.bridgeScript === undefined ? {} : { bridgeScript: config.bridgeScript }),
@@ -94,20 +91,6 @@ function errorMessage(error: unknown, fallback: string): Error {
   return error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`)
 }
 
-async function ownerToken(file: string, create: boolean): Promise<string | undefined> {
-  try {
-    const existing = (await readFile(file, 'utf8')).trim()
-    if (existing.length > 0) return existing
-  } catch {
-    if (!create) return undefined
-  }
-  if (!create) return undefined
-  const value = randomBytes(32).toString('hex')
-  await mkdir(dirname(file), { recursive: true })
-  await writeFile(file, `${value}\n`, { encoding: 'utf8', mode: 0o600 })
-  return value
-}
-
 function hasCapability(health: Record<string, unknown>, name: string): boolean {
   const capabilities = health.capabilities
   return typeof capabilities === 'object'
@@ -132,7 +115,6 @@ function lifecycleError(code: string, message: string): Error & { readonly code:
  */
 export class BrowserBridgeClient {
   private socket: WebSocket | undefined
-  private bridgeProcess?: ChildProcess
   private connecting: Promise<void> | undefined
   private restarting: Promise<Record<string, unknown>> | undefined
   private readonly pending = new Map<string, PendingEntry>()
@@ -163,7 +145,7 @@ export class BrowserBridgeClient {
   }
 
   /**
-   * Restart a Bridge owned by this DSH client through its cooperative control
+   * Restart a compatible Bridge through the local-user cooperative control
    * protocol, or start it when the configured port is offline.
    * @returns the new Bridge health document and lifecycle result.
    */
@@ -285,16 +267,10 @@ export class BrowserBridgeClient {
     if (instanceId === undefined || !hasCapability(health, 'cooperativeRestart')) {
       throw lifecycleError('BRIDGE_RESTART_UNSUPPORTED', 'This Bridge does not expose cooperative restart capabilities')
     }
-    if (health.managedBy !== 'dsh') {
-      throw lifecycleError('BRIDGE_NOT_OWNER', `The active Bridge is managed by ${String(health.managedBy ?? 'unknown')}`)
-    }
-    const secret = await ownerToken(config.ownerTokenFile, false)
-    if (secret === undefined) throw lifecycleError('BRIDGE_NOT_OWNER', 'The DSH owner secret is unavailable')
 
     const control = await this.request('bridge_restart', {
       expectedInstanceId: instanceId,
-      managedBy: 'dsh',
-      ownerToken: secret,
+      requester: 'dsh',
     })
     await this.waitForBridgeOffline(config)
     await this.startBridgeProcess(config)
@@ -346,18 +322,17 @@ export class BrowserBridgeClient {
 
   private async startBridgeProcess(config: ResolvedConfig): Promise<void> {
     const bridgeScript = this.resolveBridgeScript(config)
-    await ownerToken(config.ownerTokenFile, true)
-    this.bridgeProcess = spawn(process.execPath, [
+    const child = spawn(process.execPath, [
       bridgeScript,
       '--port', String(config.bridgePort),
       '--token-file', config.tokenFile,
-      '--managed-by', 'dsh',
-      '--owner-token-file', config.ownerTokenFile,
+      '--started-by', 'dsh',
     ], {
       stdio: 'ignore',
       windowsHide: true,
     })
-    this.bridgeProcess.unref()
+    child.once('error', () => {})
+    child.unref()
   }
 
   private resolveBridgeScript(config: ResolvedConfig): string {

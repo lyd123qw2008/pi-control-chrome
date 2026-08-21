@@ -10,8 +10,6 @@ export interface Config {
   bridgePort?: number
   /** Pairing-token file. Defaults to the current user's Pi agent token path. */
   tokenFile?: string
-  /** Owner-secret file used by the DSH-managed Bridge restart contract. */
-  ownerTokenFile?: string
   /** Start the bundled Bridge when no healthy Bridge is running. Defaults to true. */
   autoStartBridge?: boolean
   /** Per-request Bridge timeout in milliseconds. Defaults to 120000. */
@@ -25,7 +23,6 @@ export interface ResolvedConfig {
   readonly bridgeHost: string
   readonly bridgePort: number
   readonly tokenFile: string
-  readonly ownerTokenFile: string
   readonly autoStartBridge: boolean
   readonly requestTimeoutMs: number
   readonly bridgeScript?: string

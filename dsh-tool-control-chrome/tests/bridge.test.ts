@@ -23,32 +23,7 @@ it('resolveConfig rejects non-loopback Bridge hosts and accepts defaults', () =>
   expect(defaults.bridgeHost).toBe('127.0.0.1')
   expect(defaults.bridgePort).toBe(17318)
   expect(defaults.autoStartBridge).toBe(true)
-  expect(defaults.ownerTokenFile).toMatch(/pi-control-chrome\.owner$/u)
   expect(() => resolveConfig({ bridgeHost: '192.0.2.10' })).toThrow(/must be loopback/)
-})
-
-it('refuses to restart a Bridge owned by Pi', async () => {
-  const server = createServer((request, response) => {
-    if (request.url === '/health') return json(response, 200, {
-      ok: true,
-      protocol: 1,
-      instanceId: 'pi-instance',
-      managedBy: 'pi',
-      capabilities: { cooperativeRestart: true },
-      restart: { available: true, managedBy: 'pi' },
-    })
-    if (request.url === '/pair') return json(response, 200, { ok: true, protocol: 1, token: 'test-token' })
-    return json(response, 404, { ok: false })
-  })
-  const port = await listen(server)
-  const client = new BrowserBridgeClient(() => resolveConfig({ bridgePort: port, autoStartBridge: false }))
-  try {
-    await expect(client.restart()).rejects.toMatchObject({ code: 'BRIDGE_NOT_OWNER' })
-  } finally {
-    await client.stop()
-    server.close()
-    await once(server, 'close')
-  }
 })
 
 it('BrowserBridgeClient pairs, routes requests, reads health, and observes abort', async () => {

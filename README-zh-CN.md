@@ -30,8 +30,7 @@
 - 安装和配对一次后，正常操作不重复请求授权或浏览器动作确认；
 - 支持 Pi、Bridge 和浏览器扩展之间的自动重连。
 
-### 标签页管理
-
+- Bridge 使用本机配对令牌和实例 ID；同一用户控制域中的 DSH 或 Pi Host 都可以通过显式 `/chrome restart` 请求协作式重启。
 - 发现当前窗口和标签页；
 - claim/release 用户标签页；
 - Agent 创建的页面自动进入 Pi 专属分组；
@@ -64,6 +63,7 @@
 - `extension/`：Manifest V3 Chrome/Edge 扩展；
 - `bridge/`：本地 WebSocket Bridge；
 - `pi-extension/`：Pi 原生浏览器工具和 `/chrome` 命令；
+- `dsh-tool-control-chrome/`：DSH `browser_*` 工具和 `/chrome status|doctor|restart|tabs` 命令；
 - `tests/bridge.test.mjs`：Bridge 单元/协议测试；
 - `tests/skill-script.test.mjs`：Skill 快速脚本的实时 Bridge 集成测试；
 - `tests/e2e-browser.mjs`：真实 Edge/Chrome for Testing + 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。

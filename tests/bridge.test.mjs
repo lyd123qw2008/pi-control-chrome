@@ -66,9 +66,10 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
   try {
     const health = await waitHealth(port);
     assert.equal(health.extensionConnected, false);
-     assert.equal(health.managedBy, "unknown");
-     assert.equal(health.capabilities.cooperativeRestart, false);
-     assert.equal(health.restart.available, false);
+     assert.equal(health.startedBy, "unknown");
+     assert.equal(health.controlDomain, "local_user");
+     assert.equal(health.capabilities.cooperativeRestart, true);
+     assert.equal(health.restart.available, true);
     const pair = await getJson(port, "/pair");
     assert.equal(pair.status, 200);
     assert.equal(pair.body.token, readFileSync(tokenFile, "utf8").trim());
@@ -229,19 +230,19 @@ test("bridge atomically rejects requests for a replaced browser target", async (
   }
 });
 
-test("bridge allows an owner to cooperatively restart its instance", async () => {
+test("bridge allows a paired local Host to cooperatively restart its instance", async () => {
   const port = 17800 + Math.floor(Math.random() * 500);
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-restart-test-"));
   const tokenFile = join(temp, "token");
-  const ownerTokenFile = join(temp, "owner");
-  const args = [serverPath, "--port", String(port), "--token-file", tokenFile, "--managed-by", "dsh", "--owner-token-file", ownerTokenFile];
+  const args = [serverPath, "--port", String(port), "--token-file", tokenFile, "--started-by", "pi"];
   const child = spawn(process.execPath, args, { stdio: "ignore", windowsHide: true });
   let pi;
   let extension;
   let replacement;
   try {
     const initialHealth = await waitHealth(port);
-    assert.equal(initialHealth.managedBy, "dsh");
+    assert.equal(initialHealth.startedBy, "pi");
+    assert.equal(initialHealth.controlDomain, "local_user");
     assert.equal(initialHealth.capabilities.cooperativeRestart, true);
     assert.equal(initialHealth.restart.available, true);
     const pair = await getJson(port, "/pair");
@@ -252,7 +253,36 @@ test("bridge allows an owner to cooperatively restart its instance", async () =>
     });
     extension = await connect("extension");
     pi = await connect("pi");
-    const restartId = "restart-owner";
+    const pendingId = "pending-browser-request";
+    const pendingForwarded = new Promise((resolve) => {
+      extension.on("message", (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type === "request" && message.id === pendingId) resolve();
+      });
+    });
+    pi.send(JSON.stringify({ type: "request", id: pendingId, method: "wait_forever", params: {} }));
+    await pendingForwarded;
+    const blockedRestart = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("pending-request restart did not fail")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== "pending-restart") return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({
+        type: "request",
+        id: "pending-restart",
+        method: "bridge_restart",
+        params: { expectedInstanceId: initialHealth.instanceId, requester: "dsh" },
+      }));
+    });
+    assert.equal(blockedRestart.error.code, "BRIDGE_IN_USE");
+    extension.send(JSON.stringify({ type: "response", id: pendingId, result: { ok: true } }));
+
+    const restartId = "restart-local-user";
     const piClosed = new Promise((resolve) => pi.once("close", resolve));
     const extensionClosed = new Promise((resolve) => extension.once("close", resolve));
     const response = await new Promise((resolve, reject) => {
@@ -271,12 +301,18 @@ test("bridge allows an owner to cooperatively restart its instance", async () =>
         method: "bridge_restart",
         params: {
           expectedInstanceId: initialHealth.instanceId,
-          managedBy: "dsh",
-          ownerToken: readFileSync(ownerTokenFile, "utf8").trim(),
+          requester: "dsh",
         },
       }));
     });
-    assert.deepEqual(response.result, { ok: true, restarting: true, instanceId: initialHealth.instanceId, managedBy: "dsh" });
+    assert.deepEqual(response.result, {
+      ok: true,
+      restarting: true,
+      instanceId: initialHealth.instanceId,
+      startedBy: "pi",
+      controlDomain: "local_user",
+      requester: "dsh",
+    });
     await Promise.all([piClosed, extensionClosed]);
 
     replacement = spawn(process.execPath, args, { stdio: "ignore", windowsHide: true });

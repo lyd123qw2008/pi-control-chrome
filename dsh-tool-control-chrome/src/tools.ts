@@ -13,6 +13,7 @@ import {
   type ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
 import type { BrowserBridgeClient } from './bridge.js'
+import { bridgeRecovery, unavailableBridgeRecovery } from './diagnostics.js'
 import type { ResolvedConfig, ScreenshotResult } from './types.js'
 
 const TAB_ID: ParameterPropertySpec = { type: 'number', description: 'Browser tab id. Omit to use the selected tab.' }
@@ -579,23 +580,10 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function bridgeRecovery(health: Record<string, unknown>): Record<string, unknown> {
-  const restart = isRecord(health.restart) ? health.restart : undefined
-  const capabilities = isRecord(health.capabilities) ? health.capabilities : undefined
-  const ownership = health.managedBy === 'dsh' || health.managedBy === 'pi' ? health.managedBy : 'unknown'
-  const available = ownership === 'dsh' && restart?.available === true && capabilities?.cooperativeRestart === true
-  return {
-    available,
-    ownership,
-    method: available ? 'cooperative_restart' : 'unavailable',
-    requiresUserConfirmation: !available,
-  }
-}
-
 async function bridgeTargetHealth(bridge: BrowserBridgeClient, target: BrowserTarget): Promise<Record<string, unknown>> {
   const health = await bridge.health()
   if (health.browserId !== target.browserId) {
-    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor to inspect recovery ownership')
+    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor to inspect recovery availability')
   }
   return health
 }
@@ -631,7 +619,7 @@ async function browserDoctor(
       ok: false,
       recommendation: 'check_bridge',
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
-       recovery: { available: false, ownership: 'unknown', method: 'unavailable', requiresUserConfirmation: true },
+      recovery: unavailableBridgeRecovery(),
     })
   }
   if (bridgeHealth.extensionConnected !== true) {
@@ -670,7 +658,7 @@ async function browserDoctor(
       bridgeHealth,
       targetStability,
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
-       recovery: { available: false, ownership: 'unknown', method: 'unavailable', requiresUserConfirmation: true },
+      recovery: unavailableBridgeRecovery(),
       notices: [],
     })
   }

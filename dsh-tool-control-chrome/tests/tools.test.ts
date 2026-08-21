@@ -25,8 +25,7 @@ function setup(bridge: Pick<BrowserBridgeClient, 'request' | 'health'>, attachme
     bridgeHost: '127.0.0.1',
     bridgePort: 17318,
     tokenFile: 'C:/test/token',
-     ownerTokenFile: 'C:/test/owner',
-    autoStartBridge: false,
+              autoStartBridge: false,
     requestTimeoutMs: 120_000,
   }))
   return tools
@@ -136,7 +135,7 @@ describe('DSH browser tool catalog', () => {
     await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())).rejects.toThrow(/atomic target routing/)
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
   })
-  it('reports cooperative recovery availability for a DSH-owned Bridge', async () => {
+  it('reports cooperative recovery availability for a compatible local-user Bridge', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.5' }
       : { method })
@@ -144,15 +143,16 @@ describe('DSH browser tool catalog', () => {
       ok: true,
       extensionConnected: true,
       browserId: 'edge:test',
-      managedBy: 'dsh',
-      capabilities: { cooperativeRestart: true },
-      restart: { available: true, managedBy: 'dsh' },
+      startedBy: 'pi',
+      controlDomain: 'local_user',
+       capabilities: { cooperativeRestart: true },
+      restart: { available: true, controlDomain: 'local_user' },
     }))
     const tools = setup({ request, health })
     const diagnosis = await tools.get('browser_doctor')?.execute({}, execution())
     expect(diagnosis).toMatchObject({
       ok: true,
-      recovery: { available: true, ownership: 'dsh', method: 'cooperative_restart', requiresUserConfirmation: false },
+      recovery: { available: true, authority: 'local_user', controlDomain: 'local_user', method: 'cooperative_restart', requiresUserConfirmation: false },
     })
   })
 

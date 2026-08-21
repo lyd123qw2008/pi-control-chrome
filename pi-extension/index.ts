@@ -1,7 +1,7 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcess } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -13,7 +13,6 @@ const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17318;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 const SESSION_ID = randomUUID();
-const OWNER_TOKEN_FILE = join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.owner");
 const BRIDGE_WAIT_ATTEMPTS = 30;
 const BRIDGE_WAIT_DELAY_MS = 100;
 let paused = false;
@@ -37,23 +36,11 @@ function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode
   });
 }
 
-async function ensureOwnerToken(): Promise<string> {
-  try {
-    const existing = (await readFile(OWNER_TOKEN_FILE, "utf8")).trim();
-    if (existing) return existing;
-  } catch {}
-  const token = randomBytes(32).toString("hex");
-  await mkdir(dirname(OWNER_TOKEN_FILE), { recursive: true });
-  await writeFile(OWNER_TOKEN_FILE, `${token}\n`, { encoding: "utf8", mode: 0o600 });
-  return token;
-}
-
 const TAB_ID = Type.Optional(Type.Number({ description: "Chrome/Edge tab id. Omit to use the active tab." }));
 const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a ref from browser_snapshot." }));
 
 class BridgeClient {
   private socket?: WebSocket;
-  private bridgeProcess?: ChildProcess;
   private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private connecting?: Promise<void>;
 
@@ -83,14 +70,12 @@ class BridgeClient {
   async restart(): Promise<any> {
     const health = await this.health();
     const instanceId = typeof health.instanceId === "string" ? health.instanceId : undefined;
-    if (!instanceId || health.managedBy !== "pi" || health.capabilities?.cooperativeRestart !== true) {
-      throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge is not a Pi-owned cooperative instance");
+    if (!instanceId || health.capabilities?.cooperativeRestart !== true) {
+      throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge does not expose cooperative restart capabilities");
     }
-    const ownerToken = await ensureOwnerToken();
     const control = await this.request("bridge_restart", {
       expectedInstanceId: instanceId,
-      managedBy: "pi",
-      ownerToken,
+      requester: "pi",
     });
     await this.waitForOffline();
     await this.startBridgeProcess();
@@ -124,18 +109,17 @@ class BridgeClient {
     const bridgePath = fileURLToPath(new URL("../bridge/server.mjs", import.meta.url));
     if (!existsSync(bridgePath)) throw new Error(`Missing Pi browser bridge: ${bridgePath}`);
     const tokenFile = join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.token");
-    await ensureOwnerToken();
-    this.bridgeProcess = spawn(process.execPath, [
+    const child = spawn(process.execPath, [
       bridgePath,
       "--port", String(BRIDGE_PORT),
       "--token-file", tokenFile,
-      "--managed-by", "pi",
-      "--owner-token-file", OWNER_TOKEN_FILE,
+      "--started-by", "pi",
     ], {
       stdio: "ignore",
       windowsHide: true,
     });
-    this.bridgeProcess.unref();
+    child.once("error", () => {});
+    child.unref();
   }
 
   private async waitForHealth(): Promise<any> {
@@ -207,14 +191,17 @@ class BridgeClient {
 
   private handleMessage(raw: string): void {
     try {
-      const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { message?: string } };
+      const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { code?: string; message?: string } };
       if (message.type !== "response" || !message.id) return;
       const entry = this.pending.get(message.id);
       if (!entry) return;
       clearTimeout(entry.timer);
       this.pending.delete(message.id);
-      if (message.error) entry.reject(new Error(message.error.message || "Browser request failed"));
-      else entry.resolve(message.result);
+      if (message.error) {
+        const error = new Error(message.error.message || "Browser request failed") as Error & { code?: string };
+        if (message.error.code) error.code = message.error.code;
+        entry.reject(error);
+      } else entry.resolve(message.result);
     } catch {
       // Ignore malformed bridge events; the next request will report connection state.
     }

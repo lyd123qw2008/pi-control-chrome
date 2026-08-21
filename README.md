@@ -29,7 +29,7 @@ Chrome / Edge Manifest V3 Extension
 Current Chromium Profile
 ```
 
-The Bridge binds to loopback and requires a local pairing token. Host-managed Bridge instances also expose a non-secret instance id, owner, and capability list; only the owning host can request a cooperative restart. Unknown legacy instances are left untouched. Installing the extension and completing local pairing are the trust boundary; normal browser operations do not request repeated per-action authorization.
+The Bridge binds to loopback and requires a local pairing token. Host-launched instances expose a non-secret instance id, launcher label and capability list; any paired DSH or Pi Host in the same local-user control domain may request a cooperative restart when the Bridge has no pending browser request. The instance id prevents stale restart races, and a restart lock serializes concurrent requests. Unknown legacy Bridges remain untouched when they do not expose the cooperative capability. Installing the extension and completing local pairing are the trust steps; normal browser operations do not request repeated per-action authorization.
 
 ## Installation
 
@@ -57,7 +57,7 @@ The package registers the Pi extension and the bundled Skill through its `packag
 
 This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, copy its `config/cordis.patch.yml.example`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
-The DSH package reuses this project's Bridge and Manifest V3 extension. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+The DSH package reuses this project's Bridge and Manifest V3 extension. It registers the model-facing `browser_*` tools and the human `/chrome status|doctor|restart|tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
 
 ## Load the browser extension
 
