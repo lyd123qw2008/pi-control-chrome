@@ -145,7 +145,7 @@ describe('DSH browser tool catalog', () => {
       browserId: 'edge:test',
       startedBy: 'pi',
       controlDomain: 'local_user',
-       capabilities: { cooperativeRestart: true, localUserRestart: true },
+      capabilities: { cooperativeRestart: true, localUserRestart: true },
       restart: { available: true, controlDomain: 'local_user' },
     }))
     const tools = setup({ request, health })
@@ -153,6 +153,25 @@ describe('DSH browser tool catalog', () => {
     expect(diagnosis).toMatchObject({
       ok: true,
       recovery: { available: true, authority: 'local_user', controlDomain: 'local_user', method: 'cooperative_restart', requiresUserConfirmation: false },
+    })
+  })
+
+  it('does not advertise recovery for the old launcher-owner protocol', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.6' }
+      : { method })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browserId: 'edge:test',
+      managedBy: 'dsh',
+      capabilities: { cooperativeRestart: true },
+      restart: { available: true, managedBy: 'dsh' },
+    }))
+    const tools = setup({ request, health })
+    const diagnosis = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(diagnosis).toMatchObject({
+      recovery: { available: false, authority: 'unknown', method: 'unavailable', requiresUserConfirmation: true },
     })
   })
 

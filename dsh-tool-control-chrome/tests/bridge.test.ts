@@ -26,6 +26,29 @@ it('resolveConfig rejects non-loopback Bridge hosts and accepts defaults', () =>
   expect(() => resolveConfig({ bridgeHost: '192.0.2.10' })).toThrow(/must be loopback/)
 })
 
+it('rejects the old launcher-owner restart protocol', async () => {
+  const server = createServer((request, response) => {
+    if (request.url === '/health') return json(response, 200, {
+      ok: true,
+      protocol: 1,
+      instanceId: 'legacy-instance',
+      managedBy: 'dsh',
+      capabilities: { cooperativeRestart: true },
+      restart: { available: true, managedBy: 'dsh' },
+    })
+    return json(response, 404, { ok: false })
+  })
+  const port = await listen(server)
+  const client = new BrowserBridgeClient(() => resolveConfig({ bridgePort: port, autoStartBridge: false }))
+  try {
+    await expect(client.restart()).rejects.toMatchObject({ code: 'BRIDGE_RESTART_UNSUPPORTED' })
+  } finally {
+    await client.stop()
+    server.close()
+    await once(server, 'close')
+  }
+})
+
 it('BrowserBridgeClient pairs, routes requests, reads health, and observes abort', async () => {
   const server = createServer((request, response) => {
     if (request.url === '/health') return json(response, 200, { ok: true, protocol: 1, extensionConnected: true })
