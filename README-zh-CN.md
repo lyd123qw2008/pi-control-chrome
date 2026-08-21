@@ -101,6 +101,8 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 
 项目同时包含 `skills/pi-control-chrome/SKILL.md`。该 Skill 会指导 Pi 优先使用本项目的 `browser_*` 工具控制已连接的 Chrome/Edge，并遵循标签页 ownership、handoff 和 cleanup 规则。
 
+同一个 Bridge 当前只接受一个活动中的扩展连接。Chrome 和 Edge 可以同时打开，但如果两个浏览器都加载这套扩展并连接到同一个 Bridge，后连接的扩展会替换先连接的扩展，Pi 的控制目标可能在两个浏览器之间切换。实际使用时请为一个 Bridge 只连接一个受控浏览器。
+
 ## DSH 集成
 
 仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。它把本项目的完整 `browser_*` 能力注册成 DeepSeek Harness 的模型工具，并通过现有本地 Bridge 控制 Chrome/Edge。
@@ -142,6 +144,8 @@ npm run smoke:e2e
 $env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
 npm run smoke:e2e
 ```
+
+该测试使用隔离的临时浏览器 Profile，不会修改用户日常 Profile。部分已安装的 Google Chrome 版本会拒绝命令行加载 unpacked extension 的参数；验证正常 Chrome Profile 时，应在 `chrome://extensions` 中手动加载 `extension/`。
 
 ## 对齐基线
 

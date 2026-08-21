@@ -16,11 +16,11 @@
 
 ### A1. 浏览器类型
 
-- [ ] **P0** Chrome 支持
-- [ ] **P0** Edge 支持
+- [x] **P0** Chrome 支持
+- [x] **P0** Edge 支持
 - [ ] **P1** Chromium/Brave 兼容
 - [ ] **P1** 同一 Bridge 同时识别多个浏览器实例
-- [ ] **P1** Pi 工具中显示浏览器名称、Profile、版本和连接状态
+- [x] **P1** Pi 工具中显示浏览器名称、Profile、版本和连接状态
 
 ### A2. 扩展与 Bridge
 

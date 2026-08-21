@@ -9,9 +9,9 @@ import WebSocket from "ws";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const bridge = join(root, "bridge", "server.mjs");
-const extension = join(root, "extension");
+const extension = process.env.PI_CONTROL_CHROME_EXTENSION || join(root, "extension");
 const browserExecutable = process.env.PI_CONTROL_CHROME_BROWSER || "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
-const bridgePort = 17318;
+const bridgePort = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
 const pagePort = 18180;
 
 if (!existsSync(browserExecutable)) {

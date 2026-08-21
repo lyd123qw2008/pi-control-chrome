@@ -96,3 +96,33 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
     rmSync(temp, { recursive: true, force: true });
   }
 });
+
+test("bridge keeps one active extension connection and replaces the older one", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-replace-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let first;
+  let second;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = () => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=extension&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    first = await connect();
+    second = await connect();
+    await new Promise((resolve) => first.once("close", resolve));
+    assert.equal(first.readyState, WebSocket.CLOSED);
+    assert.equal(second.readyState, WebSocket.OPEN);
+    assert.equal((await getJson(port, "/health")).body.extensionConnected, true);
+  } finally {
+    first?.close();
+    second?.close();
+    stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
