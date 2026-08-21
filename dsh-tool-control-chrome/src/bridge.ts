@@ -151,7 +151,7 @@ export class BrowserBridgeClient {
    */
   async restart(): Promise<Record<string, unknown>> {
     if (this.restarting !== undefined) return this.restarting
-    this.restarting = this.restartOwnedBridge().finally(() => {
+    this.restarting = this.restartBridge().finally(() => {
       this.restarting = undefined
     })
     return this.restarting
@@ -251,7 +251,7 @@ export class BrowserBridgeClient {
     })
   }
 
-  private async restartOwnedBridge(): Promise<Record<string, unknown>> {
+  private async restartBridge(): Promise<Record<string, unknown>> {
     const config = this.resolveConfig()
     let health: Record<string, unknown>
     try {
@@ -259,7 +259,7 @@ export class BrowserBridgeClient {
     } catch {
       if (!config.autoStartBridge) throw lifecycleError('BRIDGE_OFFLINE', 'Browser Bridge is offline and autoStartBridge is disabled')
       await this.ensureBridgeProcess(config)
-      health = await this.waitForHealth(config)
+      health = await this.readHealth(config)
       return { ok: true, restarted: true, recovery: 'started', bridgeHealth: health }
     }
 
@@ -310,7 +310,7 @@ export class BrowserBridgeClient {
       if (!(await this.isHealthy(config))) return
       await new Promise<void>(resolve => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS))
     }
-    throw new Error(`Timed out stopping the owned browser Bridge on ${config.bridgeHost}:${config.bridgePort}`)
+    throw new Error(`Timed out stopping the browser Bridge on ${config.bridgeHost}:${config.bridgePort}`)
   }
 
   private async ensureBridgeProcess(config: ResolvedConfig): Promise<void> {

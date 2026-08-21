@@ -34,7 +34,7 @@ describe('DSH /chrome command', () => {
     expect(request).toHaveBeenCalledWith('status', { sessionId: 'session-test' }, expect.any(AbortSignal))
   })
 
-  it('allows a human restart command without launcher-owner checks', async () => {
+  it('allows a human restart command without launcher-label checks', async () => {
     const restart = vi.fn(async () => ({ ok: true, restarted: true, bridgeHealth: { startedBy: 'pi' } }))
     const { handler } = setup({ request: vi.fn(), health: vi.fn(), restart })
     const result = await handler(invocation('restart'))
