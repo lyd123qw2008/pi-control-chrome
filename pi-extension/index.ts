@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcess } from "node:child_process";
-import { request as httpRequest } from "node:http";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import WebSocket from "ws";
@@ -11,27 +10,70 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17318;
+const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 const SESSION_ID = randomUUID();
+const BRIDGE_WAIT_ATTEMPTS = 30;
+const BRIDGE_WAIT_DELAY_MS = 100;
 let paused = false;
 
-function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
-  return new Promise((resolve, reject) => {
-    const request = httpRequest({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, method: "GET" }, (response) => {
-      const chunks: Buffer[] = [];
-      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-      response.on("end", () => {
-        try {
-          resolve({ statusCode: response.statusCode || 0, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-    request.setTimeout(timeoutMs, () => request.destroy(new Error(`Local bridge request timed out: ${path}`)));
-    request.on("error", reject);
-    request.end();
-  });
+type BrowserTarget = { browser: string; browserId: string; profile: string };
+type TargetStability = {
+  stable: boolean;
+  changed: boolean;
+  acknowledged: boolean;
+  requiresAcknowledgement: boolean;
+  competition: string;
+  observedBrowserIds: string[];
+  browser?: string;
+  browserId?: string;
+  profile?: string;
+  previousBrowser?: string;
+  previousBrowserId?: string;
+  issue?: string;
+};
+let acknowledgedTarget: BrowserTarget | undefined;
+const observedBrowserIds = new Set<string>();
+
+function readBrowserTarget(value: unknown): BrowserTarget | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.browser !== "string" || !record.browser || typeof record.browserId !== "string" || !record.browserId || typeof record.profile !== "string" || !record.profile) return undefined;
+  return { browser: record.browser, browserId: record.browserId, profile: record.profile };
+}
+
+function observeBrowserTarget(value: unknown, acknowledgeBrowserId?: string): TargetStability {
+  const target = readBrowserTarget(value);
+  if (!target) return { stable: false, changed: false, acknowledged: false, requiresAcknowledgement: false, competition: "unknown", observedBrowserIds: [...observedBrowserIds], issue: "status_missing_browser_target" };
+  const previous = acknowledgedTarget;
+  const changed = previous !== undefined && previous.browserId !== target.browserId;
+  const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId;
+  observedBrowserIds.add(target.browserId);
+  if (acknowledged) acknowledgedTarget = target;
+  return {
+    stable: !changed,
+    changed,
+    acknowledged,
+    requiresAcknowledgement: changed && !acknowledged,
+    competition: previous === undefined ? "unknown" : changed ? "changed" : "stable_observed",
+    browser: target.browser,
+    browserId: target.browserId,
+    profile: target.profile,
+    observedBrowserIds: [...observedBrowserIds],
+    ...(previous === undefined ? {} : { previousBrowser: previous.browser, previousBrowserId: previous.browserId }),
+  };
+}
+
+async function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
+  try {
+    const response = await fetch(`${BRIDGE_ORIGIN}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
+    return { statusCode: response.status, value: await response.json() };
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new Error(`Local bridge request timed out: ${path}`);
+    }
+    throw error;
+  }
 }
 
 const TAB_ID = Type.Optional(Type.Number({ description: "Chrome/Edge tab id. Omit to use the active tab." }));
@@ -39,12 +81,10 @@ const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector
 
 class BridgeClient {
   private socket?: WebSocket;
-  private bridgeProcess?: ChildProcess;
   private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private connecting?: Promise<void>;
 
   async start(): Promise<void> {
-    await this.ensureBridgeProcess();
     await this.connect();
   }
 
@@ -66,6 +106,23 @@ class BridgeClient {
     return response.value;
   }
 
+  async restart(): Promise<any> {
+    const health = await this.health();
+    const instanceId = typeof health.instanceId === "string" ? health.instanceId : undefined;
+    if (!instanceId || health.capabilities?.localUserRestart !== true) {
+      throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge does not expose local-user cooperative restart capabilities");
+    }
+    const control = await this.request("bridge_restart", {
+      expectedInstanceId: instanceId,
+      requester: "pi",
+    });
+    await this.waitForOffline();
+    await this.startBridgeProcess();
+    const next = await this.waitForHealth();
+    if (next.instanceId === instanceId) throw new Error("BRIDGE_INSTANCE_CHANGED: Bridge restart reused the previous instance");
+    return { ok: true, restarted: true, recovery: "cooperative_restart", previousInstanceId: instanceId, control, bridgeHealth: next };
+  }
+
   async request(method: string, params: Record<string, unknown> = {}): Promise<any> {
     await this.connect();
     const socket = this.socket;
@@ -83,17 +140,46 @@ class BridgeClient {
 
   private async ensureBridgeProcess(): Promise<void> {
     if (await this.isHealthy()) return;
+    await this.startBridgeProcess();
+    await this.waitForHealth();
+  }
+
+  private async startBridgeProcess(): Promise<void> {
     const bridgePath = fileURLToPath(new URL("../bridge/server.mjs", import.meta.url));
     if (!existsSync(bridgePath)) throw new Error(`Missing Pi browser bridge: ${bridgePath}`);
     const tokenFile = join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.token");
-    this.bridgeProcess = spawn(process.execPath, [bridgePath, "--port", String(BRIDGE_PORT), "--token-file", tokenFile], {
+    const child = spawn(process.execPath, [
+      bridgePath,
+      "--port", String(BRIDGE_PORT),
+      "--token-file", tokenFile,
+      "--started-by", "pi",
+    ], {
       stdio: "ignore",
       windowsHide: true,
     });
-    // Keep the local bridge reusable across Pi reloads without keeping the Pi
-    // process alive after its session shuts down.
-    this.bridgeProcess.unref();
-    await this.waitForHealth();
+    child.once("error", () => {});
+    child.unref();
+  }
+
+  private async waitForHealth(): Promise<any> {
+    for (let i = 0; i < BRIDGE_WAIT_ATTEMPTS; i += 1) {
+      try {
+        const health = await this.health();
+        if (health?.ok === true) return health;
+      } catch {
+        // Keep polling while a newly spawned Bridge is binding its port.
+      }
+      await new Promise((resolve) => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS));
+    }
+    throw new Error("Timed out starting the Pi browser bridge");
+  }
+
+  private async waitForOffline(): Promise<void> {
+    for (let i = 0; i < BRIDGE_WAIT_ATTEMPTS; i += 1) {
+      if (!(await this.isHealthy())) return;
+      await new Promise((resolve) => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS));
+    }
+    throw new Error("Timed out stopping the Pi browser bridge");
   }
 
   private async isHealthy(): Promise<boolean> {
@@ -105,13 +191,6 @@ class BridgeClient {
     }
   }
 
-  private async waitForHealth(): Promise<void> {
-    for (let i = 0; i < 30; i += 1) {
-      if (await this.isHealthy()) return;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error("Timed out starting the Pi browser bridge");
-  }
 
   private async connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return;
@@ -155,14 +234,17 @@ class BridgeClient {
 
   private handleMessage(raw: string): void {
     try {
-      const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { message?: string } };
+      const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { code?: string; message?: string } };
       if (message.type !== "response" || !message.id) return;
       const entry = this.pending.get(message.id);
       if (!entry) return;
       clearTimeout(entry.timer);
       this.pending.delete(message.id);
-      if (message.error) entry.reject(new Error(message.error.message || "Browser request failed"));
-      else entry.resolve(message.result);
+      if (message.error) {
+        const error = new Error(message.error.message || "Browser request failed") as Error & { code?: string };
+        if (message.error.code) error.code = message.error.code;
+        entry.reject(error);
+      } else entry.resolve(message.result);
     } catch {
       // Ignore malformed bridge events; the next request will report connection state.
     }
@@ -187,21 +269,31 @@ async function call(method: string, params: Record<string, unknown> = {}) {
   if (paused && !["status", "list_tabs", "selected_tab", "cleanup"].includes(method)) {
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
-  const result = await bridge.request(method, { ...params, sessionId: SESSION_ID });
   if (method === "status") {
-    try { return { ...result, bridgeHealth: await bridge.health() }; } catch { return result; }
+    const { acknowledgeBrowserId, ...statusParams } = params;
+    const result = await bridge.request("status", { ...statusParams, sessionId: SESSION_ID });
+    const targetStability = observeBrowserTarget(result, typeof acknowledgeBrowserId === "string" ? acknowledgeBrowserId : undefined);
+    const base = result && typeof result === "object" ? result : { result };
+    try { return { ...base, targetStability, bridgeHealth: await bridge.health() }; } catch { return { ...base, targetStability }; }
   }
-  return result;
+  const status = await bridge.request("status", { sessionId: SESSION_ID });
+  const targetStability = observeBrowserTarget(status);
+  const target = readBrowserTarget(status);
+  if (targetStability.issue !== undefined || target === undefined) throw new Error("Browser status did not identify an active browser target; run browser_status");
+  if (!targetStability.stable || !targetStability.acknowledged) {
+    throw new Error(`Browser target changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`);
+  }
+  return bridge.request(method, { ...params, sessionId: SESSION_ID, expectedBrowserId: target.browserId });
 }
 
 function registerBrowserTools(pi: ExtensionAPI) {
   pi.registerTool({
     name: "browser_status",
     label: "Browser Status",
-    description: "Return the connected Chrome/Edge browser and Pi bridge status.",
-    parameters: Type.Object({}),
-    async execute() {
-      try { return textResult(await call("status")); } catch (error) { return errorResult(error); }
+    description: "Return the connected Chrome/Edge browser, target stability and Pi bridge status.",
+    parameters: Type.Object({ acknowledgeBrowserId: Type.Optional(Type.String({ description: "Explicitly acknowledge this browserId after confirming a browser switch." })) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("status", params)); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -495,7 +587,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_network",
     label: "Browser Network",
     description: "Enable and read Network request/response events and response bodies from a browser tab.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()), timeoutMs: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
         if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Network", "Page"] }));
@@ -539,7 +631,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_download",
     label: "Browser Download",
     description: "Start, wait for, list, cancel or erase browser downloads and return their paths/status.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: Type.Optional(Type.Number()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("download", params)); } catch (error) { return errorResult(error); }
     },
@@ -584,8 +676,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
   pi.registerTool({
     name: "browser_close_tab",
     label: "Close Browser Tab",
-    description: "Close a specified browser tab. Use only for Agent-owned or explicitly requested tabs.",
-    parameters: Type.Object({ tabId: Type.Number() }),
+    description: "Close a specified browser tab. Agent-owned tabs must belong to the current session; unowned user tabs require userRequested: true.",
+    parameters: Type.Object({ tabId: Type.Number(), userRequested: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("close_tab", params)); } catch (error) { return errorResult(error); }
     },
@@ -657,6 +749,12 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           ctx.ui.notify(JSON.stringify(result), "info");
           return;
         }
+        if (action === "restart") {
+          const result = await bridge.restart();
+          updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
+          ctx.ui.notify(JSON.stringify(result), "info");
+          return;
+        }
         if (action === "disconnect") {
           await bridge.stop();
           updateStatus(ctx, "chrome: disconnected");
@@ -702,7 +800,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           ctx.ui.notify("Load extension/ as an unpacked Chrome/Edge extension, then run /chrome connect and /chrome status.", "info");
           return;
         }
-        ctx.ui.notify("用法：/chrome status|connect|disconnect|pause|resume|tabs|profile|group|setup|cleanup|release <tabId>", "warning");
+        ctx.ui.notify("用法：/chrome status|connect|restart|disconnect|pause|resume|tabs|profile|group|setup|cleanup|release <tabId>", "warning");
       } catch (error) {
         updateStatus(ctx, "chrome: offline");
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");

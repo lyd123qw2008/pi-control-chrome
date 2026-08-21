@@ -4,6 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { registerChromeCommand } from './commands.js'
 import { BrowserBridgeClient, resolveConfig } from './bridge.js'
 import { registerBrowserTools } from './tools.js'
 import type { Config as ControlChromeConfig } from './types.js'
@@ -17,7 +18,7 @@ export { BROWSER_TOOL_NAMES, browserToolCatalog } from './tools.js'
 export const name = 'tool-control-chrome'
 
 /** The DSH registry consumed by the model-facing browser tools. */
-export const inject = ['tools']
+export const inject = ['tools', 'commands']
 
 /** Settings namespace carrying the local Bridge connection configuration. */
 export const CONTROL_CHROME_SETTINGS_NAMESPACE = settingsNamespace('control-chrome')
@@ -50,6 +51,7 @@ export function apply(ctx: Context, config: Config): void {
   const bridge = new BrowserBridgeClient(current)
   const attachments = ctx.get('attachments') as AttachmentStore | undefined
   registerBrowserTools(ctx, bridge, attachments, current)
+  registerChromeCommand(ctx, bridge)
   ctx.effect(() => async () => {
     await bridge.stop()
   }, 'control-chrome: dispose Bridge client')

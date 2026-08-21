@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 
 const DEFAULT_PORT = 17318;
@@ -15,6 +14,20 @@ const DEFAULT_TOKEN_FILE = join(
   "pi-control-chrome.token",
 );
 const DEBUG = process.env.PI_CONTROL_CHROME_DEBUG === "1";
+const BRIDGE_SERVICE = "pi-control-chrome";
+const BRIDGE_CAPABILITIES = Object.freeze({
+  browserIdentity: true,
+  atomicTargetRouting: true,
+  cooperativeRestart: true,
+  localUserRestart: true,
+});
+const BRIDGE_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version || "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 function argValue(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -23,6 +36,10 @@ function argValue(name, fallback) {
 
 const port = Number(argValue("--port", DEFAULT_PORT));
 const tokenFile = argValue("--token-file", DEFAULT_TOKEN_FILE);
+const startedByValue = argValue("--started-by", argValue("--managed-by", "unknown"));
+const startedBy = startedByValue === "dsh" || startedByValue === "pi" ? startedByValue : "unknown";
+
+const instanceId = randomUUID();
 
 function ensureToken() {
   if (existsSync(tokenFile)) {
@@ -40,6 +57,7 @@ const clients = new Set();
 const pending = new Map();
 let extensionClient;
 let requestCounter = 0;
+let restarting = false;
 
 function nonEmptyString(value) {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -72,6 +90,44 @@ function requestExpectedBrowserId(message) {
   return nonEmptyString(message.params.expectedBrowserId);
 }
 
+function requestParams(message) {
+  return message.params && typeof message.params === "object" ? message.params : {};
+}
+
+function handleBridgeRestart(client, id, message) {
+  if (restarting) {
+    sendError(client, id, "BRIDGE_IN_USE", "The Bridge is already restarting.");
+    return;
+  }
+  const params = requestParams(message);
+  if (params.expectedInstanceId !== instanceId) {
+    sendError(client, id, "BRIDGE_INSTANCE_CHANGED", "The Bridge instance changed before the restart request was accepted.");
+    return;
+  }
+  if (pending.size !== 0) {
+    sendError(client, id, "BRIDGE_IN_USE", "The Bridge has a pending browser request.");
+    return;
+  }
+  restarting = true;
+  const requester = nonEmptyString(params.requester) ?? "unknown";
+  if (!send(client, {
+    type: "response",
+    id,
+    result: { ok: true, restarting: true, instanceId, startedBy, controlDomain: "local_user", requester },
+  })) {
+    restarting = false;
+    return;
+  }
+  broadcast({ type: "event", event: "restarting", instanceId, requester });
+  setTimeout(shutdown, 25).unref();
+}
+
+function rejectWhileRestarting(client, id) {
+  if (!restarting) return false;
+  sendError(client, id, "BRIDGE_RESTARTING", "The Bridge is restarting; retry after it reconnects.");
+  return true;
+}
+
 function rejectPendingForExtension(extension, code, message) {
   for (const [id, entry] of pending.entries()) {
     if (entry.extension !== extension) continue;
@@ -85,14 +141,22 @@ function debug(...args) {
   if (DEBUG) console.error("[pi-control-chrome]", ...args);
 }
 
+function isExtensionOrigin(origin) {
+  return typeof origin === "string" && /^chrome-extension:\/\/[a-p]{32}$/.test(origin);
+}
+
+function extensionCorsHeaders(request) {
+  const origin = request.headers.origin;
+  if (!isExtensionOrigin(origin)) return {};
+  return { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
+}
+
 function jsonResponse(res, status, value, extraHeaders = {}) {
   const body = JSON.stringify(value);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
     ...extraHeaders,
   });
   res.end(body);
@@ -117,6 +181,11 @@ function handleMessage(client, message) {
 
   if (message.type === "request" && client.role === "pi") {
     const id = String(message.id || `req-${++requestCounter}`);
+    if (message.method === "bridge_restart") {
+      handleBridgeRestart(client, id, message);
+      return;
+    }
+    if (rejectWhileRestarting(client, id)) return;
     const activeExtension = extensionClient;
     if (!activeExtension || activeExtension.readyState !== 1) {
       sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension is not connected.");
@@ -176,7 +245,7 @@ const server = createServer((req, res) => {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1:${port}"}`);
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      ...extensionCorsHeaders(req),
       "Access-Control-Allow-Headers": "content-type",
       "Access-Control-Allow-Methods": "GET, OPTIONS",
     });
@@ -189,16 +258,26 @@ const server = createServer((req, res) => {
     jsonResponse(res, 200, {
       ok: true,
       protocol: 1,
+      service: BRIDGE_SERVICE,
+      bridgeVersion: BRIDGE_VERSION,
+      instanceId,
+      startedBy,
+      controlDomain: "local_user",
+      capabilities: BRIDGE_CAPABILITIES,
+      restart: {
+        available: true,
+        method: "cooperative_restart",
+        controlDomain: "local_user",
+      },
       port,
       extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
-      piClients: [...clients].filter((client) => client.role === "pi" && client.readyState === 1).length,
       ...(identity || {}),
-    });
+    }, extensionCorsHeaders(req));
     return;
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/pair") {
-    jsonResponse(res, 200, { ok: true, protocol: 1, token });
+    jsonResponse(res, 200, { ok: true, protocol: 1, token }, extensionCorsHeaders(req));
     return;
   }
 
@@ -207,6 +286,11 @@ const server = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 wss.on("connection", (client, request) => {
+  const requestOrigin = request.headers.origin;
+  if (requestOrigin !== undefined && !isExtensionOrigin(requestOrigin)) {
+    client.close(1008, "invalid origin");
+    return;
+  }
   const requestUrl = new URL(request.url || "/ws", `http://${request.headers.host || "127.0.0.1:${port}"}`);
   const suppliedToken = requestUrl.searchParams.get("token");
   const role = requestUrl.searchParams.get("role");
@@ -229,7 +313,18 @@ wss.on("connection", (client, request) => {
     debug("pi client connected");
   }
 
-  send(client, { type: "hello", role: "bridge", protocol: 1, extensionConnected: Boolean(extensionClient) });
+  send(client, {
+    type: "hello",
+    role: "bridge",
+    protocol: 1,
+    service: BRIDGE_SERVICE,
+    bridgeVersion: BRIDGE_VERSION,
+    instanceId,
+    startedBy,
+    controlDomain: "local_user",
+    capabilities: BRIDGE_CAPABILITIES,
+    extensionConnected: Boolean(extensionClient),
+  });
   broadcast({ type: "event", event: "connection", role, connected: true });
 
   client.on("message", (raw) => {
@@ -256,6 +351,7 @@ server.listen(port, "127.0.0.1", () => {
 function shutdown() {
   for (const entry of pending.values()) clearTimeout(entry.timer);
   pending.clear();
+  for (const client of clients) client.close(1012, "restarting");
   wss.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();
@@ -263,8 +359,3 @@ function shutdown() {
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
-process.once("exit", () => {
-  for (const entry of pending.values()) clearTimeout(entry.timer);
-});
-
-export { tokenFile };

@@ -25,7 +25,7 @@ function setup(bridge: Pick<BrowserBridgeClient, 'request' | 'health'>, attachme
     bridgeHost: '127.0.0.1',
     bridgePort: 17318,
     tokenFile: 'C:/test/token',
-    autoStartBridge: false,
+              autoStartBridge: false,
     requestTimeoutMs: 120_000,
   }))
   return tools
@@ -45,6 +45,12 @@ describe('DSH browser tool catalog', () => {
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_screenshot')
     expect(browserToolCatalog.advanced.map(tool => tool.name)).toContain('browser_cdp')
+    const accessibility = browserToolCatalog.core.find(tool => tool.name === 'browser_accessibility_snapshot')
+    const network = browserToolCatalog.advanced.find(tool => tool.name === 'browser_network')
+    const download = browserToolCatalog.advanced.find(tool => tool.name === 'browser_download')
+    expect(accessibility?.prepare).toBeUndefined()
+    expect(network?.parameters).not.toHaveProperty('timeoutMs')
+    expect(download?.parameters).not.toHaveProperty('tabId')
   })
 
   it('routes session identity and operation parameters to the Bridge after target validation', async () => {
@@ -135,6 +141,46 @@ describe('DSH browser tool catalog', () => {
     await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())).rejects.toThrow(/atomic target routing/)
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
   })
+  it('reports cooperative recovery availability for a compatible local-user Bridge', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.5' }
+      : { method })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browserId: 'edge:test',
+      startedBy: 'pi',
+      controlDomain: 'local_user',
+      capabilities: { cooperativeRestart: true, localUserRestart: true },
+      restart: { available: true, controlDomain: 'local_user' },
+    }))
+    const tools = setup({ request, health })
+    const diagnosis = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(diagnosis).toMatchObject({
+      ok: true,
+      recovery: { available: true, authority: 'local_user', controlDomain: 'local_user', method: 'cooperative_restart', requiresUserConfirmation: false },
+    })
+  })
+
+  it('does not advertise recovery for the old launcher-owner protocol', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.6' }
+      : { method })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browserId: 'edge:test',
+      managedBy: 'dsh',
+      capabilities: { cooperativeRestart: true },
+      restart: { available: true, managedBy: 'dsh' },
+    }))
+    const tools = setup({ request, health })
+    const diagnosis = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(diagnosis).toMatchObject({
+      recovery: { available: false, authority: 'unknown', method: 'unavailable', requiresUserConfirmation: true },
+    })
+  })
+
   it('projects accessibility and network specializations', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }

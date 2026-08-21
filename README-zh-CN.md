@@ -30,8 +30,7 @@
 - 安装和配对一次后，正常操作不重复请求授权或浏览器动作确认；
 - 支持 Pi、Bridge 和浏览器扩展之间的自动重连。
 
-### 标签页管理
-
+- Bridge 使用本机配对令牌和实例 ID；同一用户控制域中的 DSH 或 Pi Host 都可以通过显式 `/chrome restart` 请求协作式重启。
 - 发现当前窗口和标签页；
 - claim/release 用户标签页；
 - Agent 创建的页面自动进入 Pi 专属分组；
@@ -64,6 +63,7 @@
 - `extension/`：Manifest V3 Chrome/Edge 扩展；
 - `bridge/`：本地 WebSocket Bridge；
 - `pi-extension/`：Pi 原生浏览器工具和 `/chrome` 命令；
+- `dsh-tool-control-chrome/`：DSH `browser_*` 工具和 `/chrome status|doctor|restart|tabs` 命令；
 - `tests/bridge.test.mjs`：Bridge 单元/协议测试；
 - `tests/skill-script.test.mjs`：Skill 快速脚本的实时 Bridge 集成测试；
 - `tests/e2e-browser.mjs`：真实 Edge/Chrome for Testing + 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。
@@ -107,7 +107,7 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 
 仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。它把本项目的完整 `browser_*` 能力注册成 DeepSeek Harness 的模型工具，并通过现有本地 Bridge 控制 Chrome/Edge。
 
-在 DSH Profile 中安装该包，复制它的 `config/cordis.patch.yml.example`，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
+在 DSH Profile 中安装该包，把它的 `config/cordis.patch.yml.example` 中的 `insert` 条目合并到现有 `cordis.patch.yml`，不要覆盖其他 patch 条目，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
 
 加载 Chrome/Edge 扩展：
 
@@ -173,5 +173,6 @@ npm run smoke:e2e
 - Chrome/Edge 配置；
 - 浏览器 Profile；
 - 用户标签页；
-- 本地 Bridge；
-- 任何登录凭据。
+- 浏览器登录凭据。
+
+Pi 或 DSH Host 可以按配置启动或复用本地 Bridge，并在默认位置创建配对令牌文件；这不等于读取或修改浏览器 Profile、配置或登录凭据。

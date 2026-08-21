@@ -13,6 +13,7 @@ import {
   type ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
 import type { BrowserBridgeClient } from './bridge.js'
+import { bridgeRecovery, unavailableBridgeRecovery } from './diagnostics.js'
 import type { ResolvedConfig, ScreenshotResult } from './types.js'
 
 const TAB_ID: ParameterPropertySpec = { type: 'number', description: 'Browser tab id. Omit to use the selected tab.' }
@@ -59,7 +60,7 @@ function sameBrowserTarget(left: BrowserTarget, right: BrowserTarget): boolean {
 
 class BrowserTargetTracker {
   private acknowledged?: BrowserTarget
-  private readonly observed = new Map<string, BrowserTarget>()
+  private readonly observed = new Set<string>()
 
   observe(value: unknown, acknowledgeBrowserId?: string): TargetStability {
     const target = readBrowserTarget(value)
@@ -77,7 +78,7 @@ class BrowserTargetTracker {
     const previous = this.acknowledged
     const changed = previous !== undefined && !sameBrowserTarget(previous, target)
     const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId
-    this.observed.set(target.browserId, target)
+    this.observed.add(target.browserId)
     if (acknowledged) this.acknowledged = target
     return {
       stable: !changed,
@@ -215,7 +216,6 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     description: 'Return the accessibility-oriented semantic tree included in the current page snapshot.',
     parameters: { tabId: TAB_ID },
     method: 'snapshot',
-    prepare: args => ({ ...args, __accessibilityOnly: true }),
   },
   {
     name: 'browser_navigate',
@@ -313,8 +313,8 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_close_tab',
-    description: 'Close a specified browser tab. Use only for Agent-owned or explicitly requested tabs.',
-    parameters: { tabId: requiredNumber() },
+    description: 'Close a specified browser tab. Agent-owned tabs must belong to the current session; unowned user tabs require userRequested: true.',
+    parameters: { tabId: requiredNumber(), userRequested: OPTIONAL_BOOLEAN },
     method: 'close_tab',
   },
   {
@@ -427,7 +427,6 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
       action: OPTIONAL_STRING,
       requestId: OPTIONAL_STRING,
       clear: OPTIONAL_BOOLEAN,
-      timeoutMs: OPTIONAL_NUMBER,
     },
     method: 'network_requests',
     prepare: args => args.action === 'enable'
@@ -456,7 +455,6 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
     name: 'browser_download',
     description: 'Start, wait for, list, cancel or erase browser downloads and return paths and status.',
     parameters: {
-      tabId: TAB_ID,
       action: requiredString(),
       url: OPTIONAL_STRING,
       filename: OPTIONAL_STRING,
@@ -582,7 +580,7 @@ function errorText(error: unknown): string {
 async function bridgeTargetHealth(bridge: BrowserBridgeClient, target: BrowserTarget): Promise<Record<string, unknown>> {
   const health = await bridge.health()
   if (health.browserId !== target.browserId) {
-    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; restart the Bridge with pi-control-chrome 0.2.5 or newer')
+    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor to inspect recovery availability')
   }
   return health
 }
@@ -618,6 +616,7 @@ async function browserDoctor(
       ok: false,
       recommendation: 'check_bridge',
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
+      recovery: unavailableBridgeRecovery(),
     })
   }
   if (bridgeHealth.extensionConnected !== true) {
@@ -625,7 +624,8 @@ async function browserDoctor(
       ok: false,
       recommendation: 'enable_or_reload_extension',
       bridgeHealth,
-      issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
+      recovery: bridgeRecovery(bridgeHealth),
+       issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
     })
   }
 
@@ -637,6 +637,7 @@ async function browserDoctor(
       ok: false,
       recommendation: 'reconnect_extension',
       bridgeHealth,
+      recovery: bridgeRecovery(bridgeHealth),
       issues: [{ code: 'browser_status_unavailable', message: errorText(error) }],
     })
   }
@@ -654,6 +655,7 @@ async function browserDoctor(
       bridgeHealth,
       targetStability,
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
+      recovery: unavailableBridgeRecovery(),
       notices: [],
     })
   }
@@ -669,7 +671,7 @@ async function browserDoctor(
       message: `The active browser changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}).`,
     })
   } else if (bridgeBrowserId === undefined) {
-    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity. Restart it with pi-control-chrome 0.2.5 or newer.' })
+    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor and update or restart the Bridge.' })
   } else if (target !== undefined && target.browserId !== bridgeBrowserId) {
     issues.push({
       code: 'bridge_browser_target_changed',
@@ -694,6 +696,7 @@ async function browserDoctor(
     recommendation,
     bridgeHealth,
     targetStability,
+    recovery: bridgeRecovery(bridgeHealth),
     issues,
     notices,
   })

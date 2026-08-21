@@ -1,6 +1,6 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.2.5",
+  "version": "0.3.3",
   "description": "Codex-aligned Chrome and Edge browser control for Pi",
   "type": "module",
   "license": "MIT",
@@ -42,14 +42,13 @@
     "bridge",
     "extension",
     "pi-extension",
-    "skills",
-    "tests"
+    "skills"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "check": "node --check bridge/server.mjs && node --check extension/background.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
+    "check": "node --check bridge/server.mjs && node --check extension/background.js && node --check pi-extension/index.ts && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
     "test": "node --test tests/bridge.test.mjs",
     "test:skill": "node --test tests/skill-script.test.mjs",
     "test:all": "npm test && npm run test:skill",

@@ -3,16 +3,19 @@
 import { createRequire } from 'node:module'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join, resolve as resolvePath } from 'node:path'
 import WebSocket from 'ws'
 import type { Config, ResolvedConfig } from './types.js'
+import { bridgeRecovery } from './diagnostics.js'
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 17318
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_TOKEN_FILE = join(homedir(), '.pi', 'agent', 'pi-control-chrome.token')
+const BRIDGE_WAIT_ATTEMPTS = 30
+const BRIDGE_WAIT_DELAY_MS = 100
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 
 type PendingEntry = {
@@ -60,22 +63,18 @@ function bridgeOrigin(config: ResolvedConfig): string {
   return `http://${authority(config.bridgeHost, config.bridgePort)}`
 }
 
+function connectionKey(config: ResolvedConfig): string {
+  return `${authority(config.bridgeHost, config.bridgePort)}|${config.tokenFile}`
+}
+
 function bridgeWebSocket(config: ResolvedConfig, token: string): string {
   return `ws://${authority(config.bridgeHost, config.bridgePort)}/ws?role=pi&token=${encodeURIComponent(token)}`
 }
 
 async function localJsonRequest(config: ResolvedConfig, path: string, timeoutMs: number): Promise<{ status: number; value: unknown }> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const response = await fetch(`${bridgeOrigin(config)}${path}`, { signal: controller.signal })
-    const value: unknown = await response.json()
-    return { status: response.status, value }
-  } catch (error) {
-    throw error instanceof Error ? error : new Error(String(error))
-  } finally {
-    clearTimeout(timer)
-  }
+  const response = await fetch(`${bridgeOrigin(config)}${path}`, { signal: AbortSignal.timeout(timeoutMs) })
+  const value: unknown = await response.json()
+  return { status: response.status, value }
 }
 
 function isHealthyResponse(response: { status: number; value: unknown }): boolean {
@@ -89,6 +88,16 @@ function errorMessage(error: unknown, fallback: string): Error {
   return error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`)
 }
 
+function healthInstanceId(health: Record<string, unknown>): string | undefined {
+  return typeof health.instanceId === 'string' && health.instanceId.length > 0 ? health.instanceId : undefined
+}
+
+function lifecycleError(code: string, message: string): Error & { readonly code: string } {
+  const error = new Error(`${code}: ${message}`) as Error & { code: string }
+  error.code = code
+  return error
+}
+
 /**
  * Connect to, and when configured start, one loopback pi-control-chrome Bridge.
  * The Bridge process is deliberately left alive when this client stops so Pi
@@ -96,8 +105,11 @@ function errorMessage(error: unknown, fallback: string): Error {
  */
 export class BrowserBridgeClient {
   private socket: WebSocket | undefined
-  private bridgeProcess?: ChildProcess
+  private socketKey: string | undefined
   private connecting: Promise<void> | undefined
+  private restarting: Promise<Record<string, unknown>> | undefined
+  private readonly starting = new Map<string, Promise<Record<string, unknown>>>()
+  private lifecycle = 0
   private readonly pending = new Map<string, PendingEntry>()
   private readonly resolveConfig: () => ResolvedConfig
 
@@ -113,28 +125,48 @@ export class BrowserBridgeClient {
 
   /** Stop this client connection without stopping the reusable Bridge process. */
   async stop(): Promise<void> {
+    this.lifecycle += 1
     this.rejectPending(new Error('DSH browser Bridge client stopped'))
     const socket = this.socket
     this.socket = undefined
+    this.socketKey = undefined
     socket?.close()
-    await Promise.resolve()
+    const connecting = this.connecting
+    const starting = [...this.starting.values()]
+    if (connecting !== undefined) await connecting.catch(() => {})
+    await Promise.all(starting.map(promise => promise.catch(() => {})))
   }
 
   /** Read the local Bridge health document. */
   async health(): Promise<Record<string, unknown>> {
-    const response = await localJsonRequest(this.resolveConfig(), '/health', 1_500)
-    if (!isHealthyResponse(response)) throw new Error(`Browser Bridge health failed: HTTP ${response.status}`)
-    return response.value as Record<string, unknown>
+    return this.readHealth(this.resolveConfig())
+  }
+
+  /**
+   * Restart a compatible Bridge through the local-user cooperative control
+   * protocol, or start it when the configured port is offline.
+   * @returns the new Bridge health document and lifecycle result.
+   */
+  async restart(): Promise<Record<string, unknown>> {
+    if (this.restarting !== undefined) return this.restarting
+    const lifecycle = this.lifecycle
+    this.restarting = this.restartBridge(lifecycle).finally(() => {
+      this.restarting = undefined
+    })
+    return this.restarting
   }
 
   /** Send one browser method request and preserve caller cancellation locally. */
   async request(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
     if (signal?.aborted) throw new Error(`Browser request aborted: ${method}`)
     await this.connect()
+    const config = this.resolveConfig()
+    if (this.socketKey !== connectionKey(config)) {
+      await this.connect()
+    }
     if (signal?.aborted) throw new Error(`Browser request aborted: ${method}`)
     const socket = this.socket
     if (socket === undefined || socket.readyState !== WebSocket.OPEN) throw new Error('Browser Bridge is not connected')
-    const config = this.resolveConfig()
     const id = randomUUID()
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -164,10 +196,18 @@ export class BrowserBridgeClient {
   }
 
   private async connect(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) return
+    const config = this.resolveConfig()
+    const targetKey = connectionKey(config)
+    if (this.socket?.readyState === WebSocket.OPEN && this.socketKey === targetKey) return
+    if (this.socket !== undefined && this.socketKey !== targetKey) {
+      this.rejectPending(new Error('Browser Bridge settings changed; reconnecting'))
+      this.socket.close()
+      this.socket = undefined
+      this.socketKey = undefined
+    }
     if (this.connecting !== undefined) return this.connecting
+    const lifecycle = this.lifecycle
     this.connecting = (async () => {
-      const config = this.resolveConfig()
       await this.ensureBridgeProcess(config)
       const pairing = await localJsonRequest(config, '/pair', 2_000)
       if (pairing.status !== 200 || typeof pairing.value !== 'object' || pairing.value === null) {
@@ -175,16 +215,21 @@ export class BrowserBridgeClient {
       }
       const token = (pairing.value as { token?: unknown }).token
       if (typeof token !== 'string' || token.length === 0) throw new Error('Browser Bridge pairing response did not contain a token')
-      await this.openSocket(config, token)
+      await this.openSocket(config, token, lifecycle)
     })().finally(() => {
       this.connecting = undefined
     })
     return this.connecting
   }
 
-  private async openSocket(config: ResolvedConfig, token: string): Promise<void> {
+  private async openSocket(config: ResolvedConfig, token: string, lifecycle: number): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(bridgeWebSocket(config, token))
+      if (lifecycle !== this.lifecycle) {
+        socket.close()
+        reject(new Error('DSH browser Bridge client stopped'))
+        return
+      }
       let settled = false
       const timeout = setTimeout(() => {
         socket.close()
@@ -194,14 +239,24 @@ export class BrowserBridgeClient {
         }
       }, 5_000)
       this.socket = socket
+      this.socketKey = connectionKey(config)
       socket.once('open', () => {
         clearTimeout(timeout)
+        if (lifecycle !== this.lifecycle) {
+          settled = true
+          socket.close()
+          reject(new Error('DSH browser Bridge client stopped'))
+          return
+        }
         settled = true
         resolve()
       })
       socket.once('close', () => {
-        if (this.socket === socket) this.socket = undefined
-        this.rejectPending(new Error('Browser Bridge disconnected'))
+        if (this.socket === socket) {
+          this.socket = undefined
+          this.socketKey = undefined
+          this.rejectPending(new Error('Browser Bridge disconnected'))
+        }
         if (!settled) {
           clearTimeout(timeout)
           settled = true
@@ -215,26 +270,116 @@ export class BrowserBridgeClient {
           reject(errorMessage(error, 'Browser Bridge websocket failed'))
           return
         }
-        this.rejectPending(errorMessage(error, 'Browser Bridge websocket failed'))
+        if (this.socket === socket) this.rejectPending(errorMessage(error, 'Browser Bridge websocket failed'))
       })
       socket.on('message', raw => this.handleMessage(raw.toString()))
     })
   }
 
-  private async ensureBridgeProcess(config: ResolvedConfig): Promise<void> {
-    if (await this.isHealthy(config)) return
-    if (!config.autoStartBridge) throw new Error('Browser Bridge is offline and autoStartBridge is disabled')
+  private async restartBridge(lifecycle: number): Promise<Record<string, unknown>> {
+    const config = this.resolveConfig()
+    const assertActive = () => {
+      if (lifecycle !== this.lifecycle) throw new Error('DSH browser Bridge client stopped')
+    }
+    let health: Record<string, unknown>
+    try {
+      health = await this.readHealth(config)
+    } catch {
+      if (!config.autoStartBridge) throw lifecycleError('BRIDGE_OFFLINE', 'Browser Bridge is offline and autoStartBridge is disabled')
+      health = await this.ensureBridgeProcess(config)
+      assertActive()
+      return { ok: true, restarted: true, recovery: 'started', bridgeHealth: health }
+    }
+    assertActive()
+    const instanceId = healthInstanceId(health)
+    if (instanceId === undefined || !bridgeRecovery(health).available) {
+      throw lifecycleError('BRIDGE_RESTART_UNSUPPORTED', 'This Bridge does not expose local-user cooperative restart capabilities')
+    }
+
+    const control = await this.request('bridge_restart', {
+      expectedInstanceId: instanceId,
+      requester: 'dsh',
+    })
+    assertActive()
+    await this.waitForBridgeOffline(config)
+    assertActive()
+    await this.startBridgeProcess(config)
+    assertActive()
+    const next = await this.waitForHealth(config)
+    assertActive()
+    if (healthInstanceId(next) === instanceId) {
+      throw lifecycleError('BRIDGE_INSTANCE_CHANGED', 'The restarted Bridge reused the previous instance id')
+    }
+    return {
+      ok: true,
+      restarted: true,
+      recovery: 'cooperative_restart',
+      previousInstanceId: instanceId,
+      control,
+      bridgeHealth: next,
+    }
+  }
+
+  private async readHealth(config: ResolvedConfig): Promise<Record<string, unknown>> {
+    const response = await localJsonRequest(config, '/health', 1_500)
+    if (!isHealthyResponse(response)) throw new Error(`Browser Bridge health failed: HTTP ${response.status}`)
+    return response.value as Record<string, unknown>
+  }
+
+  private async waitForHealth(config: ResolvedConfig): Promise<Record<string, unknown>> {
+    for (let attempt = 0; attempt < BRIDGE_WAIT_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.readHealth(config)
+      } catch {
+        await new Promise<void>(resolve => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS))
+      }
+    }
+    throw new Error(`Timed out starting the browser Bridge on ${config.bridgeHost}:${config.bridgePort}`)
+  }
+
+  private async waitForBridgeOffline(config: ResolvedConfig): Promise<void> {
+    for (let attempt = 0; attempt < BRIDGE_WAIT_ATTEMPTS; attempt += 1) {
+      if (!(await this.isHealthy(config))) return
+      await new Promise<void>(resolve => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS))
+    }
+    throw new Error(`Timed out stopping the browser Bridge on ${config.bridgeHost}:${config.bridgePort}`)
+  }
+
+  private async ensureBridgeProcess(config: ResolvedConfig): Promise<Record<string, unknown>> {
+    const key = authority(config.bridgeHost, config.bridgePort)
+    const existing = this.starting.get(key)
+    if (existing !== undefined) return existing
+    const starting = (async () => {
+      try {
+        return await this.readHealth(config)
+      } catch {
+        if (!config.autoStartBridge) throw new Error('Browser Bridge is offline and autoStartBridge is disabled')
+        await this.startBridgeProcess(config)
+        return this.waitForHealth(config)
+      }
+    })().finally(() => {
+      if (this.starting.get(key) === starting) this.starting.delete(key)
+    })
+    this.starting.set(key, starting)
+    return starting
+  }
+
+  private async startBridgeProcess(config: ResolvedConfig): Promise<void> {
     const bridgeScript = this.resolveBridgeScript(config)
-    this.bridgeProcess = spawn(process.execPath, [bridgeScript, '--port', String(config.bridgePort), '--token-file', config.tokenFile], {
+    const child = spawn(process.execPath, [
+      bridgeScript,
+      '--port', String(config.bridgePort),
+      '--token-file', config.tokenFile,
+      '--started-by', 'dsh',
+    ], {
       stdio: 'ignore',
       windowsHide: true,
     })
-    this.bridgeProcess.unref()
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      if (await this.isHealthy(config)) return
-      await new Promise<void>(resolve => setTimeout(resolve, 100))
-    }
-    throw new Error(`Timed out starting the browser Bridge on ${config.bridgeHost}:${config.bridgePort}`)
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', () => resolve())
+      child.once('error', error => reject(errorMessage(error, 'Cannot start the browser Bridge')))
+      child.unref()
+    })
   }
 
   private resolveBridgeScript(config: ResolvedConfig): string {
@@ -270,7 +415,10 @@ export class BrowserBridgeClient {
     const entry = this.pending.get(message.id)
     if (entry === undefined) return
     if (message.error !== undefined) {
-      this.settlePending(message.id, new Error(message.error.message ?? message.error.code ?? 'Browser request failed'))
+      const code = message.error.code
+      const error = new Error(message.error.message ?? code ?? 'Browser request failed') as Error & { code?: string }
+      if (code !== undefined) error.code = code
+      this.settlePending(message.id, error)
       return
     }
     this.settlePending(message.id, undefined, message.result)

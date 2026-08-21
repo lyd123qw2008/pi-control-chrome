@@ -1,5 +1,5 @@
 # Optional Profile patch for DSH browser-control tools.
-# Copy this file to the active Profile's cordis.patch.yml.
+# Merge this insert entry into the active Profile's cordis.patch.yml; do not replace unrelated entries.
 # The Profile package.json must list this package as a dependency first.
 # Bridge options belong in <DSH_HOME>/settings.yaml under control-chrome.
 - insert:

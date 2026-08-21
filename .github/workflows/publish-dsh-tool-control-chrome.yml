@@ -37,7 +37,7 @@ jobs:
         run: corepack pnpm run build
 
       - name: Pack check
-        run: corepack pnpm run pack:check
+        run: npm pack --dry-run --ignore-scripts
 
       - name: Publish
         run: npm publish --access public

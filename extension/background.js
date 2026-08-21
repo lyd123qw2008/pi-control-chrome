@@ -1,6 +1,7 @@
 const BRIDGE_ORIGIN = "http://127.0.0.1:17318";
 const BRIDGE_WS = "ws://127.0.0.1:17318/ws";
 const OWNED_TABS_KEY = "piControlChromeOwnedTabs";
+const PROFILE_ID_KEY = "piControlChromeProfileId";
 const GROUP_TITLE = "Pi";
 const GROUP_COLOR = "blue";
 const MAX_EVENTS = 500;
@@ -9,6 +10,7 @@ let socket;
 let reconnectTimer;
 let connectedAt;
 let cachedToken;
+let profileIdentity;
 
 const persistentDebuggers = new Map();
 const devtoolsState = new Map();
@@ -136,11 +138,9 @@ chrome.debugger?.onEvent?.addListener((source, method, params = {}) => {
   }
 });
 
-chrome.debugger?.onDetach?.addListener((source, reason) => {
+chrome.debugger?.onDetach?.addListener((source) => {
   if (source?.tabId !== undefined) {
     persistentDebuggers.delete(Number(source.tabId));
-    const state = stateForTab(source.tabId);
-    if (reason !== "canceled_by_user") state.debuggerDetachReason = reason;
   }
 });
 
@@ -204,14 +204,24 @@ function scheduleReconnect() {
   }, 1500);
 }
 
+async function ensureProfileIdentity() {
+  if (profileIdentity) return profileIdentity;
+  const data = await chrome.storage.local.get({ [PROFILE_ID_KEY]: "" });
+  profileIdentity = typeof data[PROFILE_ID_KEY] === "string" && data[PROFILE_ID_KEY].length > 0
+    ? data[PROFILE_ID_KEY]
+    : crypto.randomUUID();
+  if (data[PROFILE_ID_KEY] !== profileIdentity) await chrome.storage.local.set({ [PROFILE_ID_KEY]: profileIdentity });
+  return profileIdentity;
+}
+
 function browserIdentity() {
   const manifest = chrome.runtime.getManifest();
   const userAgent = navigator.userAgent;
   const browser = /Edg\//i.test(userAgent) ? "edge" : /Chrome\//i.test(userAgent) ? "chrome" : "chromium";
   return {
     browser,
-    browserId: `${browser}:${chrome.runtime.id}`,
-    profile: "current",
+    browserId: `${browser}:${chrome.runtime.id}:${profileIdentity || "uninitialized"}`,
+    profile: profileIdentity || "uninitialized",
     userAgent,
     extensionVersion: manifest.version,
   };
@@ -219,6 +229,7 @@ function browserIdentity() {
 
 async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  await ensureProfileIdentity();
   const token = await getPairingToken();
   const next = new WebSocket(`${BRIDGE_WS}?role=extension&token=${encodeURIComponent(token)}`);
   socket = next;
@@ -268,6 +279,21 @@ async function ownedTabs() {
   return data[OWNED_TABS_KEY] || {};
 }
 
+function sessionKey(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : "default";
+}
+
+async function ownedTabForSession(tabId, sessionId, action, required = false) {
+  const owned = await ownedTabs();
+  const record = owned[String(tabId)];
+  if (!record) {
+    if (required) throw new Error(`Cannot ${action} tab ${tabId}; it is not owned by an Agent session`);
+    return undefined;
+  }
+  if (record.sessionId !== sessionKey(sessionId)) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another Agent session`);
+  return record;
+}
+
 async function saveOwnedTabs(value) {
   await chrome.storage.local.set({ [OWNED_TABS_KEY]: value });
 }
@@ -277,7 +303,7 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
   owned[String(tab.id)] = {
     tabId: tab.id,
     windowId: tab.windowId,
-    sessionId: sessionId || "default",
+    sessionId: sessionKey(sessionId),
     createdAt: Date.now(),
     groupId: tab.groupId,
     owner,
@@ -288,16 +314,19 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
   await saveOwnedTabs(owned);
 }
 
-async function updateOwnedTab(tabId, patch) {
+async function updateOwnedTab(tabId, patch, sessionId) {
   const owned = await ownedTabs();
   const key = String(tabId);
-  if (!owned[key]) throw new Error(`Agent-owned tab not found: ${tabId}`);
-  owned[key] = { ...owned[key], ...patch };
+  const record = owned[key];
+  if (!record) throw new Error(`Agent-owned tab not found: ${tabId}`);
+  if (record.sessionId !== sessionKey(sessionId)) throw new Error(`Cannot update tab ${tabId}; it belongs to another Agent session`);
+  owned[key] = { ...record, ...patch };
   await saveOwnedTabs(owned);
   return owned[key];
 }
 
-async function forgetOwnedTab(tabId) {
+async function forgetOwnedTab(tabId, sessionId) {
+  await ownedTabForSession(tabId, sessionId, "forget");
   const owned = await ownedTabs();
   delete owned[String(tabId)];
   await saveOwnedTabs(owned);
@@ -609,7 +638,7 @@ async function locatorAction({ locator, action, value, key, index, attribute, ha
     const rect = element.getBoundingClientRect();
     return { tag: element.tagName.toLowerCase(), role: roleOf(element), name: normalize(nameOf(element)), text: normalize(element.innerText || element.textContent), rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
   };
-  if (action === "filter") return { ...locator, hasText: value !== undefined ? String(value) : locator.hasText, hasSelector: params.hasSelector || locator.hasSelector };
+  if (action === "filter") return { ...locator, hasText: value !== undefined ? String(value) : locator.hasText, hasSelector: hasSelector ?? locator.hasSelector };
   if (action === "and" || action === "or") return { combine: action, left: locator, right: other };
   if (action === "count") return resolve().length;
   if (action === "all") return resolve().map(describe);
@@ -719,16 +748,22 @@ async function executeInTab(tabId, func, args = []) {
   return result?.[0]?.result;
 }
 
-async function attachDebugger(tabId) {
+async function attachDebugger(tabId, sessionId) {
   const id = Number(tabId);
-  if (persistentDebuggers.has(id)) return;
+  const existing = persistentDebuggers.get(id);
+  if (existing) {
+    if (existing.sessionId !== sessionKey(sessionId)) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
+    return;
+  }
   await chrome.debugger.attach({ tabId: id }, "1.3");
-  persistentDebuggers.set(id, { attachedAt: Date.now() });
+  persistentDebuggers.set(id, { attachedAt: Date.now(), sessionId: sessionKey(sessionId) });
 }
 
-async function detachDebugger(tabId) {
+async function detachDebugger(tabId, sessionId) {
   const id = Number(tabId);
-  if (!persistentDebuggers.has(id)) return;
+  const record = persistentDebuggers.get(id);
+  if (!record) return;
+  if (sessionKey(sessionId) !== record.sessionId) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
   try { await chrome.debugger.detach({ tabId: id }); } catch {}
   persistentDebuggers.delete(id);
 }
@@ -737,25 +772,27 @@ async function debuggerCommand(tabId, method, params = {}) {
   return chrome.debugger.sendCommand({ tabId: Number(tabId) }, method, params);
 }
 
-async function withDebugger(tabId, callback) {
+async function withDebugger(tabId, callback, sessionId) {
   const id = Number(tabId);
-  const persistent = persistentDebuggers.has(id);
-  if (!persistent) await attachDebugger(id);
+  const persistentRecord = persistentDebuggers.get(id);
+  const persistent = persistentRecord !== undefined;
+  if (persistent && sessionId !== undefined && persistentRecord.sessionId !== sessionKey(sessionId)) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
+  if (!persistent) await attachDebugger(id, sessionId);
   try { return await callback((method, params) => debuggerCommand(id, method, params)); }
-  finally { if (!persistent) await detachDebugger(id); }
+  finally { if (!persistent) await detachDebugger(id, sessionId); }
 }
 
-async function enableDevtools(tabId, domains = ["Runtime", "Log", "Network", "Page"]) {
+async function enableDevtools(tabId, domains = ["Runtime", "Log", "Network", "Page"], sessionId) {
   const id = Number(tabId);
-  await attachDebugger(id);
+  await attachDebugger(id, sessionId);
   for (const domain of domains) {
     try { await debuggerCommand(id, `${domain}.enable`); } catch (error) { log(`could not enable ${domain}`, error); }
   }
   return { tabId: id, enabled: domains, attached: true };
 }
 
-async function disableDevtools(tabId) {
-  await detachDebugger(tabId);
+async function disableDevtools(tabId, sessionId) {
+  await detachDebugger(tabId, sessionId);
   return { tabId: Number(tabId), attached: false };
 }
 
@@ -780,7 +817,7 @@ async function createTab(params) {
 
 async function cleanup(params) {
   const owned = await ownedTabs();
-  const sessionId = params.sessionId || "default";
+  const sessionId = sessionKey(params.sessionId);
   const removed = [];
   const released = [];
   const kept = { ...owned };
@@ -797,7 +834,10 @@ async function cleanup(params) {
   }
   await saveOwnedTabs(kept);
   if (params.detachDevtools !== false) {
-    for (const tabId of [...persistentDebuggers.keys()]) await detachDebugger(tabId);
+    for (const [tabId, record] of [...persistentDebuggers.entries()]) {
+      if (record.sessionId !== sessionKey(sessionId)) continue;
+      await detachDebugger(tabId, sessionId);
+    }
   }
   return { removed, released };
 }
@@ -837,7 +877,7 @@ async function uploadFiles(tabId, params) {
       await sendCommand("DOM.setFileInputFiles", { nodeId, files });
     } else throw new Error("No file input matched and no intercepted file chooser is available");
     return { tabId: Number(tabId), files, nodeId };
-  });
+  }, params.sessionId);
 }
 
 async function clipboardText(tabId, action, text) {
@@ -904,7 +944,7 @@ async function coordinateAction(tabId, params) {
       return { ok: true, action, key: params.key };
     }
     throw new Error(`Unsupported coordinate action: ${action}`);
-  });
+  }, params.sessionId);
 }
 
 async function handleRequest(method, params) {
@@ -947,8 +987,10 @@ async function handleRequest(method, params) {
   }
   if (method === "close_tab") {
     const tab = await getTab(params.tabId, params);
+    const record = await ownedTabForSession(tab.id, params.sessionId, "close");
+    if (!record && params.userRequested !== true) throw new Error("Closing an unowned user tab requires userRequested: true");
     await chrome.tabs.remove(tab.id);
-    await forgetOwnedTab(tab.id);
+    await forgetOwnedTab(tab.id, params.sessionId);
     return { closed: tab.id };
   }
   if (method === "extract") {
@@ -960,7 +1002,7 @@ async function handleRequest(method, params) {
     const snapshot = await executeInTab(tab.id, collectSnapshot);
     if (snapshot) snapshot.accessibility = await executeInTab(tab.id, collectAccessibilitySnapshot);
     let frameTree;
-    try { frameTree = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.getFrameTree")); } catch {}
+    try { frameTree = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.getFrameTree"), params.sessionId); } catch {}
     return { tabId: tab.id, snapshot, frameTree };
   }
   if (method === "locator") {
@@ -982,27 +1024,27 @@ async function handleRequest(method, params) {
   }
   if (method === "screenshot") {
     const tab = await getTab(params.tabId, params);
-    const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.captureScreenshot", { format: params.format || "png", captureBeyondViewport: params.fullPage === true }));
+    const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.captureScreenshot", { format: params.format || "png", captureBeyondViewport: params.fullPage === true }), params.sessionId);
     return { tabId: tab.id, data: result.data, mimeType: `image/${params.format || "png"}` };
   }
   if (method === "evaluate") {
     const tab = await getTab(params.tabId, params);
-    const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Runtime.evaluate", { expression: String(params.expression || "undefined"), awaitPromise: params.awaitPromise !== false, returnByValue: true }));
+    const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Runtime.evaluate", { expression: String(params.expression || "undefined"), awaitPromise: params.awaitPromise !== false, returnByValue: true }), params.sessionId);
     return { tabId: tab.id, result };
   }
   if (method === "cdp") {
     const tab = await getTab(params.tabId, params);
-    const result = await withDebugger(tab.id, (sendCommand) => sendCommand(String(params.method), params.params || {}));
+    const result = await withDebugger(tab.id, (sendCommand) => sendCommand(String(params.method), params.params || {}), params.sessionId);
     return { tabId: tab.id, result };
   }
   if (method === "devtools_enable") {
     const tab = await getTab(params.tabId, params);
-    return enableDevtools(tab.id, params.domains || ["Runtime", "Log", "Network", "Page"]);
+    return enableDevtools(tab.id, params.domains || ["Runtime", "Log", "Network", "Page"], params.sessionId);
   }
-  if (method === "devtools_disable") return disableDevtools(params.tabId);
+  if (method === "devtools_disable") return disableDevtools(params.tabId, params.sessionId);
   if (method === "console_logs") {
     const tab = await getTab(params.tabId, params);
-    await enableDevtools(tab.id, ["Runtime", "Log"]);
+    await enableDevtools(tab.id, ["Runtime", "Log"], params.sessionId);
     const state = stateForTab(tab.id);
     const logs = [...state.console];
     if (params.clear === true) state.console.length = 0;
@@ -1010,7 +1052,7 @@ async function handleRequest(method, params) {
   }
   if (method === "network_requests") {
     const tab = await getTab(params.tabId, params);
-    await enableDevtools(tab.id, ["Network", "Page"]);
+    await enableDevtools(tab.id, ["Network", "Page"], params.sessionId);
     const state = stateForTab(tab.id);
     const requests = [...state.network];
     if (params.clear === true) state.network.length = 0;
@@ -1018,7 +1060,7 @@ async function handleRequest(method, params) {
   }
   if (method === "network_response_body") {
     const tab = await getTab(params.tabId, params);
-    await enableDevtools(tab.id, ["Network"]);
+    await enableDevtools(tab.id, ["Network"], params.sessionId);
     return { tabId: tab.id, result: await debuggerCommand(tab.id, "Network.getResponseBody", { requestId: String(params.requestId) }) };
   }
   if (method === "dialog") {
@@ -1026,7 +1068,9 @@ async function handleRequest(method, params) {
     const state = stateForTab(tab.id);
     if (params.action === "get") return { tabId: tab.id, dialog: state.dialog };
     if (!["accept", "dismiss"].includes(params.action)) throw new Error("dialog action must be get, accept or dismiss");
-    if (!persistentDebuggers.has(Number(tab.id))) await enableDevtools(tab.id, ["Page"]);
+    const debuggerRecord = persistentDebuggers.get(Number(tab.id));
+    if (debuggerRecord && debuggerRecord.sessionId !== sessionKey(params.sessionId)) throw new Error(`DevTools for tab ${tab.id} belongs to another Agent session`);
+    if (!debuggerRecord) await enableDevtools(tab.id, ["Page"], params.sessionId);
     await debuggerCommand(tab.id, "Page.handleJavaScriptDialog", { accept: params.action === "accept", promptText: params.promptText });
     const dialog = state.dialog;
     state.dialog = undefined;
@@ -1034,7 +1078,7 @@ async function handleRequest(method, params) {
   }
   if (method === "upload") {
     const tab = await getTab(params.tabId, params);
-    await enableDevtools(tab.id, ["Page"]);
+    await enableDevtools(tab.id, ["Page"], params.sessionId);
     return uploadFiles(tab.id, params);
   }
   if (method === "clipboard") {
@@ -1060,17 +1104,21 @@ async function handleRequest(method, params) {
     if (params.windowId !== undefined && Number(params.windowId) !== Number(tab.windowId)) throw new Error("Tab window changed since the claim snapshot");
     if (params.title !== undefined && String(params.title) !== String(tab.title || "")) throw new Error("Tab title changed since the claim snapshot");
     if (params.url !== undefined && String(params.url) !== String(tab.url || "")) throw new Error("Tab URL changed since the claim snapshot");
+    const existing = await ownedTabForSession(tab.id, params.sessionId, "claim");
+    if (existing) throw new Error(`Tab ${tab.id} is already owned; release it before claiming again`);
     await recordOwnedTab(tab, params.sessionId, "claimed", "claimed");
     return { claimed: (await listTabs()).tabs.find((entry) => entry.id === tab.id) };
   }
   if (method === "release") {
-    if (params.tabId !== undefined) await forgetOwnedTab(params.tabId);
-    return { released: params.tabId === undefined ? [] : [Number(params.tabId)] };
+    if (params.tabId === undefined) throw new Error("tabId is required");
+    await ownedTabForSession(params.tabId, params.sessionId, "release", true);
+    await forgetOwnedTab(params.tabId, params.sessionId);
+    return { released: [Number(params.tabId)] };
   }
   if (method === "mark_handoff" || method === "mark_deliverable") {
     if (params.tabId === undefined) throw new Error("tabId is required");
     const lifecycle = method === "mark_handoff" ? "handoff" : "deliverable";
-    return { tab: await updateOwnedTab(params.tabId, { lifecycle }) };
+    return { tab: await updateOwnedTab(params.tabId, { lifecycle }, params.sessionId) };
   }
   if (method === "cleanup") return cleanup(params);
   throw new Error(`Unsupported browser method: ${method}`);

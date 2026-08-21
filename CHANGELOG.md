@@ -1,8 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
-- Added `browser_doctor` and browser target stability checks to the DSH plugin.
+- Fixed `browser_locator` filtering with `hasSelector`.
+- Restricted pairing and health CORS responses to valid Chromium extension origins instead of exposing the pairing response to webpages.
+- Added persisted per-Profile browser identity and Pi-side `expectedBrowserId` acknowledgement/preflight handling.
+- Enforced session ownership for claim, release, lifecycle marking, Agent cleanup, persistent DevTools cleanup and Agent tab close; unowned user-tab close now requires explicit `userRequested: true`.
+- Added Bridge lifecycle fencing, endpoint-aware DSH websocket reuse, shared restart capability checks and startup health reuse.
+- Removed the unused Skill CLI token-file setting and clarified Profile patch merging and current architecture documentation.
+
+## 0.3.2
+
+- Removed the unused `webNavigation` extension permission and private debugger-detach state.
+- Simplified Pi Bridge health polling and replaced the hand-rolled HTTP JSON helper with Node's built-in fetch.
+- Removed unconsumed Pi client health telemetry and development-only test files from the npm artifact.
+- Removed unused browser tool schema fields for accessibility hints, network timeouts and download tab scoping.
+
+## 0.3.1
+
+- Added an explicit local-user restart capability marker so updated Hosts reject older owner-token restart protocols instead of reporting false recovery availability.
+
+## 0.3.0
+
+- Added non-secret instance, launcher and capability metadata to Bridge health and pairing handshakes.
+- Added local-user cooperative Bridge restart with instance-race, pending-request and concurrent-restart checks; DSH and Pi Hosts share the restart authority through the authenticated local pairing channel.
+- Added DSH `/chrome status|doctor|restart|tabs` commands and kept browser tabs untouched during Bridge restart.
 - Added an extension identity handshake and atomic Bridge validation for `expectedBrowserId`, preventing a request from crossing an Edge/Chrome replacement.
 - The DSH plugin now rejects an older running Bridge that cannot expose the active browser identity needed for atomic target routing.
 
