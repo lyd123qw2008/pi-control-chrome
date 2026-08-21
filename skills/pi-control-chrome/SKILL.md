@@ -62,10 +62,10 @@ Do not keep retrying a page action while the two extensions are competing for th
 
 1. Stop browser actions and run `browser_doctor` once.
 2. Inspect `recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`.
-3. When the Bridge exposes cooperative restart, invoke the explicit host command (`/chrome restart` in Pi or DSH). The Bridge validates the instance id, rejects pending browser work, serializes concurrent restart requests, and leaves browser tabs untouched.
+3. When the Bridge exposes `capabilities.localUserRestart: true`, invoke the explicit host command (`/chrome restart` in Pi or DSH). The Bridge validates the instance id, rejects pending browser work, serializes concurrent restart requests, and leaves browser tabs untouched.
 4. Do not terminate a port owner based on the port alone, a PID lookup, or a command-line match, and do not start a second Bridge while the existing one is healthy.
 5. Run `browser_doctor` again, then call `browser_status` before retrying the requested operation.
-6. Ask the user for host-level help only when the Bridge is legacy or lacks cooperative restart capability. The user should not be asked to find a hidden Bridge terminal as the default recovery path.
+6. Ask the user for host-level help only when the Bridge is legacy or lacks `capabilities.localUserRestart: true`. The user should not be asked to find a hidden Bridge terminal as the default recovery path.
 
 ### Bridge or extension is offline
 

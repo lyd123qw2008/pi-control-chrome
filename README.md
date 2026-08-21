@@ -29,7 +29,7 @@ Chrome / Edge Manifest V3 Extension
 Current Chromium Profile
 ```
 
-The Bridge binds to loopback and requires a local pairing token. Host-launched instances expose a non-secret instance id, launcher label and capability list; any paired DSH or Pi Host in the same local-user control domain may request a cooperative restart when the Bridge has no pending browser request. The instance id prevents stale restart races, and a restart lock serializes concurrent requests. Unknown legacy Bridges remain untouched when they do not expose the cooperative capability. Installing the extension and completing local pairing are the trust steps; normal browser operations do not request repeated per-action authorization.
+The Bridge binds to loopback and requires a local pairing token. Host-launched instances expose a non-secret instance id, launcher label and capability list; any paired DSH or Pi Host in the same local-user control domain may request a cooperative restart when the Bridge exposes `capabilities.localUserRestart: true` and has no pending browser request. The instance id prevents stale restart races, and a restart lock serializes concurrent requests. Unknown legacy Bridges remain untouched when they do not expose the local-user capability. Installing the extension and completing local pairing are the trust steps; normal browser operations do not request repeated per-action authorization.
 
 ## Installation
 

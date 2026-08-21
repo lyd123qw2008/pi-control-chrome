@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- Removed the unused `webNavigation` extension permission and private debugger-detach state.
+- Simplified Pi Bridge health polling and replaced the hand-rolled HTTP JSON helper with Node's built-in fetch.
+- Removed unconsumed Pi client health telemetry and development-only test files from the npm artifact.
+- Removed unused browser tool schema fields for accessibility hints, network timeouts and download tab scoping.
+
 ## 0.3.1
 
 - Added an explicit local-user restart capability marker so updated Hosts reject older owner-token restart protocols instead of reporting false recovery availability.

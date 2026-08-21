@@ -56,6 +56,11 @@ async function waitHealthIdentity(port, browserId) {
   throw new Error(`bridge did not expose browser identity ${browserId}`);
 }
 
+test("extension manifest omits the unused webNavigation permission", () => {
+  const manifest = JSON.parse(readFileSync(join(root, "extension", "manifest.json"), "utf8"));
+  assert.equal(manifest.permissions.includes("webNavigation"), false);
+});
+
 test("bridge exposes health/pair endpoints and routes Pi requests to extension", async () => {
   const port = 17800 + Math.floor(Math.random() * 500);
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-test-"));
@@ -71,6 +76,7 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
      assert.equal(health.capabilities.cooperativeRestart, true);
      assert.equal(health.capabilities.localUserRestart, true);
      assert.equal(health.restart.available, true);
+     assert.equal("piClients" in health, false);
     const pair = await getJson(port, "/pair");
     assert.equal(pair.status, 200);
     assert.equal(pair.body.token, readFileSync(tokenFile, "utf8").trim());

@@ -94,10 +94,6 @@ function requestParams(message) {
   return message.params && typeof message.params === "object" ? message.params : {};
 }
 
-function activePiClients() {
-  return [...clients].filter((client) => client.role === "pi" && client.readyState === 1);
-}
-
 function handleBridgeRestart(client, id, message) {
   if (restarting) {
     sendError(client, id, "BRIDGE_IN_USE", "The Bridge is already restarting.");
@@ -267,7 +263,6 @@ const server = createServer((req, res) => {
       },
       port,
       extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
-      piClients: activePiClients().length,
       ...(identity || {}),
     });
     return;
@@ -351,8 +346,3 @@ function shutdown() {
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
-process.once("exit", () => {
-  for (const entry of pending.values()) clearTimeout(entry.timer);
-});
-
-export { tokenFile };

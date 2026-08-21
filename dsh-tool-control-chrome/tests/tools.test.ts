@@ -45,6 +45,12 @@ describe('DSH browser tool catalog', () => {
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_screenshot')
     expect(browserToolCatalog.advanced.map(tool => tool.name)).toContain('browser_cdp')
+    const accessibility = browserToolCatalog.core.find(tool => tool.name === 'browser_accessibility_snapshot')
+    const network = browserToolCatalog.advanced.find(tool => tool.name === 'browser_network')
+    const download = browserToolCatalog.advanced.find(tool => tool.name === 'browser_download')
+    expect(accessibility?.prepare).toBeUndefined()
+    expect(network?.parameters).not.toHaveProperty('timeoutMs')
+    expect(download?.parameters).not.toHaveProperty('tabId')
   })
 
   it('routes session identity and operation parameters to the Bridge after target validation', async () => {

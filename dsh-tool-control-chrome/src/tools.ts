@@ -216,7 +216,6 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     description: 'Return the accessibility-oriented semantic tree included in the current page snapshot.',
     parameters: { tabId: TAB_ID },
     method: 'snapshot',
-    prepare: args => ({ ...args, __accessibilityOnly: true }),
   },
   {
     name: 'browser_navigate',
@@ -428,7 +427,6 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
       action: OPTIONAL_STRING,
       requestId: OPTIONAL_STRING,
       clear: OPTIONAL_BOOLEAN,
-      timeoutMs: OPTIONAL_NUMBER,
     },
     method: 'network_requests',
     prepare: args => args.action === 'enable'
@@ -457,7 +455,6 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
     name: 'browser_download',
     description: 'Start, wait for, list, cancel or erase browser downloads and return paths and status.',
     parameters: {
-      tabId: TAB_ID,
       action: requiredString(),
       url: OPTIONAL_STRING,
       filename: OPTIONAL_STRING,

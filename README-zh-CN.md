@@ -173,5 +173,6 @@ npm run smoke:e2e
 - Chrome/Edge 配置；
 - 浏览器 Profile；
 - 用户标签页；
-- 本地 Bridge；
-- 任何登录凭据。
+- 浏览器登录凭据。
+
+Pi 或 DSH Host 可以按配置启动或复用本地 Bridge，并在默认位置创建配对令牌文件；这不等于读取或修改浏览器 Profile、配置或登录凭据。

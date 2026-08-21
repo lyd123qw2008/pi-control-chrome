@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import WebSocket from "ws";
@@ -11,29 +10,23 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17318;
+const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 const SESSION_ID = randomUUID();
 const BRIDGE_WAIT_ATTEMPTS = 30;
 const BRIDGE_WAIT_DELAY_MS = 100;
 let paused = false;
 
-function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
-  return new Promise((resolve, reject) => {
-    const request = httpRequest({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, method: "GET" }, (response) => {
-      const chunks: Buffer[] = [];
-      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-      response.on("end", () => {
-        try {
-          resolve({ statusCode: response.statusCode || 0, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-    request.setTimeout(timeoutMs, () => request.destroy(new Error(`Local bridge request timed out: ${path}`)));
-    request.on("error", reject);
-    request.end();
-  });
+async function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
+  try {
+    const response = await fetch(`${BRIDGE_ORIGIN}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
+    return { statusCode: response.status, value: await response.json() };
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new Error(`Local bridge request timed out: ${path}`);
+    }
+    throw error;
+  }
 }
 
 const TAB_ID = Type.Optional(Type.Number({ description: "Chrome/Edge tab id. Omit to use the active tab." }));
@@ -45,7 +38,6 @@ class BridgeClient {
   private connecting?: Promise<void>;
 
   async start(): Promise<void> {
-    await this.ensureBridgeProcess();
     await this.connect();
   }
 
@@ -124,7 +116,12 @@ class BridgeClient {
 
   private async waitForHealth(): Promise<any> {
     for (let i = 0; i < BRIDGE_WAIT_ATTEMPTS; i += 1) {
-      if (await this.isHealthy()) return await this.health();
+      try {
+        const health = await this.health();
+        if (health?.ok === true) return health;
+      } catch {
+        // Keep polling while a newly spawned Bridge is binding its port.
+      }
       await new Promise((resolve) => setTimeout(resolve, BRIDGE_WAIT_DELAY_MS));
     }
     throw new Error("Timed out starting the Pi browser bridge");
@@ -137,7 +134,6 @@ class BridgeClient {
     }
     throw new Error("Timed out stopping the Pi browser bridge");
   }
-
 
   private async isHealthy(): Promise<boolean> {
     try {
@@ -534,7 +530,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_network",
     label: "Browser Network",
     description: "Enable and read Network request/response events and response bodies from a browser tab.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()), timeoutMs: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
         if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Network", "Page"] }));
@@ -578,7 +574,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_download",
     label: "Browser Download",
     description: "Start, wait for, list, cancel or erase browser downloads and return their paths/status.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: Type.Optional(Type.Number()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("download", params)); } catch (error) { return errorResult(error); }
     },

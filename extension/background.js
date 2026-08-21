@@ -136,11 +136,9 @@ chrome.debugger?.onEvent?.addListener((source, method, params = {}) => {
   }
 });
 
-chrome.debugger?.onDetach?.addListener((source, reason) => {
+chrome.debugger?.onDetach?.addListener((source) => {
   if (source?.tabId !== undefined) {
     persistentDebuggers.delete(Number(source.tabId));
-    const state = stateForTab(source.tabId);
-    if (reason !== "canceled_by_user") state.debuggerDetachReason = reason;
   }
 });
 
