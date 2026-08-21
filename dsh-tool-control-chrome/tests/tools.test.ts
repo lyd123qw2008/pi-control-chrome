@@ -31,9 +31,9 @@ function setup(bridge: Pick<BrowserBridgeClient, 'request' | 'health'>, attachme
   return tools
 }
 
-function execution(): ToolRunContext {
+function execution(sessionId = 'session-test'): ToolRunContext {
   return {
-    agent: { session: { id: 'session-test' } },
+    agent: { session: { id: sessionId } },
     signal: new AbortController().signal,
   } as unknown as ToolRunContext
 }
@@ -54,8 +54,8 @@ describe('DSH browser tool catalog', () => {
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
     const tools = setup({ request, health })
     const result = await tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())
-    expect(result).toEqual({ method: 'interaction', params: { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click' } })
-    expect(request).toHaveBeenLastCalledWith('interaction', { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click' }, expect.any(AbortSignal))
+    expect(result).toEqual({ method: 'interaction', params: { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click', expectedBrowserId: 'edge:test' } })
+    expect(request).toHaveBeenLastCalledWith('interaction', { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click', expectedBrowserId: 'edge:test' }, expect.any(AbortSignal))
   })
 
   it('reports an actionable diagnosis when the Bridge has no extension', async () => {
@@ -72,7 +72,23 @@ describe('DSH browser tool catalog', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
-  it('blocks browser operations when the active browser target changes', async () => {
+  it('marks first-call browser competition as unverified', async () => {
+    const request = vi.fn(async () => ({ connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true }))
+    const tools = setup({ request, health })
+    const result = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(result).toMatchObject({ ok: true, recommendation: 'confirm_browser_target', targetStability: { competition: 'unknown' }, notices: [{ code: 'browser_competition_unverified' }] })
+  })
+
+  it('rejects an incomplete browser status contract', async () => {
+    const request = vi.fn(async () => ({ connected: true, browser: '', browserId: '', profile: '' }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true }))
+    const tools = setup({ request, health })
+    const result = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(result).toMatchObject({ ok: false, recommendation: 'refresh_browser_status', issues: [{ code: 'status_missing_browser_target' }] })
+  })
+
+  it('blocks browser operations when the active browser target changes until explicitly acknowledged', async () => {
     let browser = 'edge'
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser, browserId: `${browser}:test`, profile: 'current', extensionVersion: '0.2.4' }
@@ -83,10 +99,29 @@ describe('DSH browser tool catalog', () => {
     browser = 'chrome'
     await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())).rejects.toThrow(/changed from edge.*chrome/)
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
-    const status = await tools.get('browser_status')?.execute({}, execution())
-    expect(status).toMatchObject({ targetStability: { stable: false, changed: true, browser: 'chrome' } })
+    const unacknowledged = await tools.get('browser_status')?.execute({}, execution())
+    expect(unacknowledged).toMatchObject({ targetStability: { stable: false, changed: true, acknowledged: false, requiresAcknowledgement: true } })
+    await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())).rejects.toThrow(/acknowledgeBrowserId/)
+    const status = await tools.get('browser_status')?.execute({ acknowledgeBrowserId: 'chrome:test' }, execution())
+    expect(status).toMatchObject({ targetStability: { stable: false, changed: true, acknowledged: true, browser: 'chrome' } })
     await tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
+  })
+
+  it('keeps browser target acknowledgements isolated per session', async () => {
+    let browser = 'edge'
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser, browserId: `${browser}:test`, profile: 'current', extensionVersion: '0.2.4' }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const tools = setup({ request, health })
+    await tools.get('browser_status')?.execute({}, execution('session-a'))
+    browser = 'chrome'
+    await tools.get('browser_status')?.execute({}, execution('session-b'))
+    await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution('session-a'))).rejects.toThrow(/changed from edge.*chrome/)
+    await tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution('session-b'))
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
+    expect(request.mock.calls.at(-1)?.[1]).toMatchObject({ expectedBrowserId: 'chrome:test', sessionId: 'session-b' })
   })
 
   it('projects accessibility and network specializations', async () => {

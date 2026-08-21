@@ -233,7 +233,16 @@ async function connect() {
       const message = JSON.parse(event.data);
       id = message.id;
       if (message.type !== "request") return;
-      const result = await handleRequest(message.method, message.params || {});
+      const expectedBrowserId = message.params?.expectedBrowserId;
+       if (expectedBrowserId !== undefined && (typeof expectedBrowserId !== "string" || expectedBrowserId.length === 0)) {
+         send({ type: "response", id, error: { code: "INVALID_BROWSER_TARGET", message: "expectedBrowserId must be a non-empty string" } });
+         return;
+       }
+       if (expectedBrowserId !== undefined && expectedBrowserId !== browserIdentity().browserId) {
+         send({ type: "response", id, error: { code: "BROWSER_TARGET_CHANGED", message: `Browser target changed; expected ${expectedBrowserId} but this extension is ${browserIdentity().browserId}` } });
+         return;
+       }
+       const result = await handleRequest(message.method, message.params || {});
       send({ type: "response", id, result });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

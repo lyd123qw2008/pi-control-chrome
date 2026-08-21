@@ -32,6 +32,9 @@ type BrowserTarget = {
 type TargetStability = {
   readonly stable: boolean
   readonly changed: boolean
+  readonly acknowledged: boolean
+  readonly requiresAcknowledgement: boolean
+  readonly competition: 'unknown' | 'stable_observed' | 'changed'
   readonly browser?: string
   readonly browserId?: string
   readonly profile?: string
@@ -46,7 +49,7 @@ function readBrowserTarget(value: unknown): BrowserTarget | undefined {
   const browser = value.browser
   const browserId = value.browserId
   const profile = value.profile
-  if (typeof browser !== 'string' || typeof browserId !== 'string' || typeof profile !== 'string') return undefined
+  if (typeof browser !== 'string' || browser.length === 0 || typeof browserId !== 'string' || browserId.length === 0 || typeof profile !== 'string' || profile.length === 0) return undefined
   return { browser, browserId, profile }
 }
 
@@ -58,18 +61,30 @@ class BrowserTargetTracker {
   private acknowledged?: BrowserTarget
   private readonly observed = new Map<string, BrowserTarget>()
 
-  observe(value: unknown, acknowledge: boolean): TargetStability {
+  observe(value: unknown, acknowledgeBrowserId?: string): TargetStability {
     const target = readBrowserTarget(value)
     if (target === undefined) {
-      return { stable: false, changed: false, observedBrowserIds: [...this.observed.keys()], issue: 'status_missing_browser_target' }
+      return {
+        stable: false,
+        changed: false,
+        acknowledged: false,
+        requiresAcknowledgement: false,
+        competition: 'unknown',
+        observedBrowserIds: [...this.observed.keys()],
+        issue: 'status_missing_browser_target',
+      }
     }
     const previous = this.acknowledged
     const changed = previous !== undefined && !sameBrowserTarget(previous, target)
+    const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId
     this.observed.set(target.browserId, target)
-    if (acknowledge || previous === undefined) this.acknowledged = target
+    if (acknowledged) this.acknowledged = target
     return {
       stable: !changed,
       changed,
+      acknowledged,
+      requiresAcknowledgement: changed && !acknowledged,
+      competition: previous === undefined ? 'unknown' : changed ? 'changed' : 'stable_observed',
       browser: target.browser,
       browserId: target.browserId,
       profile: target.profile,
@@ -78,11 +93,15 @@ class BrowserTargetTracker {
     }
   }
 
-  assertStable(value: unknown): void {
-    const observation = this.observe(value, false)
+  assertStable(value: unknown): BrowserTarget {
+    const observation = this.observe(value)
     if (observation.issue !== undefined) throw new Error('Browser status did not identify an active browser target; run browser_doctor')
-    if (observation.stable) return
-    throw new Error(`Browser target changed from ${observation.previousBrowser} (${observation.previousBrowserId}) to ${observation.browser} (${observation.browserId}); run browser_status and disable the other browser extension before retrying`)
+    if (!observation.stable || !observation.acknowledged) {
+      throw new Error(`Browser target changed from ${observation.previousBrowser} (${observation.previousBrowserId}) to ${observation.browser} (${observation.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`)
+    }
+    const target = readBrowserTarget(value)
+    if (target === undefined) throw new Error('Browser status did not identify an active browser target; run browser_doctor')
+    return target
   }
 }
 
@@ -136,7 +155,9 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   {
     name: 'browser_status',
     description: 'Return the connected Chrome/Edge browser, active browser target stability and local Bridge status.',
-    parameters: EMPTY_PARAMETERS,
+    parameters: {
+      acknowledgeBrowserId: { type: 'string', description: 'Explicitly acknowledge this browserId after the user confirms a browser switch.' },
+    },
     method: 'status',
   },
   {
@@ -563,9 +584,10 @@ async function browserStatus(
   tracker: BrowserTargetTracker,
   sessionId: string,
   signal: AbortSignal,
+  acknowledgeBrowserId?: string,
 ): Promise<JsonValue> {
   const result = await bridge.request('status', { sessionId }, signal)
-  const targetStability = tracker.observe(result, true)
+  const targetStability = tracker.observe(result, acknowledgeBrowserId)
   const base = isRecord(result) ? result : { result }
   try {
     return asJsonValue({ ...base, targetStability, bridgeHealth: await bridge.health() })
@@ -610,22 +632,35 @@ async function browserDoctor(
       issues: [{ code: 'browser_status_unavailable', message: errorText(error) }],
     })
   }
-  const targetStability = tracker.observe(status, false)
+  const targetStability = tracker.observe(status)
   const base = isRecord(status) ? status : { status }
+  const target = readBrowserTarget(status)
+  const bridgeBrowserId = typeof bridgeHealth.browserId === 'string' && bridgeHealth.browserId.length > 0 ? bridgeHealth.browserId : undefined
   const issues = [] as Array<{ code: string; message: string }>
+  const notices = [] as Array<{ code: string; message: string }>
   if (targetStability.issue !== undefined) {
-    issues.push({ code: targetStability.issue, message: 'The browser status did not identify browser, browserId and profile.' })
+    issues.push({ code: targetStability.issue, message: 'The browser status did not identify browser, browserId and profile. Reload the extension to update its status contract.' })
   } else if (targetStability.changed) {
     issues.push({
       code: 'browser_target_changed',
       message: `The active browser changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}).`,
     })
+  } else if (target !== undefined && bridgeBrowserId !== undefined && target.browserId !== bridgeBrowserId) {
+    issues.push({
+      code: 'bridge_browser_target_changed',
+      message: `Bridge health reports ${bridgeBrowserId}, but the status response came from ${target.browserId}.`,
+    })
   }
-  const recommendation = issues.length === 0
-    ? 'ready'
-    : targetStability.changed
+  if (targetStability.competition === 'unknown' && issues.length === 0) {
+    notices.push({ code: 'browser_competition_unverified', message: 'The active browser is healthy, but this session has not observed it twice yet.' })
+  }
+  const recommendation = issues.length > 0
+    ? targetStability.changed || (target !== undefined && bridgeBrowserId !== undefined && target.browserId !== bridgeBrowserId)
       ? 'disable_other_browser_extension'
       : 'refresh_browser_status'
+    : notices.length > 0
+      ? 'confirm_browser_target'
+      : 'ready'
   return asJsonValue({
     ...base,
     ok: issues.length === 0,
@@ -633,6 +668,7 @@ async function browserDoctor(
     bridgeHealth,
     targetStability,
     issues,
+    notices,
   })
 }
 
@@ -641,9 +677,9 @@ async function assertStableBrowserTarget(
   tracker: BrowserTargetTracker,
   sessionId: string,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<BrowserTarget> {
   const status = await bridge.request('status', { sessionId }, signal)
-  tracker.assertStable(status)
+  return tracker.assertStable(status)
 }
 
 /** Register the full browser-control tool surface and return its disposers. */
@@ -654,7 +690,14 @@ export function registerBrowserTools(
   resolveSettings: () => ResolvedConfig,
 ): void {
   const specs = [...CORE_TOOLS, ...ADVANCED_TOOLS]
-  const tracker = new BrowserTargetTracker()
+  const trackers = new Map<string, BrowserTargetTracker>()
+  const trackerFor = (sessionId: string): BrowserTargetTracker => {
+    const existing = trackers.get(sessionId)
+    if (existing !== undefined) return existing
+    const created = new BrowserTargetTracker()
+    trackers.set(sessionId, created)
+    return created
+  }
   for (const spec of specs) {
     const tool = defineTool({
       name: spec.name,
@@ -667,11 +710,16 @@ export function registerBrowserTools(
       timeoutMs: resolveSettings().requestTimeoutMs,
       async execute(args: Record<string, JsonValue>, exec: ToolRunContext): Promise<JsonValue> {
         const sessionId = requireAgentSession(exec)
+        const tracker = trackerFor(sessionId)
         let params = { ...args, sessionId } as Record<string, JsonValue>
         if (spec.prepare !== undefined) params = spec.prepare(params)
         if (spec.name === 'browser_doctor') return browserDoctor(bridge, tracker, sessionId, exec.signal)
-        if (spec.name !== 'browser_status') await assertStableBrowserTarget(bridge, tracker, sessionId, exec.signal)
-        if (spec.name === 'browser_status') return browserStatus(bridge, tracker, sessionId, exec.signal)
+        if (spec.name === 'browser_status') {
+          const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
+          return browserStatus(bridge, tracker, sessionId, exec.signal, acknowledgeBrowserId)
+        }
+        const target = await assertStableBrowserTarget(bridge, tracker, sessionId, exec.signal)
+        params = { ...params, expectedBrowserId: target.browserId }
         let method = spec.method
         if (spec.name === 'browser_accessibility_snapshot') {
           const result = await bridge.request('snapshot', params, exec.signal)

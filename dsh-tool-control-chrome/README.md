@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.2.0
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.2.1
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -33,7 +33,7 @@ The DSH package cannot install a browser extension automatically. Install `pi-co
 3. Choose **Load unpacked**.
 4. Select the installed `pi-control-chrome/extension/` directory.
 
-The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, and Chrome/Edge competition. Browser operations perform a status preflight; if the active `browserId` changes, the operation fails before dispatching to the new browser. Call `browser_status`, confirm the requested browser, and disable the other browser extension before retrying.
+The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, and Chrome/Edge competition. Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.2.4 provides them and 0.2.5 additionally sends an identity handshake.
 
 ## Configuration
 
