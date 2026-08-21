@@ -12,8 +12,8 @@ importers:
         specifier: ^3.18.1
         version: 3.18.1
       pi-control-chrome:
-        specifier: ^0.3.0
-        version: 0.3.0(@earendil-works/pi-coding-agent@0.84.2(ws@8.21.3)(zod@4.4.3))(typebox@1.3.16)
+        specifier: ^0.3.1
+        version: 0.3.1(@earendil-works/pi-coding-agent@0.84.2(ws@8.21.3)(zod@4.4.3))(typebox@1.3.16)
       ws:
         specifier: ^8.18.0
         version: 8.21.3
@@ -981,8 +981,8 @@ packages:
   pathe@2.0.3:
     resolution: {integrity: sha512-WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w==}
 
-  pi-control-chrome@0.3.0:
-    resolution: {integrity: sha512-a4+swZHP1ZKqapmCb/pCXPznSoI+1/mIFymZRAwDIFhAB3b7dQ717OiO+nnghCJbmQzXJBSQJ1LAwn4zPnKDUA==}
+  pi-control-chrome@0.3.1:
+    resolution: {integrity: sha512-8q4mB1S9HR1bL5ByN5Osv1YUpR+StEqsxjoddkbNEUrGtOUQnkHyZv+52aVXC5cShADzP31NbQZrZsbDPrBTPw==}
     engines: {node: '>=22'}
     peerDependencies:
       '@earendil-works/pi-coding-agent': '*'
@@ -2155,7 +2155,7 @@ snapshots:
 
   pathe@2.0.3: {}
 
-  pi-control-chrome@0.3.0(@earendil-works/pi-coding-agent@0.84.2(ws@8.21.3)(zod@4.4.3))(typebox@1.3.16):
+  pi-control-chrome@0.3.1(@earendil-works/pi-coding-agent@0.84.2(ws@8.21.3)(zod@4.4.3))(typebox@1.3.16):
     dependencies:
       '@earendil-works/pi-coding-agent': 0.84.2(ws@8.21.3)(zod@4.4.3)
       typebox: 1.3.16
