@@ -1,6 +1,6 @@
 {
   "name": "@lyd123qw2008/dsh-tool-control-chrome",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "DeepSeek Harness browser-control tools backed by the pi-control-chrome local Bridge",
   "keywords": [
     "deepseek-harness",
@@ -30,7 +30,12 @@
   "files": [
     "config/cordis.patch.yml.example",
     "config/settings.yaml.example",
-    "lib/*.js",
+    "lib/bridge.js",
+    "lib/commands.js",
+    "lib/diagnostics.js",
+    "lib/index.js",
+    "lib/invariant.js",
+    "lib/tools.js",
     "lib/types/**/*.d.ts",
     "README.md",
     "package.json"

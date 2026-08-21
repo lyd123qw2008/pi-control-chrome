@@ -141,14 +141,22 @@ function debug(...args) {
   if (DEBUG) console.error("[pi-control-chrome]", ...args);
 }
 
+function isExtensionOrigin(origin) {
+  return typeof origin === "string" && /^chrome-extension:\/\/[a-p]{32}$/.test(origin);
+}
+
+function extensionCorsHeaders(request) {
+  const origin = request.headers.origin;
+  if (!isExtensionOrigin(origin)) return {};
+  return { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
+}
+
 function jsonResponse(res, status, value, extraHeaders = {}) {
   const body = JSON.stringify(value);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
     ...extraHeaders,
   });
   res.end(body);
@@ -237,7 +245,7 @@ const server = createServer((req, res) => {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1:${port}"}`);
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      ...extensionCorsHeaders(req),
       "Access-Control-Allow-Headers": "content-type",
       "Access-Control-Allow-Methods": "GET, OPTIONS",
     });
@@ -264,12 +272,12 @@ const server = createServer((req, res) => {
       port,
       extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
       ...(identity || {}),
-    });
+    }, extensionCorsHeaders(req));
     return;
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/pair") {
-    jsonResponse(res, 200, { ok: true, protocol: 1, token });
+    jsonResponse(res, 200, { ok: true, protocol: 1, token }, extensionCorsHeaders(req));
     return;
   }
 
@@ -278,6 +286,11 @@ const server = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 wss.on("connection", (client, request) => {
+  const requestOrigin = request.headers.origin;
+  if (requestOrigin !== undefined && !isExtensionOrigin(requestOrigin)) {
+    client.close(1008, "invalid origin");
+    return;
+  }
   const requestUrl = new URL(request.url || "/ws", `http://${request.headers.host || "127.0.0.1:${port}"}`);
   const suppliedToken = requestUrl.searchParams.get("token");
   const role = requestUrl.searchParams.get("role");

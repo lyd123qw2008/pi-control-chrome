@@ -60,7 +60,7 @@ function sameBrowserTarget(left: BrowserTarget, right: BrowserTarget): boolean {
 
 class BrowserTargetTracker {
   private acknowledged?: BrowserTarget
-  private readonly observed = new Map<string, BrowserTarget>()
+  private readonly observed = new Set<string>()
 
   observe(value: unknown, acknowledgeBrowserId?: string): TargetStability {
     const target = readBrowserTarget(value)
@@ -78,7 +78,7 @@ class BrowserTargetTracker {
     const previous = this.acknowledged
     const changed = previous !== undefined && !sameBrowserTarget(previous, target)
     const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId
-    this.observed.set(target.browserId, target)
+    this.observed.add(target.browserId)
     if (acknowledged) this.acknowledged = target
     return {
       stable: !changed,
@@ -313,8 +313,8 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_close_tab',
-    description: 'Close a specified browser tab. Use only for Agent-owned or explicitly requested tabs.',
-    parameters: { tabId: requiredNumber() },
+    description: 'Close a specified browser tab. Agent-owned tabs must belong to the current session; unowned user tabs require userRequested: true.',
+    parameters: { tabId: requiredNumber(), userRequested: OPTIONAL_BOOLEAN },
     method: 'close_tab',
   },
   {

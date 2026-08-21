@@ -1,4 +1,4 @@
-# Proposed Architecture
+# Architecture
 
 ## Components
 
@@ -11,11 +11,9 @@ Chrome/Edge MV3 Extension
   └── local Bridge client
           ↕ 127.0.0.1 + pairing token
 Local Bridge
-  ├── session registry
+  ├── pairing and lifecycle state
   ├── request routing
-  ├── reconnect handling
-  ├── authorization state
-  └── audit log
+  └── browser target validation
           ↕ Pi Extension protocol
 Pi Extension
   ├── browser lifecycle
@@ -43,20 +41,7 @@ interface BrowserConnection {
 
 ### Tab handle
 
-```ts
-interface TabHandle {
-  browserId: string;
-  windowId: number;
-  tabId: number;
-  title: string;
-  url: string;
-  snapshotVersion: string;
-  owner: "user" | "agent";
-  sessionId?: string;
-  groupId?: number;
-  state: "claimed" | "released" | "closed" | "stale";
-}
-```
+The extension returns tab metadata with `browserId`, `windowId`, `tabId`, title, URL, group, ownership, session and lifecycle fields. A stale claimed handle is detected when its saved title or URL no longer matches the current tab.
 
 ### Ownership
 
@@ -74,22 +59,14 @@ The Bridge still needs two mechanical protocol protections: bind to loopback by 
 
 - Request IDs are unique and cancellable.
 - Browser events are separate from request responses.
-- Every response carries the browser, window and tab identity.
+- Tab-oriented responses carry browser, window and tab identity.
 - Stale handles fail closed and require a fresh tab snapshot.
 - Tab/group cleanup is ownership-aware and idempotent.
 - Screenshots can be returned as Pi image content plus a saved path.
 - CDP commands are capability-discovered; auditing is optional and deferred beyond the trusted-local v1 mode.
 
-## First implementation slice
+## Current implementation boundary
 
-Before implementing the full API, build and test only:
+The current implementation covers local pairing, Bridge request routing, one active extension target, tab and group ownership, stale-handle checks, page snapshots, locator and DOM operations, CUA, native CDP, screenshots, Console, Network, Dialog, Upload, Download and Clipboard controls. DSH and Pi expose separate host adapters over the same Bridge protocol.
 
-1. Extension ↔ Bridge pairing.
-2. Pi `chrome_status` and `chrome_tabs` tools.
-3. `chrome_snapshot` for the selected tab.
-4. `chrome_navigate`, `chrome_click`, `chrome_fill` and `chrome_screenshot`.
-5. Agent tab creation with a Pi group.
-6. Claim/release and session cleanup.
-7. One raw `Runtime.evaluate` CDP method.
-
-The complete feature matrix remains in `FEATURES.md`; no P1/P2 feature should silently expand the first slice before the user confirms the scope.
+Deferred scope includes multiple browser Profiles, WebMCP, GSuite export, history APIs, media-specific downloads, capability discovery and browser-store packaging. The feature matrix records the remaining product scope.

@@ -17,6 +17,53 @@ const BRIDGE_WAIT_ATTEMPTS = 30;
 const BRIDGE_WAIT_DELAY_MS = 100;
 let paused = false;
 
+type BrowserTarget = { browser: string; browserId: string; profile: string };
+type TargetStability = {
+  stable: boolean;
+  changed: boolean;
+  acknowledged: boolean;
+  requiresAcknowledgement: boolean;
+  competition: string;
+  observedBrowserIds: string[];
+  browser?: string;
+  browserId?: string;
+  profile?: string;
+  previousBrowser?: string;
+  previousBrowserId?: string;
+  issue?: string;
+};
+let acknowledgedTarget: BrowserTarget | undefined;
+const observedBrowserIds = new Set<string>();
+
+function readBrowserTarget(value: unknown): BrowserTarget | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.browser !== "string" || !record.browser || typeof record.browserId !== "string" || !record.browserId || typeof record.profile !== "string" || !record.profile) return undefined;
+  return { browser: record.browser, browserId: record.browserId, profile: record.profile };
+}
+
+function observeBrowserTarget(value: unknown, acknowledgeBrowserId?: string): TargetStability {
+  const target = readBrowserTarget(value);
+  if (!target) return { stable: false, changed: false, acknowledged: false, requiresAcknowledgement: false, competition: "unknown", observedBrowserIds: [...observedBrowserIds], issue: "status_missing_browser_target" };
+  const previous = acknowledgedTarget;
+  const changed = previous !== undefined && previous.browserId !== target.browserId;
+  const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId;
+  observedBrowserIds.add(target.browserId);
+  if (acknowledged) acknowledgedTarget = target;
+  return {
+    stable: !changed,
+    changed,
+    acknowledged,
+    requiresAcknowledgement: changed && !acknowledged,
+    competition: previous === undefined ? "unknown" : changed ? "changed" : "stable_observed",
+    browser: target.browser,
+    browserId: target.browserId,
+    profile: target.profile,
+    observedBrowserIds: [...observedBrowserIds],
+    ...(previous === undefined ? {} : { previousBrowser: previous.browser, previousBrowserId: previous.browserId }),
+  };
+}
+
 async function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
   try {
     const response = await fetch(`${BRIDGE_ORIGIN}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
@@ -222,21 +269,31 @@ async function call(method: string, params: Record<string, unknown> = {}) {
   if (paused && !["status", "list_tabs", "selected_tab", "cleanup"].includes(method)) {
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
-  const result = await bridge.request(method, { ...params, sessionId: SESSION_ID });
   if (method === "status") {
-    try { return { ...result, bridgeHealth: await bridge.health() }; } catch { return result; }
+    const { acknowledgeBrowserId, ...statusParams } = params;
+    const result = await bridge.request("status", { ...statusParams, sessionId: SESSION_ID });
+    const targetStability = observeBrowserTarget(result, typeof acknowledgeBrowserId === "string" ? acknowledgeBrowserId : undefined);
+    const base = result && typeof result === "object" ? result : { result };
+    try { return { ...base, targetStability, bridgeHealth: await bridge.health() }; } catch { return { ...base, targetStability }; }
   }
-  return result;
+  const status = await bridge.request("status", { sessionId: SESSION_ID });
+  const targetStability = observeBrowserTarget(status);
+  const target = readBrowserTarget(status);
+  if (targetStability.issue !== undefined || target === undefined) throw new Error("Browser status did not identify an active browser target; run browser_status");
+  if (!targetStability.stable || !targetStability.acknowledged) {
+    throw new Error(`Browser target changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`);
+  }
+  return bridge.request(method, { ...params, sessionId: SESSION_ID, expectedBrowserId: target.browserId });
 }
 
 function registerBrowserTools(pi: ExtensionAPI) {
   pi.registerTool({
     name: "browser_status",
     label: "Browser Status",
-    description: "Return the connected Chrome/Edge browser and Pi bridge status.",
-    parameters: Type.Object({}),
-    async execute() {
-      try { return textResult(await call("status")); } catch (error) { return errorResult(error); }
+    description: "Return the connected Chrome/Edge browser, target stability and Pi bridge status.",
+    parameters: Type.Object({ acknowledgeBrowserId: Type.Optional(Type.String({ description: "Explicitly acknowledge this browserId after confirming a browser switch." })) }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("status", params)); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -619,8 +676,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
   pi.registerTool({
     name: "browser_close_tab",
     label: "Close Browser Tab",
-    description: "Close a specified browser tab. Use only for Agent-owned or explicitly requested tabs.",
-    parameters: Type.Object({ tabId: Type.Number() }),
+    description: "Close a specified browser tab. Agent-owned tabs must belong to the current session; unowned user tabs require userRequested: true.",
+    parameters: Type.Object({ tabId: Type.Number(), userRequested: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("close_tab", params)); } catch (error) { return errorResult(error); }
     },

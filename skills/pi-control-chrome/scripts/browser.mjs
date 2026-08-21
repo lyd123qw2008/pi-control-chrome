@@ -6,21 +6,19 @@
  * Requires Node.js 22+ for the built-in WebSocket and fetch APIs.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname, resolve, join } from "node:path";
-import { homedir } from "node:os";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 const BRIDGE_HOST = process.env.PI_CONTROL_CHROME_BRIDGE_HOST || "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
 const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
-const TOKEN_FILE = process.env.PI_CONTROL_CHROME_TOKEN_FILE || join(process.env.USERPROFILE || homedir(), ".pi", "agent", "pi-control-chrome.token");
 const DEFAULT_TIMEOUT = 30_000;
 const DEFAULT_MAX_CHARS = 8_000;
 
 function usage() {
   console.log(`Usage:
-  node browser.mjs status [--json]
+  node browser.mjs status [--acknowledge-browser-id <id>] [--json]
   node browser.mjs tabs [--json]
   node browser.mjs group [--json]
   node browser.mjs open <url> [--active|--inactive] [--session <id>] [--json]
@@ -28,7 +26,7 @@ function usage() {
   node browser.mjs snapshot <tabId> [--json]
   node browser.mjs extract <tabId> [--max-chars <n>] [--json]
   node browser.mjs screenshot <tabId> <path> [--full-page]
-  node browser.mjs close <tabId> [--json]
+  node browser.mjs close <tabId> [--session <id>] [--json]
   node browser.mjs cleanup [--session <id>] [--json]
 
 Examples:
@@ -70,16 +68,6 @@ function numberOption(options, name, fallback) {
   return value;
 }
 
-function readToken() {
-  try {
-    const token = readFileSync(TOKEN_FILE, "utf8").trim();
-    if (!token) throw new Error("token file is empty");
-    return token;
-  } catch (error) {
-    throw new Error(`Cannot read Bridge token: ${TOKEN_FILE} (${error.message})`);
-  }
-}
-
 async function bridgeHealth() {
   const response = await fetch(`${BRIDGE_ORIGIN}/health`, { signal: AbortSignal.timeout(3_000) });
   if (!response.ok) throw new Error(`Bridge health failed: HTTP ${response.status}`);
@@ -94,12 +82,19 @@ async function pairingToken() {
   return value.token;
 }
 
+function browserTarget(value) {
+  if (!value || typeof value !== "object") return undefined;
+  if (typeof value.browser !== "string" || !value.browser || typeof value.browserId !== "string" || !value.browserId || typeof value.profile !== "string" || !value.profile) return undefined;
+  return { browser: value.browser, browserId: value.browserId, profile: value.profile };
+}
+
 class BridgeClient {
   constructor(token) {
     this.token = token;
     this.socket = undefined;
     this.sequence = 0;
     this.pending = new Map();
+    this.acknowledgedTarget = undefined;
   }
 
   async connect() {
@@ -141,7 +136,7 @@ class BridgeClient {
     else entry.resolve(message.result);
   }
 
-  request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT) {
+  rawRequest(method, params = {}, timeoutMs = DEFAULT_TIMEOUT) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("Bridge WebSocket is not connected"));
     }
@@ -154,6 +149,40 @@ class BridgeClient {
       this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
       this.socket.send(JSON.stringify({ type: "request", id, method, params }));
     });
+  }
+
+  async request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT) {
+    if (method === "status") {
+      const { acknowledgeBrowserId, ...statusParams } = params;
+      const result = await this.rawRequest("status", statusParams, timeoutMs);
+      const target = browserTarget(result);
+      const previous = this.acknowledgedTarget;
+      const changed = previous !== undefined && previous.browserId !== target?.browserId;
+      const acknowledged = target !== undefined && (previous === undefined || !changed || acknowledgeBrowserId === target.browserId);
+      if (target !== undefined && acknowledged) this.acknowledgedTarget = target;
+      return {
+        ...result,
+        targetStability: {
+          stable: target !== undefined && !changed,
+          changed,
+          acknowledged,
+          requiresAcknowledgement: changed && !acknowledged,
+          browser: target?.browser,
+          browserId: target?.browserId,
+          profile: target?.profile,
+          ...(previous === undefined ? {} : { previousBrowser: previous.browser, previousBrowserId: previous.browserId }),
+        },
+      };
+    }
+    const status = await this.rawRequest("status", {}, timeoutMs);
+    const target = browserTarget(status);
+    const previous = this.acknowledgedTarget;
+    if (target === undefined) throw new Error("Browser status did not identify an active browser target; run status");
+    if (previous !== undefined && previous.browserId !== target.browserId) {
+      throw new Error(`Browser target changed from ${previous.browser} (${previous.browserId}) to ${target.browser} (${target.browserId}); run status with --acknowledge-browser-id after disabling the other browser extension`);
+    }
+    if (previous === undefined) this.acknowledgedTarget = target;
+    return this.rawRequest(method, { ...params, expectedBrowserId: target.browserId }, timeoutMs);
   }
 
   close() {
@@ -297,7 +326,7 @@ async function main() {
   const { client, health } = await createClient();
   try {
     if (command === "status") {
-      const status = await client.request("status");
+      const status = await client.request("status", options.acknowledge_browser_id ? { acknowledgeBrowserId: String(options.acknowledge_browser_id) } : {});
       printResult({ status, health }, options);
       return;
     }
@@ -315,11 +344,11 @@ async function main() {
       if (!positionals[0]) throw new Error("open requires a URL");
       const result = await openTab(client, positionals[0], options);
       if (boolOption(options, "handoff", false)) {
-        await client.request("mark_handoff", { tabId: result.tabId });
+        await client.request("mark_handoff", { tabId: result.tabId, sessionId: result.sessionId });
         if (result.tab) result.tab.lifecycle = "handoff";
       }
       if (boolOption(options, "deliverable", false)) {
-        await client.request("mark_deliverable", { tabId: result.tabId });
+        await client.request("mark_deliverable", { tabId: result.tabId, sessionId: result.sessionId });
         if (result.tab) result.tab.lifecycle = "deliverable";
       }
       printResult({ tab: tabSummary(result.tab), group: result.tabs?.groups?.find((entry) => entry.id === result.tab?.groupId), waitMs: result.waitMs }, options);
@@ -365,7 +394,8 @@ async function main() {
     }
     if (command === "close") {
       if (!positionals[0]) throw new Error("close requires a tab id");
-      printResult(await client.request("close_tab", { tabId: Number(positionals[0]) }), options);
+      const sessionId = options.session === undefined ? undefined : String(options.session);
+      printResult(await client.request("close_tab", { tabId: Number(positionals[0]), userRequested: true, ...(sessionId === undefined ? {} : { sessionId }) }), options);
       return;
     }
     if (command === "cleanup") {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.3
+
+- Fixed `browser_locator` filtering with `hasSelector`.
+- Restricted pairing and health CORS responses to valid Chromium extension origins instead of exposing the pairing response to webpages.
+- Added persisted per-Profile browser identity and Pi-side `expectedBrowserId` acknowledgement/preflight handling.
+- Enforced session ownership for claim, release, lifecycle marking, Agent cleanup, persistent DevTools cleanup and Agent tab close; unowned user-tab close now requires explicit `userRequested: true`.
+- Added Bridge lifecycle fencing, endpoint-aware DSH websocket reuse, shared restart capability checks and startup health reuse.
+- Removed the unused Skill CLI token-file setting and clarified Profile patch merging and current architecture documentation.
+
 ## 0.3.2
 
 - Removed the unused `webNavigation` extension permission and private debugger-detach state.

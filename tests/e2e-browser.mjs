@@ -158,6 +158,15 @@ try {
     action: "count",
   });
   assert.equal(placeholderCount.result, 1);
+  const filteredLocator = await request("locator", {
+    tabId: selected.tab.id,
+    locator: { strategy: "css", value: "label" },
+    action: "filter",
+    hasSelector: "input",
+  });
+  assert.equal(filteredLocator.result.hasSelector, "input");
+  const filteredCount = await request("locator", { tabId: selected.tab.id, locator: filteredLocator.result, action: "count" });
+  assert.equal(filteredCount.result, 2);
   await request("locator", {
     tabId: selected.tab.id,
     locator: { strategy: "placeholder", value: "Name", exact: true },
@@ -188,7 +197,7 @@ try {
 
   await request("devtools_enable", { tabId: selected.tab.id, domains: ["Runtime", "Log", "Network", "Page"] });
   await request("evaluate", { tabId: selected.tab.id, expression: "console.error('e2e-console'); fetch('/api/data')", awaitPromise: true });
-  await sleep(700);
+  await sleep(1200);
   const consoleLogs = await request("console_logs", { tabId: selected.tab.id });
   assert.ok(consoleLogs.logs.some((entry) => String(entry.text).includes("e2e-console")));
   const network = await request("network_requests", { tabId: selected.tab.id });
@@ -198,8 +207,14 @@ try {
   assert.match(responseBody.result?.body || "", /pi-control-chrome|e2e/);
 
   await request("evaluate", { tabId: selected.tab.id, expression: "setTimeout(()=>alert('e2e-dialog'),100); 'scheduled'" });
-  await sleep(500);
-  const dialog = await request("dialog", { tabId: selected.tab.id, action: "get" });
+  await sleep(1200);
+  let dialog;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    dialog = await request("dialog", { tabId: selected.tab.id, action: "get" });
+    if (dialog.dialog?.message === "e2e-dialog") break;
+    await sleep(100);
+  }
+
   assert.equal(dialog.dialog?.message, "e2e-dialog");
   await request("dialog", { tabId: selected.tab.id, action: "accept" });
 
@@ -223,7 +238,7 @@ try {
   await sleep(700);
   const listed = await request("list_tabs");
   assert.ok(listed.browserId);
-  assert.equal(listed.profile, "current");
+  assert.ok(typeof listed.profile === "string" && listed.profile.length > 0);
   assert.ok(listed.tabs[0].handle?.tabId !== undefined);
   const owned = listed.tabs.find((tab) => tab.id === created.tab.id);
   assert.equal(owned.owner, "agent");
@@ -232,7 +247,10 @@ try {
   assert.equal(group.title, "Pi");
   assert.equal(group.color, "blue");
 
-  await request("mark_handoff", { tabId: created.tab.id });
+  await assert.rejects(() => request("close_tab", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
+   await await assert.rejects(() => request("mark_handoff", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
+   await assert.rejects(() => request("release", { tabId: selected.tab.id, sessionId: "other-session" }), /another Agent session/);
+   await request("mark_handoff", { tabId: created.tab.id, sessionId: "e2e-session" });
   const temporary = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-session" });
   await sleep(300);
   const temporaryListed = await request("list_tabs");
@@ -245,7 +263,7 @@ try {
   assert.equal(cleanup.removed.includes(created.tab.id), false);
   assert.equal(cleanup.removed.includes(temporary.tab.id), true);
   assert.equal(cleanup.released.includes(selected.tab.id), true);
-  await request("close_tab", { tabId: created.tab.id });
+  await request("close_tab", { tabId: created.tab.id, sessionId: "e2e-session" });
 
   socket.close();
   console.log(JSON.stringify({

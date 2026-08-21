@@ -13,13 +13,13 @@ const serverPath = join(root, "bridge", "server.mjs");
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-function getJson(port, path) {
+function getJson(port, path, headers = {}) {
   return new Promise((resolve, reject) => {
-    const request = httpGet({ hostname: "127.0.0.1", port, path }, (response) => {
+    const request = httpGet({ hostname: "127.0.0.1", port, path, headers }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => {
-        try { resolve({ status: response.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
+        try { resolve({ status: response.statusCode, headers: response.headers, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
         catch (error) { reject(error); }
       });
     });
@@ -80,6 +80,17 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
     const pair = await getJson(port, "/pair");
     assert.equal(pair.status, 200);
     assert.equal(pair.body.token, readFileSync(tokenFile, "utf8").trim());
+     const webpagePair = await getJson(port, "/pair", { Origin: "https://example.com" });
+     assert.equal(webpagePair.headers["access-control-allow-origin"], undefined);
+     const extensionPair = await getJson(port, "/pair", { Origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+     const forbiddenSocket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=pi&token=${encodeURIComponent(pair.body.token)}`, { origin: "https://example.com" });
+     const forbiddenCode = await new Promise((resolve, reject) => {
+       forbiddenSocket.once("close", (code) => resolve(code));
+       forbiddenSocket.once("error", () => {});
+       setTimeout(() => reject(new Error("forbidden-origin socket did not close")), 1000);
+     });
+     assert.equal(forbiddenCode, 1008);
+
 
     const connect = (role) => new Promise((resolve, reject) => {
       const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);

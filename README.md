@@ -55,7 +55,7 @@ The package registers the Pi extension and the bundled Skill through its `packag
 
 ### DSH integration
 
-This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, copy its `config/cordis.patch.yml.example`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
+This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, merge the `insert` entry from its `config/cordis.patch.yml.example` into the existing `cordis.patch.yml`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
 The DSH package reuses this project's Bridge and Manifest V3 extension. It registers the model-facing `browser_*` tools and the human `/chrome status|doctor|restart|tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
 
@@ -95,7 +95,6 @@ The CLI reuses the currently connected browser and supports these environment va
 ```text
 PI_CONTROL_CHROME_BRIDGE_HOST
 PI_CONTROL_CHROME_BRIDGE_PORT
-PI_CONTROL_CHROME_TOKEN_FILE
 ```
 
 Use the `browser_*` Pi tools for complex interactions, locators, CUA, CDP, dialogs, uploads, downloads, and other page-specific controls.
