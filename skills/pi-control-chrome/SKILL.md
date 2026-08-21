@@ -59,7 +59,7 @@ Do not keep retrying a page action while the two extensions are competing for th
 
 **Symptoms:** `browser_status` fails, `extensionConnected` is false, or the request reports `EXTENSION_OFFLINE`.
 
-1. Run `/chrome status` or `browser_status` to separate Bridge failure from extension failure.
+1. Run `browser_doctor` when available; use `/chrome status` or `browser_status` to separate Bridge failure from extension failure.
 2. Check `http://127.0.0.1:17318/health`.
 3. If the Bridge is healthy, confirm the unpacked extension is enabled in the requested browser's extension page.
 4. Run `/chrome connect`, then check `/chrome status` again.
@@ -180,7 +180,8 @@ Use the scripts for status, tabs, grouping, open/view, snapshot, extraction, scr
 
 Use these tools when available:
 
-- `browser_status`: verify browser, profile, Bridge, and extension state.
+- `browser_doctor`: diagnose Bridge reachability, extension connection, active browser target, and Chrome/Edge competition without changing tabs.
+- `browser_status`: verify browser, profile, Bridge, extension, and target stability.
 - `browser_tabs`: inspect windows, tabs, groups, ownership, lifecycle, and handles.
 - `browser_selected`: inspect the selected tab without changing it.
 - `browser_new_tab`: create an Agent-owned tab. Prefer `active: false` unless the user needs to see it.

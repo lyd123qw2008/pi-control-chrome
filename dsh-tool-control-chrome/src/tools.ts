@@ -23,6 +23,69 @@ const OPTIONAL_NUMBER: ParameterPropertySpec = { type: 'number' }
 const OPTIONAL_BOOLEAN: ParameterPropertySpec = { type: 'boolean' }
 const EMPTY_PARAMETERS: ParameterSchemaSpec = {}
 
+type BrowserTarget = {
+  readonly browser: string
+  readonly browserId: string
+  readonly profile: string
+}
+
+type TargetStability = {
+  readonly stable: boolean
+  readonly changed: boolean
+  readonly browser?: string
+  readonly browserId?: string
+  readonly profile?: string
+  readonly previousBrowser?: string
+  readonly previousBrowserId?: string
+  readonly observedBrowserIds: readonly string[]
+  readonly issue?: string
+}
+
+function readBrowserTarget(value: unknown): BrowserTarget | undefined {
+  if (!isRecord(value)) return undefined
+  const browser = value.browser
+  const browserId = value.browserId
+  const profile = value.profile
+  if (typeof browser !== 'string' || typeof browserId !== 'string' || typeof profile !== 'string') return undefined
+  return { browser, browserId, profile }
+}
+
+function sameBrowserTarget(left: BrowserTarget, right: BrowserTarget): boolean {
+  return left.browser === right.browser && left.browserId === right.browserId && left.profile === right.profile
+}
+
+class BrowserTargetTracker {
+  private acknowledged?: BrowserTarget
+  private readonly observed = new Map<string, BrowserTarget>()
+
+  observe(value: unknown, acknowledge: boolean): TargetStability {
+    const target = readBrowserTarget(value)
+    if (target === undefined) {
+      return { stable: false, changed: false, observedBrowserIds: [...this.observed.keys()], issue: 'status_missing_browser_target' }
+    }
+    const previous = this.acknowledged
+    const changed = previous !== undefined && !sameBrowserTarget(previous, target)
+    this.observed.set(target.browserId, target)
+    if (acknowledge || previous === undefined) this.acknowledged = target
+    return {
+      stable: !changed,
+      changed,
+      browser: target.browser,
+      browserId: target.browserId,
+      profile: target.profile,
+      observedBrowserIds: [...this.observed.keys()],
+      ...(!changed || previous === undefined ? {} : { previousBrowser: previous.browser, previousBrowserId: previous.browserId }),
+    }
+  }
+
+  assertStable(value: unknown): void {
+    const observation = this.observe(value, false)
+    if (observation.issue !== undefined) throw new Error('Browser status did not identify an active browser target; run browser_doctor')
+    if (observation.stable) return
+    throw new Error(`Browser target changed from ${observation.previousBrowser} (${observation.previousBrowserId}) to ${observation.browser} (${observation.browserId}); run browser_status and disable the other browser extension before retrying`)
+  }
+}
+
 interface BrowserToolSpec {
   readonly name: string
   readonly description: string
@@ -65,8 +128,14 @@ function coordinates(): ParameterPropertySpec {
 
 const CORE_TOOLS: readonly BrowserToolSpec[] = [
   {
+    name: 'browser_doctor',
+    description: 'Diagnose the local Bridge, extension connection, active browser target and Chrome/Edge competition without changing tabs.',
+    parameters: EMPTY_PARAMETERS,
+    method: 'doctor',
+  },
+  {
     name: 'browser_status',
-    description: 'Return the connected Chrome/Edge browser and local Bridge status.',
+    description: 'Return the connected Chrome/Edge browser, active browser target stability and local Bridge status.',
     parameters: EMPTY_PARAMETERS,
     method: 'status',
   },
@@ -485,6 +554,98 @@ function prepareNetwork(args: Record<string, JsonValue>): { method: string; para
   return { method: 'network_requests', params: args }
 }
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function browserStatus(
+  bridge: BrowserBridgeClient,
+  tracker: BrowserTargetTracker,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<JsonValue> {
+  const result = await bridge.request('status', { sessionId }, signal)
+  const targetStability = tracker.observe(result, true)
+  const base = isRecord(result) ? result : { result }
+  try {
+    return asJsonValue({ ...base, targetStability, bridgeHealth: await bridge.health() })
+  } catch {
+    return asJsonValue({ ...base, targetStability })
+  }
+}
+
+async function browserDoctor(
+  bridge: BrowserBridgeClient,
+  tracker: BrowserTargetTracker,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<JsonValue> {
+  let bridgeHealth: Record<string, unknown>
+  try {
+    bridgeHealth = await bridge.health()
+  } catch (error) {
+    return asJsonValue({
+      ok: false,
+      recommendation: 'check_bridge',
+      issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
+    })
+  }
+  if (bridgeHealth.extensionConnected !== true) {
+    return asJsonValue({
+      ok: false,
+      recommendation: 'enable_or_reload_extension',
+      bridgeHealth,
+      issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
+    })
+  }
+
+  let status: unknown
+  try {
+    status = await bridge.request('status', { sessionId }, signal)
+  } catch (error) {
+    return asJsonValue({
+      ok: false,
+      recommendation: 'reconnect_extension',
+      bridgeHealth,
+      issues: [{ code: 'browser_status_unavailable', message: errorText(error) }],
+    })
+  }
+  const targetStability = tracker.observe(status, false)
+  const base = isRecord(status) ? status : { status }
+  const issues = [] as Array<{ code: string; message: string }>
+  if (targetStability.issue !== undefined) {
+    issues.push({ code: targetStability.issue, message: 'The browser status did not identify browser, browserId and profile.' })
+  } else if (targetStability.changed) {
+    issues.push({
+      code: 'browser_target_changed',
+      message: `The active browser changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}).`,
+    })
+  }
+  const recommendation = issues.length === 0
+    ? 'ready'
+    : targetStability.changed
+      ? 'disable_other_browser_extension'
+      : 'refresh_browser_status'
+  return asJsonValue({
+    ...base,
+    ok: issues.length === 0,
+    recommendation,
+    bridgeHealth,
+    targetStability,
+    issues,
+  })
+}
+
+async function assertStableBrowserTarget(
+  bridge: BrowserBridgeClient,
+  tracker: BrowserTargetTracker,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const status = await bridge.request('status', { sessionId }, signal)
+  tracker.assertStable(status)
+}
+
 /** Register the full browser-control tool surface and return its disposers. */
 export function registerBrowserTools(
   ctx: Context,
@@ -493,6 +654,7 @@ export function registerBrowserTools(
   resolveSettings: () => ResolvedConfig,
 ): void {
   const specs = [...CORE_TOOLS, ...ADVANCED_TOOLS]
+  const tracker = new BrowserTargetTracker()
   for (const spec of specs) {
     const tool = defineTool({
       name: spec.name,
@@ -507,6 +669,9 @@ export function registerBrowserTools(
         const sessionId = requireAgentSession(exec)
         let params = { ...args, sessionId } as Record<string, JsonValue>
         if (spec.prepare !== undefined) params = spec.prepare(params)
+        if (spec.name === 'browser_doctor') return browserDoctor(bridge, tracker, sessionId, exec.signal)
+        if (spec.name !== 'browser_status') await assertStableBrowserTarget(bridge, tracker, sessionId, exec.signal)
+        if (spec.name === 'browser_status') return browserStatus(bridge, tracker, sessionId, exec.signal)
         let method = spec.method
         if (spec.name === 'browser_accessibility_snapshot') {
           const result = await bridge.request('snapshot', params, exec.signal)
@@ -525,13 +690,6 @@ export function registerBrowserTools(
           return prepareScreenshot(result, params, attachments)
         }
         const result = await bridge.request(method, params, exec.signal)
-        if (spec.name === 'browser_status') {
-          try {
-            return asJsonValue({ ...(isRecord(result) ? result : { result }), bridgeHealth: await bridge.health() })
-          } catch {
-            return asJsonValue(result)
-          }
-        }
         return asJsonValue(result)
       },
     })

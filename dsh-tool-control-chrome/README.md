@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.1.0
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.2.0
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.1.0"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.2.0"
   }
 }
 ```
@@ -33,7 +33,7 @@ The DSH package cannot install a browser extension automatically. Install `pi-co
 3. Choose **Load unpacked**.
 4. Select the installed `pi-control-chrome/extension/` directory.
 
-The plugin starts or reuses the loopback Bridge at `127.0.0.1:17318`. The extension must be connected before browser operations can succeed.
+The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, and Chrome/Edge competition. Browser operations perform a status preflight; if the active `browserId` changes, the operation fails before dispatching to the new browser. Call `browser_status`, confirm the requested browser, and disable the other browser extension before retrying.
 
 ## Configuration
 
@@ -56,7 +56,7 @@ The plugin uses the active DSH Agent session id as the browser ownership session
 
 The package exposes the full browser-control surface:
 
-- `browser_status`, `browser_tabs`, `browser_selected`;
+- `browser_doctor`, `browser_status`, `browser_tabs`, `browser_selected`;
 - `browser_claim_tab`, `browser_select_tab`, `browser_new_tab`;
 - `browser_snapshot`, `browser_accessibility_snapshot`, `browser_extract`;
 - `browser_navigate`, `browser_wait`, `browser_back`, `browser_forward`, `browser_reload`;
@@ -72,7 +72,7 @@ Browser tools are model-facing DSH tools, not a `ctx.web` search provider. Web s
 
 ## Model-facing cost
 
-The full catalog contributes 37 tool schemas to each native tool assembly. Descriptions are intentionally scoped to browser tasks; deployments that need a smaller prompt can restrict the package's visible tool layer without changing the Bridge protocol. Screenshots use the DSH attachment store when available, so image bytes are not duplicated in the durable tool result.
+The full catalog contributes 38 tool schemas to each native tool assembly. Descriptions are intentionally scoped to browser tasks; deployments that need a smaller prompt can restrict the package's visible tool layer without changing the Bridge protocol. Screenshots use the DSH attachment store when available, so image bytes are not duplicated in the durable tool result.
 
 ## Development
 

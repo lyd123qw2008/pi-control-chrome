@@ -40,25 +40,61 @@ function execution(): ToolRunContext {
 
 describe('DSH browser tool catalog', () => {
   it('exposes the complete Pi browser tool surface', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(37)
+    expect(BROWSER_TOOL_NAMES).toHaveLength(38)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
+    expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_screenshot')
     expect(browserToolCatalog.advanced.map(tool => tool.name)).toContain('browser_cdp')
   })
 
-  it('routes session identity and operation parameters to the Bridge', async () => {
-    const request = vi.fn(async (method: string, params: Record<string, unknown>) => ({ method, params }))
+  it('routes session identity and operation parameters to the Bridge after target validation', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
+      : { method, params })
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
     const tools = setup({ request, health })
     const result = await tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())
     expect(result).toEqual({ method: 'interaction', params: { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click' } })
-    expect(request).toHaveBeenCalledTimes(1)
+    expect(request).toHaveBeenLastCalledWith('interaction', { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click' }, expect.any(AbortSignal))
+  })
+
+  it('reports an actionable diagnosis when the Bridge has no extension', async () => {
+    const request = vi.fn(async () => ({ connected: false }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: false }))
+    const tools = setup({ request, health })
+    const result = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(result).toMatchObject({
+      ok: false,
+      recommendation: 'enable_or_reload_extension',
+      bridgeHealth: { ok: true, extensionConnected: false },
+      issues: [{ code: 'extension_not_connected' }],
+    })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('blocks browser operations when the active browser target changes', async () => {
+    let browser = 'edge'
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser, browserId: `${browser}:test`, profile: 'current', extensionVersion: '0.2.4' }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const tools = setup({ request, health })
+    await tools.get('browser_status')?.execute({}, execution())
+    browser = 'chrome'
+    await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())).rejects.toThrow(/changed from edge.*chrome/)
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
+    const status = await tools.get('browser_status')?.execute({}, execution())
+    expect(status).toMatchObject({ targetStability: { stable: false, changed: true, browser: 'chrome' } })
+    await tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })
 
   it('projects accessibility and network specializations', async () => {
-    const request = vi.fn(async (method: string) => method === 'snapshot'
-      ? { snapshot: { accessibility: { role: 'main' } } }
-      : { method })
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
+      : method === 'snapshot'
+        ? { snapshot: { accessibility: { role: 'main' } } }
+        : { method })
     const health = vi.fn(async () => ({ ok: true }))
     const tools = setup({ request, health })
     const accessibility = await tools.get('browser_accessibility_snapshot')?.execute({}, execution())
@@ -71,7 +107,9 @@ describe('DSH browser tool catalog', () => {
     const ref = { attachmentId: 'attachment-1', mediaType: 'image/png', bytes: 3, width: 1, height: 1 } as unknown as ImageAttachmentRef
     const saveImage = vi.fn(async () => ref)
     const attachments = { saveImage } as unknown as AttachmentStore
-    const request = vi.fn(async () => ({ tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' }))
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
+      : { tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' })
     const health = vi.fn(async () => ({ ok: true }))
     const tools = setup({ request, health }, attachments)
     const tool = tools.get('browser_screenshot')
