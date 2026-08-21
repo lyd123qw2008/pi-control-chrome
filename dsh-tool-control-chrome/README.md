@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.3.3
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.3.4
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.3"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.4"
   }
 }
 ```
@@ -33,7 +33,7 @@ The DSH package cannot install a browser extension automatically. Install `pi-co
 3. Choose **Load unpacked**.
 4. Select the installed `pi-control-chrome/extension/` directory.
 
-The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, Chrome/Edge competition, and recovery metadata (`recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`). Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. Any paired DSH or Pi Host can request a cooperative restart from the same local-user control domain when the Bridge exposes the capability and has no pending browser request. The Bridge does not use its launcher label as authorization, and a legacy Bridge without the capability is left untouched. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.3.2 sends the identity handshake and local-user lifecycle metadata.
+The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, Chrome/Edge competition, and recovery metadata (`recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`). Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. Any paired DSH or Pi Host can request a local-user cooperative restart from the same control domain when the Bridge exposes `capabilities.localUserRestart: true` and has no pending browser request. The Bridge does not use its launcher label as authorization, and a legacy Bridge without the capability is left untouched. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.3.2 sends the identity handshake and local-user lifecycle metadata.
 
 ## Configuration
 
