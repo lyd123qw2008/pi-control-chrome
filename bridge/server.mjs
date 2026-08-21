@@ -41,6 +41,46 @@ const pending = new Map();
 let extensionClient;
 let requestCounter = 0;
 
+function nonEmptyString(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function extensionIdentity(value) {
+  if (!value || typeof value !== "object") return undefined;
+  const browser = nonEmptyString(value.browser);
+  const browserId = nonEmptyString(value.browserId);
+  const profile = nonEmptyString(value.profile);
+  if (!browser || !browserId || !profile) return undefined;
+  return {
+    browser,
+    browserId,
+    profile,
+    ...(nonEmptyString(value.extensionVersion) ? { extensionVersion: value.extensionVersion } : {}),
+    ...(nonEmptyString(value.userAgent) ? { userAgent: value.userAgent } : {}),
+  };
+}
+
+function setExtensionIdentity(client, value) {
+  const identity = extensionIdentity(value);
+  if (!identity) return false;
+  client.browserIdentity = identity;
+  return true;
+}
+
+function requestExpectedBrowserId(message) {
+  if (!message.params || typeof message.params !== "object") return undefined;
+  return nonEmptyString(message.params.expectedBrowserId);
+}
+
+function rejectPendingForExtension(extension, code, message) {
+  for (const [id, entry] of pending.entries()) {
+    if (entry.extension !== extension) continue;
+    clearTimeout(entry.timer);
+    pending.delete(id);
+    sendError(entry.client, id, code, message);
+  }
+}
+
 function debug(...args) {
   if (DEBUG) console.error("[pi-control-chrome]", ...args);
 }
@@ -76,22 +116,51 @@ function handleMessage(client, message) {
   if (!message || typeof message !== "object") return;
 
   if (message.type === "request" && client.role === "pi") {
-    if (!extensionClient || extensionClient.readyState !== 1) {
-      sendError(client, message.id, "EXTENSION_OFFLINE", "Chrome/Edge extension is not connected.");
+    const id = String(message.id || `req-${++requestCounter}`);
+    const activeExtension = extensionClient;
+    if (!activeExtension || activeExtension.readyState !== 1) {
+      sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension is not connected.");
       return;
     }
-    const id = String(message.id || `req-${++requestCounter}`);
-    pending.set(id, { client, timer: setTimeout(() => {
+    const expectedBrowserId = requestExpectedBrowserId(message);
+    if (message.params && typeof message.params === "object" && message.params.expectedBrowserId !== undefined && !expectedBrowserId) {
+      sendError(client, id, "INVALID_BROWSER_TARGET", "expectedBrowserId must be a non-empty string.");
+      return;
+    }
+    if (expectedBrowserId && activeExtension.browserIdentity?.browserId !== expectedBrowserId) {
+      const actual = activeExtension.browserIdentity?.browserId;
+      sendError(
+        client,
+        id,
+        actual ? "BROWSER_TARGET_CHANGED" : "BROWSER_TARGET_UNAVAILABLE",
+        actual
+          ? `Browser target changed; expected ${expectedBrowserId} but the active extension is ${actual}.`
+          : "The active extension has not identified its browser target yet.",
+      );
+      return;
+    }
+    pending.set(id, { client, extension: activeExtension, method: message.method, timer: setTimeout(() => {
       pending.delete(id);
       sendError(client, id, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
     }, 120_000) });
-    send(extensionClient, { type: "request", id, method: message.method, params: message.params ?? {} });
+    if (!send(activeExtension, { type: "request", id, method: message.method, params: message.params ?? {} })) {
+      const entry = pending.get(id);
+      if (entry) clearTimeout(entry.timer);
+      pending.delete(id);
+      sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected before the request was sent.");
+    }
+    return;
+  }
+
+  if (message.type === "hello" && client.role === "extension") {
+    if (!setExtensionIdentity(client, message)) debug("extension hello did not contain a browser identity");
     return;
   }
 
   if (message.type === "response" && client.role === "extension") {
     const entry = pending.get(String(message.id));
-    if (!entry) return;
+    if (!entry || entry.extension !== client) return;
+    if (entry.method === "status") setExtensionIdentity(client, message.result);
     clearTimeout(entry.timer);
     pending.delete(String(message.id));
     send(entry.client, message);
@@ -116,12 +185,14 @@ const server = createServer((req, res) => {
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/health") {
+    const identity = extensionClient?.browserIdentity;
     jsonResponse(res, 200, {
       ok: true,
       protocol: 1,
       port,
       extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
       piClients: [...clients].filter((client) => client.role === "pi" && client.readyState === 1).length,
+      ...(identity || {}),
     });
     return;
   }
@@ -145,9 +216,13 @@ wss.on("connection", (client, request) => {
   }
 
   client.role = role;
+  client.browserIdentity = undefined;
   clients.add(client);
   if (role === "extension") {
-    if (extensionClient && extensionClient !== client) extensionClient.close(1012, "replaced");
+    if (extensionClient && extensionClient !== client) {
+      rejectPendingForExtension(extensionClient, "BROWSER_TARGET_CHANGED", "The active Chrome/Edge extension was replaced by another browser extension.");
+      extensionClient.close(1012, "replaced");
+    }
     extensionClient = client;
     debug("extension connected");
   } else {
@@ -166,6 +241,7 @@ wss.on("connection", (client, request) => {
   });
   client.on("close", () => {
     clients.delete(client);
+    if (client.role === "extension") rejectPendingForExtension(client, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected.");
     if (extensionClient === client) extensionClient = undefined;
     broadcast({ type: "event", event: "connection", role, connected: false });
     debug(`${role} disconnected`);

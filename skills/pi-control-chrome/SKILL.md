@@ -51,7 +51,8 @@ Treat a browser obstacle as a diagnosis problem, not a reason to repeat the last
 1. Stop all browser actions and record only `browser`, `browserId`, `profile`, and `extensionVersion`.
 2. Ask the user which browser should be controlled.
 3. In the unwanted browser, open `chrome://extensions` or `edge://extensions` and disable the Pi Control Chrome extension.
-4. Run `browser_status` again and continue only after the requested browser is stable across two checks.
+4. Run `browser_status` again. If the target changed, continue only after the user confirms the requested browser and acknowledge it with `browser_status` using `acknowledgeBrowserId`.
+5. Confirm the requested browser is stable across the next check before acting.
 
 Do not keep retrying a page action while the two extensions are competing for the Bridge.
 
