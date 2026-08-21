@@ -145,7 +145,7 @@ describe('DSH browser tool catalog', () => {
       browserId: 'edge:test',
       startedBy: 'pi',
       controlDomain: 'local_user',
-       capabilities: { cooperativeRestart: true },
+       capabilities: { cooperativeRestart: true, localUserRestart: true },
       restart: { available: true, controlDomain: 'local_user' },
     }))
     const tools = setup({ request, health })

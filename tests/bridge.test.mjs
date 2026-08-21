@@ -69,6 +69,7 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
      assert.equal(health.startedBy, "unknown");
      assert.equal(health.controlDomain, "local_user");
      assert.equal(health.capabilities.cooperativeRestart, true);
+     assert.equal(health.capabilities.localUserRestart, true);
      assert.equal(health.restart.available, true);
     const pair = await getJson(port, "/pair");
     assert.equal(pair.status, 200);
@@ -244,6 +245,7 @@ test("bridge allows a paired local Host to cooperatively restart its instance", 
     assert.equal(initialHealth.startedBy, "pi");
     assert.equal(initialHealth.controlDomain, "local_user");
     assert.equal(initialHealth.capabilities.cooperativeRestart, true);
+    assert.equal(initialHealth.capabilities.localUserRestart, true);
     assert.equal(initialHealth.restart.available, true);
     const pair = await getJson(port, "/pair");
     const connect = (role) => new Promise((resolve, reject) => {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Added an explicit local-user restart capability marker so updated Hosts reject older owner-token restart protocols instead of reporting false recovery availability.
+
 ## 0.3.0
 
 - Added non-secret instance, launcher and capability metadata to Bridge health and pairing handshakes.

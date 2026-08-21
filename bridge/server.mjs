@@ -19,6 +19,7 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   browserIdentity: true,
   atomicTargetRouting: true,
   cooperativeRestart: true,
+  localUserRestart: true,
 });
 const BRIDGE_VERSION = (() => {
   try {

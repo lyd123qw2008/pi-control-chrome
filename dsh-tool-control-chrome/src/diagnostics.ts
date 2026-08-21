@@ -16,7 +16,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function bridgeRecovery(health: Record<string, unknown>): BridgeRecovery {
   const restart = isRecord(health.restart) ? health.restart : undefined
   const capabilities = isRecord(health.capabilities) ? health.capabilities : undefined
-  const available = restart?.available === true && capabilities?.cooperativeRestart === true
+  const available = restart?.available === true
+    && restart?.controlDomain === 'local_user'
+    && capabilities?.localUserRestart === true
   return {
     available,
     authority: available ? 'local_user' : 'unknown',

@@ -264,8 +264,8 @@ export class BrowserBridgeClient {
     }
 
     const instanceId = healthInstanceId(health)
-    if (instanceId === undefined || !hasCapability(health, 'cooperativeRestart')) {
-      throw lifecycleError('BRIDGE_RESTART_UNSUPPORTED', 'This Bridge does not expose cooperative restart capabilities')
+    if (instanceId === undefined || !hasCapability(health, 'localUserRestart')) {
+      throw lifecycleError('BRIDGE_RESTART_UNSUPPORTED', 'This Bridge does not expose local-user cooperative restart capabilities')
     }
 
     const control = await this.request('bridge_restart', {

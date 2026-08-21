@@ -70,8 +70,8 @@ class BridgeClient {
   async restart(): Promise<any> {
     const health = await this.health();
     const instanceId = typeof health.instanceId === "string" ? health.instanceId : undefined;
-    if (!instanceId || health.capabilities?.cooperativeRestart !== true) {
-      throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge does not expose cooperative restart capabilities");
+    if (!instanceId || health.capabilities?.localUserRestart !== true) {
+      throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge does not expose local-user cooperative restart capabilities");
     }
     const control = await this.request("bridge_restart", {
       expectedInstanceId: instanceId,
