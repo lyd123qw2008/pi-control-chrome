@@ -45,6 +45,17 @@ async function waitHealth(port) {
   throw new Error("bridge did not become healthy");
 }
 
+async function waitHealthIdentity(port, browserId) {
+  for (let i = 0; i < 50; i += 1) {
+    try {
+      const result = await getJson(port, "/health");
+      if (result.body.browserId === browserId) return result.body;
+    } catch {}
+    await sleep(50);
+  }
+  throw new Error(`bridge did not expose browser identity ${browserId}`);
+}
+
 test("bridge exposes health/pair endpoints and routes Pi requests to extension", async () => {
   const port = 17800 + Math.floor(Math.random() * 500);
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-test-"));
@@ -91,6 +102,124 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
   } finally {
     pi?.close();
     extension?.close();
+    stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("bridge keeps one active extension connection and replaces the older one", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-replace-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let first;
+  let second;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = () => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=extension&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    first = await connect();
+    second = await connect();
+    await new Promise((resolve) => first.once("close", resolve));
+    assert.equal(first.readyState, WebSocket.CLOSED);
+    assert.equal(second.readyState, WebSocket.OPEN);
+    assert.equal((await getJson(port, "/health")).body.extensionConnected, true);
+  } finally {
+    first?.close();
+    second?.close();
+    stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("bridge atomically rejects requests for a replaced browser target", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-target-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let pi;
+  let first;
+  let second;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = (role) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    first = await connect("extension");
+    first.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:test", profile: "current", extensionVersion: "0.2.5" }));
+    await waitHealthIdentity(port, "edge:test");
+    pi = await connect("pi");
+
+    const acceptedId = "accepted-target";
+    first.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "request" && message.id === acceptedId) first.send(JSON.stringify({ type: "response", id: acceptedId, result: { browserId: "edge:test" } }));
+    });
+    const accepted = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("accepted target request timed out")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== acceptedId) return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "request", id: acceptedId, method: "status", params: { expectedBrowserId: "edge:test" } }));
+    });
+    assert.deepEqual(accepted.result, { browserId: "edge:test" });
+
+    second = await connect("extension");
+    second.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "chrome", browserId: "chrome:test", profile: "current", extensionVersion: "0.2.5" }));
+    await new Promise((resolve) => first.once("close", resolve));
+    await waitHealthIdentity(port, "chrome:test");
+
+    const rejectedId = "rejected-target";
+    const rejected = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("replaced target request did not fail")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== rejectedId) return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "request", id: rejectedId, method: "click", params: { expectedBrowserId: "edge:test" } }));
+    });
+    assert.equal(rejected.error.code, "BROWSER_TARGET_CHANGED");
+
+    const acceptedNewId = "accepted-new-target";
+    second.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "request" && message.id === acceptedNewId) second.send(JSON.stringify({ type: "response", id: acceptedNewId, result: { browserId: "chrome:test" } }));
+    });
+    const acceptedNew = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("new target request timed out")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== acceptedNewId) return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "request", id: acceptedNewId, method: "status", params: { expectedBrowserId: "chrome:test" } }));
+    });
+    assert.deepEqual(acceptedNew.result, { browserId: "chrome:test" });
+  } finally {
+    pi?.close();
+    first?.close();
+    second?.close();
     stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 ---
 name: pi-control-chrome
-description: Control the user's existing Chrome or Edge profile through the pi-control-chrome extension and local Bridge. Use for browser tabs, logged-in sessions, page inspection, interaction, screenshots, uploads, downloads, dialogs, clipboard, console/network/CDP, and tab handoff or cleanup.
+description: Control the user's existing Chrome or Edge profile through the pi-control-chrome extension and local Bridge. Use for browser tabs, logged-in sessions, page inspection, interaction, screenshots, uploads, downloads, dialogs, clipboard, console/network/CDP, tab handoff or cleanup, and diagnosing Bridge, extension, browser-target, or stale-handle problems.
 compatibility: Requires Pi with the pi-control-chrome package or extension loaded, the Chromium MV3 extension installed, the local Bridge at 127.0.0.1:17318, and Node.js 22+ for the bundled scripts.
 ---
 
@@ -31,7 +31,129 @@ The expected healthy state is:
 - Extension: connected
 - Extension version: the installed project version
 
-The Edge or Chrome Manifest V3 Service Worker may show `不活动` or `inactive` when idle. That is normal; use `/chrome status` or `browser_status` as the connection check.
+## Recovery Playbook
+
+Treat a browser obstacle as a diagnosis problem, not a reason to repeat the last action. Use the smallest recovery path below, and stop when a step says to ask the user.
+
+### Non-negotiable stop conditions
+
+- Run `browser_status` before acting when the target browser is not already confirmed.
+- If `browser` or `browserId` is not the browser the user requested, stop. Do not use its tab ids or handles.
+- One Bridge endpoint accepts one active extension connection. If Chrome and Edge both connect to `127.0.0.1:17318`, the newer connection replaces the older one and reconnect attempts can make the target alternate.
+- If `browserId` changes during a task, stop the task, refresh `browser_status`, and ask the user which browser should remain connected.
+- Never recover by closing, navigating, or moving an existing user tab. Prefer an Agent tab.
+- Do not expose pairing tokens, cookies, passwords, access tokens, private keys, or unrelated page data in a diagnostic report.
+
+### Wrong browser or a flapping connection
+
+**Symptoms:** `browser_status` reports the wrong browser, `browserId` changes between requests, or control moves between Chrome and Edge.
+
+1. Stop all browser actions and record only `browser`, `browserId`, `profile`, and `extensionVersion`.
+2. Ask the user which browser should be controlled.
+3. In the unwanted browser, open `chrome://extensions` or `edge://extensions` and disable the Pi Control Chrome extension.
+4. Run `browser_status` again. If the target changed, continue only after the user confirms the requested browser and acknowledge it with `browser_status` using `acknowledgeBrowserId`.
+5. Confirm the requested browser is stable across the next check before acting.
+
+Do not keep retrying a page action while the two extensions are competing for the Bridge.
+
+### Bridge or extension is offline
+
+**Symptoms:** `browser_status` fails, `extensionConnected` is false, or the request reports `EXTENSION_OFFLINE`.
+
+1. Run `browser_doctor` when available; use `/chrome status` or `browser_status` to separate Bridge failure from extension failure.
+2. Check `http://127.0.0.1:17318/health`.
+3. If the Bridge is healthy, confirm the unpacked extension is enabled in the requested browser's extension page.
+4. Run `/chrome connect`, then check `/chrome status` again.
+5. Reload the unpacked extension only after the previous checks fail.
+6. Ask the user to restart Pi or the Bridge if the health endpoint remains unavailable.
+
+Do not start a second Bridge on port `17318` while the daily Bridge is running. A port collision can make an isolated test look like an installed-extension failure.
+
+### Service Worker is inactive
+
+**Symptom:** the browser extension page labels the Manifest V3 Service Worker as `inactive` or `不活动`.
+
+This is normal for an idle Service Worker. Send a harmless `browser_status` request and check Bridge health. Reload the extension only when the request fails or `extensionConnected` is false.
+
+### Tab, handle, or element is stale
+
+**Symptoms:** a tab id no longer exists, a snapshot ref is rejected, an action reports stale state, or the target moved.
+
+1. Run `browser_tabs` again.
+2. Match the target by current title and URL; do not trust an old tab id or ref.
+3. Run `browser_snapshot` or `browser_accessibility_snapshot` again.
+4. Use refs from that latest snapshot only.
+5. If the user tab changed unexpectedly, stop and ask before claiming or navigating it.
+
+Never retry a stale click or fill with the old ref.
+
+### Element cannot be found or an interaction fails
+
+Use this recovery ladder, stopping when the target is unambiguous:
+
+```text
+latest browser_snapshot
+→ browser_accessibility_snapshot
+→ browser_locator
+→ browser_dom_cua
+→ browser_cua
+→ narrowly scoped browser_evaluate
+```
+
+After a navigation or DOM-changing action, obtain a fresh snapshot. Do not switch to coordinate clicks merely because the first locator was not tried with the latest page state.
+
+### Navigation or page request times out
+
+1. Run `browser_tabs` and confirm the tab still exists.
+2. Use `browser_wait` for the relevant load state, URL, or URL fragment.
+3. If the tab was closed or navigated elsewhere, obtain a fresh handle and snapshot.
+4. Retry a read-only operation once.
+5. Do not automatically repeat a form submission, download, upload, or other externally visible action; ask the user if its completion is unclear.
+
+### Dialog, upload, download, clipboard, Console, or Network trouble
+
+- For a JavaScript dialog, use `browser_dialog` only after confirming the current tab and the intended accept, dismiss, or prompt value.
+- For an upload, confirm the target file input and use `browser_upload`; never reveal unrelated local paths.
+- For a download, use `browser_download` to inspect status before retrying; do not repeatedly start a download whose completion is uncertain.
+- For clipboard failures, confirm the selected tab and retry only the requested clipboard operation.
+- For Console or Network data, enable the relevant capture on the current tab and report only data needed for the task.
+- If a CDP method fails, prefer the higher-level browser tool before trying another raw method.
+
+### Ownership, handoff, and cleanup trouble
+
+1. Run `browser_tabs` and inspect `owner`, `sessionId`, and `lifecycle`.
+2. Release a claimed user tab with `browser_release`; do not close it.
+3. Use `browser_mark_handoff` or `browser_mark_deliverable` when the user needs the page preserved.
+4. Use `browser_cleanup` only for the current Agent session.
+5. Do not delete the Pi group or tabs belonging to another session.
+
+### Isolated E2E test failure
+
+If `npm run smoke:e2e` fails while the daily Bridge is healthy, first check whether the test tried to bind port `17318`. Run the test with an isolated Bridge port and matching temporary extension configuration, or stop the daily Bridge only with the user's approval. Do not diagnose a port collision as a Chrome or Edge compatibility failure.
+
+### Browser controls are paused
+
+**Symptom:** the browser tools report that controls are paused.
+
+Run:
+
+```text
+/chrome resume
+```
+
+Then call `browser_status` and retry the operation only after the requested browser and Bridge are healthy.
+
+### Escalation report
+
+When recovery does not work, report:
+
+- requested browser and observed `browser`/`browserId`;
+- `profile`, `extensionVersion`, and Bridge health fields;
+- the last operation and whether the tab was user-owned or Agent-owned;
+- the exact safe error code or message;
+- the recovery steps already attempted.
+
+Never include the pairing token, cookies, passwords, access tokens, or unrelated page contents.
 
 ## Fast Common Workflows
 
@@ -59,7 +181,8 @@ Use the scripts for status, tabs, grouping, open/view, snapshot, extraction, scr
 
 Use these tools when available:
 
-- `browser_status`: verify browser, profile, Bridge, and extension state.
+- `browser_doctor`: diagnose Bridge reachability, extension connection, active browser target, and Chrome/Edge competition without changing tabs.
+- `browser_status`: verify browser, profile, Bridge, extension, and target stability.
 - `browser_tabs`: inspect windows, tabs, groups, ownership, lifecycle, and handles.
 - `browser_selected`: inspect the selected tab without changing it.
 - `browser_new_tab`: create an Agent-owned tab. Prefer `active: false` unless the user needs to see it.
@@ -128,34 +251,6 @@ Do not reuse a ref after navigation or a DOM-changing action. If a tab handle re
 ```
 
 The browser tools are registered by `pi-extension/index.ts`; the extension and Bridge are implemented under `extension/` and `bridge/`.
-
-## Troubleshooting
-
-### Extension is not connected
-
-1. Confirm Edge or Chrome is running.
-2. Confirm the unpacked `extension/` is enabled in `edge://extensions` or `chrome://extensions`.
-3. Check that the Bridge responds at `http://127.0.0.1:17318/health`.
-4. Run `/chrome connect`, then `/chrome status`.
-5. Reload the unpacked extension only if the status still reports no extension connection.
-
-### Service Worker says inactive
-
-This is expected for an idle Manifest V3 Service Worker. Send a harmless `browser_status` request and check the Bridge health instead of treating the inactive label as an error.
-
-### Tab request times out
-
-Refresh `browser_tabs`, confirm the target tab still exists, and retry with its current tab id. Do not keep using a stale handle. If only the standalone E2E test times out while the daily Bridge is running, check for a port collision on `17318` before diagnosing the installed extension.
-
-### Browser controls are paused
-
-Run:
-
-```text
-/chrome resume
-```
-
-Then retry the browser action.
 
 ## Project References
 

@@ -76,7 +76,7 @@ Check the connection in Pi:
 /chrome tabs
 ```
 
-The extension is shared by Chrome and Edge and uses Chromium Manifest V3 capability detection rather than separate browser-specific implementations.
+The extension is shared by Chrome and Edge and uses Chromium Manifest V3 capability detection rather than separate browser-specific implementations. One Bridge endpoint currently accepts one active extension connection. Chrome and Edge may both remain open, but loading the shared extension in both against the same Bridge makes the newer connection replace the older one; use one controlled browser per Bridge.
 
 ## Skill CLI
 
@@ -116,6 +116,15 @@ npm run pack:check
 ```powershell
 npm run smoke:e2e
 ```
+
+The smoke test defaults to Edge. Run the same coverage against Chrome for Testing with:
+
+```powershell
+$env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
+npm run smoke:e2e
+```
+
+This uses an isolated temporary browser profile and does not touch the normal user profile. The installed Google Chrome may reject command-line unpacked-extension flags; load `extension/` manually from `chrome://extensions` for a normal-profile check.
 
 ## Design principles
 

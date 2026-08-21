@@ -1,4 +1,4 @@
-name: Publish DSH Chrome Control Package
+name: Publish Pi Control Chrome
 
 on:
   workflow_dispatch:
@@ -10,9 +10,6 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dsh-tool-control-chrome
 
     steps:
       - name: Checkout
@@ -27,17 +24,14 @@ jobs:
       - name: Install dependencies
         run: corepack pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: corepack pnpm run check
+      - name: Check
+        run: npm run check
 
       - name: Test
-        run: corepack pnpm test
-
-      - name: Build
-        run: corepack pnpm run build
+        run: npm test
 
       - name: Pack check
-        run: corepack pnpm run pack:check
+        run: npm pack --dry-run
 
       - name: Publish
         run: npm publish --access public

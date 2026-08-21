@@ -204,6 +204,19 @@ function scheduleReconnect() {
   }, 1500);
 }
 
+function browserIdentity() {
+  const manifest = chrome.runtime.getManifest();
+  const userAgent = navigator.userAgent;
+  const browser = /Edg\//i.test(userAgent) ? "edge" : /Chrome\//i.test(userAgent) ? "chrome" : "chromium";
+  return {
+    browser,
+    browserId: `${browser}:${chrome.runtime.id}`,
+    profile: "current",
+    userAgent,
+    extensionVersion: manifest.version,
+  };
+}
+
 async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   const token = await getPairingToken();
@@ -211,6 +224,7 @@ async function connect() {
   socket = next;
   next.addEventListener("open", () => {
     connectedAt = Date.now();
+    send({ type: "hello", role: "extension", protocol: 1, ...browserIdentity() });
     log("connected to Pi bridge");
   });
   next.addEventListener("message", async (event) => {
@@ -219,7 +233,16 @@ async function connect() {
       const message = JSON.parse(event.data);
       id = message.id;
       if (message.type !== "request") return;
-      const result = await handleRequest(message.method, message.params || {});
+      const expectedBrowserId = message.params?.expectedBrowserId;
+       if (expectedBrowserId !== undefined && (typeof expectedBrowserId !== "string" || expectedBrowserId.length === 0)) {
+         send({ type: "response", id, error: { code: "INVALID_BROWSER_TARGET", message: "expectedBrowserId must be a non-empty string" } });
+         return;
+       }
+       if (expectedBrowserId !== undefined && expectedBrowserId !== browserIdentity().browserId) {
+         send({ type: "response", id, error: { code: "BROWSER_TARGET_CHANGED", message: `Browser target changed; expected ${expectedBrowserId} but this extension is ${browserIdentity().browserId}` } });
+         return;
+       }
+       const result = await handleRequest(message.method, message.params || {});
       send({ type: "response", id, result });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -309,15 +332,13 @@ async function listGroups() {
 async function listTabs() {
   const tabs = await chrome.tabs.query({});
   const owned = await ownedTabs();
-  const userAgent = navigator.userAgent;
-  const browser = /Edg\//i.test(userAgent) ? "edge" : /Chrome\//i.test(userAgent) ? "chrome" : "chromium";
-  const browserId = `${browser}:${chrome.runtime.id}`;
+  const identity = browserIdentity();
   return {
-    browserId,
-    profile: "current",
+    browserId: identity.browserId,
+    profile: identity.profile,
     tabs: tabs.map((tab) => ({
       id: tab.id,
-      browserId,
+      browserId: identity.browserId,
       favicon: tab.favIconUrl || "",
       windowId: tab.windowId,
       index: tab.index,
@@ -888,10 +909,7 @@ async function coordinateAction(tabId, params) {
 
 async function handleRequest(method, params) {
   if (method === "status") {
-    const manifest = chrome.runtime.getManifest();
-    const userAgent = navigator.userAgent;
-    const browser = /Edg\//i.test(userAgent) ? "edge" : /Chrome\//i.test(userAgent) ? "chrome" : "chromium";
-    return { connected: true, browser, browserId: `${browser}:${chrome.runtime.id}`, profile: "current", userAgent, extensionVersion: manifest.version, bridge: BRIDGE_ORIGIN, connectedAt };
+    return { connected: true, ...browserIdentity(), bridge: BRIDGE_ORIGIN, connectedAt };
   }
   if (method === "list_tabs") return listTabs();
   if (method === "selected_tab") {

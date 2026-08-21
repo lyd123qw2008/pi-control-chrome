@@ -40,6 +40,7 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
   const fixture = await startFixture();
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-skill-test-"));
   const sessionId = `skill-script-test-${process.pid}`;
+  let seedTabId;
   let openedTabId;
   let viewedTabId;
   try {
@@ -47,6 +48,8 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.equal(status.status.connected, true);
     assert.equal(status.health.extensionConnected, true);
 
+    const seeded = await runScript("open", "about:blank", "--inactive", "--session", `${sessionId}-seed`, "--json");
+    seedTabId = seeded.tab.id;
     const groups = await runScript("group", "--json");
     assert.ok(groups.some((group) => group.title === "Pi" && group.color === "blue"));
 
@@ -90,6 +93,9 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.equal(tabs.tabs.some((tab) => tab.id === openedTabId), false);
     assert.equal(tabs.tabs.some((tab) => tab.id === viewedTabId), false);
   } finally {
+    if (seedTabId !== undefined) {
+      try { await runScript("cleanup", "--session", `${sessionId}-seed`, "--json"); } catch {}
+    }
     if (openedTabId !== undefined) {
       try { await runScript("close", String(openedTabId), "--json"); } catch {}
     }

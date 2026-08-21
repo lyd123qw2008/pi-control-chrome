@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- Added the standalone `@lyd123qw2008/dsh-tool-control-chrome` package with the full `browser_*` tool surface, local Bridge reuse, DSH Agent session ownership, screenshot attachment output and real Loader lifecycle coverage.
+- Added `browser_doctor` and browser target stability checks to the DSH plugin.
+- Added an extension identity handshake and atomic Bridge validation for `expectedBrowserId`, preventing a request from crossing an Edge/Chrome replacement.
+- Added session-scoped browser target acknowledgements and explicit `browser_status` target confirmation.
 
 ## 0.2.4 - 2026-08-17
 
