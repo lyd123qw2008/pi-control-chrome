@@ -51,7 +51,7 @@ describe('DSH browser tool catalog', () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
       : { method, params })
-    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const tools = setup({ request, health })
     const result = await tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())
     expect(result).toEqual({ method: 'interaction', params: { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click', expectedBrowserId: 'edge:test' } })
@@ -74,7 +74,7 @@ describe('DSH browser tool catalog', () => {
 
   it('marks first-call browser competition as unverified', async () => {
     const request = vi.fn(async () => ({ connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }))
-    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true, browserId: 'edge:test' }))
     const tools = setup({ request, health })
     const result = await tools.get('browser_doctor')?.execute({}, execution())
     expect(result).toMatchObject({ ok: true, recommendation: 'confirm_browser_target', targetStability: { competition: 'unknown' }, notices: [{ code: 'browser_competition_unverified' }] })
@@ -82,7 +82,7 @@ describe('DSH browser tool catalog', () => {
 
   it('rejects an incomplete browser status contract', async () => {
     const request = vi.fn(async () => ({ connected: true, browser: '', browserId: '', profile: '' }))
-    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true, browserId: 'edge:test' }))
     const tools = setup({ request, health })
     const result = await tools.get('browser_doctor')?.execute({}, execution())
     expect(result).toMatchObject({ ok: false, recommendation: 'refresh_browser_status', issues: [{ code: 'status_missing_browser_target' }] })
@@ -93,7 +93,7 @@ describe('DSH browser tool catalog', () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser, browserId: `${browser}:test`, profile: 'current', extensionVersion: '0.2.4' }
       : { method, params })
-    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: `${browser}:test` }))
     const tools = setup({ request, health })
     await tools.get('browser_status')?.execute({}, execution())
     browser = 'chrome'
@@ -113,7 +113,7 @@ describe('DSH browser tool catalog', () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser, browserId: `${browser}:test`, profile: 'current', extensionVersion: '0.2.4' }
       : { method, params })
-    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: `${browser}:test` }))
     const tools = setup({ request, health })
     await tools.get('browser_status')?.execute({}, execution('session-a'))
     browser = 'chrome'
@@ -124,13 +124,24 @@ describe('DSH browser tool catalog', () => {
     expect(request.mock.calls.at(-1)?.[1]).toMatchObject({ expectedBrowserId: 'chrome:test', sessionId: 'session-b' })
   })
 
+  it('reports and blocks an old Bridge without atomic target routing', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
+      : { method })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const tools = setup({ request, health })
+    const diagnosis = await tools.get('browser_doctor')?.execute({}, execution())
+    expect(diagnosis).toMatchObject({ ok: false, recommendation: 'restart_bridge', issues: [{ code: 'bridge_target_routing_unavailable' }] })
+    await expect(tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution())).rejects.toThrow(/atomic target routing/)
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
+  })
   it('projects accessibility and network specializations', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
       : method === 'snapshot'
         ? { snapshot: { accessibility: { role: 'main' } } }
         : { method })
-    const health = vi.fn(async () => ({ ok: true }))
+    const health = vi.fn(async () => ({ ok: true, browserId: 'edge:test' }))
     const tools = setup({ request, health })
     const accessibility = await tools.get('browser_accessibility_snapshot')?.execute({}, execution())
     expect(accessibility).toEqual({ role: 'main' })
@@ -145,7 +156,7 @@ describe('DSH browser tool catalog', () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
       : { tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' })
-    const health = vi.fn(async () => ({ ok: true }))
+    const health = vi.fn(async () => ({ ok: true, browserId: 'edge:test' }))
     const tools = setup({ request, health }, attachments)
     const tool = tools.get('browser_screenshot')
     const value = await tool?.execute({ tabId: 7 }, execution())

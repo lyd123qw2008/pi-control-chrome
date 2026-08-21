@@ -4,7 +4,7 @@
 
 - Added `browser_doctor` and browser target stability checks to the DSH plugin.
 - Added an extension identity handshake and atomic Bridge validation for `expectedBrowserId`, preventing a request from crossing an Edge/Chrome replacement.
-- Added session-scoped browser target acknowledgements and explicit `browser_status` target confirmation.
+- The DSH plugin now rejects an older running Bridge that cannot expose the active browser identity needed for atomic target routing.
 
 ## 0.2.4 - 2026-08-17
 

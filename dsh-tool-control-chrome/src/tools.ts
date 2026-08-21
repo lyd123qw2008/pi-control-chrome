@@ -579,6 +579,14 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+async function bridgeTargetHealth(bridge: BrowserBridgeClient, target: BrowserTarget): Promise<Record<string, unknown>> {
+  const health = await bridge.health()
+  if (health.browserId !== target.browserId) {
+    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; restart the Bridge with pi-control-chrome 0.2.5 or newer')
+  }
+  return health
+}
+
 async function browserStatus(
   bridge: BrowserBridgeClient,
   tracker: BrowserTargetTracker,
@@ -635,6 +643,21 @@ async function browserDoctor(
   const targetStability = tracker.observe(status)
   const base = isRecord(status) ? status : { status }
   const target = readBrowserTarget(status)
+  let currentBridgeHealth: Record<string, unknown>
+  try {
+    currentBridgeHealth = await bridge.health()
+  } catch (error) {
+    return asJsonValue({
+      ...base,
+      ok: false,
+      recommendation: 'check_bridge',
+      bridgeHealth,
+      targetStability,
+      issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
+      notices: [],
+    })
+  }
+  bridgeHealth = currentBridgeHealth
   const bridgeBrowserId = typeof bridgeHealth.browserId === 'string' && bridgeHealth.browserId.length > 0 ? bridgeHealth.browserId : undefined
   const issues = [] as Array<{ code: string; message: string }>
   const notices = [] as Array<{ code: string; message: string }>
@@ -645,7 +668,9 @@ async function browserDoctor(
       code: 'browser_target_changed',
       message: `The active browser changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}).`,
     })
-  } else if (target !== undefined && bridgeBrowserId !== undefined && target.browserId !== bridgeBrowserId) {
+  } else if (bridgeBrowserId === undefined) {
+    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity. Restart it with pi-control-chrome 0.2.5 or newer.' })
+  } else if (target !== undefined && target.browserId !== bridgeBrowserId) {
     issues.push({
       code: 'bridge_browser_target_changed',
       message: `Bridge health reports ${bridgeBrowserId}, but the status response came from ${target.browserId}.`,
@@ -655,9 +680,11 @@ async function browserDoctor(
     notices.push({ code: 'browser_competition_unverified', message: 'The active browser is healthy, but this session has not observed it twice yet.' })
   }
   const recommendation = issues.length > 0
-    ? targetStability.changed || (target !== undefined && bridgeBrowserId !== undefined && target.browserId !== bridgeBrowserId)
-      ? 'disable_other_browser_extension'
-      : 'refresh_browser_status'
+    ? issues.some(issue => issue.code === 'bridge_target_routing_unavailable')
+      ? 'restart_bridge'
+      : targetStability.changed || (target !== undefined && bridgeBrowserId !== undefined && target.browserId !== bridgeBrowserId)
+        ? 'disable_other_browser_extension'
+        : 'refresh_browser_status'
     : notices.length > 0
       ? 'confirm_browser_target'
       : 'ready'
@@ -679,7 +706,9 @@ async function assertStableBrowserTarget(
   signal: AbortSignal,
 ): Promise<BrowserTarget> {
   const status = await bridge.request('status', { sessionId }, signal)
-  return tracker.assertStable(status)
+  const target = tracker.assertStable(status)
+  await bridgeTargetHealth(bridge, target)
+  return target
 }
 
 /** Register the full browser-control tool surface and return its disposers. */
