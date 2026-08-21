@@ -65,7 +65,7 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
-    "pi-control-chrome": "^0.3.2",
+    "pi-control-chrome": "^0.3.3",
     "ws": "^8.18.0"
   },
   "scripts": {
