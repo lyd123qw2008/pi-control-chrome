@@ -671,7 +671,7 @@ async function browserDoctor(
       message: `The active browser changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}).`,
     })
   } else if (bridgeBrowserId === undefined) {
-    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity required for atomic target routing.' })
+    issues.push({ code: 'bridge_target_routing_unavailable', message: 'The Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor and update or restart the Bridge.' })
   } else if (target !== undefined && target.browserId !== bridgeBrowserId) {
     issues.push({
       code: 'bridge_browser_target_changed',
