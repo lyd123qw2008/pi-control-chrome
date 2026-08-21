@@ -1,6 +1,6 @@
 {
   "name": "@lyd123qw2008/dsh-tool-control-chrome",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "DeepSeek Harness browser-control tools backed by the pi-control-chrome local Bridge",
   "keywords": [
     "deepseek-harness",
@@ -55,13 +55,13 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-commands": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.8"
+    "@deepseek-ai/dsh-agent": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-attachment": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-commands": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-settings": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.1"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
@@ -78,14 +78,14 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/cordis-plugin-loader": "1.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-commands": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.8",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-agent": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-attachment": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-commands": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-settings": "^0.1.1-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.1",
     "@types/node": "^22.20.0",
     "@types/ws": "8.18.1",
     "typescript": "^6.0.3",
