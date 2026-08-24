@@ -60,6 +60,7 @@ export function apply(ctx: Context, config: Config): void {
     name: string
     description: string
     whenToUse: string
+    source: string
     content: string
     invocation: { modelInvocable: boolean; userInvocable: boolean }
   }) => () => void } | undefined
@@ -68,6 +69,7 @@ export function apply(ctx: Context, config: Config): void {
       name: BROWSER_SKILL_NAME,
       description: BROWSER_SKILL_DESCRIPTION,
       whenToUse: 'Only when the user explicitly requests control of the existing Chrome or Edge browser.',
+      source: 'runtime',
       content: BROWSER_SKILL_CONTENT,
       invocation: { modelInvocable: true, userInvocable: true },
     }), 'control-chrome: register browser Skill')
