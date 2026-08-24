@@ -1,6 +1,6 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Codex-aligned Chrome and Edge browser control for Pi",
   "type": "module",
   "license": "MIT",
