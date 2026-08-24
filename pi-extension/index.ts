@@ -900,7 +900,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     browserActivation.reset();
     paused = false;
     setBrowserTools(browserActivation.active);
-    updateStatus(ctx, LAZY_TOOLS ? "chrome: ready (load pi-control-chrome Skill)" : "chrome: ready");
+    updateStatus(ctx, "chrome: ready");
   });
 
   pi.on("session_before_switch", async (_event, ctx) => {
