@@ -782,7 +782,6 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   const skillPrompt = /<skill\s+name=["']pi-control-chrome["'](?:\s|>)/u;
   const browserSkillPaths = new Set<string>();
   const normalizedPath = (value: string) => resolve(value).toLowerCase();
-  setBrowserTools(!LAZY_TOOLS);
   pi.on("before_agent_start", async event => {
     for (const skill of event.systemPromptOptions.skills ?? []) {
       if (skill.name === "pi-control-chrome") browserSkillPaths.add(normalizedPath(skill.filePath));

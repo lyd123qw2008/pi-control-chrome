@@ -6,7 +6,7 @@
 - Captured ordinary active-tab viewport screenshots through the extension API, reserving DevTools attachment for full-page and background-tab captures.
 - Fixed explicit user-requested close to remove ownership metadata even when the target tab belongs to another Agent session.
 
-- Added explicit `pi-control-chrome` Skill gating for Pi and DSH browser tools. DSH defaults to `lazyTools: true` and registers all 38 tools in the current Agent only after a successful Skill load; `lazyTools: false` preserves eager visibility. Pi hides the native browser tool set until explicit Skill expansion, and activation resets at session boundaries without starting the Bridge during session startup.
+- Fixed Pi extension startup to defer active-tool API calls until `session_start`, avoiding the host error that rejects action methods during extension loading.
 
 - Fixed `browser_locator` filtering with `hasSelector`.
 - Restricted pairing and health CORS responses to valid Chromium extension origins instead of exposing the pairing response to webpages.
