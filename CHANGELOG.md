@@ -6,6 +6,8 @@
 - Captured ordinary active-tab viewport screenshots through the extension API, reserving DevTools attachment for full-page and background-tab captures.
 - Fixed explicit user-requested close to remove ownership metadata even when the target tab belongs to another Agent session.
 
+- Added DSH `/chrome connect` and `/chrome disconnect` commands; `/chrome status` now reports Bridge-only readiness, and `/chrome restart` waits for extension reconnection.
+
 - Fixed DSH runtime Skill registration to provide the required `runtime` source metadata, allowing the `pi-control-chrome` Skill to load successfully.
 
 - Fixed Pi extension startup to defer active-tool API calls until `session_start`, avoiding the host error that rejects action methods during extension loading.
