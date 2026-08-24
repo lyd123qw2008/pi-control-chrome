@@ -7,14 +7,19 @@ import { dirname, join, resolve } from "node:path";
 import WebSocket from "ws";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { applyBrowserToolMask, createBrowserActivation } from "./activation.js";
 
 const BRIDGE_HOST = "127.0.0.1";
 const BRIDGE_PORT = 17318;
 const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
-const SESSION_ID = randomUUID();
-const BRIDGE_WAIT_ATTEMPTS = 30;
+let sessionId = randomUUID();
+const LAZY_TOOLS = process.env.PI_CONTROL_CHROME_LAZY_TOOLS !== "false";
+const browserActivation = createBrowserActivation({ lazyTools: LAZY_TOOLS });
+let browserToolsActive = browserActivation.active;
+let bridgeUsed = false;
 const BRIDGE_WAIT_DELAY_MS = 100;
+const BRIDGE_WAIT_ATTEMPTS = 30;
 let paused = false;
 
 type BrowserTarget = { browser: string; browserId: string; profile: string };
@@ -265,28 +270,53 @@ function errorResult(error: unknown) {
   return { content: [{ type: "text", text: `Browser error: ${message}` }], details: { error: message } };
 }
 
-async function call(method: string, params: Record<string, unknown> = {}) {
+type BrowserCallOptions = { allowInactive?: boolean };
+
+async function call(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}) {
+  if (!options.allowInactive && !browserToolsActive) {
+    throw new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control");
+  }
   if (paused && !["status", "list_tabs", "selected_tab", "cleanup"].includes(method)) {
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
+  if (method === "cleanup") {
+    if (!bridgeUsed) return { removed: [], released: [] };
+    bridgeUsed = true;
+    browserActivation.markUsed();
+    return bridge.request(method, { ...params, sessionId });
+  }
   if (method === "status") {
     const { acknowledgeBrowserId, ...statusParams } = params;
-    const result = await bridge.request("status", { ...statusParams, sessionId: SESSION_ID });
+    bridgeUsed = true;
+    browserActivation.markUsed();
+    const result = await bridge.request("status", { ...statusParams, sessionId });
     const targetStability = observeBrowserTarget(result, typeof acknowledgeBrowserId === "string" ? acknowledgeBrowserId : undefined);
     const base = result && typeof result === "object" ? result : { result };
     try { return { ...base, targetStability, bridgeHealth: await bridge.health() }; } catch { return { ...base, targetStability }; }
   }
-  const status = await bridge.request("status", { sessionId: SESSION_ID });
+  bridgeUsed = true;
+  browserActivation.markUsed();
+  const status = await bridge.request("status", { sessionId });
   const targetStability = observeBrowserTarget(status);
   const target = readBrowserTarget(status);
   if (targetStability.issue !== undefined || target === undefined) throw new Error("Browser status did not identify an active browser target; run browser_status");
   if (!targetStability.stable || !targetStability.acknowledged) {
     throw new Error(`Browser target changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`);
   }
-  return bridge.request(method, { ...params, sessionId: SESSION_ID, expectedBrowserId: target.browserId });
+  return bridge.request(method, { ...params, sessionId, expectedBrowserId: target.browserId });
 }
 
 function registerBrowserTools(pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "browser_doctor",
+    label: "Browser Doctor",
+    description: "Diagnose the local Bridge, extension connection, active browser target and Chrome/Edge competition without changing tabs.",
+    parameters: Type.Object({}),
+    async execute() {
+      try { return textResult(await call("doctor")); } catch (error) { return errorResult(error); }
+    },
+  });
+
   pi.registerTool({
     name: "browser_status",
     label: "Browser Status",
@@ -726,8 +756,54 @@ function registerBrowserTools(pi: ExtensionAPI) {
 
 export default function piControlChrome(pi: ExtensionAPI): void {
   registerBrowserTools(pi);
-
+  const setBrowserTools = (active: boolean) => {
+    applyBrowserToolMask(pi, active);
+    browserToolsActive = browserActivation.setActive(active);
+  };
   const updateStatus = (ctx: ExtensionContext, text: string) => ctx.ui.setStatus("pi-control-chrome", text);
+  const humanCall = (method: string, params: Record<string, unknown> = {}) => call(method, params, { allowInactive: true });
+  const resetSession = async (ctx: ExtensionContext, status: string) => {
+    try {
+      if (bridgeUsed) await humanCall("cleanup");
+    } catch {
+      // Session teardown must continue when the Bridge is already offline.
+    }
+    bridgeUsed = false;
+    browserActivation.reset();
+    acknowledgedTarget = undefined;
+    observedBrowserIds.clear();
+    paused = false;
+    sessionId = randomUUID();
+    browserSkillPaths.clear();
+    setBrowserTools(!LAZY_TOOLS);
+    updateStatus(ctx, status);
+  };
+
+  const skillPrompt = /<skill\s+name=["']pi-control-chrome["'](?:\s|>)/u;
+  const browserSkillPaths = new Set<string>();
+  const normalizedPath = (value: string) => resolve(value).toLowerCase();
+  setBrowserTools(!LAZY_TOOLS);
+  pi.on("before_agent_start", async event => {
+    for (const skill of event.systemPromptOptions.skills ?? []) {
+      if (skill.name === "pi-control-chrome") browserSkillPaths.add(normalizedPath(skill.filePath));
+    }
+    if (LAZY_TOOLS && skillPrompt.test(event.prompt)) setBrowserTools(true);
+  });
+  pi.on("tool_result", event => {
+    if (LAZY_TOOLS && !event.isError && event.toolName === "read" && typeof event.input.path === "string" && browserSkillPaths.has(normalizedPath(event.input.path))) {
+      setBrowserTools(true);
+      return;
+    }
+    if (event.toolName === "skill" && !event.isError && event.input.name === "pi-control-chrome") {
+      setBrowserTools(true);
+      return;
+    }
+    if (event.toolName === "browser_cleanup" && !event.isError) {
+      bridgeUsed = false;
+      browserActivation.reset();
+      setBrowserTools(browserActivation.active);
+    }
+  });
 
   pi.registerCommand("chrome", {
     description: "Control the connected Chrome/Edge browser",
@@ -735,7 +811,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
       const [action = "status", ...rest] = args.trim().split(/\s+/);
       try {
         if (action === "status") {
-          const result = await call("status");
+          const result = await humanCall("status");
           const connected = result.bridgeHealth?.extensionConnected === true;
           updateStatus(ctx, connected ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
@@ -744,19 +820,24 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         if (action === "connect") {
           paused = false;
           await bridge.start();
-          const result = await call("status");
+          const result = await humanCall("status");
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
           return;
         }
         if (action === "restart") {
           const result = await bridge.restart();
+          bridgeUsed = true;
+          browserActivation.markUsed();
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
           return;
         }
         if (action === "disconnect") {
           await bridge.stop();
+          bridgeUsed = false;
+          browserActivation.reset();
+          setBrowserTools(browserActivation.active);
           updateStatus(ctx, "chrome: disconnected");
           ctx.ui.notify("Pi browser bridge disconnected; the local Bridge remains available for a later /chrome connect.", "info");
           return;
@@ -769,30 +850,33 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         }
         if (action === "resume") {
           paused = false;
-          const result = await call("status");
+          const result = await humanCall("status");
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify("Pi browser control resumed.", "info");
           return;
         }
         if (action === "tabs") {
-          ctx.ui.notify(JSON.stringify(await call("list_tabs"), null, 2), "info");
+          ctx.ui.notify(JSON.stringify(await humanCall("list_tabs"), null, 2), "info");
           return;
         }
         if (action === "cleanup") {
-          ctx.ui.notify(JSON.stringify(await call("cleanup")), "info");
+          ctx.ui.notify(JSON.stringify(await humanCall("cleanup")), "info");
+          bridgeUsed = false;
+          browserActivation.reset();
+          setBrowserTools(browserActivation.active);
           return;
         }
         if (action === "release" && rest[0]) {
-          ctx.ui.notify(JSON.stringify(await call("release", { tabId: Number(rest[0]) })), "info");
+          ctx.ui.notify(JSON.stringify(await humanCall("release", { tabId: Number(rest[0]) })), "info");
           return;
         }
         if (action === "profile") {
-          const result = await call("status");
+          const result = await humanCall("status");
           ctx.ui.notify(JSON.stringify({ browser: result.browser, userAgent: result.userAgent, extensionVersion: result.extensionVersion }, null, 2), "info");
           return;
         }
         if (action === "group") {
-          const result = await call("list_tabs");
+          const result = await humanCall("list_tabs");
           ctx.ui.notify(JSON.stringify(result.groups || [], null, 2), "info");
           return;
         }
@@ -809,22 +893,36 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionId = randomUUID();
+    browserSkillPaths.clear();
+    acknowledgedTarget = undefined;
+    observedBrowserIds.clear();
+    bridgeUsed = false;
+    browserActivation.reset();
+    paused = false;
+    setBrowserTools(browserActivation.active);
+    updateStatus(ctx, LAZY_TOOLS ? "chrome: ready (load pi-control-chrome Skill)" : "chrome: ready");
+  });
+
+  pi.on("session_before_switch", async (_event, ctx) => {
+    await resetSession(ctx, "chrome: session released");
+  });
+  pi.on("session_before_fork", async (_event, ctx) => {
+    await resetSession(ctx, "chrome: session released");
+  });
+  pi.on("turn_end", async () => {
+    if (!bridgeUsed) return;
     try {
-      await bridge.start();
-      const status = await call("status");
-      updateStatus(ctx, status.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
-    } catch (error) {
-      updateStatus(ctx, "chrome: offline");
-      ctx.ui.notify(`Pi browser bridge is not connected: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      await humanCall("cleanup", { detachDevtools: false });
+      bridgeUsed = false;
+      browserActivation.clearUsed();
+    } catch {
+      // A failed turn cleanup must not prevent the next model turn.
     }
   });
 
-  pi.on("turn_end", async () => {
-    try { await call("cleanup"); } catch {}
-  });
-
-  pi.on("session_shutdown", async () => {
-    try { await call("cleanup"); } catch {}
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await resetSession(ctx, "chrome: session closed");
     await bridge.stop();
   });
 }

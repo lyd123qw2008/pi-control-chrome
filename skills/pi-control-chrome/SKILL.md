@@ -6,22 +6,11 @@ compatibility: Requires Pi with the pi-control-chrome package or extension loade
 
 # Pi Control Chrome
 
-Use this skill when the task explicitly involves the user's Chrome or Edge browser, existing tabs, browser login state, or browser UI. Prefer the Pi `browser_*` tools from this project for the user's daily browser. Use Playwright or standalone CDP for isolated test profiles or when this Bridge-based surface is unavailable.
+Use this Skill only when the user explicitly asks to use the existing Chrome or Edge browser, its tabs, logged-in session, or browser UI. Loading this Skill is the activation gate: do not call `browser_*` tools before it has loaded. Prefer the Pi or DSH `browser_*` tools from this project for the user's daily browser. Do not use browser control for ordinary public web search; use a search capability instead. Playwright or standalone CDP is for isolated test profiles or explicit human/developer workflows when this Bridge-based surface is unavailable.
 
 ## Connection Check
 
-Start by checking the connection:
-
-```text
-/chrome status
-```
-
-If the Bridge is not connected, try:
-
-```text
-/chrome connect
-/chrome status
-```
+After this Skill has loaded and the `browser_*` tools are visible, start with `browser_status`. `/chrome status` and `/chrome connect` are explicit human diagnostics; do not use them as a substitute for loading this Skill or as a reason to start browser control for an ordinary task.
 
 The expected healthy state is:
 
@@ -169,25 +158,9 @@ Never include the pairing token, cookies, passwords, access tokens, or unrelated
 
 ## Fast Common Workflows
 
-For repeated connection and page-reading workflows, use the bundled script instead of generating a one-off WebSocket or Node script. It talks to the already-running Bridge and reuses the current Chrome/Edge profile without launching a browser or changing directories.
+The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
 
-From the Skill directory:
-
-```text
-node scripts/browser.mjs status
-node scripts/browser.mjs tabs --json
-node scripts/browser.mjs group --json
-node scripts/browser.mjs view <url> --screenshot <path>
-node scripts/browser.mjs snapshot <tabId> --json
-node scripts/browser.mjs extract <tabId> --max-chars 12000
-node scripts/browser.mjs screenshot <tabId> <path>
-node scripts/browser.mjs close <tabId>
-node scripts/browser.mjs cleanup --session <sessionId>
-```
-
-`view` creates an Agent tab, waits for page load, extracts bounded text, records basic timing, optionally saves a screenshot, and marks the tab as `handoff` so it remains available to the user. Use `--reuse-existing` only when the user explicitly wants an existing exact-URL tab reused; never move a user-owned tab into the Pi group. Use `--temporary` when the page should be cleaned up instead of handed off.
-
-Use the scripts for status, tabs, grouping, open/view, snapshot, extraction, screenshots, close, and cleanup. Use the `browser_*` tools for complex interactions, locator actions, dialogs, uploads, downloads, network/console inspection, and other operations that need incremental page state.
+`/chrome status`, `/chrome doctor`, and `/chrome tabs` remain explicit human diagnostics and do not activate model browser tools.
 
 ## Tool Selection
 

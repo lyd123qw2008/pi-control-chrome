@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.3.3
+## Unreleased
+
+- Reused a short-lived, session-owned debugger lease across consecutive browser operations instead of attaching and detaching Chrome DevTools for every call; explicit Console/Network/CDP capture remains persistent and cleanup still releases it.
+- Captured ordinary active-tab viewport screenshots through the extension API, reserving DevTools attachment for full-page and background-tab captures.
+- Fixed explicit user-requested close to remove ownership metadata even when the target tab belongs to another Agent session.
+
+- Added explicit `pi-control-chrome` Skill gating for Pi and DSH browser tools. DSH defaults to `lazyTools: true` and registers all 38 tools in the current Agent only after a successful Skill load; `lazyTools: false` preserves eager visibility. Pi hides the native browser tool set until explicit Skill expansion, and activation resets at session boundaries without starting the Bridge during session startup.
 
 - Fixed `browser_locator` filtering with `hasSelector`.
 - Restricted pairing and health CORS responses to valid Chromium extension origins instead of exposing the pairing response to webpages.

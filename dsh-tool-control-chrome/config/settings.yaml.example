@@ -6,3 +6,6 @@ control-chrome:
   tokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.token
   autoStartBridge: true
   requestTimeoutMs: 120000
+  # Register browser_* tools only after the pi-control-chrome Skill loads.
+  lazyTools: true
+  # Set false temporarily for legacy eager tool visibility.

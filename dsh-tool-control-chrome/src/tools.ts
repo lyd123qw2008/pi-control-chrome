@@ -2,6 +2,7 @@
 
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve as resolvePath } from 'node:path'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -14,6 +15,7 @@ import {
 } from '@deepseek-ai/dsh-tools'
 import type { BrowserBridgeClient } from './bridge.js'
 import { bridgeRecovery, unavailableBridgeRecovery } from './diagnostics.js'
+import { BROWSER_SKILL_NAME } from './skill.js'
 import type { ResolvedConfig, ScreenshotResult } from './types.js'
 
 const TAB_ID: ParameterPropertySpec = { type: 'number', description: 'Browser tab id. Omit to use the selected tab.' }
@@ -239,6 +241,24 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
       timeoutMs: OPTIONAL_NUMBER,
     },
     method: 'wait',
+  },
+  {
+    name: 'browser_back',
+    description: 'Navigate the selected browser tab back in history.',
+    parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
+    method: 'back',
+  },
+  {
+    name: 'browser_forward',
+    description: 'Navigate the selected browser tab forward in history.',
+    parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
+    method: 'forward',
+  },
+  {
+    name: 'browser_reload',
+    description: 'Reload the selected browser tab.',
+    parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
+    method: 'reload',
   },
   {
     name: 'browser_click',
@@ -478,24 +498,6 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
     parameters: { tabId: TAB_ID, method: requiredString(), params: JSON_VALUE },
     method: 'cdp',
   },
-  {
-    name: 'browser_back',
-    description: 'Navigate the selected browser tab back in history.',
-    parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
-    method: 'back',
-  },
-  {
-    name: 'browser_forward',
-    description: 'Navigate the selected browser tab forward in history.',
-    parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
-    method: 'forward',
-  },
-  {
-    name: 'browser_reload',
-    description: 'Reload the selected browser tab.',
-    parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
-    method: 'reload',
-  },
 ]
 
 /** All browser tools exposed by the package. */
@@ -522,9 +524,13 @@ function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
   return blocks
 }
 
-function requireAgentSession(exec: ToolRunContext): string {
+function requireAgent(exec: ToolRunContext): Agent {
   if (exec.agent === undefined) throw new Error('Browser control requires an Agent-backed DSH session')
-  return String(exec.agent.session.id)
+  return exec.agent
+}
+
+function requireAgentSession(exec: ToolRunContext): string {
+  return String(requireAgent(exec).session.id)
 }
 
 function screenshotMediaType(value: unknown): ImageMediaType {
@@ -625,7 +631,7 @@ async function browserDoctor(
       recommendation: 'enable_or_reload_extension',
       bridgeHealth,
       recovery: bridgeRecovery(bridgeHealth),
-       issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
+      issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
     })
   }
 
@@ -714,15 +720,38 @@ async function assertStableBrowserTarget(
   return target
 }
 
-/** Register the full browser-control tool surface and return its disposers. */
+type BrowserActivation = {
+  readonly agent: Agent
+  readonly disposers: (() => void)[]
+  usedBrowser: boolean
+}
+
+function inactiveBrowserError(): Error {
+  return new Error(`Browser tools are inactive; load the ${BROWSER_SKILL_NAME} Skill before using browser_* tools`)
+}
+
+function isBrowserSkillArguments(value: unknown): boolean {
+  return isRecord(value) && value.name === BROWSER_SKILL_NAME
+}
+
+function hasBrowserSkillInvocation(messages: readonly unknown[]): boolean {
+  return messages.some(message => {
+    if (!isRecord(message) || !isRecord(message.source)) return false
+    return message.source.kind === 'skill-invocation' && message.source.name === BROWSER_SKILL_NAME
+  })
+}
+
+/** Register browser tools globally or after the browser Skill loads in an Agent scope. */
 export function registerBrowserTools(
   ctx: Context,
   bridge: BrowserBridgeClient,
   attachments: AttachmentStore | undefined,
   resolveSettings: () => ResolvedConfig,
 ): void {
-  const specs = [...CORE_TOOLS, ...ADVANCED_TOOLS]
   const trackers = new Map<string, BrowserTargetTracker>()
+  const activations = new Map<string, BrowserActivation>()
+  const usedSessions = new Set<string>()
+  const lazyTools = resolveSettings().lazyTools
   const trackerFor = (sessionId: string): BrowserTargetTracker => {
     const existing = trackers.get(sessionId)
     if (existing !== undefined) return existing
@@ -730,51 +759,117 @@ export function registerBrowserTools(
     trackers.set(sessionId, created)
     return created
   }
-  for (const spec of specs) {
-    const tool = defineTool({
-      name: spec.name,
-      description: spec.description,
-      parameters: spec.parameters,
-      output: {
-        schema: { type: 'json' },
-        render: renderResult,
-      },
-      timeoutMs: resolveSettings().requestTimeoutMs,
-      async execute(args: Record<string, JsonValue>, exec: ToolRunContext): Promise<JsonValue> {
-        const sessionId = requireAgentSession(exec)
-        const tracker = trackerFor(sessionId)
-        let params = { ...args, sessionId } as Record<string, JsonValue>
-        if (spec.prepare !== undefined) params = spec.prepare(params)
-        if (spec.name === 'browser_doctor') return browserDoctor(bridge, tracker, sessionId, exec.signal)
-        if (spec.name === 'browser_status') {
-          const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
-          return browserStatus(bridge, tracker, sessionId, exec.signal, acknowledgeBrowserId)
-        }
-        const target = await assertStableBrowserTarget(bridge, tracker, sessionId, exec.signal)
-        params = { ...params, expectedBrowserId: target.browserId }
-        let method = spec.method
-        if (spec.name === 'browser_accessibility_snapshot') {
-          const result = await bridge.request('snapshot', params, exec.signal)
-          return prepareAccessibility(result)
-        }
-        if (spec.name === 'browser_console') {
-          method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
-        }
-        if (spec.name === 'browser_network') {
-          const network = prepareNetwork(params)
-          method = network.method
-          params = network.params
-        }
-        if (spec.name === 'browser_screenshot') {
-          const result = await bridge.request(method, params, exec.signal)
-          return prepareScreenshot(result, params, attachments)
-        }
-        const result = await bridge.request(method, params, exec.signal)
-        return asJsonValue(result)
-      },
-    })
-    ctx.effect(() => ctx.tools.register(tool), `control-chrome: register ${spec.name}`)
+  const deactivate = (sessionId: string): void => {
+    const activation = activations.get(sessionId)
+    if (activation === undefined) return
+    activations.delete(sessionId)
+    usedSessions.delete(sessionId)
+    trackers.delete(sessionId)
+    for (const dispose of [...activation.disposers].reverse()) dispose()
   }
+  const toolFor = (spec: BrowserToolSpec): ReturnType<typeof defineTool> => defineTool({
+    name: spec.name,
+    description: spec.description,
+    parameters: spec.parameters,
+    output: {
+      schema: { type: 'json' },
+      render: renderResult,
+    },
+    timeoutMs: resolveSettings().requestTimeoutMs,
+    async execute(args: Record<string, JsonValue>, exec: ToolRunContext): Promise<JsonValue> {
+      const sessionId = requireAgentSession(exec)
+      const activation = lazyTools ? activations.get(sessionId) : undefined
+      if (lazyTools && activation === undefined) throw inactiveBrowserError()
+      let params = { ...args, sessionId } as Record<string, JsonValue>
+      if (spec.prepare !== undefined) params = spec.prepare(params)
+      if (spec.name === 'browser_cleanup') {
+        const used = activation?.usedBrowser === true || usedSessions.has(sessionId)
+        if (used) return asJsonValue(await bridge.request('cleanup', params, exec.signal))
+        return asJsonValue({ removed: [], released: [] })
+      }
+      if (activation !== undefined) activation.usedBrowser = true
+      else usedSessions.add(sessionId)
+      const tracker = trackerFor(sessionId)
+      if (spec.name === 'browser_doctor') return browserDoctor(bridge, tracker, sessionId, exec.signal)
+      if (spec.name === 'browser_status') {
+        const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
+        return browserStatus(bridge, tracker, sessionId, exec.signal, acknowledgeBrowserId)
+      }
+      const target = await assertStableBrowserTarget(bridge, tracker, sessionId, exec.signal)
+      params = { ...params, expectedBrowserId: target.browserId }
+      let method = spec.method
+      if (spec.name === 'browser_accessibility_snapshot') {
+        const result = await bridge.request('snapshot', params, exec.signal)
+        return prepareAccessibility(result)
+      }
+      if (spec.name === 'browser_console') {
+        method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
+      }
+      if (spec.name === 'browser_network') {
+        const network = prepareNetwork(params)
+        method = network.method
+        params = network.params
+      }
+      if (spec.name === 'browser_screenshot') {
+        const result = await bridge.request(method, params, exec.signal)
+        return prepareScreenshot(result, params, attachments)
+      }
+      const result = await bridge.request(method, params, exec.signal)
+      return asJsonValue(result)
+    },
+  })
+  const registerFor = (scope: Context): (() => void)[] => {
+    const disposers: (() => void)[] = []
+    try {
+      for (const spec of [...CORE_TOOLS, ...ADVANCED_TOOLS]) disposers.push(scope.tools.register(toolFor(spec)))
+      return disposers
+    } catch (error) {
+      for (const dispose of disposers.reverse()) dispose()
+      throw error
+    }
+  }
+  const activate = (agent: Agent): void => {
+    if (!lazyTools || activations.has(String(agent.session.id))) return
+    const sessionId = String(agent.session.id)
+    const disposers = registerFor(agent.ctx)
+    activations.set(sessionId, { agent, disposers, usedBrowser: false })
+  }
+  if (!lazyTools) {
+    ctx.effect(() => {
+      const disposers = registerFor(ctx)
+      return () => { for (const dispose of disposers.reverse()) dispose() }
+    }, 'control-chrome: register browser tools')
+  }
+  ctx.on('tools/result', (exec, result) => {
+    if (exec.agent !== undefined && exec.name === 'browser_cleanup' && !result.isError) {
+      const agent = exec.agent
+      queueMicrotask(() => {
+        const sessionId = String(agent.session.id)
+        usedSessions.delete(sessionId)
+        deactivate(sessionId)
+      })
+      return
+    }
+    if (!lazyTools || result.isError || exec.name !== 'skill' || exec.agent === undefined) return
+    if (isBrowserSkillArguments(exec.arguments)) activate(exec.agent)
+  })
+  ctx.on('agent/pre-step', async (_event, next) => {
+    const decision = await next()
+    if (lazyTools && decision.kind === 'enter' && hasBrowserSkillInvocation(decision.messages)) {
+      const agent = _event.agent
+      if (agent !== undefined) activate(agent)
+    }
+    return decision
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    const sessionId = String(agent.session.id)
+    const activation = activations.get(sessionId)
+    const used = activation?.usedBrowser === true || usedSessions.has(sessionId)
+    trackers.delete(sessionId)
+    activations.delete(sessionId)
+    usedSessions.delete(sessionId)
+    if (used) void bridge.request('cleanup', { sessionId }).catch(() => undefined)
+  })
 }
 
 /** Expose the tool catalogs for tests and package consumers. */

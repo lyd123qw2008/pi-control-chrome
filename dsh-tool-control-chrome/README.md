@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.3.6
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.3.7
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,14 +15,14 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.6"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.7"
   }
 }
 ```
 
 Merge the `insert` entry from [`config/cordis.patch.yml.example`](./config/cordis.patch.yml.example) into the active Profile's `cordis.patch.yml`, preserve unrelated patch entries, then install dependencies with a frozen lockfile.
 
-The package is a function plugin. It registers DSH browser tools and the `/chrome` human command; it does not export a default plugin function.
+The package is a function plugin. It registers the `pi-control-chrome` Skill when the optional DSH Skill service is present, registers browser tools according to `lazyTools`, and registers the `/chrome` human command; it does not export a default plugin function.
 
 ## Browser prerequisite
 
@@ -33,20 +33,21 @@ The DSH package cannot install a browser extension automatically. Install `pi-co
 3. Choose **Load unpacked**.
 4. Select the installed `pi-control-chrome/extension/` directory.
 
-The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, Chrome/Edge competition, and recovery metadata (`recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`). Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. Any paired DSH or Pi Host can request a local-user cooperative restart from the same control domain when the Bridge exposes `capabilities.localUserRestart: true` and has no pending browser request. The Bridge does not use its launcher label as authorization, and a legacy Bridge without the capability is left untouched. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.3.3 persists an opaque Profile identity and sends it in the identity handshake.
+The active DSH Profile should include the standard `@deepseek-ai/dsh-skill` service so the runtime Skill registry and model-facing `skill` tool are available. This plugin contributes the canonical `pi-control-chrome` Skill to that registry; it does not require the service as a hard injection, so human diagnostics and eager compatibility mode remain loadable in profiles without Skills.
 
+The extension must be connected before browser operations can succeed. `browser_doctor` is a read-only diagnostic tool for the Bridge, extension connection, active browser target, Chrome/Edge competition, and recovery metadata (`recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`). Browser operations perform a status preflight and carry the expected `browserId` into the Bridge, which validates it atomically before dispatch. Any paired DSH or Pi Host can request a local-user cooperative restart from the same control domain when the Bridge exposes `capabilities.localUserRestart: true` and has no pending browser request. The Bridge does not use its launcher label as authorization, and a legacy Bridge without the capability is left untouched. If the active `browserId` changes, the operation fails before reaching the new browser. Call `browser_status`, confirm the requested browser, disable the other browser extension, and call `browser_status` with `acknowledgeBrowserId` before retrying. The extension status contract must provide non-empty `browser`, `browserId`, and `profile` fields; `pi-control-chrome` 0.3.4 persists an opaque Profile identity and sends it in the identity handshake.
 
 ## Configuration
 
 Put deployment settings in `<DSH_HOME>/settings.yaml`; copy the `control-chrome` section from [`config/settings.yaml.example`](./config/settings.yaml.example).
 
-`tokenFile` is a path, not a token. The plugin never logs or exposes its contents. The default host is loopback; non-loopback hosts are rejected. `autoStartBridge` starts the configured Bridge when the port is offline. A Bridge with `capabilities.localUserRestart: true` may be restarted by an explicitly invoked DSH or Pi Host command in the same local-user control domain. The Bridge validates its instance id and serializes restart requests; it rejects requests while a browser operation is pending. A legacy Bridge without that capability is left untouched.
+`tokenFile` is a path, not a token. The plugin never logs or exposes its contents. The default host is loopback; non-loopback hosts are rejected. `autoStartBridge` starts the configured Bridge when the port is offline. `lazyTools` defaults to `true`: only the `pi-control-chrome` Skill metadata is available at load time, and the complete 38-tool catalog is registered in the current Agent after a successful named Skill load. Set `lazyTools: false` for legacy eager tool visibility during migration or debugging. A Bridge with `capabilities.localUserRestart: true` may be restarted by an explicitly invoked DSH or Pi Host command in the same local-user control domain. The Bridge validates its instance id and serializes restart requests; it rejects requests while a browser operation is pending. A legacy Bridge without that capability is left untouched.
 
 The plugin uses the active DSH Agent session id as the browser ownership session id. `browser_cleanup` therefore only handles tabs created or claimed by that Agent session.
 
 ## Tools
 
-The package exposes the full browser-control surface:
+The package defines the complete browser-control surface, but default `lazyTools: true` keeps all `browser_*` schemas out of the initial global and ordinary Agent assemblies. After the `pi-control-chrome` Skill succeeds, the current Agent receives all 38 tools together; there is no Core/Advanced activation split in this phase.
 
 - `browser_doctor`, `browser_status`, `browser_tabs`, `browser_selected`;
 - `browser_claim_tab`, `browser_select_tab`, `browser_new_tab`;
@@ -64,7 +65,7 @@ Browser tools are model-facing DSH tools, not a `ctx.web` search provider. Web s
 
 ## Human commands
 
-The plugin registers the DSH `/chrome` command independently from its model-facing tools:
+The plugin registers the DSH `/chrome` command independently from its model-facing tools. These commands are explicit human diagnostics and do not activate model browser tools:
 
 ```text
 /chrome status
@@ -77,7 +78,7 @@ The plugin registers the DSH `/chrome` command independently from its model-faci
 
 ## Model-facing cost
 
-The full catalog contributes 38 tool schemas to each native tool assembly. Descriptions are intentionally scoped to browser tasks; deployments that need a smaller prompt can restrict the package's visible tool layer without changing the Bridge protocol. Screenshots use the DSH attachment store when available, so image bytes are not duplicated in the durable tool result.
+With default `lazyTools: true`, the initial model assembly contributes the Skill's short name and description but no browser tool schemas. A successful Skill load adds all 38 browser schemas to that Agent's next assembly; repeated loads are idempotent and other Agent sessions remain unaffected. `lazyTools: false` contributes all 38 schemas from plugin load for compatibility. Browser descriptions are intentionally scoped to browser tasks. Screenshots use the DSH attachment store when available, so image bytes are not duplicated in the durable tool result.
 
 ## Development
 
@@ -95,7 +96,7 @@ The package tests use a fake Bridge for protocol and tool behavior. Browser acce
 
 ## Session and cancellation behavior
 
-The package uses the standard DSH `tool/call` and `tool/result` lifecycle. It does not append a provider-specific Session event, so it does not extend DSH's durable event catalog.
+The package uses the standard DSH `tool/call` and `tool/result` lifecycle. It does not append a provider-specific Session event, so it does not extend DSH's durable event catalog. Skill activation is session-scoped. `browser_cleanup` removes the current Agent's scoped browser tools after its result is committed; Agent disposal removes the scope and requests Bridge cleanup only if that session made a real browser request. Loading the Skill without calling a browser tool does not start or contact the Bridge.
 
 Cancellation stops waiting for the DSH tool call and clears the local pending request. The current Bridge protocol does not cancel an already-dispatched browser operation inside the extension; that operation may finish remotely while the DSH call has already settled.
 

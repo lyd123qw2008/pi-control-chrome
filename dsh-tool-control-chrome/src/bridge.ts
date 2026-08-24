@@ -51,6 +51,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     tokenFile: config.tokenFile ?? DEFAULT_TOKEN_FILE,
     autoStartBridge: config.autoStartBridge ?? true,
     requestTimeoutMs,
+    lazyTools: config.lazyTools ?? true,
     ...(config.bridgeScript === undefined ? {} : { bridgeScript: config.bridgeScript }),
   }
 }

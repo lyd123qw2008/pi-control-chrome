@@ -1,7 +1,7 @@
 # Optional Profile patch for DSH browser-control tools.
 # Merge this insert entry into the active Profile's cordis.patch.yml; do not replace unrelated entries.
 # The Profile package.json must list this package as a dependency first.
-# Bridge options belong in <DSH_HOME>/settings.yaml under control-chrome.
+# The Profile should also include @deepseek-ai/dsh-skill for the model-facing Skill registry/tool.
 - insert:
     - id: tool-control-chrome
       name: '@lyd123qw2008/dsh-tool-control-chrome'
