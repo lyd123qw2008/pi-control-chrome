@@ -58,6 +58,7 @@ describe('dsh-tool-control-chrome real load path', () => {
     expect(registrations[0]).toMatchObject({
       name: controlChrome.BROWSER_SKILL_NAME,
       description: controlChrome.BROWSER_SKILL_DESCRIPTION,
+      source: 'runtime',
       invocation: { modelInvocable: true, userInvocable: true },
     })
     await fiber.dispose()
