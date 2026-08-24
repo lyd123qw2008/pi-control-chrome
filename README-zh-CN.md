@@ -20,6 +20,9 @@
 - [英文架构说明](./ARCHITECTURE.md)
 - [变更记录](./CHANGELOG.md)
 - [Pi Skill](./skills/pi-control-chrome/SKILL.md)
+- [浏览器能力显式激活方案](./BROWSER-ACTIVATION-DESIGN.zh-CN.md)
+
+本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。
 
 ## 重点目标
 
@@ -45,6 +48,7 @@
 - DOM 和 Locator 操作；
 - click、fill、type、press、scroll；
 - 截图和图片回传；
+- 普通当前标签页视口截图不打开 DevTools 调试会话；完整页面和后台标签页截图使用短时、会话归属的调试租约；
 - 原生 CDP；
 - Runtime.evaluate；
 - Console、Network、Dialog、Upload、Download；
@@ -105,9 +109,9 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 
 ## DSH 集成
 
-仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。它把本项目的完整 `browser_*` 能力注册成 DeepSeek Harness 的模型工具，并通过现有本地 Bridge 控制 Chrome/Edge。
+仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。默认 `lazyTools: true` 时，插件只注册 `pi-control-chrome` Skill 的名称和描述；Skill 成功加载后，才把完整的 38 个现有 `browser_*` 工具注册到当前 Agent 会话。设置 `lazyTools: false` 可保留旧的插件加载即显示工具行为。Pi 使用同一批原生工具定义和 active-tool 隐藏机制。DSH 还提供人工使用的 `/chrome status|doctor|restart|tabs` 命令；这些命令不替代 Skill 激活。
 
-在 DSH Profile 中安装该包，把它的 `config/cordis.patch.yml.example` 中的 `insert` 条目合并到现有 `cordis.patch.yml`，不要覆盖其他 patch 条目，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
+在 DSH Profile 中安装该包，把它的 `config/cordis.patch.yml.example` 中的 `insert` 条目合并到现有 `cordis.patch.yml`，不要覆盖其他 patch 条目，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH Profile 应包含标准的 `@deepseek-ai/dsh-skill` 服务，以便使用运行时 Skill 注册表和 `skill` 工具；浏览器插件本身不强制注入该可选服务。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
 
 加载 Chrome/Edge 扩展：
 

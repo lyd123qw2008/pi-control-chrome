@@ -23,6 +23,7 @@ it('resolveConfig rejects non-loopback Bridge hosts and accepts defaults', () =>
   expect(defaults.bridgeHost).toBe('127.0.0.1')
   expect(defaults.bridgePort).toBe(17318)
   expect(defaults.autoStartBridge).toBe(true)
+  expect(defaults.lazyTools).toBe(true)
   expect(() => resolveConfig({ bridgeHost: '192.0.2.10' })).toThrow(/must be loopback/)
 })
 

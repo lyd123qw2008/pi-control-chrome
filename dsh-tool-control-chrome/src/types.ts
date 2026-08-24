@@ -12,6 +12,8 @@ export interface Config {
   tokenFile?: string
   /** Start the bundled Bridge when no healthy Bridge is running. Defaults to true. */
   autoStartBridge?: boolean
+  /** Register browser tools only after the pi-control-chrome Skill loads. Defaults to true. */
+  lazyTools?: boolean
   /** Per-request Bridge timeout in milliseconds. Defaults to 120000. */
   requestTimeoutMs?: number
   /** Optional local Bridge script override for development and tests. */
@@ -25,6 +27,7 @@ export interface ResolvedConfig {
   readonly tokenFile: string
   readonly autoStartBridge: boolean
   readonly requestTimeoutMs: number
+  readonly lazyTools: boolean
   readonly bridgeScript?: string
 }
 

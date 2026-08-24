@@ -15,7 +15,8 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Cleans up temporary Agent tabs at the end of a session while preserving user and handoff tabs.
 - Provides DOM, accessibility, locator, coordinate, and native CDP controls.
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text.
-- Includes a reusable `pi-control-chrome` Skill and a fast CLI for common browser workflows.
+- Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
+- Includes a reusable `pi-control-chrome` Skill. Browser tool schemas are hidden until that Skill is explicitly loaded for the current session; the bundled CLI remains available for explicit human/developer workflows and tests.
 
 ## Architecture
 
@@ -57,7 +58,7 @@ The package registers the Pi extension and the bundled Skill through its `packag
 
 This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, merge the `insert` entry from its `config/cordis.patch.yml.example` into the existing `cordis.patch.yml`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
-The DSH package reuses this project's Bridge and Manifest V3 extension. It registers the model-facing `browser_*` tools and the human `/chrome status|doctor|restart|tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 38 existing `browser_*` tools are registered in that Agent session. Set `lazyTools: false` for legacy eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides the human-only `/chrome status|doctor|restart|tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
 
 ## Load the browser extension
 
@@ -80,7 +81,7 @@ The extension is shared by Chrome and Edge and uses Chromium Manifest V3 capabil
 
 ## Skill CLI
 
-The bundled Skill provides a fast CLI for common workflows without generating temporary Bridge code:
+The bundled scripts are for explicit human/developer workflows and automated tests. They connect to the Bridge directly and must not be invoked by a model shell as a substitute for the Skill-gated native tools:
 
 ```powershell
 node skills/pi-control-chrome/scripts/browser.mjs status
@@ -97,7 +98,7 @@ PI_CONTROL_CHROME_BRIDGE_HOST
 PI_CONTROL_CHROME_BRIDGE_PORT
 ```
 
-Use the `browser_*` Pi tools for complex interactions, locators, CUA, CDP, dialogs, uploads, downloads, and other page-specific controls.
+Use the native `browser_*` Pi or DSH tools for model browser work. They preserve the current Agent session, target identity, and tab ownership protections.
 
 ## Development and tests
 
@@ -143,6 +144,7 @@ This uses an isolated temporary browser profile and does not touch the normal us
 - [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md) — project decisions.
 - [`skills/pi-control-chrome/SKILL.md`](./skills/pi-control-chrome/SKILL.md) — bundled Pi Skill.
 - [`CHANGELOG.md`](./CHANGELOG.md) — release history.
+- [`BROWSER-ACTIVATION-DESIGN.zh-CN.md`](./BROWSER-ACTIVATION-DESIGN.zh-CN.md) — browser capability activation and on-demand Skill proposal.
 
 ## Current future scope
 
