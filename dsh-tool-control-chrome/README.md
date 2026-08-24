@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.3.8
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.3.9
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.7"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.9"
   }
 }
 ```
@@ -69,12 +69,14 @@ The plugin registers the DSH `/chrome` command independently from its model-faci
 
 ```text
 /chrome status
+/chrome connect
+/chrome disconnect
 /chrome doctor
 /chrome restart
 /chrome tabs
 ```
 
-`/chrome restart` is a human command and can restart a compatible Bridge started by either DSH or Pi. Model-facing `browser_*` tools do not expose Bridge lifecycle control. The command preserves browser tabs and returns an error for a legacy Bridge without `capabilities.localUserRestart: true`.
+`/chrome connect` starts or reuses the local Bridge, establishes the current DSH client connection, waits for the browser extension, and reports the final status without restarting a healthy Bridge. `/chrome disconnect` closes only the current DSH client connection; it leaves the shared Bridge and browser extension available for a later `/chrome connect`. `/chrome restart` explicitly restarts a compatible Bridge and waits for the browser extension to reconnect before returning. These commands preserve browser tabs and return an error for a legacy Bridge without `capabilities.localUserRestart: true` when a restart is requested.
 
 ## Model-facing cost
 

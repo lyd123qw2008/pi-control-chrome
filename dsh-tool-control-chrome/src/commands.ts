@@ -16,7 +16,113 @@ function sessionId(invocation: CommandInvocation): string {
 function usage(): CommandResult {
   return {
     kind: 'error',
-    text: 'Usage: /chrome status|doctor|restart|tabs',
+    text: 'Usage: /chrome status|connect|disconnect|doctor|restart|tabs',
+  }
+}
+
+const EXTENSION_READY_ATTEMPTS = 40
+const EXTENSION_READY_DELAY_MS = 150
+
+function extensionConnected(health: Record<string, unknown>): boolean {
+  return health.extensionConnected === true
+}
+
+async function waitForExtension(
+  bridge: BrowserBridgeClient,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  let lastHealth: Record<string, unknown> | undefined
+  let lastError: unknown
+  for (let attempt = 0; attempt < EXTENSION_READY_ATTEMPTS; attempt += 1) {
+    signal.throwIfAborted()
+    try {
+      lastHealth = await bridge.health()
+      if (extensionConnected(lastHealth)) return lastHealth
+    } catch (error) {
+      lastError = error
+    }
+    if (attempt + 1 < EXTENSION_READY_ATTEMPTS) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => {
+          clearTimeout(timer)
+          reject(new Error('Chrome Bridge connection was cancelled.'))
+        }
+        const timer = setTimeout(() => {
+          signal.removeEventListener('abort', onAbort)
+          resolve()
+        }, EXTENSION_READY_DELAY_MS)
+        signal.addEventListener('abort', onAbort, { once: true })
+        timer.unref?.()
+      })
+    }
+  }
+  if (lastHealth !== undefined) return lastHealth
+  throw lastError instanceof Error ? lastError : new Error('Chrome Bridge health was unavailable.')
+}
+
+function extensionOffline(bridgeHealth: Record<string, unknown>): CommandResult {
+  return {
+    kind: 'error',
+    text: render({
+      ok: false,
+      error: 'Chrome/Edge extension is not connected.',
+      bridgeHealth,
+      recommendation: 'Reload the unpacked extension or run /chrome restart.',
+    }),
+  }
+}
+
+async function browserStatus(
+  bridge: BrowserBridgeClient,
+  invocation: CommandInvocation,
+): Promise<CommandResult> {
+  await bridge.start()
+  const bridgeHealth = await bridge.health()
+  if (!extensionConnected(bridgeHealth)) {
+    return {
+      kind: 'success',
+      text: render({ status: { connected: false }, bridgeHealth }),
+    }
+  }
+  const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+  return {
+    kind: 'success',
+    text: render({
+      ...(typeof status === 'object' && status !== null ? status : { status }),
+      bridgeHealth: await bridge.health(),
+    }),
+  }
+}
+
+async function connectBrowser(
+  bridge: BrowserBridgeClient,
+  invocation: CommandInvocation,
+): Promise<CommandResult> {
+  await bridge.start()
+  const bridgeHealth = await waitForExtension(bridge, invocation.signal)
+  if (!extensionConnected(bridgeHealth)) return extensionOffline(bridgeHealth)
+  const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+  return {
+    kind: 'success',
+    text: render({
+      connected: true,
+      status,
+      bridgeHealth: await bridge.health(),
+    }),
+  }
+}
+
+async function restartBrowser(
+  bridge: BrowserBridgeClient,
+  invocation: CommandInvocation,
+): Promise<CommandResult> {
+  const result = await bridge.restart()
+  const bridgeHealth = await waitForExtension(bridge, invocation.signal)
+  if (!extensionConnected(bridgeHealth)) return extensionOffline({ ...bridgeHealth, restart: result })
+  const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+  return {
+    kind: 'success',
+    text: render({ ...result, connected: true, status, bridgeHealth: await bridge.health() }),
   }
 }
 
@@ -24,21 +130,24 @@ function usage(): CommandResult {
 export function registerChromeCommand(ctx: Context, bridge: BrowserBridgeClient): void {
   ctx.commands.register({
     name: 'chrome',
-    description: 'Inspect or restart the local Chrome/Edge Bridge.',
-    input: { hint: 'status|doctor|restart|tabs' },
+    description: 'Connect, inspect, or restart the local Chrome/Edge Bridge.',
+    input: { hint: 'status|connect|disconnect|doctor|restart|tabs' },
     handler: async invocation => {
       const parts = invocation.rawInput.trim().split(/\s+/u).filter(Boolean)
       const action = parts[0] ?? 'status'
       if (parts.length > 1) return usage()
       try {
-        if (action === 'status') {
-          const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
-          const bridgeHealth = await bridge.health()
-          return { kind: 'success', text: render({ ...(typeof status === 'object' && status !== null ? status : { status }), bridgeHealth }) }
+        if (action === 'status') return browserStatus(bridge, invocation)
+        if (action === 'connect') return connectBrowser(bridge, invocation)
+        if (action === 'disconnect') {
+          await bridge.stop()
+          return { kind: 'success', text: render({ ok: true, disconnected: true, bridge: 'left running for later /chrome connect' }) }
         }
         if (action === 'doctor') {
           const bridgeHealth = await bridge.health()
-          const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+          const status = bridgeHealth.extensionConnected === true
+            ? await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+            : { connected: false }
           return {
             kind: 'success',
             text: render({
@@ -54,8 +163,7 @@ export function registerChromeCommand(ctx: Context, bridge: BrowserBridgeClient)
         }
         if (action === 'restart') {
           if (invocation.signal.aborted) return { kind: 'error', text: 'Chrome Bridge restart was cancelled.' }
-          const result = await bridge.restart()
-          return { kind: 'success', text: render(result) }
+          return restartBrowser(bridge, invocation)
         }
         return usage()
       } catch (error) {

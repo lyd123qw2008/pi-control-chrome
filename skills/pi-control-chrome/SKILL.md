@@ -10,7 +10,7 @@ Use this Skill only when the user explicitly asks to use the existing Chrome or 
 
 ## Connection Check
 
-After this Skill has loaded and the `browser_*` tools are visible, start with `browser_status`. `/chrome status` and `/chrome connect` are explicit human diagnostics; do not use them as a substitute for loading this Skill or as a reason to start browser control for an ordinary task.
+After this Skill has loaded and the `browser_*` tools are visible, start with `browser_status`. `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are explicit human diagnostics or lifecycle commands; do not use them as a substitute for loading this Skill or as a reason to start browser control for an ordinary task.
 
 The expected healthy state is:
 
@@ -160,7 +160,7 @@ Never include the pairing token, cookies, passwords, access tokens, or unrelated
 
 The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
 
-`/chrome status`, `/chrome doctor`, and `/chrome tabs` remain explicit human diagnostics and do not activate model browser tools.
+`/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` remain explicit human diagnostics or lifecycle commands and do not activate model browser tools.
 
 ## Tool Selection
 
