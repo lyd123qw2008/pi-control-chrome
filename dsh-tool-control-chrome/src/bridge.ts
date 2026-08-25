@@ -13,6 +13,7 @@ import { bridgeRecovery } from './diagnostics.js'
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 17318
 const DEFAULT_TIMEOUT_MS = 120_000
+const DEFAULT_EXTENSION_READY_TIMEOUT_MS = 6_000
 const DEFAULT_TOKEN_FILE = join(homedir(), '.pi', 'agent', 'pi-control-chrome.token')
 const BRIDGE_WAIT_ATTEMPTS = 30
 const BRIDGE_WAIT_DELAY_MS = 100
@@ -38,6 +39,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
   const bridgeHost = config.bridgeHost ?? DEFAULT_HOST
   const bridgePort = config.bridgePort ?? DEFAULT_PORT
   const requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS
+  const extensionReadyTimeoutMs = config.extensionReadyTimeoutMs ?? DEFAULT_EXTENSION_READY_TIMEOUT_MS
   if (!LOOPBACK_HOSTS.has(bridgeHost)) throw new Error(`control-chrome bridgeHost must be loopback: ${bridgeHost}`)
   if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65_535) {
     throw new Error(`control-chrome bridgePort must be an integer from 1 to 65535: ${bridgePort}`)
@@ -45,12 +47,16 @@ export function resolveConfig(config: Config): ResolvedConfig {
   if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
     throw new Error(`control-chrome requestTimeoutMs must be positive: ${requestTimeoutMs}`)
   }
+  if (!Number.isFinite(extensionReadyTimeoutMs) || extensionReadyTimeoutMs < 0) {
+    throw new Error(`control-chrome extensionReadyTimeoutMs must be a non-negative finite number: ${extensionReadyTimeoutMs}`)
+  }
   return {
     bridgeHost,
     bridgePort,
     tokenFile: config.tokenFile ?? DEFAULT_TOKEN_FILE,
     autoStartBridge: config.autoStartBridge ?? true,
     requestTimeoutMs,
+    extensionReadyTimeoutMs,
     lazyTools: config.lazyTools ?? true,
     ...(config.bridgeScript === undefined ? {} : { bridgeScript: config.bridgeScript }),
   }

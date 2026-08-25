@@ -589,6 +589,35 @@ function bridgeErrorCode(error: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined
 }
 
+const EXTENSION_READY_INTERVAL_MS = 150
+
+async function waitForExtension(
+  bridge: BrowserBridgeClient,
+  initialHealth: Record<string, unknown>,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  let health = initialHealth
+  const attempts = Math.ceil(timeoutMs / EXTENSION_READY_INTERVAL_MS)
+  for (let attempt = 0; health.extensionConnected !== true && attempt < attempts; attempt += 1) {
+    signal.throwIfAborted()
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer)
+        reject(new Error('Waiting for the browser extension was cancelled.'))
+      }
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, EXTENSION_READY_INTERVAL_MS)
+      signal.addEventListener('abort', onAbort, { once: true })
+      timer.unref?.()
+    })
+    health = await bridge.health()
+  }
+  return health
+}
+
 type BrowserConnection =
   | { readonly state: 'connected'; readonly status: unknown; readonly bridgeHealth: Record<string, unknown> }
   | { readonly state: 'bridge_only'; readonly bridgeHealth: Record<string, unknown>; readonly error?: unknown }
@@ -598,6 +627,7 @@ async function readBrowserConnection(
   bridge: BrowserBridgeClient,
   sessionId: string,
   signal: AbortSignal,
+  extensionReadyTimeoutMs: number,
 ): Promise<BrowserConnection> {
   try {
     await bridge.start()
@@ -608,6 +638,12 @@ async function readBrowserConnection(
   try {
     bridgeHealth = await bridge.health()
   } catch (error) {
+    return { state: 'bridge_offline', error }
+  }
+  try {
+    bridgeHealth = await waitForExtension(bridge, bridgeHealth, signal, extensionReadyTimeoutMs)
+  } catch (error) {
+    if (signal.aborted) throw error
     return { state: 'bridge_offline', error }
   }
   if (bridgeHealth.extensionConnected !== true) return { state: 'bridge_only', bridgeHealth }
@@ -630,11 +666,13 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
       connected: false,
       state: connection.state,
       completed: false,
-      nextAction: '/chrome connect',
-      recommendation: 'run_chrome_connect',
+      retryable: true,
+      userActionRequired: false,
+      nextAction: 'browser_status',
+      recommendation: 'retry_browser_status',
       error: {
         code: 'extension_not_connected',
-        message: 'Chrome/Edge extension is not connected. No browser action was sent.',
+        message: 'The browser extension is still reconnecting after the automatic wait. No browser action was sent; retry browser_status before asking the user to connect it.',
       },
       bridgeHealth: connection.bridgeHealth,
       recovery: bridgeRecovery(connection.bridgeHealth),
@@ -706,9 +744,10 @@ async function browserStatus(
   tracker: BrowserTargetTracker,
   sessionId: string,
   signal: AbortSignal,
+  extensionReadyTimeoutMs: number,
   acknowledgeBrowserId?: string,
 ): Promise<JsonValue> {
-  const connection = await readBrowserConnection(bridge, sessionId, signal)
+  const connection = await readBrowserConnection(bridge, sessionId, signal, extensionReadyTimeoutMs)
   if (connection.state !== 'connected') return connectionResult(connection)
   const targetStability = tracker.observe(connection.status, acknowledgeBrowserId)
   const base = isRecord(connection.status) ? connection.status : { result: connection.status }
@@ -907,9 +946,9 @@ export function registerBrowserTools(
       if (spec.name === 'browser_doctor') return browserDoctor(bridge, tracker, sessionId, exec.signal)
       if (spec.name === 'browser_status') {
         const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
-        return browserStatus(bridge, tracker, sessionId, exec.signal, acknowledgeBrowserId)
+        return browserStatus(bridge, tracker, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId)
       }
-      const connection = await readBrowserConnection(bridge, sessionId, exec.signal)
+      const connection = await readBrowserConnection(bridge, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs)
       if (connection.state !== 'connected') return connectionResult(connection)
       const target = await assertStableBrowserTarget(bridge, tracker, connection)
       params = { ...params, expectedBrowserId: target.browserId }

@@ -16,6 +16,8 @@ export interface Config {
   lazyTools?: boolean
   /** Per-request Bridge timeout in milliseconds. Defaults to 120000. */
   requestTimeoutMs?: number
+  /** Time to wait for the extension's background reconnect before reporting a disconnected state. Defaults to 6000. */
+  extensionReadyTimeoutMs?: number
   /** Optional local Bridge script override for development and tests. */
   bridgeScript?: string
 }
@@ -27,6 +29,7 @@ export interface ResolvedConfig {
   readonly tokenFile: string
   readonly autoStartBridge: boolean
   readonly requestTimeoutMs: number
+  readonly extensionReadyTimeoutMs: number
   readonly lazyTools: boolean
   readonly bridgeScript?: string
 }
