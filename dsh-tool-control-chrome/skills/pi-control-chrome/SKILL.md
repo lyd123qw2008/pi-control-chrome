@@ -11,7 +11,7 @@ Use this Skill only when the user explicitly asks to use the existing Chrome or 
 
 Do not activate browser tools merely because browser control might help. For ordinary public research, prefer web_search or another lightweight web capability.
 
-After this Skill loads successfully, the pi-control-chrome plugin makes the browser_* tools available for the current Agent session. Start with browser_status, then browser_tabs or browser_selected, then browser_snapshot before acting. Re-snapshot after navigation or page changes.
+After this Skill loads successfully, the pi-control-chrome plugin makes the browser_* tools available for the current Agent session. Start with browser_status, then browser_tabs or browser_selected, then browser_snapshot before acting. Re-snapshot after navigation or page changes. If browser_status returns `state: "bridge_only"` or `state: "bridge_offline"`, do not call a browser operation; tell the user to run `/chrome connect`, then call browser_status again after the connection is restored. browser_status observes the extension's background reconnect and does not reload the extension or retry a browser operation.
 
 Keep the existing browser target and browserId stable. Stop if the target changes, and ask the user which browser should remain connected. Never close, navigate, move or claim a user tab unless the task requires it. Preserve handoff and deliverable tabs. Do not expose passwords, cookies, access tokens or unrelated page data.
 
