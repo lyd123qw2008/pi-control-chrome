@@ -66,12 +66,12 @@ Pi · <当前任务名>
 
 完全按 Codex 默认语义：
 
-- Agent 创建的普通标签页：当前 turn 结束时关闭；
+- Agent 创建的普通标签页：任务完成和普通 turn 结束时保留；只有用户明确要求 `browser_cleanup` 或 Agent disposal 时才按 ownership 关闭；
 - `markDeliverable`：保留；
 - `markHandoff`：保留，等待用户接管；
-- 用户标签页 claim 后：当前 turn 结束时 release，不关闭；
+- 用户标签页 claim 后：任务完成和普通 turn 结束时保持 claim；只有用户明确要求 task finalize 或 Agent disposal 时 release，不关闭；
 - 用户标签页原有窗口和分组不改变；
-- cleanup 只操作当前 Agent session 创建的页面；
+- cleanup 只操作当前 Agent session 创建的页面；任务完成和普通 turn 不触发 cleanup，只有用户明确要求时 `browser_cleanup` 才执行，并保留工具和 Bridge；
 - 不能关闭其他 Pi session 或用户页面。
 
 ## 5. 页面控制范围
@@ -185,7 +185,7 @@ browser_cleanup
 9. 新建标签页和 Pi 分组；
 10. Navigate、Click、Fill、Screenshot；
 11. 基础 CDP evaluate；
-12. turn/session 清理。
+12. 显式 task finalize、context reset 和 session disposal。
 
 ### 阶段 2：Codex 核心能力
 
@@ -222,7 +222,7 @@ browser_cleanup
 5. Pi 打开新标签页并放入 `Pi` 分组；
 6. Pi 完成 navigate、click、fill、screenshot；
 7. Pi 执行原生 `Runtime.evaluate`；
-8. 普通 Agent 标签页在 turn 结束时自动关闭；
+8. 任务完成和普通 turn 结束不关闭 Agent 标签页；用户明确要求 task finalize 时才关闭允许关闭的临时页，Agent disposal 执行最终兜底；
 9. handoff/deliverable 页面保留；
 10. 用户标签页 release 且不关闭；
 11. Pi 重启后自动恢复连接；

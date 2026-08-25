@@ -358,9 +358,15 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_cleanup',
-    description: 'Close temporary Agent-owned tabs for the current session and preserve handoff and deliverable tabs.',
+    description: 'Only after the user explicitly asks for browser cleanup: close allowed Agent tabs and release claims while keeping browser tools and the Bridge active.',
     parameters: EMPTY_PARAMETERS,
     method: 'cleanup',
+  },
+  {
+    name: 'browser_context_reset',
+    description: 'Only after the user explicitly asks to reset or clear browser context: finalize resources and deactivate lazy browser tools without stopping the shared Bridge.',
+    parameters: EMPTY_PARAMETERS,
+    method: 'context_reset',
   },
 ]
 
@@ -879,7 +885,7 @@ type BrowserActivation = {
   cleanupRequired: boolean
 }
 
-type CleanupMode = 'turn' | 'task' | 'disposal'
+type CleanupMode = 'task' | 'context' | 'disposal'
 type CleanupOutcome =
   | { readonly ok: true; readonly value: unknown }
   | { readonly ok: false; readonly error: unknown }
@@ -911,8 +917,9 @@ export function registerBrowserTools(
   resolveSettings: () => ResolvedConfig,
 ): () => Promise<void> {
   type AgentSession = Agent['session']
-  type PendingTaskCleanup = {
+  type PendingCleanup = {
     readonly session: AgentSession
+    readonly mode: 'task' | 'context'
     readonly activation: BrowserActivation | undefined
     readonly generation: number
   }
@@ -929,7 +936,7 @@ export function registerBrowserTools(
   const recoveryRecords = new Map<string, { readonly owner: AgentSession; readonly promise: Promise<{ readonly ok: boolean }> }>()
   const operationLeases = new Set<Promise<void>>()
   const wireBarriers = new Map<string, Promise<void>>()
-  const pendingTaskCleanups = new WeakMap<Readonly<ToolExecution>, PendingTaskCleanup>()
+  const pendingCleanups = new WeakMap<Readonly<ToolExecution>, PendingCleanup>()
   const lazyTools = resolveSettings().lazyTools
   let closed = false
   let disposePromise: Promise<void> | undefined
@@ -942,13 +949,13 @@ export function registerBrowserTools(
     trackers.set(session, created)
     return created
   }
-  const hasTurnUsage = (session: AgentSession): boolean => {
+  const hasUsage = (session: AgentSession): boolean => {
     const activation = activations.get(session)
     return activation?.usedBrowser === true || usedSessions.has(session) || cleanupFailures.has(session)
   }
   const hasBrowserUsage = (session: AgentSession): boolean => {
     const activation = activations.get(session)
-    return hasTurnUsage(session)
+    return hasUsage(session)
       || activation?.cleanupRequired === true
       || cleanupRequiredSessions.has(session)
   }
@@ -969,16 +976,7 @@ export function registerBrowserTools(
       cleanupRequiredSessions.add(session)
     }
   }
-  const markTurnCleaned = (session: AgentSession): void => {
-    const activation = activations.get(session)
-    if (activation !== undefined) {
-      activation.usedBrowser = false
-      activation.cleanupRequired = true
-    }
-    usedSessions.delete(session)
-    cleanupRequiredSessions.add(session)
-    cleanupFailures.delete(session)
-  }
+
   const clearRecovery = (session: AgentSession): void => {
     const record = recoveryRecords.get(sessionId(session))
     if (record?.owner === session) recoveryRecords.delete(sessionId(session))
@@ -1039,12 +1037,26 @@ export function registerBrowserTools(
     if (retirement !== undefined) await raceAbort(retirement, signal)
     await waitForRecovery(session, signal)
   }
-  const acquireOperation = (): (() => void) => {
+  const operationTails = new Map<AgentSession, Promise<void>>()
+  const acquireOperation = async (session: AgentSession, signal?: AbortSignal): Promise<() => void> => {
+    const previous = operationTails.get(session)
     let release!: () => void
-    const lease = new Promise<void>(resolve => { release = resolve })
-    operationLeases.add(lease)
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const tail = (previous ?? Promise.resolve()).then(() => gate)
+    operationTails.set(session, tail)
+    operationLeases.add(tail)
+    try {
+      await raceAbort(previous ?? Promise.resolve(), signal)
+    } catch (error) {
+      release()
+      if (operationTails.get(session) === tail) operationTails.delete(session)
+      operationLeases.delete(tail)
+      throw error
+    }
     return () => {
-      if (operationLeases.delete(lease)) release()
+      release()
+      if (operationTails.get(session) === tail) operationTails.delete(session)
+      operationLeases.delete(tail)
     }
   }
   const waitForWireBarrier = async (session: AgentSession, signal?: AbortSignal): Promise<void> => {
@@ -1078,17 +1090,17 @@ export function registerBrowserTools(
     const run = (async (): Promise<CleanupOutcome> => {
       try {
         if (previous !== undefined) await raceAbort(previous, signal)
-        const needsCleanup = mode === 'turn' ? hasTurnUsage(session) : hasBrowserUsage(session)
+        const needsCleanup = hasBrowserUsage(session)
         if (!needsCleanup) {
-          if (mode === 'disposal') deactivate(session)
+          if (mode === 'context' || mode === 'disposal') {
+            resetSessionUsage(session)
+            clearRecovery(session)
+            deactivate(session)
+          }
           return { ok: true, value: { removed: [], released: [] } }
         }
-        const params = mode === 'turn'
-          ? { sessionId: sessionId(session), detachDevtools: false }
-          : { sessionId: sessionId(session) }
-        const value = await requestCleanup(session, params, signal)
-        if (mode === 'turn') markTurnCleaned(session)
-        if (mode === 'disposal') {
+        const value = await requestCleanup(session, { sessionId: sessionId(session) }, signal)
+        if (mode === 'context' || mode === 'disposal') {
           resetSessionUsage(session)
           clearRecovery(session)
           deactivate(session)
@@ -1122,6 +1134,8 @@ export function registerBrowserTools(
   }
   const disposeAgent = async (session: AgentSession): Promise<boolean> => {
     try {
+      const operation = operationTails.get(session)
+      if (operation !== undefined) await operation
       const result = await cleanupSession(session, 'disposal')
       if (!result.ok) {
         deactivate(session)
@@ -1199,7 +1213,7 @@ export function registerBrowserTools(
       const sessionId = requireAgentSession(exec)
       const session = requireAgent(exec).session
       if (closed) throw inactiveBrowserError()
-      const releaseOperation = acquireOperation()
+      const releaseOperation = await acquireOperation(session, exec.signal)
       try {
         await waitForRetirement(session, exec.signal)
         if (retiredSessions.has(session)) throw inactiveBrowserError()
@@ -1208,13 +1222,11 @@ export function registerBrowserTools(
         await waitForWireBarrier(session, exec.signal)
         let params = { ...args, sessionId } as Record<string, JsonValue>
         if (spec.prepare !== undefined) params = spec.prepare(params)
-        if (spec.name === 'browser_cleanup') {
-          const result = await cleanupSession(session, 'task', exec.signal)
-          if (!result.ok) {
-            if (bridgeErrorCode(result.error) === 'EXTENSION_OFFLINE') return await operationDisconnectedResult(bridge)
-            throw result.error
-          }
-          pendingTaskCleanups.set(exec, { session, activation, generation: generationFor(session) })
+        if (spec.name === 'browser_cleanup' || spec.name === 'browser_context_reset') {
+          const mode = spec.name === 'browser_context_reset' ? 'context' : 'task'
+          const result = await cleanupSession(session, mode, exec.signal)
+          if (!result.ok) throw result.error
+          pendingCleanups.set(exec, { session, mode, activation, generation: generationFor(session) })
           return asJsonValue(result.value)
         }
         markBrowserUsed(session)
@@ -1290,15 +1302,15 @@ export function registerBrowserTools(
     }, 'control-chrome: register browser tools')
   }
   ctx.on('tools/result', (exec, result) => {
-    const pending = pendingTaskCleanups.get(exec)
+    const pending = pendingCleanups.get(exec)
     if (pending !== undefined) {
-      pendingTaskCleanups.delete(exec)
+      pendingCleanups.delete(exec)
       if (!result.isError) queueMicrotask(() => {
         if (generationFor(pending.session) !== pending.generation) return
         if (lazyTools && activations.get(pending.session) !== pending.activation) return
         resetSessionUsage(pending.session)
         clearRecovery(pending.session)
-        if (lazyTools && activations.get(pending.session) === pending.activation && !hasBrowserUsage(pending.session)) {
+        if (pending.mode === 'context' && lazyTools && activations.get(pending.session) === pending.activation && !hasBrowserUsage(pending.session)) {
           deactivate(pending.session)
         }
       })
@@ -1306,10 +1318,7 @@ export function registerBrowserTools(
     if (!lazyTools || result.isError || exec.name !== 'skill' || exec.agent === undefined) return
     if (isBrowserSkillArguments(exec.arguments)) activate(exec.agent)
   })
-  ctx.on('session/event', (session, event) => {
-    if (event.type !== 'turn/end' || closed || retiredSessions.has(session) || !hasTurnUsage(session)) return
-    void cleanupSession(session, 'turn').catch(() => undefined)
-  })
+
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     if (retiredSessions.has(agent.session)) throw inactiveBrowserError()
     const pending = cleanupFlights.get(agent.session)

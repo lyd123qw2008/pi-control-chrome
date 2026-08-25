@@ -258,6 +258,32 @@ class BridgeClient {
 
 const bridge = new BridgeClient();
 
+const pendingCleanupSessionIds = new Set<string>();
+const cleanupFlights = new Map<string, Promise<unknown>>();
+
+async function requestCleanup(session: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  const existing = cleanupFlights.get(session);
+  if (existing !== undefined) return existing;
+  const run = (async () => {
+    try {
+      const value = await bridge.request("cleanup", { ...params, sessionId: session });
+      pendingCleanupSessionIds.delete(session);
+      return value;
+    } catch (error) {
+      pendingCleanupSessionIds.add(session);
+      throw error;
+    } finally {
+      if (cleanupFlights.get(session) === run) cleanupFlights.delete(session);
+    }
+  })();
+  cleanupFlights.set(session, run);
+  return run;
+}
+
+async function retryPendingCleanups(): Promise<void> {
+  await Promise.allSettled([...pendingCleanupSessionIds].map(session => requestCleanup(session)));
+}
+
 function textResult(value: unknown, details?: unknown) {
   return {
     content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
@@ -276,14 +302,15 @@ async function call(method: string, params: Record<string, unknown> = {}, option
   if (!options.allowInactive && !browserToolsActive) {
     throw new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control");
   }
-  if (paused && !["status", "list_tabs", "selected_tab", "cleanup"].includes(method)) {
+  if (paused && !["status", "list_tabs", "selected_tab", "cleanup", "context_reset"].includes(method)) {
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
+  if (method === "context_reset") return call("cleanup", params, options);
   if (method === "cleanup") {
     if (!bridgeUsed && !browserActivation.cleanupRequired) return { removed: [], released: [] };
     bridgeUsed = true;
     browserActivation.markUsed();
-    return bridge.request(method, { ...params, sessionId });
+    return requestCleanup(sessionId, params);
   }
   if (method === "status") {
     const { acknowledgeBrowserId, ...statusParams } = params;
@@ -308,6 +335,7 @@ async function call(method: string, params: Record<string, unknown> = {}, option
 
 function registerBrowserTools(pi: ExtensionAPI) {
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_doctor",
     label: "Browser Doctor",
     description: "Diagnose the local Bridge, extension connection, active browser target and Chrome/Edge competition without changing tabs.",
@@ -318,6 +346,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_status",
     label: "Browser Status",
     description: "Return the connected Chrome/Edge browser, target stability and Pi bridge status.",
@@ -328,6 +357,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_tabs",
     label: "Browser Tabs",
     description: "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state.",
@@ -338,6 +368,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_selected",
     label: "Selected Browser Tab",
     description: "Return the currently selected Chrome/Edge tab.",
@@ -348,6 +379,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_claim_tab",
     label: "Claim Browser Tab",
     description: "Claim an existing user tab using its current tab id and optional title/URL snapshot. Fails if the snapshot changed.",
@@ -363,6 +395,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_select_tab",
     label: "Select Browser Tab",
     description: "Select an existing browser tab by id, optionally focusing its window.",
@@ -373,6 +406,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_new_tab",
     label: "New Browser Tab",
     description: "Create an Agent-owned tab and place it in the Pi tab group.",
@@ -386,6 +420,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_snapshot",
     label: "Browser Snapshot",
     description: "Read the active page title, URL, visible text and interactive elements with stable eN refs.",
@@ -396,6 +431,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_extract",
     label: "Extract Browser Page",
     description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper.",
@@ -406,6 +442,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_accessibility_snapshot",
     label: "Browser Accessibility Snapshot",
     description: "Return the accessibility-oriented semantic tree included in the current page snapshot.",
@@ -419,6 +456,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_locator",
     label: "Browser Locator",
     description: "Playwright-style locator operations: css, role, text, label, placeholder and testid strategies plus count, first, last, nth, text, attributes and actions.",
@@ -455,6 +493,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_navigate",
     label: "Navigate Browser",
     description: "Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete.",
@@ -465,6 +504,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_wait",
     label: "Wait for Browser Page",
     description: "Wait for a selected browser tab to finish loading or reach a URL/URL fragment.",
@@ -475,6 +515,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_click",
     label: "Click Browser Element",
     description: "Click an element by an eN ref from browser_snapshot or by CSS selector.",
@@ -485,6 +526,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_double_click",
     label: "Double Click Browser Element",
     description: "Double-click an element by an eN ref or CSS selector.",
@@ -495,6 +537,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_fill",
     label: "Fill Browser Field",
     description: "Fill an input, textarea or contenteditable element by eN ref or CSS selector.",
@@ -505,6 +548,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_type",
     label: "Type Browser Text",
     description: "Type or append text into a focused browser field.",
@@ -515,6 +559,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_press_key",
     label: "Press Browser Key",
     description: "Dispatch a keyboard key to an eN ref or CSS selector.",
@@ -525,6 +570,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_scroll",
     label: "Scroll Browser",
     description: "Scroll the selected page by a viewport delta.",
@@ -535,6 +581,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_dom_cua",
     label: "Browser DOM CUA",
     description: "Use visible DOM node ids for click, double-click, type, keypress and scroll operations.",
@@ -553,6 +600,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_cua",
     label: "Browser Coordinate CUA",
     description: "Use native CDP mouse and keyboard input at viewport coordinates, including click, move, scroll, drag, type and keypress.",
@@ -576,6 +624,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_screenshot",
     label: "Browser Screenshot",
     description: "Capture the selected browser tab and return it as an image.",
@@ -601,6 +650,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_console",
     label: "Browser Console",
     description: "Enable and read Runtime console and Log entries captured from a browser tab.",
@@ -614,6 +664,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_network",
     label: "Browser Network",
     description: "Enable and read Network request/response events and response bodies from a browser tab.",
@@ -628,6 +679,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_dialog",
     label: "Browser JavaScript Dialog",
     description: "Inspect and accept or dismiss alert, confirm and prompt dialogs using native CDP.",
@@ -638,6 +690,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_upload",
     label: "Browser File Upload",
     description: "Set local files on a page file input using native CDP DOM.setFileInputFiles in Trusted Local Mode.",
@@ -648,6 +701,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_clipboard",
     label: "Browser Clipboard",
     description: "Read or write plain text through the selected tab's browser clipboard.",
@@ -658,6 +712,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_download",
     label: "Browser Download",
     description: "Start, wait for, list, cancel or erase browser downloads and return their paths/status.",
@@ -668,6 +723,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_evaluate",
     label: "Evaluate Browser JavaScript",
     description: "Evaluate JavaScript in the selected page using the native CDP Runtime.evaluate path.",
@@ -678,6 +734,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_cdp",
     label: "Native Browser CDP",
     description: "Send a native Chrome DevTools Protocol command to the selected browser tab.",
@@ -693,6 +750,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     ["browser_reload", "reload", "Browser Reload", "Reload the selected browser tab."],
   ] as const) {
     pi.registerTool({
+      executionMode: "sequential",
       name,
       label,
       description,
@@ -704,6 +762,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_close_tab",
     label: "Close Browser Tab",
     description: "Close a specified browser tab. Agent-owned tabs must belong to the current session; unowned user tabs require userRequested: true.",
@@ -714,6 +773,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_release",
     label: "Release Browser Tab",
     description: "Release a claimed/Agent tab from the current Pi session without closing the page.",
@@ -724,9 +784,10 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_mark_handoff",
     label: "Keep Browser Handoff",
-    description: "Mark an Agent-owned tab to survive turn cleanup for manual user handoff.",
+    description: "Mark an Agent-owned tab to survive task finalize and Agent disposal for manual user handoff.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("mark_handoff", params)); } catch (error) { return errorResult(error); }
@@ -734,6 +795,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_mark_deliverable",
     label: "Keep Browser Deliverable",
     description: "Mark an Agent-owned tab to survive cleanup as a user-facing deliverable.",
@@ -744,12 +806,24 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    executionMode: "sequential",
     name: "browser_cleanup",
-    label: "Cleanup Agent Browser Tabs",
-    description: "Close temporary Agent-owned tabs for the current Pi session and preserve handoff/deliverable tabs.",
+    label: "Finalize Browser Task",
+    description: "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs and release claims while keeping browser tools and the Bridge active.",
     parameters: Type.Object({}),
     async execute() {
-      try { return textResult(await call("cleanup")); } catch (error) { return errorResult(error); }
+      return textResult(await call("cleanup"));
+    },
+  });
+
+  pi.registerTool({
+    executionMode: "sequential",
+    name: "browser_context_reset",
+    label: "Reset Browser Context",
+    description: "Only after the user explicitly asks to reset or clear browser context: finalize resources and hide browser tools without stopping the shared Bridge.",
+    parameters: Type.Object({}),
+    async execute() {
+      return textResult(await call("context_reset"));
     },
   });
 }
@@ -763,11 +837,18 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   const updateStatus = (ctx: ExtensionContext, text: string) => ctx.ui.setStatus("pi-control-chrome", text);
   const humanCall = (method: string, params: Record<string, unknown> = {}) => call(method, params, { allowInactive: true });
   const resetSession = async (ctx: ExtensionContext, status: string) => {
-    try {
-      if (bridgeUsed || browserActivation.cleanupRequired) await humanCall("cleanup");
-    } catch {
-      // Session teardown must continue when the Bridge is already offline.
+    const previousSessionId = sessionId;
+    const needsCleanup = bridgeUsed || browserActivation.cleanupRequired;
+    let cleanupSucceeded = !needsCleanup;
+    if (needsCleanup) {
+      try {
+        await requestCleanup(previousSessionId);
+      } catch {
+        cleanupSucceeded = false;
+      }
     }
+    await retryPendingCleanups();
+    if (pendingCleanupSessionIds.has(previousSessionId)) cleanupSucceeded = false;
     bridgeUsed = false;
     browserActivation.reset();
     acknowledgedTarget = undefined;
@@ -776,7 +857,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     sessionId = randomUUID();
     browserSkillPaths.clear();
     setBrowserTools(!LAZY_TOOLS);
-    updateStatus(ctx, status);
+    updateStatus(ctx, cleanupSucceeded ? status : status + "; browser cleanup pending");
   };
 
   const skillPrompt = /<skill\s+name=["']pi-control-chrome["'](?:\s|>)/u;
@@ -799,6 +880,11 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     }
     if (event.toolName === "browser_cleanup" && !event.isError) {
       bridgeUsed = false;
+      browserActivation.finalize();
+      return;
+    }
+    if (event.toolName === "browser_context_reset" && !event.isError) {
+      bridgeUsed = false;
       browserActivation.reset();
       setBrowserTools(browserActivation.active);
     }
@@ -819,6 +905,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         if (action === "connect") {
           paused = false;
           await bridge.start();
+          await retryPendingCleanups();
           const result = await humanCall("status");
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
@@ -834,9 +921,6 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         }
         if (action === "disconnect") {
           await bridge.stop();
-          bridgeUsed = false;
-          browserActivation.reset();
-          setBrowserTools(browserActivation.active);
           updateStatus(ctx, "chrome: disconnected");
           ctx.ui.notify("Pi browser bridge disconnected; the local Bridge remains available for a later /chrome connect.", "info");
           return;
@@ -861,8 +945,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         if (action === "cleanup") {
           ctx.ui.notify(JSON.stringify(await humanCall("cleanup")), "info");
           bridgeUsed = false;
-          browserActivation.reset();
-          setBrowserTools(browserActivation.active);
+          browserActivation.finalize();
           return;
         }
         if (action === "release" && rest[0]) {
@@ -908,16 +991,6 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   });
   pi.on("session_before_fork", async (_event, ctx) => {
     await resetSession(ctx, "chrome: session released");
-  });
-  pi.on("turn_end", async () => {
-    if (!bridgeUsed) return;
-    try {
-      await humanCall("cleanup", { detachDevtools: false });
-      bridgeUsed = false;
-      browserActivation.clearUsed();
-    } catch {
-      // A failed turn cleanup must not prevent the next model turn.
-    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {

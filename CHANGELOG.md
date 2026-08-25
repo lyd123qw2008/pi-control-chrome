@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- DSH browser cleanup commits tool deactivation only after the authoritative successful tool result, retains recovery state after final-result errors, serializes cleanup across reused session IDs, and drains active operations before plugin shutdown.
+- Browser lifecycle is now session-sticky: task completion and ordinary turn end retain browser state by default; only an explicit user request triggers `browser_cleanup`, which finalizes resources while keeping tools active. `browser_context_reset` explicitly deactivates the lazy catalog. Cleanup failures retain recovery state and browser operations serialize per session.
 
-- DSH browser tools now clean turn-owned browser resources at `turn/end` while retaining the active catalog for multi-turn browser tasks; successful `browser_cleanup` ends the task and removes lazy browser tools. Agent and plugin disposal provide final cleanup.
+- Agent and plugin disposal provide final cleanup for resources left after session-sticky browser tasks, while handoff and deliverable tabs remain protected by ownership rules.
 
 - DSH browser tools now wait up to six seconds for the extension's background reconnect before returning `bridge_only`; a timed-out readiness result directs the model to retry `browser_status` before requesting human connection.
 

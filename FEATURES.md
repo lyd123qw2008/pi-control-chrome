@@ -315,7 +315,7 @@
 - [ ] **P0** Pi claim 现有标签页，不移动它、不改变用户分组
 - [ ] **P0** Pi 打开一个新页面，自动放入 `Pi` 标签页分组
 - [ ] **P0** Pi 在新页面中完成 snapshot、click、fill、screenshot
-- [ ] **P0** Pi 结束后释放用户标签页，关闭 Agent 创建的临时页面
+- [ ] **P0** 用户明确要求清理后释放用户标签页，关闭允许关闭的 Agent 临时页面
 - [ ] **P0** 用户标记 handoff 的页面不被关闭
 - [ ] **P0** 用户标记 deliverable 的页面保留
 - [ ] **P0** Pi 直接执行一条原生 CDP `Runtime.evaluate`
@@ -337,7 +337,7 @@
 - **已决定**：Network、Console、Dialog、Upload、Download 和 Clipboard 按 Codex API 对齐。
 - **已决定**：Agent 页面默认进入 `Pi` 蓝色分组。
 - **已决定**：claim 后允许用户授权的页面继续导航、点击和输入；release 时不关闭。
-- **已决定**：普通 Agent 页面按 Codex 语义在 turn 结束时清理。
+- **已决定**：任务完成和普通 turn 结束默认保留浏览器状态；只有用户明确要求 task finalize 或 Agent disposal 才按 ownership 清理普通 Agent 页面，handoff/deliverable 页面保留。
 - **已决定**：`handoff` 和 `deliverable` 按 Codex 语义保留。
 - **已决定**：Chrome 和 Edge 第一版同时支持；多 Profile 排在后续阶段。
 - **已决定**：扩展安装/配对一次，后续不逐次授权。

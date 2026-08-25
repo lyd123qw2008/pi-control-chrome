@@ -1,10 +1,10 @@
 # 浏览器能力按 Skill 显式激活与任务清理方案
 
-本文档定义 Pi 和 DSH 浏览器工具的激活、普通 turn 清理、显式任务 cleanup、Agent disposal 和插件关闭语义。
+本文档定义 Pi 和 DSH 浏览器工具的激活、普通 turn checkpoint、显式任务 finalize、context reset、Agent disposal 和插件关闭语义。详细的 Codex 对齐实施方案见 [`docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md`](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md)。
 
 ## 1. 背景
 
-`pi-control-chrome` 和 `dsh-tool-control-chrome` 当前已经使用惰性 Bridge 连接，但插件加载时就注册完整的 `browser_*` 工具集合。Bridge 不一定立即连接，模型却已经能够看到 38 个浏览器工具，因此可能在用户没有明确要求浏览器时主动使用当前浏览器。
+`pi-control-chrome` 和 `dsh-tool-control-chrome` 使用惰性 Bridge 连接。Pi 扩展静态注册浏览器工具但默认从 active set 隐藏，DSH 默认 `lazyTools: true` 时只暴露 Skill 元数据；Skill 成功加载后才向当前 Agent 提供 39 个 `browser_*` 工具。Bridge 不一定立即连接，模型也不应在用户没有明确要求浏览器时主动使用当前浏览器。
 
 浏览器控制应当与普通搜索和普通推理区分开。它会访问用户当前 Chrome/Edge Profile、登录态、标签页和页面数据，也会带来较高的上下文和运行时成本。
 
@@ -36,9 +36,11 @@
     ↓
 同一个 Agent session 内连续复用浏览器能力
      ↓
-普通 turn 结束时清理临时资源并保留工具激活
+普通 turn 结束只做 checkpoint，不关闭 Tab、不 release claim、不停止 Bridge
      ↓
-显式 browser_cleanup 结束浏览器任务并注销工具
+用户明确要求 browser_cleanup finalize 任务资源并保留工具激活
+     ↓
+显式 browser_context_reset 才停用当前上下文工具
      ↓
 session 结束或 Agent disposal 时执行最终 cleanup
 ```
@@ -103,7 +105,7 @@ Skill 内容负责：
 第一阶段只实现一个 Skill gate：
 
 - Skill 未激活：隐藏完整浏览器工具集合；
-- Skill 已激活：动态开放当前完整的 38 个浏览器工具；
+- Skill 已激活：动态开放当前完整的 39 个浏览器工具，并在当前 Agent/session 后续 turn 保持激活；
 - 不在第一阶段增加 `browser_activate` 或 `browser_enable_advanced` 模型工具；
 - 不要求模型使用 CLI 替代原生工具。
 
@@ -162,15 +164,15 @@ Pi 的扩展也必须在执行层检查激活状态，避免旧工具快照、�
 
 ## 5. Session 生命周期
 
-激活状态绑定当前 Agent session，不绑定整个进程：
+激活状态绑定当前 Agent session，不绑定整个进程；task finalize 不会停用工具：
 
 ```text
 inactive
   ↓ Skill 成功加载
-active
-  ↓ 普通 turn 继续
-active
-  ↓ browser_cleanup / session 结束 / session 切换
+active-sticky
+  ↓ 普通 turn checkpoint / task finalize / Bridge reconnect
+active-sticky
+  ↓ browser_context_reset / session 结束 / session 切换 / Agent disposal
 inactive
 ```
 
@@ -182,16 +184,22 @@ inactive
 
 ### 普通 turn 结束
 
-- DSH 监听 `session/event` 的 `turn/end`，清理当前 Agent 的临时 Tab、claim 和可释放资源，但不注销 browser tools。
-- Pi 的 `turn_end` 执行同样的资源 cleanup，并保留 Skill 激活状态。
-- 普通 turn cleanup 使用 `detachDevtools: false` 保留短时复用的 debugger lease，并记录仍需最终 cleanup 的状态。
-- 显式 `browser_cleanup`、Agent disposal 或 session teardown 使用最终 cleanup 释放保留的 debugger lease。
+- DSH 和 Pi 只记录轻量 checkpoint，不关闭 Tab、不 release claim、不停止 Bridge、不清除上下文，也不注销 browser tools。
+- checkpoint 不产生模型可见的 cleanup 结果，不追加生命周期 transcript 噪音。
+- debugger lease 和 ownership 状态继续由任务级 finalize 或 Agent disposal 管理。
 
-### 显式 cleanup
+### 用户明确要求的 task finalize
 
+- 任务完成默认保留浏览器状态，不自动调用 `browser_cleanup`。
+- 只有用户明确要求关闭临时 Tab、释放 claim 或清理浏览器任务时，才调用 `browser_cleanup`。
 - `browser_cleanup` 完成当前 session 的 Tab cleanup 和 DevTools cleanup。
-- cleanup 成功后，当前 session 的浏览器工具注销或隐藏。
-- 下一次浏览器任务需要重新加载 Skill。
+- cleanup 成功后，当前 session 的浏览器工具和健康 Bridge 继续可用。
+- 下一次浏览器操作不需要重新加载 Skill。
+
+### 显式 context reset
+
+- `browser_context_reset` 先完成资源 finalize，再清除当前浏览器上下文并隐藏惰性 browser tools。
+- context reset 失败时保留 recovery state，不报告伪造成功，也不停止共享 Bridge。
 
 ### session 结束和 Agent disposal
 
@@ -219,7 +227,7 @@ tools/change
 下一次模型 assembly 出现 browser_* schema
 ```
 
-工具 disposer 保存到当前 Agent 的 activation record。激活失败时按逆序释放已经注册的工具，不留下部分工具集合。普通 `turn/end`、显式 `browser_cleanup`、Agent disposal 和插件关闭共享同一个按 session 隔离的幂等 cleanup finalizer；成功的显式 cleanup 会调用 disposers 并移除当前 Agent 的 browser tools，失败时保留可恢复状态。
+工具 disposer 保存到当前 Agent 的 activation record。激活失败时按逆序释放已经注册的工具，不留下部分工具集合。普通 `turn/end` 只做 checkpoint；`browser_cleanup` finalize 资源但保留当前 Agent 的 browser tools，`browser_context_reset`、Agent disposal 和插件关闭才调用 disposers。所有 cleanup 按 session 隔离、幂等、可重试，失败时保留可恢复状态。
 
 `lazyTools: false` 时直接使用原来的 global registration，确保旧 Profile 和调试流程可用。
 
@@ -229,9 +237,10 @@ Pi 使用 `pi.registerTool()` 配合 `pi.setActiveTools()`：
 
 - 工具定义可在扩展加载时注册；
 - 默认 active set 移除浏览器工具；
-- Skill 成功加载后恢复浏览器工具到 active set；
-- 普通 `turn_end` 清理资源但保留 active set；
-- 成功的 `browser_cleanup` 和 session 切换、fork、shutdown 隐藏浏览器工具；
+- Skill 成功加载后恢复浏览器工具到 active set，并跨 turn 保持；
+- 普通 `turn_end` 不执行破坏性 cleanup，只保留运行时 checkpoint；
+- 成功的 `browser_cleanup` 清理任务资源但保留 active set；
+- 成功的 `browser_context_reset`、session 切换、fork、shutdown 才隐藏浏览器工具；
 - 执行函数额外验证 session activation state，并记录仍需最终 cleanup 的资源状态。
 
 如果目标 Pi 版本支持工具 disposer，后续可以从 active set 隐藏升级为真正注销；当前实现优先使用官方动态 active-tool API，避免依赖未稳定的私有 registry。
@@ -281,8 +290,9 @@ control-chrome:
 - 错误的 Skill 名称和失败的 Skill result 不激活工具；
 - 其他 Agent session 看不到已激活 Agent 的工具；
 - 重复 Skill 加载不重复注册；
-- 普通 `turn/end` 清理资源但保留工具，并为最终 DevTools cleanup 保留状态；
-- 成功的 `browser_cleanup` 注销当前 Agent 工具；
+- 普通 `turn/end` 只做 checkpoint，不清理资源且保留工具；
+- 成功的 `browser_cleanup` 清理资源但保留当前 Agent 工具；
+- 成功的 `browser_context_reset` 清理资源并停用当前 Agent 工具；
 - cleanup 失败保留 recovery state，Agent disposal 和 plugin disposal 可重试；
 - Agent disposal 清理 activation record 并请求 Bridge cleanup；
 - `lazyTools: false` 保持完整工具集合；
@@ -294,8 +304,9 @@ control-chrome:
 - `before_agent_start` 发现 `pi-control-chrome` 后恢复浏览器工具；
 - 成功 Skill tool result 可以激活工具；
 - 普通搜索任务不会激活浏览器工具；
-- 普通 `turn_end` 清理资源但保留 active set，并保留最终 cleanup 状态；
-- 显式 `browser_cleanup`、session shutdown 和 switch 隐藏工具并执行最终 cleanup；
+- 普通 `turn_end` 只做 checkpoint 并保留 active set；
+- 显式 `browser_cleanup` 清理任务资源但保留 active set；
+- 显式 `browser_context_reset`、session shutdown 和 switch 隐藏工具并执行最终 cleanup；
 - Bridge 未激活前不会连接或请求浏览器状态；
 - 旧 tool snapshot 在执行层仍被 active gate 拒绝。
 
@@ -306,9 +317,9 @@ control-chrome:
 3. 明确要求“使用当前浏览器打开网页”，确认模型先加载 `pi-control-chrome` Skill。
 4. 确认 Skill 成功后下一轮才出现完整浏览器工具。
 5. 连续执行 snapshot、evaluate、screenshot，确认 Bridge 和 debugger lease 正常复用。
-6. 结束一个普通 turn，确认临时资源被清理但 browser tools 仍可用于下一轮。
-7. 执行显式 `browser_cleanup`，确认工具不可见、Tab ownership 和 DevTools 状态清理。
-8. 再次请求浏览器，确认重新加载 Skill 后工具恢复。
+6. 结束一个普通 turn，确认没有关闭或 release 资源，且 browser tools 仍可用于下一轮。
+7. 执行显式 `browser_cleanup`，确认任务资源按 ownership 清理、工具和 Bridge 仍可用。
+8. 执行显式 `browser_context_reset`，确认资源清理后工具隐藏；失败时确认 recovery state 保留。
 
 ## 10. 验证与发布
 

@@ -5,7 +5,7 @@ export const BROWSER_TOOL_NAMES = Object.freeze([
   'browser_snapshot', 'browser_extract', 'browser_accessibility_snapshot', 'browser_navigate', 'browser_wait', 'browser_back',
   'browser_forward', 'browser_reload', 'browser_click', 'browser_double_click', 'browser_fill', 'browser_type', 'browser_press_key',
   'browser_scroll', 'browser_screenshot', 'browser_close_tab', 'browser_release', 'browser_mark_handoff', 'browser_mark_deliverable',
-  'browser_cleanup', 'browser_locator', 'browser_dom_cua', 'browser_cua', 'browser_console', 'browser_network', 'browser_dialog',
+  'browser_cleanup', 'browser_context_reset', 'browser_locator', 'browser_dom_cua', 'browser_cua', 'browser_console', 'browser_network', 'browser_dialog',
   'browser_upload', 'browser_clipboard', 'browser_download', 'browser_evaluate', 'browser_cdp',
 ]);
 
@@ -42,6 +42,10 @@ export function createBrowserActivation(options = {}) {
     },
     clearUsed() {
       used = false;
+    },
+    finalize() {
+      used = false;
+      cleanupRequired = false;
     },
     reset() {
       active = !lazyTools;

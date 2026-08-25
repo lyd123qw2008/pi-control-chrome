@@ -12,7 +12,7 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Lets Pi inspect and claim explicitly selected existing tabs without moving them by default.
 - Places Agent-created tabs in a dedicated blue `Pi` tab group.
 - Tracks Agent ownership, sessions, `handoff`, and `deliverable` lifecycle states.
-- Cleans up temporary Agent tabs at the end of a session while preserving user and handoff tabs.
+- Keeps temporary Agent tabs across turns, then closes allowed temporary tabs only after explicit user-authorized task finalize or Agent disposal while preserving user, handoff, and deliverable tabs.
 - Provides DOM, accessibility, locator, coordinate, and native CDP controls.
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text.
 - Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
@@ -58,7 +58,7 @@ The package registers the Pi extension and the bundled Skill through its `packag
 
 This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, merge the `insert` entry from its `config/cordis.patch.yml.example` into the existing `cordis.patch.yml`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
-The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 38 existing `browser_*` tools are registered in that Agent. Ordinary turn cleanup releases browser resources without removing the tools, while successful `browser_cleanup` ends the browser task and removes the lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. The next browser task loads the Skill again. Set `lazyTools: false` for legacy eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 39 `browser_*` tools are registered in that Agent and remain active across turns in the current Agent session. Ordinary turn end and task completion retain browser state by default: they do not close or release tabs, disconnect the Bridge, remove tools, reload the Skill, or call cleanup. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it retains the lazy tools and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and deactivates lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. Set `lazyTools: false` for eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
 
 ## Load the browser extension
 
@@ -144,7 +144,8 @@ This uses an isolated temporary browser profile and does not touch the normal us
 - [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md) — project decisions.
 - [`skills/pi-control-chrome/SKILL.md`](./skills/pi-control-chrome/SKILL.md) — bundled Pi Skill.
 - [`CHANGELOG.md`](./CHANGELOG.md) — release history.
-- [`BROWSER-ACTIVATION-DESIGN.zh-CN.md`](./BROWSER-ACTIVATION-DESIGN.zh-CN.md) — browser capability activation and on-demand Skill proposal.
+- [`BROWSER-ACTIVATION-DESIGN.zh-CN.md`](./BROWSER-ACTIVATION-DESIGN.zh-CN.md) — browser capability activation and on-demand Skill design.
+- [`docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md`](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md) — implemented Codex-aligned browser lifecycle.
 
 ## Current future scope
 

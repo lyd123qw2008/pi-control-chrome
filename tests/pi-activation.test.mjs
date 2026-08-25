@@ -27,7 +27,7 @@ test('Pi Skill activation exposes all browser tools and does not drop ordinary t
   assert.equal(new Set(calls[0]).size, 2 + BROWSER_TOOL_NAMES.length);
 });
 
-test('Pi ordinary turn cleanup clears usage but retains final cleanup state until task reset', () => {
+test('Pi turn checkpoints retain cleanup state and task finalize clears it without deactivation', () => {
   const activation = createBrowserActivation();
   activation.setActive(true);
   activation.markUsed();
@@ -37,6 +37,11 @@ test('Pi ordinary turn cleanup clears usage but retains final cleanup state unti
   assert.equal(activation.active, true);
   assert.equal(activation.used, false);
   assert.equal(activation.cleanupRequired, true);
+  activation.finalize();
+  assert.equal(activation.active, true);
+  assert.equal(activation.used, false);
+  assert.equal(activation.cleanupRequired, false);
+  activation.markUsed();
   activation.reset();
   assert.equal(activation.active, false);
   assert.equal(activation.used, false);
