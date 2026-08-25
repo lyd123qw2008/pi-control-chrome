@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- DSH browser tools now return structured `bridge_offline` and `bridge_only` states instead of exposing the first-use extension-offline error; disconnected operations are not dispatched or replayed, and Skill guidance directs the user to `/chrome connect`.
+- DSH browser tools now wait up to six seconds for the extension's background reconnect before returning `bridge_only`; a timed-out readiness result directs the model to retry `browser_status` before requesting human connection.
 
 - Reused a short-lived, session-owned debugger lease across consecutive browser operations instead of attaching and detaching Chrome DevTools for every call; explicit Console/Network/CDP capture remains persistent and cleanup still releases it.
 - Captured ordinary active-tab viewport screenshots through the extension API, reserving DevTools attachment for full-page and background-tab captures.

@@ -35,7 +35,7 @@ function agentContext(tools: Map<string, ToolDefinition>): Context {
 function setup(
   bridge: Pick<BrowserBridgeClient, 'request' | 'health'> & Partial<Pick<BrowserBridgeClient, 'start'>>,
   attachments?: AttachmentStore,
-  options: { lazyTools?: boolean; activate?: boolean } = {},
+  options: { lazyTools?: boolean; activate?: boolean; extensionReadyTimeoutMs?: number } = {},
 ): Harness {
   const globalTools = new Map<string, ToolDefinition>()
   const perAgentTools = new Map<string, Map<string, ToolDefinition>>()
@@ -77,6 +77,7 @@ function setup(
     tokenFile: 'C:/test/token',
     autoStartBridge: false,
     requestTimeoutMs: 120_000,
+    extensionReadyTimeoutMs: options.extensionReadyTimeoutMs ?? 0,
     lazyTools,
   })
   const bridgeClient = { start: vi.fn(async () => {}), ...bridge } as unknown as BrowserBridgeClient
@@ -227,8 +228,10 @@ describe('DSH browser tool catalog', () => {
       connected: false,
       state: 'bridge_only',
       completed: false,
-      nextAction: '/chrome connect',
-      recommendation: 'run_chrome_connect',
+      retryable: true,
+      userActionRequired: false,
+      nextAction: 'browser_status',
+      recommendation: 'retry_browser_status',
       error: { code: 'extension_not_connected' },
       bridgeHealth: { extensionConnected: false },
     })
@@ -251,6 +254,24 @@ describe('DSH browser tool catalog', () => {
     })
   })
 
+  it('waits for the extension background reconnect before reporting status', async () => {
+    let healthReads = 0
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : { method })
+    const health = vi.fn(async () => {
+      healthReads += 1
+      return healthReads === 1
+        ? { ok: true, protocol: 1, extensionConnected: false }
+        : { ok: true, protocol: 1, extensionConnected: true, browserId: 'edge:test' }
+    })
+    const harness = setup({ request, health }, undefined, { extensionReadyTimeoutMs: 300 })
+    const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({ state: 'connected', connected: true })
+    expect(health).toHaveBeenCalledTimes(3)
+    expect(request).toHaveBeenCalledWith('status', { sessionId: 'session-test' }, expect.any(AbortSignal))
+  })
+
   it('returns a structured Bridge-offline state when the local Bridge cannot start', async () => {
     const start = vi.fn(async () => { throw new Error('Browser Bridge is offline') })
     const request = vi.fn(async () => ({ connected: false }))
@@ -270,6 +291,23 @@ describe('DSH browser tool catalog', () => {
     expect(health).not.toHaveBeenCalled()
   })
 
+  it('waits for reconnect before dispatching a browser operation', async () => {
+    let healthReads = 0
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : { method, params })
+    const health = vi.fn(async () => {
+      healthReads += 1
+      return healthReads === 1
+        ? { ok: true, protocol: 1, extensionConnected: false }
+        : { ok: true, protocol: 1, extensionConnected: true, browserId: 'edge:test' }
+    })
+    const harness = setup({ request, health }, undefined, { extensionReadyTimeoutMs: 300 })
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
+    expect(result).toEqual({ method: 'interaction', params: { tabId: 7, ref: 'e4', sessionId: 'session-test', operation: 'click', expectedBrowserId: 'edge:test' } })
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
+  })
+
   it('does not dispatch a browser operation while the extension is disconnected', async () => {
     const request = vi.fn(async () => ({ connected: false }))
     const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: false }))
@@ -278,9 +316,10 @@ describe('DSH browser tool catalog', () => {
     expect(result).toMatchObject({
       ok: false,
       completed: false,
-      state: 'bridge_only',
-      nextAction: '/chrome connect',
-      error: { code: 'extension_not_connected' },
+      retryable: true,
+      userActionRequired: false,
+      nextAction: 'browser_status',
+      recommendation: 'retry_browser_status',
     })
     expect(request).not.toHaveBeenCalled()
   })
