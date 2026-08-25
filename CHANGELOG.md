@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.7 / 0.3.14 - 2026-08-25
 
 - Browser lifecycle is now session-sticky: task completion and ordinary turn end retain browser state by default; only an explicit user request triggers `browser_cleanup`, which finalizes resources while keeping tools active. `browser_context_reset` explicitly deactivates the lazy catalog. Cleanup failures retain recovery state and browser operations serialize per session.
 

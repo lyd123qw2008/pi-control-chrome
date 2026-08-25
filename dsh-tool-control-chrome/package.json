@@ -1,6 +1,6 @@
 {
   "name": "@lyd123qw2008/dsh-tool-control-chrome",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "description": "DeepSeek Harness browser-control tools backed by the pi-control-chrome local Bridge",
   "keywords": [
     "deepseek-harness",
