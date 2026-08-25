@@ -7,7 +7,7 @@ import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-sett
 import { registerChromeCommand } from './commands.js'
 import { BrowserBridgeClient, resolveConfig } from './bridge.js'
 import { registerBrowserTools } from './tools.js'
-import { BROWSER_SKILL_CONTENT, BROWSER_SKILL_DESCRIPTION, BROWSER_SKILL_NAME } from './skill.js'
+import { registerBrowserSkill } from './skill.js'
 import type { Config as ControlChromeConfig } from './types.js'
 
 export type { BrowserResult, ResolvedConfig, ScreenshotResult } from './types.js'
@@ -56,24 +56,7 @@ export function apply(ctx: Context, config: Config): void {
   const bridge = new BrowserBridgeClient(current)
   const attachments = ctx.get('attachments') as AttachmentStore | undefined
   registerBrowserTools(ctx, bridge, attachments, current)
-  const skills = ctx.get('skills') as { register: (skill: {
-    name: string
-    description: string
-    whenToUse: string
-    source: string
-    content: string
-    invocation: { modelInvocable: boolean; userInvocable: boolean }
-  }) => () => void } | undefined
-  if (skills !== undefined) {
-    ctx.effect(() => skills.register({
-      name: BROWSER_SKILL_NAME,
-      description: BROWSER_SKILL_DESCRIPTION,
-      whenToUse: 'Only when the user explicitly requests control of the existing Chrome or Edge browser.',
-      source: 'runtime',
-      content: BROWSER_SKILL_CONTENT,
-      invocation: { modelInvocable: true, userInvocable: true },
-    }), 'control-chrome: register browser Skill')
-  }
+  registerBrowserSkill(ctx)
   registerChromeCommand(ctx, bridge)
   ctx.effect(() => async () => {
     await bridge.stop()
