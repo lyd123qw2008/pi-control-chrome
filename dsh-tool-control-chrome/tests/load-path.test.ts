@@ -33,7 +33,77 @@ describe('dsh-tool-control-chrome real load path', () => {
     expect(tools.schemas()).toHaveLength(0)
   })
 
-  it('registers canonical Skill metadata when the optional Skill service is present', async () => {
+  it('registers and lazily loads the bundled Skill when the provider service is present', async () => {
+    type SkillProvider = {
+      name: string
+      list(options: { signal?: AbortSignal }): Promise<readonly Record<string, unknown>[]>
+      get(candidate: Record<string, unknown>, options: { signal?: AbortSignal }): Promise<Record<string, unknown> | undefined>
+    }
+    const providers: SkillProvider[] = []
+    const skillService: {
+      providers: SkillProvider[]
+      registerProvider(this: { providers: SkillProvider[] }, create: (control: { signal: AbortSignal }) => SkillProvider): () => void
+    } = {
+      providers,
+      registerProvider(create) {
+        this.providers.push(create({ signal: new AbortController().signal }))
+        return () => {}
+      },
+    }
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(CommandRuntime)
+    await ctx.plugin({
+      name: 'test-skill-service',
+      apply(context) {
+        context.provide('skills', skillService)
+      },
+    })
+    const loader = Object.create(Loader.prototype) as Loader
+    const unwrapped = loader.unwrapExports(controlChrome) as Parameters<Context['plugin']>[0]
+    const fiber = await ctx.plugin(unwrapped, { autoStartBridge: false })
+    expect(providers).toHaveLength(1)
+    const provider = providers[0]
+    expect(provider).toBeDefined()
+    const candidates = await provider!.list({})
+    expect(candidates).toHaveLength(1)
+    expect(candidates[0]).toMatchObject({
+      name: 'pi-control-chrome',
+      description: 'Use when the user explicitly requests control of the existing Chrome or Edge browser, including tabs, logged-in pages, screenshots, interaction, uploads, downloads, dialogs, console, Network or CDP.',
+      whenToUse: 'Only when the user explicitly requests control of the existing Chrome or Edge browser.',
+      source: 'bundled',
+      provider: 'control-chrome-bundled',
+      rank: 600,
+      resourceBase: {
+        kind: 'directory',
+        path: expect.stringContaining('dsh-tool-control-chrome'),
+      },
+      metadata: {
+        compatibility: expect.stringContaining('DSH pi-control-chrome'),
+      },
+    })
+    const definition = await provider!.get(candidates[0]!, {})
+    expect(definition).toMatchObject({
+      name: 'pi-control-chrome',
+      description: 'Use when the user explicitly requests control of the existing Chrome or Edge browser, including tabs, logged-in pages, screenshots, interaction, uploads, downloads, dialogs, console, Network or CDP.',
+      whenToUse: 'Only when the user explicitly requests control of the existing Chrome or Edge browser.',
+      content: expect.stringContaining('# Pi Control Chrome for DSH'),
+      source: 'bundled',
+      provider: 'control-chrome-bundled',
+      metadata: {
+        compatibility: expect.stringContaining('DSH pi-control-chrome'),
+      },
+    })
+    expect(definition?.content).toBe(controlChrome.BROWSER_SKILL_CONTENT)
+    expect(definition?.content).not.toMatch(/^---/u)
+    expect(definition?.content).not.toContain('/chrome profile')
+    expect(definition?.content).not.toContain('/chrome group')
+    expect(definition?.content).not.toContain('/chrome cleanup')
+    await fiber.dispose()
+  })
+
+  it('falls back to runtime registration for legacy Skill services', async () => {
     const registrations: Record<string, unknown>[] = []
     const skillService = {
       register(skill: Record<string, unknown>) {
@@ -46,7 +116,7 @@ describe('dsh-tool-control-chrome real load path', () => {
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(CommandRuntime)
     await ctx.plugin({
-      name: 'test-skill-service',
+      name: 'legacy-skill-service',
       apply(context) {
         context.provide('skills', skillService)
       },
