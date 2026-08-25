@@ -33,7 +33,7 @@ function agentContext(tools: Map<string, ToolDefinition>): Context {
 }
 
 function setup(
-  bridge: Pick<BrowserBridgeClient, 'request' | 'health'>,
+  bridge: Pick<BrowserBridgeClient, 'request' | 'health'> & Partial<Pick<BrowserBridgeClient, 'start'>>,
   attachments?: AttachmentStore,
   options: { lazyTools?: boolean; activate?: boolean } = {},
 ): Harness {
@@ -79,7 +79,8 @@ function setup(
     requestTimeoutMs: 120_000,
     lazyTools,
   })
-  registerBrowserTools(rootContext, bridge as BrowserBridgeClient, attachments, resolveSettings)
+  const bridgeClient = { start: vi.fn(async () => {}), ...bridge } as unknown as BrowserBridgeClient
+  registerBrowserTools(rootContext, bridgeClient, attachments, resolveSettings)
   const agent = createAgent('session-test')
   const activate = (target: Agent, name = BROWSER_SKILL_NAME, isError = false): void => {
     const handler = events.get('tools/result')
@@ -216,6 +217,74 @@ describe('DSH browser tool catalog', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
+  it('returns a structured Bridge-only state without sending a browser request', async () => {
+    const request = vi.fn(async () => ({ connected: false }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: false }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      connected: false,
+      state: 'bridge_only',
+      completed: false,
+      nextAction: '/chrome connect',
+      recommendation: 'run_chrome_connect',
+      error: { code: 'extension_not_connected' },
+      bridgeHealth: { extensionConnected: false },
+    })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('converts a status-handshake extension disconnect into Bridge-only state', async () => {
+    const request = vi.fn(async () => {
+      const error = new Error('Chrome/Edge extension is not connected.') as Error & { code?: string }
+      error.code = 'EXTENSION_OFFLINE'
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      state: 'bridge_only',
+      error: { code: 'extension_not_connected' },
+    })
+  })
+
+  it('returns a structured Bridge-offline state when the local Bridge cannot start', async () => {
+    const start = vi.fn(async () => { throw new Error('Browser Bridge is offline') })
+    const request = vi.fn(async () => ({ connected: false }))
+    const health = vi.fn(async () => ({ ok: false }))
+    const harness = setup({ start, request, health })
+    const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      connected: false,
+      state: 'bridge_offline',
+      completed: false,
+      nextAction: '/chrome connect',
+      recommendation: 'check_bridge',
+      error: { code: 'bridge_unavailable' },
+    })
+    expect(request).not.toHaveBeenCalled()
+    expect(health).not.toHaveBeenCalled()
+  })
+
+  it('does not dispatch a browser operation while the extension is disconnected', async () => {
+    const request = vi.fn(async () => ({ connected: false }))
+    const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: false }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      state: 'bridge_only',
+      nextAction: '/chrome connect',
+      error: { code: 'extension_not_connected' },
+    })
+    expect(request).not.toHaveBeenCalled()
+  })
+
   it('marks first-call browser competition as unverified', async () => {
     const request = vi.fn(async () => ({ connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }))
     const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: true, browserId: 'edge:test' }))
@@ -270,6 +339,26 @@ describe('DSH browser tool catalog', () => {
     await harness.toolsFor(sessionB).get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(sessionB))
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
     expect(request.mock.calls.at(-1)?.[1]).toMatchObject({ expectedBrowserId: 'chrome:test', sessionId: 'session-b' })
+  })
+
+  it('reports an uncertain operation when the extension disconnects after target validation', async () => {
+    const request = vi.fn(async (method: string, _params: Record<string, unknown>) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      const error = new Error('Chrome/Edge extension disconnected before the request was sent.') as Error & { code?: string }
+      error.code = 'EXTENSION_OFFLINE'
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'unknown',
+      retryable: false,
+      error: { code: 'extension_disconnected_during_operation' },
+    })
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })
 
   it('reports and blocks an old Bridge without atomic target routing', async () => {
@@ -330,7 +419,7 @@ describe('DSH browser tool catalog', () => {
       : method === 'snapshot'
         ? { snapshot: { accessibility: { role: 'main' } } }
         : { method })
-    const health = vi.fn(async () => ({ ok: true, browserId: 'edge:test' }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const harness = setup({ request, health })
     const accessibility = await harness.tools.get('browser_accessibility_snapshot')?.execute({}, execution(harness.agent))
     expect(accessibility).toEqual({ role: 'main' })
@@ -368,7 +457,7 @@ describe('DSH browser tool catalog', () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
       : { tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' })
-    const health = vi.fn(async () => ({ ok: true, browserId: 'edge:test' }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const harness = setup({ request, health }, attachments)
     const tool = harness.tools.get('browser_screenshot')
     const value = await tool?.execute({ tabId: 7 }, execution(harness.agent))

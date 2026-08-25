@@ -583,6 +583,116 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function bridgeErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined
+  const code = (error as Error & { readonly code?: unknown }).code
+  return typeof code === 'string' ? code : undefined
+}
+
+type BrowserConnection =
+  | { readonly state: 'connected'; readonly status: unknown; readonly bridgeHealth: Record<string, unknown> }
+  | { readonly state: 'bridge_only'; readonly bridgeHealth: Record<string, unknown>; readonly error?: unknown }
+  | { readonly state: 'bridge_offline'; readonly error: unknown }
+
+async function readBrowserConnection(
+  bridge: BrowserBridgeClient,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<BrowserConnection> {
+  try {
+    await bridge.start()
+  } catch (error) {
+    return { state: 'bridge_offline', error }
+  }
+  let bridgeHealth: Record<string, unknown>
+  try {
+    bridgeHealth = await bridge.health()
+  } catch (error) {
+    return { state: 'bridge_offline', error }
+  }
+  if (bridgeHealth.extensionConnected !== true) return { state: 'bridge_only', bridgeHealth }
+  try {
+    return {
+      state: 'connected',
+      status: await bridge.request('status', { sessionId }, signal),
+      bridgeHealth,
+    }
+  } catch (error) {
+    if (bridgeErrorCode(error) === 'EXTENSION_OFFLINE') return { state: 'bridge_only', bridgeHealth, error }
+    throw error
+  }
+}
+
+function connectionResult(connection: Exclude<BrowserConnection, { readonly state: 'connected' }>): JsonValue {
+  if (connection.state === 'bridge_only') {
+    return asJsonValue({
+      ok: false,
+      connected: false,
+      state: connection.state,
+      completed: false,
+      nextAction: '/chrome connect',
+      recommendation: 'run_chrome_connect',
+      error: {
+        code: 'extension_not_connected',
+        message: 'Chrome/Edge extension is not connected. No browser action was sent.',
+      },
+      bridgeHealth: connection.bridgeHealth,
+      recovery: bridgeRecovery(connection.bridgeHealth),
+    })
+  }
+  return asJsonValue({
+    ok: false,
+    connected: false,
+    state: connection.state,
+    completed: false,
+    nextAction: '/chrome connect',
+    recommendation: 'check_bridge',
+    error: {
+      code: 'bridge_unavailable',
+      message: `The local browser Bridge is unavailable. ${errorText(connection.error)} No browser action was sent.`,
+    },
+    recovery: unavailableBridgeRecovery(),
+  })
+}
+
+async function operationDisconnectedResult(bridge: BrowserBridgeClient): Promise<JsonValue> {
+  let bridgeHealth: Record<string, unknown> | undefined
+  try {
+    bridgeHealth = await bridge.health()
+  } catch {
+    // Preserve the operation uncertainty even if the Bridge also went offline.
+  }
+  return asJsonValue({
+    ok: false,
+    completed: false,
+    actionState: 'unknown',
+    retryable: false,
+    error: {
+      code: 'extension_disconnected_during_operation',
+      message: 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.',
+    },
+    ...(bridgeHealth === undefined ? {} : { bridgeHealth }),
+  })
+}
+
+type BrowserOperationResponse =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false }
+
+async function requestBrowserOperation(
+  bridge: BrowserBridgeClient,
+  method: string,
+  params: Record<string, JsonValue>,
+  signal: AbortSignal,
+): Promise<BrowserOperationResponse> {
+  try {
+    return { ok: true, value: await bridge.request(method, params, signal) }
+  } catch (error) {
+    if (bridgeErrorCode(error) === 'EXTENSION_OFFLINE') return { ok: false }
+    throw error
+  }
+}
+
 async function bridgeTargetHealth(bridge: BrowserBridgeClient, target: BrowserTarget): Promise<Record<string, unknown>> {
   const health = await bridge.health()
   if (health.browserId !== target.browserId) {
@@ -598,13 +708,14 @@ async function browserStatus(
   signal: AbortSignal,
   acknowledgeBrowserId?: string,
 ): Promise<JsonValue> {
-  const result = await bridge.request('status', { sessionId }, signal)
-  const targetStability = tracker.observe(result, acknowledgeBrowserId)
-  const base = isRecord(result) ? result : { result }
+  const connection = await readBrowserConnection(bridge, sessionId, signal)
+  if (connection.state !== 'connected') return connectionResult(connection)
+  const targetStability = tracker.observe(connection.status, acknowledgeBrowserId)
+  const base = isRecord(connection.status) ? connection.status : { result: connection.status }
   try {
-    return asJsonValue({ ...base, targetStability, bridgeHealth: await bridge.health() })
+    return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: await bridge.health() })
   } catch {
-    return asJsonValue({ ...base, targetStability })
+    return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: connection.bridgeHealth })
   }
 }
 
@@ -620,6 +731,7 @@ async function browserDoctor(
   } catch (error) {
     return asJsonValue({
       ok: false,
+      state: 'bridge_offline',
       recommendation: 'check_bridge',
       issues: [{ code: 'bridge_unreachable', message: errorText(error) }],
       recovery: unavailableBridgeRecovery(),
@@ -628,6 +740,7 @@ async function browserDoctor(
   if (bridgeHealth.extensionConnected !== true) {
     return asJsonValue({
       ok: false,
+      state: 'bridge_only',
       recommendation: 'enable_or_reload_extension',
       bridgeHealth,
       recovery: bridgeRecovery(bridgeHealth),
@@ -698,6 +811,7 @@ async function browserDoctor(
       : 'ready'
   return asJsonValue({
     ...base,
+    state: 'connected',
     ok: issues.length === 0,
     recommendation,
     bridgeHealth,
@@ -711,11 +825,9 @@ async function browserDoctor(
 async function assertStableBrowserTarget(
   bridge: BrowserBridgeClient,
   tracker: BrowserTargetTracker,
-  sessionId: string,
-  signal: AbortSignal,
+  connection: Extract<BrowserConnection, { readonly state: 'connected' }>,
 ): Promise<BrowserTarget> {
-  const status = await bridge.request('status', { sessionId }, signal)
-  const target = tracker.assertStable(status)
+  const target = tracker.assertStable(connection.status)
   await bridgeTargetHealth(bridge, target)
   return target
 }
@@ -784,8 +896,10 @@ export function registerBrowserTools(
       if (spec.prepare !== undefined) params = spec.prepare(params)
       if (spec.name === 'browser_cleanup') {
         const used = activation?.usedBrowser === true || usedSessions.has(sessionId)
-        if (used) return asJsonValue(await bridge.request('cleanup', params, exec.signal))
-        return asJsonValue({ removed: [], released: [] })
+        if (!used) return asJsonValue({ removed: [], released: [] })
+        const result = await requestBrowserOperation(bridge, 'cleanup', params, exec.signal)
+        if (!result.ok) return operationDisconnectedResult(bridge)
+        return asJsonValue(result.value)
       }
       if (activation !== undefined) activation.usedBrowser = true
       else usedSessions.add(sessionId)
@@ -795,12 +909,15 @@ export function registerBrowserTools(
         const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
         return browserStatus(bridge, tracker, sessionId, exec.signal, acknowledgeBrowserId)
       }
-      const target = await assertStableBrowserTarget(bridge, tracker, sessionId, exec.signal)
+      const connection = await readBrowserConnection(bridge, sessionId, exec.signal)
+      if (connection.state !== 'connected') return connectionResult(connection)
+      const target = await assertStableBrowserTarget(bridge, tracker, connection)
       params = { ...params, expectedBrowserId: target.browserId }
       let method = spec.method
       if (spec.name === 'browser_accessibility_snapshot') {
-        const result = await bridge.request('snapshot', params, exec.signal)
-        return prepareAccessibility(result)
+        const result = await requestBrowserOperation(bridge, 'snapshot', params, exec.signal)
+        if (!result.ok) return operationDisconnectedResult(bridge)
+        return prepareAccessibility(result.value)
       }
       if (spec.name === 'browser_console') {
         method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
@@ -811,11 +928,13 @@ export function registerBrowserTools(
         params = network.params
       }
       if (spec.name === 'browser_screenshot') {
-        const result = await bridge.request(method, params, exec.signal)
-        return prepareScreenshot(result, params, attachments)
+        const result = await requestBrowserOperation(bridge, method, params, exec.signal)
+        if (!result.ok) return operationDisconnectedResult(bridge)
+        return prepareScreenshot(result.value, params, attachments)
       }
-      const result = await bridge.request(method, params, exec.signal)
-      return asJsonValue(result)
+      const result = await requestBrowserOperation(bridge, method, params, exec.signal)
+      if (!result.ok) return operationDisconnectedResult(bridge)
+      return asJsonValue(result.value)
     },
   })
   const registerFor = (scope: Context): (() => void)[] => {
