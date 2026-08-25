@@ -211,7 +211,7 @@ Do not reuse a ref after navigation or a DOM-changing action. If a tab handle re
 - Agent-created tabs are normally temporary and should be closed at the end of the task.
 - Mark a tab as `handoff` when the user needs to continue using it manually.
 - Mark a tab as `deliverable` when it is a user-facing result that must remain open.
-- Use `browser_cleanup` at the end of a browser turn. It preserves handoff and deliverable tabs and releases claimed user tabs without closing them.
+- Use `browser_cleanup` at the end of a browser task. It preserves handoff and deliverable tabs and releases claimed user tabs without closing them; ordinary turn cleanup is handled by the host.
 - Never delete or alter the user's Pi tab group or unrelated tabs.
 
 ## Safety Boundaries

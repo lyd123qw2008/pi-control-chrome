@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- DSH browser cleanup commits tool deactivation only after the authoritative successful tool result, retains recovery state after final-result errors, serializes cleanup across reused session IDs, and drains active operations before plugin shutdown.
+
+- DSH browser tools now clean turn-owned browser resources at `turn/end` while retaining the active catalog for multi-turn browser tasks; successful `browser_cleanup` ends the task and removes lazy browser tools. Agent and plugin disposal provide final cleanup.
+
 - DSH browser tools now wait up to six seconds for the extension's background reconnect before returning `bridge_only`; a timed-out readiness result directs the model to retry `browser_status` before requesting human connection.
 
 - Reused a short-lived, session-owned debugger lease across consecutive browser operations instead of attaching and detaching Chrome DevTools for every call; explicit Console/Network/CDP capture remains persistent and cleanup still releases it.

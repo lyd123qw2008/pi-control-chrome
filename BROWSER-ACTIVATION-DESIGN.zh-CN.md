@@ -1,6 +1,6 @@
-# 浏览器能力按 Skill 显式激活改造方案
+# 浏览器能力按 Skill 显式激活与任务清理方案
 
-状态：设计已确认，代码实施中。
+本文档定义 Pi 和 DSH 浏览器工具的激活、普通 turn 清理、显式任务 cleanup、Agent disposal 和插件关闭语义。
 
 ## 1. 背景
 
@@ -35,8 +35,12 @@
 第一次真实浏览器工具调用时才连接 Bridge
     ↓
 同一个 Agent session 内连续复用浏览器能力
-    ↓
-session 结束或显式 cleanup 时注销工具并清理资源
+     ↓
+普通 turn 结束时清理临时资源并保留工具激活
+     ↓
+显式 browser_cleanup 结束浏览器任务并注销工具
+     ↓
+session 结束或 Agent disposal 时执行最终 cleanup
 ```
 
 核心规则：
@@ -178,9 +182,10 @@ inactive
 
 ### 普通 turn 结束
 
-- Pi 当前 `turn_end` cleanup 可以释放临时 Tab 和 claim，但不注销 Skill 激活状态。
-- 显式浏览器 session 复用能力保持不变。
-- debugger lease 继续遵循现有短时复用和显式 DevTools 持久化规则。
+- DSH 监听 `session/event` 的 `turn/end`，清理当前 Agent 的临时 Tab、claim 和可释放资源，但不注销 browser tools。
+- Pi 的 `turn_end` 执行同样的资源 cleanup，并保留 Skill 激活状态。
+- 普通 turn cleanup 使用 `detachDevtools: false` 保留短时复用的 debugger lease，并记录仍需最终 cleanup 的状态。
+- 显式 `browser_cleanup`、Agent disposal 或 session teardown 使用最终 cleanup 释放保留的 debugger lease。
 
 ### 显式 cleanup
 
@@ -188,11 +193,11 @@ inactive
 - cleanup 成功后，当前 session 的浏览器工具注销或隐藏。
 - 下一次浏览器任务需要重新加载 Skill。
 
-### session 结束
+### session 结束和 Agent disposal
 
-- DSH 在 `agent/disposed` 时清理当前 session。
-- Pi 在 `session_shutdown`、session switch 或 fork 前清理当前 session。
-- cleanup 失败不能阻止宿主 session 结束，但必须保持 fail-closed，不得自动切换浏览器目标。
+- DSH 在 `agent/disposed` 时执行最终 cleanup；插件关闭时再次清理仍待处理的 session，并停止 Bridge。
+- Pi 在 `session_shutdown`、session switch 或 fork 前执行最终 cleanup，并在 session 边界隐藏浏览器工具。
+- cleanup 失败不能阻止宿主 session 结束，但必须保留 recovery state，不能自动切换浏览器 target；工具只有在成功 cleanup 后才被视为完成任务。
 
 ## 6. 工具注册实现
 
@@ -214,7 +219,7 @@ tools/change
 下一次模型 assembly 出现 browser_* schema
 ```
 
-工具 disposer 保存到当前 session 的 activation record。激活失败时按逆序释放已经注册的工具，不留下部分工具集合。
+工具 disposer 保存到当前 Agent 的 activation record。激活失败时按逆序释放已经注册的工具，不留下部分工具集合。普通 `turn/end`、显式 `browser_cleanup`、Agent disposal 和插件关闭共享同一个按 session 隔离的幂等 cleanup finalizer；成功的显式 cleanup 会调用 disposers 并移除当前 Agent 的 browser tools，失败时保留可恢复状态。
 
 `lazyTools: false` 时直接使用原来的 global registration，确保旧 Profile 和调试流程可用。
 
@@ -225,8 +230,9 @@ Pi 使用 `pi.registerTool()` 配合 `pi.setActiveTools()`：
 - 工具定义可在扩展加载时注册；
 - 默认 active set 移除浏览器工具；
 - Skill 成功加载后恢复浏览器工具到 active set；
-- session 切换和结束时移除浏览器工具；
-- 执行函数额外验证 session activation state。
+- 普通 `turn_end` 清理资源但保留 active set；
+- 成功的 `browser_cleanup` 和 session 切换、fork、shutdown 隐藏浏览器工具；
+- 执行函数额外验证 session activation state，并记录仍需最终 cleanup 的资源状态。
 
 如果目标 Pi 版本支持工具 disposer，后续可以从 active set 隐藏升级为真正注销；当前实现优先使用官方动态 active-tool API，避免依赖未稳定的私有 registry。
 
@@ -275,7 +281,10 @@ control-chrome:
 - 错误的 Skill 名称和失败的 Skill result 不激活工具；
 - 其他 Agent session 看不到已激活 Agent 的工具；
 - 重复 Skill 加载不重复注册；
-- agent disposal 清理 activation record 并请求 Bridge cleanup；
+- 普通 `turn/end` 清理资源但保留工具，并为最终 DevTools cleanup 保留状态；
+- 成功的 `browser_cleanup` 注销当前 Agent 工具；
+- cleanup 失败保留 recovery state，Agent disposal 和 plugin disposal 可重试；
+- Agent disposal 清理 activation record 并请求 Bridge cleanup；
 - `lazyTools: false` 保持完整工具集合；
 - BrowserTargetTracker 和截图 attachment 测试继续通过。
 
@@ -285,8 +294,10 @@ control-chrome:
 - `before_agent_start` 发现 `pi-control-chrome` 后恢复浏览器工具；
 - 成功 Skill tool result 可以激活工具；
 - 普通搜索任务不会激活浏览器工具；
-- session shutdown 和 switch 隐藏工具并执行 cleanup；
-- Bridge 未激活前不会连接或请求浏览器状态。
+- 普通 `turn_end` 清理资源但保留 active set，并保留最终 cleanup 状态；
+- 显式 `browser_cleanup`、session shutdown 和 switch 隐藏工具并执行最终 cleanup；
+- Bridge 未激活前不会连接或请求浏览器状态；
+- 旧 tool snapshot 在执行层仍被 active gate 拒绝。
 
 ### 真实验收
 
@@ -295,13 +306,14 @@ control-chrome:
 3. 明确要求“使用当前浏览器打开网页”，确认模型先加载 `pi-control-chrome` Skill。
 4. 确认 Skill 成功后下一轮才出现完整浏览器工具。
 5. 连续执行 snapshot、evaluate、screenshot，确认 Bridge 和 debugger lease 正常复用。
-6. 执行 cleanup 或结束 session，确认工具不可见、Tab ownership 和 DevTools 状态清理。
+6. 结束一个普通 turn，确认临时资源被清理但 browser tools 仍可用于下一轮。
+7. 执行显式 `browser_cleanup`，确认工具不可见、Tab ownership 和 DevTools 状态清理。
+8. 再次请求浏览器，确认重新加载 Skill 后工具恢复。
 
-## 10. 实施顺序
+## 10. 验证与发布
 
-1. 先更新本方案和 Skill 文档，固定 Skill 名称、`lazyTools` 默认值、激活事件和 session 语义。
-2. DSH 增加 `lazyTools` 配置和 Skill 成功加载监听，实现 Agent-scoped registration。
-3. Pi 增加 active-tool gate、Skill 检测和 session cleanup。
-4. 更新 DSH/Pi 测试和 README，加入模型上下文成本说明。
-5. 运行包级检查、协议测试、Skill 流程测试和静态检查。
-6. 手动 reload 扩展后再做真实浏览器验收；不自动重启 DSH，不自动操作用户 Tab。
+1. 运行 DSH 包的 `check`、单元测试、构建和 pack check。
+2. 运行 Pi 的 syntax check、Bridge 测试、activation 测试和 Skill 测试。
+3. 验证普通 turn、显式 cleanup、cleanup 失败、Agent disposal、session teardown 和 plugin shutdown 路径。
+4. 手动 reload 扩展后进行真实浏览器验收；不自动重启 DSH，不自动操作用户 Tab。
+5. 发布时同步实现、测试、README、Skill 文档和 changelog。

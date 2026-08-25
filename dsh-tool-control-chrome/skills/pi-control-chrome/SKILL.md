@@ -17,4 +17,4 @@ Keep the existing browser target and browserId stable. Stop if the target change
 
 Use browser_locator, browser_cua, browser_console, browser_network, browser_dialog, browser_upload, browser_download, browser_evaluate or browser_cdp only when the user's task requires that capability. Verify destructive or externally visible actions immediately before performing them.
 
-When the browser task is complete, use browser_cleanup when the current Agent session should release temporary browser state. The DSH human commands `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are diagnostics or lifecycle commands; they do not replace loading this Skill for model browser control.
+When the browser task is complete, use browser_cleanup to end the task and release temporary browser state. Ordinary turn cleanup is handled by the host. The DSH human commands `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are diagnostics or lifecycle commands; they do not replace loading this Skill for model browser control.

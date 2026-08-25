@@ -27,15 +27,18 @@ export function createBrowserActivation(options = {}) {
   const lazyTools = options.lazyTools !== false;
   let active = !lazyTools;
   let used = false;
+  let cleanupRequired = false;
   return {
     get active() { return active; },
     get used() { return used; },
+    get cleanupRequired() { return cleanupRequired; },
     setActive(value) {
       active = value;
       return active;
     },
     markUsed() {
       used = true;
+      cleanupRequired = true;
     },
     clearUsed() {
       used = false;
@@ -43,6 +46,7 @@ export function createBrowserActivation(options = {}) {
     reset() {
       active = !lazyTools;
       used = false;
+      cleanupRequired = false;
     },
   };
 }

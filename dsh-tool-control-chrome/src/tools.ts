@@ -11,6 +11,7 @@ import {
   type JsonValue,
   type ParameterPropertySpec,
   type ParameterSchemaSpec,
+  type ToolExecution,
   type ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
 import type { BrowserBridgeClient } from './bridge.js'
@@ -875,7 +876,13 @@ type BrowserActivation = {
   readonly agent: Agent
   readonly disposers: (() => void)[]
   usedBrowser: boolean
+  cleanupRequired: boolean
 }
+
+type CleanupMode = 'turn' | 'task' | 'disposal'
+type CleanupOutcome =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly error: unknown }
 
 function inactiveBrowserError(): Error {
   return new Error(`Browser tools are inactive; load the ${BROWSER_SKILL_NAME} Skill before using browser_* tools`)
@@ -892,31 +899,292 @@ function hasBrowserSkillInvocation(messages: readonly unknown[]): boolean {
   })
 }
 
-/** Register browser tools globally or after the browser Skill loads in an Agent scope. */
+/**
+ * Register browser tools globally or after the browser Skill loads in an Agent scope.
+ * The returned idempotent disposer closes new browser operations, waits for active
+ * executions and per-session cleanup, retries final recovery, and contains disposal failures.
+ */
 export function registerBrowserTools(
   ctx: Context,
   bridge: BrowserBridgeClient,
   attachments: AttachmentStore | undefined,
   resolveSettings: () => ResolvedConfig,
-): void {
-  const trackers = new Map<string, BrowserTargetTracker>()
-  const activations = new Map<string, BrowserActivation>()
-  const usedSessions = new Set<string>()
+): () => Promise<void> {
+  type AgentSession = Agent['session']
+  type PendingTaskCleanup = {
+    readonly session: AgentSession
+    readonly activation: BrowserActivation | undefined
+    readonly generation: number
+  }
+  const trackers = new Map<AgentSession, BrowserTargetTracker>()
+  const generations = new Map<AgentSession, number>()
+  const activations = new Map<AgentSession, BrowserActivation>()
+  const usedSessions = new Set<AgentSession>()
+  const cleanupRequiredSessions = new Set<AgentSession>()
+  const cleanupFailures = new Set<AgentSession>()
+  const cleanupFlights = new Map<AgentSession, Promise<CleanupOutcome>>()
+  const cleanupTails = new Map<AgentSession, Promise<void>>()
+  const retirementTails = new Map<string, Promise<void>>()
+  const retiredSessions = new Set<AgentSession>()
+  const recoveryRecords = new Map<string, { readonly owner: AgentSession; readonly promise: Promise<{ readonly ok: boolean }> }>()
+  const operationLeases = new Set<Promise<void>>()
+  const wireBarriers = new Map<string, Promise<void>>()
+  const pendingTaskCleanups = new WeakMap<Readonly<ToolExecution>, PendingTaskCleanup>()
   const lazyTools = resolveSettings().lazyTools
-  const trackerFor = (sessionId: string): BrowserTargetTracker => {
-    const existing = trackers.get(sessionId)
+  let closed = false
+  let disposePromise: Promise<void> | undefined
+  let globalDisposers: (() => void)[] = []
+  const sessionId = (session: AgentSession): string => String(session.id)
+  const trackerFor = (session: AgentSession): BrowserTargetTracker => {
+    const existing = trackers.get(session)
     if (existing !== undefined) return existing
     const created = new BrowserTargetTracker()
-    trackers.set(sessionId, created)
+    trackers.set(session, created)
     return created
   }
-  const deactivate = (sessionId: string): void => {
-    const activation = activations.get(sessionId)
+  const hasTurnUsage = (session: AgentSession): boolean => {
+    const activation = activations.get(session)
+    return activation?.usedBrowser === true || usedSessions.has(session) || cleanupFailures.has(session)
+  }
+  const hasBrowserUsage = (session: AgentSession): boolean => {
+    const activation = activations.get(session)
+    return hasTurnUsage(session)
+      || activation?.cleanupRequired === true
+      || cleanupRequiredSessions.has(session)
+  }
+  const generationFor = (session: AgentSession): number => generations.get(session) ?? 0
+  const bumpGeneration = (session: AgentSession): number => {
+    const generation = generationFor(session) + 1
+    generations.set(session, generation)
+    return generation
+  }
+  const markBrowserUsed = (session: AgentSession): void => {
+    bumpGeneration(session)
+    const activation = activations.get(session)
+    if (activation !== undefined) {
+      activation.usedBrowser = true
+      activation.cleanupRequired = true
+    } else {
+      usedSessions.add(session)
+      cleanupRequiredSessions.add(session)
+    }
+  }
+  const markTurnCleaned = (session: AgentSession): void => {
+    const activation = activations.get(session)
+    if (activation !== undefined) {
+      activation.usedBrowser = false
+      activation.cleanupRequired = true
+    }
+    usedSessions.delete(session)
+    cleanupRequiredSessions.add(session)
+    cleanupFailures.delete(session)
+  }
+  const clearRecovery = (session: AgentSession): void => {
+    const record = recoveryRecords.get(sessionId(session))
+    if (record?.owner === session) recoveryRecords.delete(sessionId(session))
+  }
+  const retainRecoveryFailure = (session: AgentSession): void => {
+    const id = sessionId(session)
+    const existing = recoveryRecords.get(id)
+    if (existing?.owner === session) return
+    recoveryRecords.set(id, { owner: session, promise: Promise.resolve({ ok: false }) })
+  }
+  const resetSessionUsage = (session: AgentSession): void => {
+    const activation = activations.get(session)
+    if (activation !== undefined) {
+      activation.usedBrowser = false
+      activation.cleanupRequired = false
+    }
+    usedSessions.delete(session)
+    cleanupRequiredSessions.delete(session)
+    cleanupFailures.delete(session)
+  }
+  const deactivate = (session: AgentSession): void => {
+    bumpGeneration(session)
+    const activation = activations.get(session)
+    activations.delete(session)
+    usedSessions.delete(session)
+    trackers.delete(session)
     if (activation === undefined) return
-    activations.delete(sessionId)
-    usedSessions.delete(sessionId)
-    trackers.delete(sessionId)
-    for (const dispose of [...activation.disposers].reverse()) dispose()
+    for (const dispose of [...activation.disposers].reverse()) {
+      try {
+        dispose()
+      } catch {
+        // A registry disposer cannot prevent browser cleanup or Bridge shutdown.
+      }
+    }
+  }
+  const raceAbort = async <T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+    if (signal === undefined) return promise
+    if (signal.aborted) throw signal.reason ?? new Error('Browser cleanup wait aborted')
+    let onAbort: (() => void) | undefined
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason ?? new Error('Browser cleanup wait aborted'))
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      return await Promise.race([promise, aborted])
+    } finally {
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+    }
+  }
+  const waitForRecovery = async (session: AgentSession, signal?: AbortSignal): Promise<void> => {
+    const record = recoveryRecords.get(sessionId(session))
+    if (record === undefined || record.owner === session) return
+    const outcome = await raceAbort(record.promise, signal)
+    if (!outcome.ok) throw new Error(`Browser session ${sessionId(session)} is unavailable until prior cleanup succeeds`)
+  }
+  const waitForRetirement = async (session: AgentSession, signal?: AbortSignal): Promise<void> => {
+    const retirement = retirementTails.get(sessionId(session))
+    if (retirement !== undefined) await raceAbort(retirement, signal)
+    await waitForRecovery(session, signal)
+  }
+  const acquireOperation = (): (() => void) => {
+    let release!: () => void
+    const lease = new Promise<void>(resolve => { release = resolve })
+    operationLeases.add(lease)
+    return () => {
+      if (operationLeases.delete(lease)) release()
+    }
+  }
+  const waitForWireBarrier = async (session: AgentSession, signal?: AbortSignal): Promise<void> => {
+    const barrier = wireBarriers.get(sessionId(session))
+    if (barrier !== undefined) await raceAbort(barrier, signal)
+  }
+  const requestCleanup = async (
+    session: AgentSession,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> => {
+    const id = sessionId(session)
+    const previous = wireBarriers.get(id)
+    const request = (previous ?? Promise.resolve()).then(async () => {
+      if (signal?.aborted) throw signal.reason ?? new Error('Browser cleanup request aborted')
+      return signal === undefined
+        ? bridge.request('cleanup', params)
+        : bridge.request('cleanup', params, signal)
+    })
+    const barrier = request.then(() => undefined, () => undefined)
+    wireBarriers.set(id, barrier)
+    void request.then(() => {
+      if (wireBarriers.get(id) === barrier) wireBarriers.delete(id)
+    }, () => {
+      if (wireBarriers.get(id) === barrier) wireBarriers.delete(id)
+    })
+    return raceAbort(request, signal)
+  }
+  const cleanupSession = (session: AgentSession, mode: CleanupMode, signal?: AbortSignal): Promise<CleanupOutcome> => {
+    const previous = cleanupTails.get(session)
+    const run = (async (): Promise<CleanupOutcome> => {
+      try {
+        if (previous !== undefined) await raceAbort(previous, signal)
+        const needsCleanup = mode === 'turn' ? hasTurnUsage(session) : hasBrowserUsage(session)
+        if (!needsCleanup) {
+          if (mode === 'disposal') deactivate(session)
+          return { ok: true, value: { removed: [], released: [] } }
+        }
+        const params = mode === 'turn'
+          ? { sessionId: sessionId(session), detachDevtools: false }
+          : { sessionId: sessionId(session) }
+        const value = await requestCleanup(session, params, signal)
+        if (mode === 'turn') markTurnCleaned(session)
+        if (mode === 'disposal') {
+          resetSessionUsage(session)
+          clearRecovery(session)
+          deactivate(session)
+        }
+        return { ok: true, value }
+      } catch (error) {
+        cleanupFailures.add(session)
+        retainRecoveryFailure(session)
+        return { ok: false, error }
+      }
+    })()
+    const tail = run.then(() => undefined, () => undefined)
+    cleanupTails.set(session, tail)
+    cleanupFlights.set(session, run)
+    if (mode === 'disposal') {
+      const recovery = run.then(result => ({ ok: result.ok }), () => ({ ok: false }))
+      const record = { owner: session, promise: recovery }
+      recoveryRecords.set(sessionId(session), record)
+      void recovery.then(outcome => {
+        if (outcome.ok && recoveryRecords.get(sessionId(session)) === record) recoveryRecords.delete(sessionId(session))
+      })
+    }
+    void run.then(() => {
+      if (cleanupFlights.get(session) === run) cleanupFlights.delete(session)
+      if (cleanupTails.get(session) === tail) cleanupTails.delete(session)
+    }, () => {
+      if (cleanupFlights.get(session) === run) cleanupFlights.delete(session)
+      if (cleanupTails.get(session) === tail) cleanupTails.delete(session)
+    })
+    return run
+  }
+  const disposeAgent = async (session: AgentSession): Promise<boolean> => {
+    try {
+      const result = await cleanupSession(session, 'disposal')
+      if (!result.ok) {
+        deactivate(session)
+        return false
+      }
+      return true
+    } catch {
+      retainRecoveryFailure(session)
+      deactivate(session)
+      return false
+    }
+  }
+  const retireAgent = (session: AgentSession): void => {
+    if (retiredSessions.has(session)) return
+    retiredSessions.add(session)
+    const id = sessionId(session)
+    const previous = retirementTails.get(id)
+    const run = (previous ?? Promise.resolve()).then(() => disposeAgent(session))
+    const tail = run.then(() => undefined, () => undefined)
+    retirementTails.set(id, tail)
+    void run.then(succeeded => {
+      if (retirementTails.get(id) !== tail) return
+      retirementTails.delete(id)
+      if (succeeded) retiredSessions.delete(session)
+    }, () => undefined)
+  }
+  const disposeAll = (): Promise<void> => {
+    if (disposePromise !== undefined) return disposePromise
+    closed = true
+    disposePromise = (async () => {
+      await Promise.all([...operationLeases])
+      const sessions = new Set([
+        ...trackers.keys(),
+        ...activations.keys(),
+        ...usedSessions,
+        ...cleanupRequiredSessions,
+        ...cleanupFailures,
+        ...cleanupFlights.keys(),
+        ...cleanupTails.keys(),
+        ...retiredSessions,
+        ...[...recoveryRecords.values()].map(record => record.owner),
+      ])
+      await Promise.allSettled([...sessions].map(async session => {
+        const result = await cleanupSession(session, 'disposal')
+        if (!result.ok) deactivate(session)
+      }))
+      await Promise.allSettled([...retirementTails.values()])
+      await Promise.allSettled([...wireBarriers.values()])
+      for (const session of sessions) {
+        deactivate(session)
+        if (!recoveryRecords.has(sessionId(session))) retiredSessions.delete(session)
+      }
+      const disposers = globalDisposers
+      globalDisposers = []
+      for (const dispose of disposers.reverse()) {
+        try {
+          dispose()
+        } catch {
+          // A global registry disposer cannot prevent Bridge shutdown.
+        }
+      }
+    })()
+    return disposePromise
   }
   const toolFor = (spec: BrowserToolSpec): ReturnType<typeof defineTool> => defineTool({
     name: spec.name,
@@ -929,51 +1197,62 @@ export function registerBrowserTools(
     timeoutMs: resolveSettings().requestTimeoutMs,
     async execute(args: Record<string, JsonValue>, exec: ToolRunContext): Promise<JsonValue> {
       const sessionId = requireAgentSession(exec)
-      const activation = lazyTools ? activations.get(sessionId) : undefined
-      if (lazyTools && activation === undefined) throw inactiveBrowserError()
-      let params = { ...args, sessionId } as Record<string, JsonValue>
-      if (spec.prepare !== undefined) params = spec.prepare(params)
-      if (spec.name === 'browser_cleanup') {
-        const used = activation?.usedBrowser === true || usedSessions.has(sessionId)
-        if (!used) return asJsonValue({ removed: [], released: [] })
-        const result = await requestBrowserOperation(bridge, 'cleanup', params, exec.signal)
-        if (!result.ok) return operationDisconnectedResult(bridge)
-        return asJsonValue(result.value)
-      }
-      if (activation !== undefined) activation.usedBrowser = true
-      else usedSessions.add(sessionId)
-      const tracker = trackerFor(sessionId)
-      if (spec.name === 'browser_doctor') return browserDoctor(bridge, tracker, sessionId, exec.signal)
-      if (spec.name === 'browser_status') {
-        const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
-        return browserStatus(bridge, tracker, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId)
-      }
-      const connection = await readBrowserConnection(bridge, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs)
-      if (connection.state !== 'connected') return connectionResult(connection)
-      const target = await assertStableBrowserTarget(bridge, tracker, connection)
-      params = { ...params, expectedBrowserId: target.browserId }
-      let method = spec.method
-      if (spec.name === 'browser_accessibility_snapshot') {
-        const result = await requestBrowserOperation(bridge, 'snapshot', params, exec.signal)
-        if (!result.ok) return operationDisconnectedResult(bridge)
-        return prepareAccessibility(result.value)
-      }
-      if (spec.name === 'browser_console') {
-        method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
-      }
-      if (spec.name === 'browser_network') {
-        const network = prepareNetwork(params)
-        method = network.method
-        params = network.params
-      }
-      if (spec.name === 'browser_screenshot') {
+      const session = requireAgent(exec).session
+      if (closed) throw inactiveBrowserError()
+      const releaseOperation = acquireOperation()
+      try {
+        await waitForRetirement(session, exec.signal)
+        if (retiredSessions.has(session)) throw inactiveBrowserError()
+        const activation = lazyTools ? activations.get(session) : undefined
+        if (lazyTools && activation === undefined) throw inactiveBrowserError()
+        await waitForWireBarrier(session, exec.signal)
+        let params = { ...args, sessionId } as Record<string, JsonValue>
+        if (spec.prepare !== undefined) params = spec.prepare(params)
+        if (spec.name === 'browser_cleanup') {
+          const result = await cleanupSession(session, 'task', exec.signal)
+          if (!result.ok) {
+            if (bridgeErrorCode(result.error) === 'EXTENSION_OFFLINE') return await operationDisconnectedResult(bridge)
+            throw result.error
+          }
+          pendingTaskCleanups.set(exec, { session, activation, generation: generationFor(session) })
+          return asJsonValue(result.value)
+        }
+        markBrowserUsed(session)
+        const tracker = trackerFor(session)
+        if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, exec.signal)
+        if (spec.name === 'browser_status') {
+          const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
+          return await browserStatus(bridge, tracker, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId)
+        }
+        const connection = await readBrowserConnection(bridge, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs)
+        if (connection.state !== 'connected') return connectionResult(connection)
+        const target = await assertStableBrowserTarget(bridge, tracker, connection)
+        params = { ...params, expectedBrowserId: target.browserId }
+        let method = spec.method
+        if (spec.name === 'browser_accessibility_snapshot') {
+          const result = await requestBrowserOperation(bridge, 'snapshot', params, exec.signal)
+          if (!result.ok) return await operationDisconnectedResult(bridge)
+          return prepareAccessibility(result.value)
+        }
+        if (spec.name === 'browser_console') {
+          method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
+        }
+        if (spec.name === 'browser_network') {
+          const network = prepareNetwork(params)
+          method = network.method
+          params = network.params
+        }
+        if (spec.name === 'browser_screenshot') {
+          const result = await requestBrowserOperation(bridge, method, params, exec.signal)
+          if (!result.ok) return await operationDisconnectedResult(bridge)
+          return prepareScreenshot(result.value, params, attachments)
+        }
         const result = await requestBrowserOperation(bridge, method, params, exec.signal)
-        if (!result.ok) return operationDisconnectedResult(bridge)
-        return prepareScreenshot(result.value, params, attachments)
+        if (!result.ok) return await operationDisconnectedResult(bridge)
+        return asJsonValue(result.value)
+      } finally {
+        releaseOperation()
       }
-      const result = await requestBrowserOperation(bridge, method, params, exec.signal)
-      if (!result.ok) return operationDisconnectedResult(bridge)
-      return asJsonValue(result.value)
     },
   })
   const registerFor = (scope: Context): (() => void)[] => {
@@ -987,47 +1266,72 @@ export function registerBrowserTools(
     }
   }
   const activate = (agent: Agent): void => {
-    if (!lazyTools || activations.has(String(agent.session.id))) return
-    const sessionId = String(agent.session.id)
+    const session = agent.session
+    const recovery = recoveryRecords.get(sessionId(session))
+    if (closed || !lazyTools || activations.has(session) || retiredSessions.has(session) || retirementTails.has(sessionId(session)) || (recovery !== undefined && recovery.owner !== session)) return
     const disposers = registerFor(agent.ctx)
-    activations.set(sessionId, { agent, disposers, usedBrowser: false })
+    bumpGeneration(session)
+    activations.set(session, { agent, disposers, usedBrowser: false, cleanupRequired: false })
   }
   if (!lazyTools) {
     ctx.effect(() => {
-      const disposers = registerFor(ctx)
-      return () => { for (const dispose of disposers.reverse()) dispose() }
+      globalDisposers = registerFor(ctx)
+      return () => {
+        const disposers = globalDisposers
+        globalDisposers = []
+        for (const dispose of disposers.reverse()) {
+          try {
+            dispose()
+          } catch {
+            // A global registry disposer cannot prevent the remaining teardown.
+          }
+        }
+      }
     }, 'control-chrome: register browser tools')
   }
   ctx.on('tools/result', (exec, result) => {
-    if (exec.agent !== undefined && exec.name === 'browser_cleanup' && !result.isError) {
-      const agent = exec.agent
-      queueMicrotask(() => {
-        const sessionId = String(agent.session.id)
-        usedSessions.delete(sessionId)
-        deactivate(sessionId)
+    const pending = pendingTaskCleanups.get(exec)
+    if (pending !== undefined) {
+      pendingTaskCleanups.delete(exec)
+      if (!result.isError) queueMicrotask(() => {
+        if (generationFor(pending.session) !== pending.generation) return
+        if (lazyTools && activations.get(pending.session) !== pending.activation) return
+        resetSessionUsage(pending.session)
+        clearRecovery(pending.session)
+        if (lazyTools && activations.get(pending.session) === pending.activation && !hasBrowserUsage(pending.session)) {
+          deactivate(pending.session)
+        }
       })
-      return
     }
     if (!lazyTools || result.isError || exec.name !== 'skill' || exec.agent === undefined) return
     if (isBrowserSkillArguments(exec.arguments)) activate(exec.agent)
   })
-  ctx.on('agent/pre-step', async (_event, next) => {
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'turn/end' || closed || retiredSessions.has(session) || !hasTurnUsage(session)) return
+    void cleanupSession(session, 'turn').catch(() => undefined)
+  })
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    if (retiredSessions.has(agent.session)) throw inactiveBrowserError()
+    const pending = cleanupFlights.get(agent.session)
+    if (pending !== undefined) await raceAbort(pending, signal)
+    await waitForRetirement(agent.session, signal)
+    await waitForWireBarrier(agent.session, signal)
     const decision = await next()
-    if (lazyTools && decision.kind === 'enter' && hasBrowserSkillInvocation(decision.messages)) {
-      const agent = _event.agent
-      if (agent !== undefined) activate(agent)
-    }
+    if (lazyTools && decision.kind === 'enter' && hasBrowserSkillInvocation(decision.messages)) activate(agent)
     return decision
-  })
+  }, { prepend: true })
   ctx.on('agent/disposed', ({ agent }) => {
-    const sessionId = String(agent.session.id)
-    const activation = activations.get(sessionId)
-    const used = activation?.usedBrowser === true || usedSessions.has(sessionId)
-    trackers.delete(sessionId)
-    activations.delete(sessionId)
-    usedSessions.delete(sessionId)
-    if (used) void bridge.request('cleanup', { sessionId }).catch(() => undefined)
+    if (closed) return
+    const session = agent.session
+    if (retiredSessions.has(session)) return
+    if (!hasBrowserUsage(session)) {
+      retiredSessions.add(session)
+      deactivate(session)
+      return
+    }
+    retireAgent(session)
   })
+  return disposeAll
 }
 
 /** Expose the tool catalogs for tests and package consumers. */

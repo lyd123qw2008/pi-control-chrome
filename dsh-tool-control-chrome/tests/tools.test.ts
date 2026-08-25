@@ -16,9 +16,11 @@ type Harness = {
   readonly createAgent: (sessionId: string) => Agent
   readonly toolsFor: (agent: Agent) => Map<string, ToolDefinition>
   readonly activate: (agent: Agent, name?: string, isError?: boolean) => void
-  readonly invokeUserSkill: (agent: Agent) => Promise<void>
-  readonly complete: (agent: Agent, name: string, isError?: boolean) => void
-  readonly dispose: (agent: Agent) => void
+  readonly complete: (agent: Agent, name: string, isError?: boolean, exec?: ToolRunContext) => void
+  readonly invokeUserSkill: (agent: Agent, signal?: AbortSignal) => Promise<void>
+  readonly emitTurnEnd: (agent: Agent) => Promise<void>
+  readonly dispose: (agent: Agent) => Promise<void>
+  readonly disposePlugin: () => Promise<void>
 }
 
 function agentContext(tools: Map<string, ToolDefinition>): Context {
@@ -38,19 +40,20 @@ function setup(
   options: { lazyTools?: boolean; activate?: boolean; extensionReadyTimeoutMs?: number } = {},
 ): Harness {
   const globalTools = new Map<string, ToolDefinition>()
-  const perAgentTools = new Map<string, Map<string, ToolDefinition>>()
+  const perAgentTools = new Map<Agent['session'], Map<string, ToolDefinition>>()
   const events = new Map<string, EventHandler>()
   const lazyTools = options.lazyTools ?? true
   const toolsFor = (agent: Agent): Map<string, ToolDefinition> => {
-    const sessionId = String(agent.session.id)
-    const existing = perAgentTools.get(sessionId)
+    const session = agent.session
+    const existing = perAgentTools.get(session)
     if (existing !== undefined) return existing
     const created = new Map<string, ToolDefinition>()
-    perAgentTools.set(sessionId, created)
+    perAgentTools.set(session, created)
     return created
   }
   const createAgent = (sessionId: string): Agent => {
-    const agent = { session: { id: sessionId } } as unknown as Agent
+    const session = { id: sessionId }
+    const agent = { session } as unknown as Agent
     Object.assign(agent, { ctx: agentContext(toolsFor(agent)) })
     return agent
   }
@@ -81,31 +84,45 @@ function setup(
     lazyTools,
   })
   const bridgeClient = { start: vi.fn(async () => {}), ...bridge } as unknown as BrowserBridgeClient
-  registerBrowserTools(rootContext, bridgeClient, attachments, resolveSettings)
+  const disposePlugin = registerBrowserTools(rootContext, bridgeClient, attachments, resolveSettings)
   const agent = createAgent('session-test')
   const activate = (target: Agent, name = BROWSER_SKILL_NAME, isError = false): void => {
     const handler = events.get('tools/result')
     if (handler === undefined) throw new Error('tools/result handler was not registered')
     handler({ name: 'skill', arguments: { name }, agent: target }, { isError })
   }
-  const invokeUserSkill = async (target: Agent): Promise<void> => {
+  const invokeUserSkill = async (target: Agent, signal?: AbortSignal): Promise<void> => {
     const handler = events.get('agent/pre-step')
     if (handler === undefined) throw new Error('agent/pre-step handler was not registered')
     await handler(
-      { agent: target, messages: [] },
+      { agent: target, messages: [], signal },
       async () => ({
         kind: 'enter',
         messages: [{ source: { kind: 'skill-invocation', name: BROWSER_SKILL_NAME } }],
       }),
     )
   }
-  const complete = (target: Agent, name: string, isError = false): void => {
+  const complete = (target: Agent, name: string, isError = false, exec = execution(target)): void => {
     const handler = events.get('tools/result')
     if (handler === undefined) throw new Error('tools/result handler was not registered')
-    handler({ name, arguments: {}, agent: target }, { isError })
+    const eventExec = exec as ToolRunContext & { name: string; arguments: unknown }
+    eventExec.name = name
+    eventExec.arguments = {}
+    handler(eventExec, { isError })
   }
-  const dispose = (target: Agent): void => {
+  const emitTurnEnd = async (target: Agent): Promise<void> => {
+    const handler = events.get('session/event')
+    if (handler === undefined) throw new Error('session/event handler was not registered')
+    handler(
+      target.session,
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    )
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+  }
+  const dispose = async (target: Agent): Promise<void> => {
     events.get('agent/disposed')?.({ agent: target })
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
   }
   if (options.activate ?? true) activate(agent)
   return {
@@ -115,9 +132,11 @@ function setup(
     createAgent,
     toolsFor,
     activate,
-    invokeUserSkill,
     complete,
+    invokeUserSkill,
+    emitTurnEnd,
     dispose,
+    disposePlugin,
   }
 }
 
@@ -181,6 +200,22 @@ describe('DSH browser tool catalog', () => {
     expect([...harness.globalTools.keys()]).toEqual(BROWSER_TOOL_NAMES)
   })
 
+  it('keeps eager tools registered and resets usage after cleanup', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : { removed: [7], released: [8] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { lazyTools: false })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    const cleanupExec = execution(harness.agent)
+    await harness.tools.get('browser_cleanup')?.execute({}, cleanupExec)
+    harness.complete(harness.agent, 'browser_cleanup', false, cleanupExec)
+    await Promise.resolve()
+    expect(harness.globalTools.size).toBe(BROWSER_TOOL_NAMES.length)
+    await harness.dispose(harness.agent)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(1)
+  })
+
   it('cleans a used eager session on Agent disposal', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
@@ -188,8 +223,7 @@ describe('DSH browser tool catalog', () => {
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const harness = setup({ request, health }, undefined, { lazyTools: false })
     await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
-    harness.dispose(harness.agent)
-    await Promise.resolve()
+    await harness.dispose(harness.agent)
     expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test' })
   })
 
@@ -466,14 +500,177 @@ describe('DSH browser tool catalog', () => {
     expect(request).toHaveBeenLastCalledWith('devtools_enable', expect.objectContaining({ domains: ['Network', 'Page'] }), expect.any(AbortSignal))
   })
 
-  it('cleans up without connecting when Skill activation has not used the Bridge', async () => {
+  it('ends a lazy browser task and hides tools even when no Bridge request was needed', async () => {
     const request = vi.fn(async () => ({ connected: true }))
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const harness = setup({ request, health })
-    await harness.tools.get('browser_cleanup')?.execute({}, execution(harness.agent))
-    harness.complete(harness.agent, 'browser_cleanup')
-    expect(request).not.toHaveBeenCalled()
+    const cleanupExec = execution(harness.agent)
+    await harness.tools.get('browser_cleanup')?.execute({}, cleanupExec)
+    harness.complete(harness.agent, 'browser_cleanup', false, cleanupExec)
     await Promise.resolve()
+    expect(request).not.toHaveBeenCalled()
+    expect(harness.tools.size).toBe(0)
+  })
+
+  it('keeps lazy tools active when the final cleanup result is an error', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : { removed: [], released: [] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    const failedExec = execution(harness.agent)
+    await harness.tools.get('browser_cleanup')?.execute({}, failedExec)
+    harness.complete(harness.agent, 'browser_cleanup', true, failedExec)
+    await Promise.resolve()
+    expect(harness.tools.size).toBe(BROWSER_TOOL_NAMES.length)
+    await harness.emitTurnEnd(harness.agent)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(2)
+    expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test', detachDevtools: false })
+    const successfulExec = execution(harness.agent)
+    await harness.tools.get('browser_cleanup')?.execute({}, successfulExec)
+    harness.complete(harness.agent, 'browser_cleanup', false, successfulExec)
+    await Promise.resolve()
+    expect(harness.tools.size).toBe(0)
+  })
+
+  it('waits for turn cleanup before the next Agent step', async () => {
+    let releaseCleanup: (() => void) | undefined
+    const cleanup = new Promise(resolve => { releaseCleanup = resolve })
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : cleanup)
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.emitTurnEnd(harness.agent)
+    let entered = false
+    const nextStep = harness.invokeUserSkill(harness.agent).then(() => { entered = true })
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    expect(entered).toBe(false)
+    releaseCleanup?.({ removed: [], released: [] })
+    await nextStep
+    expect(entered).toBe(true)
+  })
+
+  it('keeps same-ID replacement Agents isolated while stale cleanup drains', async () => {
+    let releaseCleanup: ((value: unknown) => void) | undefined
+    const cleanup = new Promise(resolve => { releaseCleanup = resolve })
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : cleanup)
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.emitTurnEnd(harness.agent)
+    const replacement = harness.createAgent('session-test')
+    harness.activate(replacement)
+    const replacementStatus = harness.toolsFor(replacement).get('browser_status')
+    const pending = replacementStatus?.execute({}, execution(replacement))
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    expect(request.mock.calls.filter(([method]) => method === 'status')).toHaveLength(1)
+    releaseCleanup?.({ removed: [], released: [] })
+    await pending
+    expect(request.mock.calls.filter(([method]) => method === 'status')).toHaveLength(2)
+    expect(harness.toolsFor(replacement).size).toBe(BROWSER_TOOL_NAMES.length)
+  })
+
+  it('does not repeat ordinary cleanup for duplicate turn-end events', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : { removed: [], released: [] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.emitTurnEnd(harness.agent)
+    await harness.emitTurnEnd(harness.agent)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(1)
+  })
+
+  it('allows pre-step cancellation while turn cleanup continues in the background', async () => {
+    let releaseCleanup: ((value: unknown) => void) | undefined
+    const cleanup = new Promise(resolve => { releaseCleanup = resolve })
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : cleanup)
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.emitTurnEnd(harness.agent)
+    const controller = new AbortController()
+    const nextStep = harness.invokeUserSkill(harness.agent, controller.signal)
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    controller.abort('cancelled')
+    await expect(nextStep).rejects.toBe('cancelled')
+    releaseCleanup?.({ removed: [], released: [] })
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+  })
+
+  it('reserves same-ID retirement while turn cleanup is still pending', async () => {
+    let releaseCleanup: ((value: unknown) => void) | undefined
+    const cleanup = new Promise(resolve => { releaseCleanup = resolve })
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : cleanup)
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.emitTurnEnd(harness.agent)
+    const disposing = harness.dispose(harness.agent)
+    const replacement = harness.createAgent('session-test')
+    harness.activate(replacement)
+    expect(harness.toolsFor(replacement).size).toBe(0)
+    releaseCleanup?.({ removed: [], released: [] })
+    await disposing
+    harness.activate(replacement)
+    expect(harness.toolsFor(replacement).size).toBe(BROWSER_TOOL_NAMES.length)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(2)
+  })
+
+  it('cleans resources at turn end without deactivating tools, then ends the task explicitly', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      : { removed: [7], released: [8] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.emitTurnEnd(harness.agent)
+    expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test', detachDevtools: false })
+    expect(harness.tools.size).toBe(BROWSER_TOOL_NAMES.length)
+    const cleanupExec = execution(harness.agent)
+    await harness.tools.get('browser_cleanup')?.execute({}, cleanupExec)
+    harness.complete(harness.agent, 'browser_cleanup', false, cleanupExec)
+    await Promise.resolve()
+    expect(harness.tools.size).toBe(0)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(2)
+    expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test' }, expect.any(AbortSignal))
+  })
+
+  it('keeps lazy tools active when cleanup transport fails and retries on disposal', async () => {
+    const error = Object.assign(new Error('extension disconnected'), { code: 'EXTENSION_OFFLINE' })
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    const cleanupExec = execution(harness.agent)
+    const result = await harness.tools.get('browser_cleanup')?.execute({}, cleanupExec)
+    harness.complete(harness.agent, 'browser_cleanup', false, cleanupExec)
+    expect(result).toMatchObject({ ok: false, completed: false, actionState: 'unknown' })
+    expect(harness.tools.size).toBe(BROWSER_TOOL_NAMES.length)
+    await harness.dispose(harness.agent)
+    expect(harness.tools.size).toBe(0)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(2)
+  })
+
+  it('disposes lazy browser tools when the Agent is disposed', () => {
+    const request = vi.fn(async () => ({ connected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    expect(harness.tools.size).toBe(BROWSER_TOOL_NAMES.length)
+    harness.dispose(harness.agent)
     expect(harness.tools.size).toBe(0)
   })
 
@@ -484,8 +681,86 @@ describe('DSH browser tool catalog', () => {
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const harness = setup({ request, health })
     await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
-    harness.dispose(harness.agent)
+    await harness.dispose(harness.agent)
+    expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test' })
+  })
+
+  it('blocks same-ID replacement Agents after failed final cleanup', async () => {
+    const error = Object.assign(new Error('extension disconnected'), { code: 'EXTENSION_OFFLINE' })
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.dispose(harness.agent)
+    const replacement = harness.createAgent('session-test')
+    harness.activate(replacement)
+    expect(harness.toolsFor(replacement).size).toBe(0)
+    await expect(harness.invokeUserSkill(replacement)).rejects.toThrow('prior cleanup succeeds')
+  })
+
+  it('disposes an in-flight browser operation before closing the plugin', async () => {
+    let releaseStatus: ((value: unknown) => void) | undefined
+    let markStarted: (() => void) | undefined
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const status = new Promise(resolve => { releaseStatus = resolve })
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? (markStarted?.(), status)
+      : { removed: [], released: [] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { extensionReadyTimeoutMs: 120_000 })
+    const operation = harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    let operationDone = false
+    void operation?.then(() => { operationDone = true })
+    await started
     await Promise.resolve()
+    expect(operationDone).toBe(false)
+    const disposing = harness.disposePlugin()
+    let disposed = false
+    void disposing.then(() => { disposed = true })
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    expect(disposed).toBe(false)
+    releaseStatus?.({ connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' })
+    await operation
+    await disposing
+    expect(harness.tools.size).toBe(0)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(1)
+  })
+
+  it('serializes concurrent failed cleanup callers', async () => {
+    const error = Object.assign(new Error('extension disconnected'), { code: 'EXTENSION_OFFLINE' })
+    let active = 0
+    let maximum = 0
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.6' }
+      active += 1
+      maximum = Math.max(maximum, active)
+      await Promise.resolve()
+      active -= 1
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    const first = harness.tools.get('browser_cleanup')?.execute({}, execution(harness.agent))
+    const second = harness.tools.get('browser_cleanup')?.execute({}, execution(harness.agent))
+    await Promise.all([first, second])
+    expect(maximum).toBe(1)
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(2)
+    expect(harness.tools.size).toBe(BROWSER_TOOL_NAMES.length)
+  })
+
+  it('cleans active browser resources before plugin disposal', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
+      : { method })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await harness.disposePlugin()
+    expect(harness.tools.size).toBe(0)
     expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test' })
   })
 

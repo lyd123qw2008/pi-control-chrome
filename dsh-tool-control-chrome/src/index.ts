@@ -55,10 +55,14 @@ export function apply(ctx: Context, config: Config): void {
   })
   const bridge = new BrowserBridgeClient(current)
   const attachments = ctx.get('attachments') as AttachmentStore | undefined
-  registerBrowserTools(ctx, bridge, attachments, current)
+  const disposeBrowserTools = registerBrowserTools(ctx, bridge, attachments, current)
   registerBrowserSkill(ctx)
   registerChromeCommand(ctx, bridge)
   ctx.effect(() => async () => {
-    await bridge.stop()
-  }, 'control-chrome: dispose Bridge client')
+    try {
+      await disposeBrowserTools()
+    } finally {
+      await bridge.stop()
+    }
+  }, 'control-chrome: dispose browser tools and Bridge client')
 }

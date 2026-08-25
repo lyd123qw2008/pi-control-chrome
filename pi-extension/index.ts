@@ -280,7 +280,7 @@ async function call(method: string, params: Record<string, unknown> = {}, option
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
   if (method === "cleanup") {
-    if (!bridgeUsed) return { removed: [], released: [] };
+    if (!bridgeUsed && !browserActivation.cleanupRequired) return { removed: [], released: [] };
     bridgeUsed = true;
     browserActivation.markUsed();
     return bridge.request(method, { ...params, sessionId });
@@ -764,7 +764,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   const humanCall = (method: string, params: Record<string, unknown> = {}) => call(method, params, { allowInactive: true });
   const resetSession = async (ctx: ExtensionContext, status: string) => {
     try {
-      if (bridgeUsed) await humanCall("cleanup");
+      if (bridgeUsed || browserActivation.cleanupRequired) await humanCall("cleanup");
     } catch {
       // Session teardown must continue when the Bridge is already offline.
     }

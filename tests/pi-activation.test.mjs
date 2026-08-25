@@ -27,15 +27,18 @@ test('Pi Skill activation exposes all browser tools and does not drop ordinary t
   assert.equal(new Set(calls[0]).size, 2 + BROWSER_TOOL_NAMES.length);
 });
 
-test('Pi activation reset hides tools at session boundaries and tracks real use separately', () => {
+test('Pi ordinary turn cleanup clears usage but retains final cleanup state until task reset', () => {
   const activation = createBrowserActivation();
   activation.setActive(true);
   activation.markUsed();
   assert.equal(activation.used, true);
+  assert.equal(activation.cleanupRequired, true);
   activation.clearUsed();
   assert.equal(activation.active, true);
   assert.equal(activation.used, false);
+  assert.equal(activation.cleanupRequired, true);
   activation.reset();
   assert.equal(activation.active, false);
   assert.equal(activation.used, false);
+  assert.equal(activation.cleanupRequired, false);
 });
