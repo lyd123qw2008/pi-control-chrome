@@ -19,7 +19,11 @@
 - Added Bridge lifecycle fencing, endpoint-aware DSH websocket reuse, shared restart capability checks and startup health reuse.
 - Removed the unused Skill CLI token-file setting and clarified Profile patch merging and current architecture documentation.
 
-## 0.3.2
+## 0.3.6 - 2026-08-25
+
+- Shortened the Pi session-ready status while retaining Skill-gated browser activation.
+- Updated bundled browser Skill guidance for the DSH `/chrome connect` and `/chrome disconnect` lifecycle commands.
+
 
 - Removed the unused `webNavigation` extension permission and private debugger-detach state.
 - Simplified Pi Bridge health polling and replaced the hand-rolled HTTP JSON helper with Node's built-in fetch.
