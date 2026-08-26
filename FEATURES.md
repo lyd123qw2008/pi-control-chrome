@@ -337,7 +337,7 @@
 - **已决定**：Network、Console、Dialog、Upload、Download 和 Clipboard 按 Codex API 对齐。
 - **已决定**：Agent 页面默认进入 `Pi` 蓝色分组。
 - **已决定**：claim 后允许用户授权的页面继续导航、点击和输入；release 时不关闭。
-- **已决定**：任务完成和普通 turn 结束默认保留浏览器状态；只有用户明确要求 task finalize 或 Agent disposal 才按 ownership 清理普通 Agent 页面，handoff/deliverable 页面保留。
+- **已决定**：按 Codex 默认生命周期处理：turn 结束关闭未标记的 Agent 临时页面、release claimed user Tab、detach debugger lease；handoff/deliverable 只保留当前 turn 标记的页面。
 - **已决定**：`handoff` 和 `deliverable` 按 Codex 语义保留。
 - **已决定**：Chrome 和 Edge 第一版同时支持；多 Profile 排在后续阶段。
 - **已决定**：扩展安装/配对一次，后续不逐次授权。

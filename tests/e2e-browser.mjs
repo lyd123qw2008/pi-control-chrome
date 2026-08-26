@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, get as httpGet } from "node:http";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
@@ -9,7 +9,7 @@ import WebSocket from "ws";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const bridge = join(root, "bridge", "server.mjs");
-const extension = process.env.PI_CONTROL_CHROME_EXTENSION || join(root, "extension");
+const extensionSource = process.env.PI_CONTROL_CHROME_EXTENSION || join(root, "extension");
 const browserExecutable = process.env.PI_CONTROL_CHROME_BROWSER || "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const bridgePort = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
 const pagePort = 18180;
@@ -22,6 +22,12 @@ if (!existsSync(browserExecutable)) {
 const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-e2e-"));
 const profile = join(temp, "profile");
 const tokenFile = join(temp, "token");
+const extension = join(temp, "extension");
+cpSync(extensionSource, extension, { recursive: true });
+const backgroundFile = join(extension, "background.js");
+writeFileSync(backgroundFile, readFileSync(backgroundFile, "utf8").replaceAll("127.0.0.1:17318", `127.0.0.1:${bridgePort}`));
+const manifestFile = join(extension, "manifest.json");
+writeFileSync(manifestFile, readFileSync(manifestFile, "utf8").replaceAll("127.0.0.1:17318", `127.0.0.1:${bridgePort}`));
 const site = `<!doctype html><title>Pi Control Chrome E2E</title><h1>Pi Control Chrome E2E</h1><label>Name <input id="name" placeholder="Name"></label><label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label><label><input id="agree" type="checkbox"> Agree</label><input id="file" type="file"><button id="go" data-testid="submit-button">Submit</button><button id="dialog" type="button">Dialog</button><div id="out"></div><script>document.querySelector('#go').addEventListener('click',()=>document.querySelector('#out').textContent='Hello '+document.querySelector('#name').value);document.querySelector('#dialog').addEventListener('click',()=>setTimeout(()=>alert('e2e-dialog'),0));console.log('page-ready');</script>`;
 const uploadPath = join(temp, "upload.txt");
 writeFileSync(join(temp, "index.html"), site);
@@ -94,6 +100,7 @@ try {
     } catch {}
   }
   assert.equal(health?.extensionConnected, true, `extension did not connect: ${JSON.stringify(health)}`);
+  await sleep(1500);
 
   const token = readFileSync(tokenFile, "utf8").trim();
   const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=pi&token=${encodeURIComponent(token)}`);
@@ -235,6 +242,12 @@ try {
   assert.ok(typeof screenshot.data === "string" && screenshot.data.length > 100);
 
   const created = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-session" });
+  const concurrent = await Promise.all(Array.from({ length: 4 }, () => request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-concurrent" })));
+  const concurrentIds = concurrent.map((entry) => entry.tab.id);
+  const concurrentListed = await request("list_tabs");
+  assert.equal(concurrentIds.filter((id) => concurrentListed.tabs.some((tab) => tab.id === id && tab.owner === "agent")).length, concurrentIds.length);
+  const concurrentCleanup = await request("cleanup", { sessionId: "e2e-concurrent", mode: "task" });
+  assert.deepEqual([...concurrentCleanup.removed].sort((left, right) => left - right), [...concurrentIds].sort((left, right) => left - right));
   await sleep(700);
   const listed = await request("list_tabs");
   assert.ok(listed.browserId);
@@ -248,9 +261,9 @@ try {
   assert.equal(group.color, "blue");
 
   await assert.rejects(() => request("close_tab", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
-   await await assert.rejects(() => request("mark_handoff", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
-   await assert.rejects(() => request("release", { tabId: selected.tab.id, sessionId: "other-session" }), /another Agent session/);
-   await request("mark_handoff", { tabId: created.tab.id, sessionId: "e2e-session" });
+  await assert.rejects(() => request("mark_handoff", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
+  await assert.rejects(() => request("release", { tabId: selected.tab.id, sessionId: "other-session" }), /another Agent session/);
+  await request("mark_handoff", { tabId: created.tab.id, sessionId: "e2e-session", turnId: 1 });
   const temporary = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-session" });
   await sleep(300);
   const temporaryListed = await request("list_tabs");
@@ -259,11 +272,12 @@ try {
   assert.equal(temporaryOwned.groupId, group.id);
   assert.equal(temporaryGroup.title, "Pi");
   assert.equal(temporaryGroup.color, "blue");
-  const cleanup = await request("cleanup", { sessionId: "e2e-session" });
+  const cleanup = await request("cleanup", { sessionId: "e2e-session", mode: "turn", turnId: 1, expectedBrowserId: listed.browserId });
   assert.equal(cleanup.removed.includes(created.tab.id), false);
   assert.equal(cleanup.removed.includes(temporary.tab.id), true);
   assert.equal(cleanup.released.includes(selected.tab.id), true);
-  await request("close_tab", { tabId: created.tab.id, sessionId: "e2e-session" });
+  const staleMarkCleanup = await request("cleanup", { sessionId: "e2e-session", mode: "turn", turnId: 2, expectedBrowserId: listed.browserId });
+  assert.equal(staleMarkCleanup.removed.includes(created.tab.id), true);
 
   socket.close();
   console.log(JSON.stringify({
@@ -275,6 +289,7 @@ try {
     screenshotBytes: Buffer.from(screenshot.data, "base64").length,
     group,
     cleanup,
+    staleMarkCleanup,
   }));
 } finally {
   siteServer.close();

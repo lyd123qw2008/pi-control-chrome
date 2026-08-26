@@ -66,12 +66,12 @@ Pi · <当前任务名>
 
 完全按 Codex 默认语义：
 
-- Agent 创建的普通标签页：任务完成和普通 turn 结束时保留；只有用户明确要求 `browser_cleanup` 或 Agent disposal 时才按 ownership 关闭；
-- `markDeliverable`：保留；
-- `markHandoff`：保留，等待用户接管；
-- 用户标签页 claim 后：任务完成和普通 turn 结束时保持 claim；只有用户明确要求 task finalize 或 Agent disposal 时 release，不关闭；
+- Agent 创建的普通标签页：turn 结束时自动关闭；只有当前 turn 标记为 `handoff` 或 `deliverable` 时保留；
+- `markDeliverable`：只对当前 turn 生效，下一 turn 仍需保留时重新标记；
+- `markHandoff`：只对当前 turn 生效，等待用户接管时下一 turn 重新标记；
+- 用户标签页 claim 后：turn 结束时 release，不关闭；
 - 用户标签页原有窗口和分组不改变；
-- cleanup 只操作当前 Agent session 创建的页面；任务完成和普通 turn 不触发 cleanup，只有用户明确要求时 `browser_cleanup` 才执行，并保留工具和 Bridge；
+- turn cleanup 只操作当前 Agent session 创建或 claim 的页面；Bridge、browser tools 和上下文跨 turn 复用；用户明确要求时 `browser_cleanup` 才执行即时清理；
 - 不能关闭其他 Pi session 或用户页面。
 
 ## 5. 页面控制范围
@@ -222,7 +222,7 @@ browser_cleanup
 5. Pi 打开新标签页并放入 `Pi` 分组；
 6. Pi 完成 navigate、click、fill、screenshot；
 7. Pi 执行原生 `Runtime.evaluate`；
-8. 任务完成和普通 turn 结束不关闭 Agent 标签页；用户明确要求 task finalize 时才关闭允许关闭的临时页，Agent disposal 执行最终兜底；
+8. turn 结束关闭未标记的 Agent 临时页并 release claimed user Tab；用户明确要求 task finalize 时执行即时清理，Agent disposal 执行最终兜底；
 9. handoff/deliverable 页面保留；
 10. 用户标签页 release 且不关闭；
 11. Pi 重启后自动恢复连接；

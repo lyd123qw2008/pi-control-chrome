@@ -10,14 +10,19 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { applyBrowserToolMask, createBrowserActivation } from "./activation.js";
 
 const BRIDGE_HOST = "127.0.0.1";
-const BRIDGE_PORT = 17318;
+const configuredBridgePort = Number.parseInt(process.env.PI_CONTROL_CHROME_BRIDGE_PORT ?? "", 10);
+const BRIDGE_PORT = Number.isInteger(configuredBridgePort) && configuredBridgePort > 0 && configuredBridgePort < 65_536 ? configuredBridgePort : 17318;
 const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 let sessionId = randomUUID();
+let turnNumber = 0;
 const LAZY_TOOLS = process.env.PI_CONTROL_CHROME_LAZY_TOOLS !== "false";
 const browserActivation = createBrowserActivation({ lazyTools: LAZY_TOOLS });
 let browserToolsActive = browserActivation.active;
 let bridgeUsed = false;
+let turnCleanupArmed = false;
+let lifecycleGeneration = 0;
+let sessionTransitionInFlight = false;
 const BRIDGE_WAIT_DELAY_MS = 100;
 const BRIDGE_WAIT_ATTEMPTS = 30;
 let paused = false;
@@ -69,9 +74,9 @@ function observeBrowserTarget(value: unknown, acknowledgeBrowserId?: string): Ta
   };
 }
 
-async function localJsonRequest(path: string, timeoutMs: number): Promise<{ statusCode: number; value: any }> {
+async function localJsonRequest(path: string, timeoutMs: number, origin = BRIDGE_ORIGIN): Promise<{ statusCode: number; value: any }> {
   try {
-    const response = await fetch(`${BRIDGE_ORIGIN}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetch(`${origin}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
     return { statusCode: response.status, value: await response.json() };
   } catch (error) {
     if (error instanceof Error && error.name === "TimeoutError") {
@@ -84,35 +89,55 @@ async function localJsonRequest(path: string, timeoutMs: number): Promise<{ stat
 const TAB_ID = Type.Optional(Type.Number({ description: "Chrome/Edge tab id. Omit to use the active tab." }));
 const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a ref from browser_snapshot." }));
 
-class BridgeClient {
+/** Client for the local Pi-to-Bridge WebSocket protocol. */
+export class BridgeClient {
+  private readonly origin: string;
+  private readonly wsUrl: string;
+  private readonly WebSocketCtor: typeof WebSocket;
   private socket?: WebSocket;
-  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; socket: WebSocket }>();
   private connecting?: Promise<void>;
+  private lifecycle = 0;
+
+  constructor(options: { origin?: string; wsUrl?: string; WebSocketCtor?: typeof WebSocket } = {}) {
+    this.origin = options.origin ?? BRIDGE_ORIGIN;
+    this.wsUrl = options.wsUrl ?? BRIDGE_WS;
+    this.WebSocketCtor = options.WebSocketCtor ?? WebSocket;
+  }
 
   async start(): Promise<void> {
     await this.connect();
   }
 
   async stop(): Promise<void> {
+    this.lifecycle += 1;
     for (const entry of this.pending.values()) {
       clearTimeout(entry.timer);
       entry.reject(new Error("Pi browser bridge stopped"));
     }
     this.pending.clear();
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = undefined;
+    socket?.close();
+    const connecting = this.connecting;
+    if (connecting !== undefined) await connecting.catch(() => {});
     // The bridge is intentionally left alive so a newly reloaded Pi session can
     // reconnect without restarting Chrome or the extension.
   }
 
   async health(): Promise<any> {
-    const response = await localJsonRequest("/health", 1500);
+    const response = await localJsonRequest("/health", 1500, this.origin);
     if (response.statusCode !== 200) throw new Error(`Bridge health failed: HTTP ${response.statusCode}`);
     return response.value;
   }
 
   async restart(): Promise<any> {
+    const lifecycle = this.lifecycle;
+    const assertLive = () => {
+      if (lifecycle !== this.lifecycle) throw new Error("Pi browser bridge restart was stopped");
+    };
     const health = await this.health();
+    assertLive();
     const instanceId = typeof health.instanceId === "string" ? health.instanceId : undefined;
     if (!instanceId || health.capabilities?.localUserRestart !== true) {
       throw new Error("BRIDGE_RESTART_UNSUPPORTED: the active Bridge does not expose local-user cooperative restart capabilities");
@@ -121,9 +146,13 @@ class BridgeClient {
       expectedInstanceId: instanceId,
       requester: "pi",
     });
+    assertLive();
     await this.waitForOffline();
+    assertLive();
     await this.startBridgeProcess();
+    assertLive();
     const next = await this.waitForHealth();
+    assertLive();
     if (next.instanceId === instanceId) throw new Error("BRIDGE_INSTANCE_CHANGED: Bridge restart reused the previous instance");
     return { ok: true, restarted: true, recovery: "cooperative_restart", previousInstanceId: instanceId, control, bridgeHealth: next };
   }
@@ -131,15 +160,21 @@ class BridgeClient {
   async request(method: string, params: Record<string, unknown> = {}): Promise<any> {
     await this.connect();
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("Pi browser bridge is not connected");
+    if (!socket || socket.readyState !== this.WebSocketCtor.OPEN) throw new Error("Pi browser bridge is not connected");
     const id = randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Browser request timed out: ${method}`));
       }, 120_000);
-      this.pending.set(id, { resolve, reject, timer });
-      socket.send(JSON.stringify({ type: "request", id, method, params }));
+      this.pending.set(id, { resolve, reject, timer, socket });
+      try {
+        socket.send(JSON.stringify({ type: "request", id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -189,7 +224,7 @@ class BridgeClient {
 
   private async isHealthy(): Promise<boolean> {
     try {
-      const response = await localJsonRequest("/health", 700);
+      const response = await localJsonRequest("/health", 700, this.origin);
       return response.statusCode === 200 && response.value?.ok === true;
     } catch {
       return false;
@@ -198,46 +233,81 @@ class BridgeClient {
 
 
   private async connect(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) return;
+    if (this.socket?.readyState === this.WebSocketCtor.OPEN) return;
     if (this.connecting) return this.connecting;
-    this.connecting = (async () => {
+    const lifecycle = this.lifecycle;
+    const attempt = (async () => {
       await this.ensureBridgeProcess();
-      const response = await localJsonRequest("/pair", 2000);
+      if (lifecycle !== this.lifecycle) throw new Error("Pi browser bridge connection was stopped");
+      const response = await localJsonRequest("/pair", 2000, this.origin);
       if (response.statusCode !== 200) throw new Error(`Bridge pairing failed: HTTP ${response.statusCode}`);
       const pairing = response.value as { token?: string };
       if (!pairing.token) throw new Error("Bridge pairing response did not contain a token");
+      if (lifecycle !== this.lifecycle) throw new Error("Pi browser bridge connection was stopped");
       await new Promise<void>((resolve, reject) => {
-        const socket = new WebSocket(`${BRIDGE_WS}?role=pi&token=${encodeURIComponent(pairing.token!)}`);
-        this.socket = socket;
-        const timeout = setTimeout(() => {
+        const socket = new this.WebSocketCtor(`${this.wsUrl}?role=pi&token=${encodeURIComponent(pairing.token!)}`);
+        if (lifecycle !== this.lifecycle) {
           socket.close();
-          reject(new Error("Timed out connecting to the Pi browser bridge"));
+          reject(new Error("Pi browser bridge connection was stopped"));
+          return;
+        }
+        this.socket = socket;
+        let timeout!: NodeJS.Timeout;
+        let settled = false;
+        const fail = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        };
+        timeout = setTimeout(() => {
+          if (this.socket === socket) this.socket = undefined;
+          fail(new Error("Timed out connecting to the Pi browser bridge"));
+          socket.close();
         }, 5000);
         socket.once("open", () => {
+          if (lifecycle !== this.lifecycle || this.socket !== socket) {
+            socket.close();
+            fail(new Error("Pi browser bridge connection was stopped"));
+            return;
+          }
+          settled = true;
           clearTimeout(timeout);
           resolve();
         });
-        socket.on("message", (raw) => this.handleMessage(raw.toString()));
+        socket.on("message", (raw) => this.handleMessage(raw.toString(), socket));
         socket.once("close", () => {
+          const error = new Error("Pi browser bridge disconnected");
           if (this.socket === socket) this.socket = undefined;
-          for (const [id, entry] of this.pending) {
-            clearTimeout(entry.timer);
-            entry.reject(new Error("Pi browser bridge disconnected"));
-            this.pending.delete(id);
-          }
+          this.rejectPendingForSocket(socket, error);
+          fail(error);
         });
         socket.once("error", (error) => {
-          clearTimeout(timeout);
-          reject(error instanceof Error ? error : new Error(String(error)));
+          if (this.socket === socket) this.socket = undefined;
+          this.rejectPendingForSocket(socket, error instanceof Error ? error : new Error(String(error)));
+          fail(error);
         });
       });
-    })().finally(() => {
-      this.connecting = undefined;
+    })();
+    let tracked!: Promise<void>;
+    tracked = attempt.finally(() => {
+      if (this.connecting === tracked) this.connecting = undefined;
     });
-    return this.connecting;
+    this.connecting = tracked;
+    return tracked;
   }
 
-  private handleMessage(raw: string): void {
+  private rejectPendingForSocket(socket: WebSocket, error: Error): void {
+    for (const [id, entry] of this.pending) {
+      if (entry.socket !== socket) continue;
+      clearTimeout(entry.timer);
+      entry.reject(error);
+      this.pending.delete(id);
+    }
+  }
+
+  private handleMessage(raw: string, source: WebSocket): void {
+    if (this.socket !== source) return;
     try {
       const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { code?: string; message?: string } };
       if (message.type !== "response" || !message.id) return;
@@ -258,19 +328,73 @@ class BridgeClient {
 
 const bridge = new BridgeClient();
 
-const pendingCleanupSessionIds = new Set<string>();
+type CleanupIntent = { readonly params: Record<string, unknown>; readonly priority: number };
+const pendingCleanupSessionIds = new Map<string, CleanupIntent>();
 const cleanupFlights = new Map<string, Promise<unknown>>();
+const cleanupTargetIds = new Map<string, string>();
+
+function cleanupRetainsTabs(value: unknown): boolean {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { retained?: unknown }).retained)) return true;
+  return (value as { retained: unknown[] }).retained.length > 0;
+}
+
+function cleanupFailure(value: unknown): Error | undefined {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { failed?: unknown }).failed) || (value as { failed: unknown[] }).failed.length === 0) return undefined;
+  const failed = (value as { failed: unknown[] }).failed;
+  return new Error(`Browser cleanup failed for ${failed.length} tab(s): ${JSON.stringify(failed)}`);
+}
+
+function cleanupIntentPriority(params: Record<string, unknown>): number {
+  if (params.mode === "turn") return 4;
+  if (params.mode === "disposal") return 3;
+  if (params.mode === "context") return 2;
+  return 1;
+}
+
+const TURN_CLEANUP_CAPABILITIES = ["turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery"] as const;
+
+async function verifyTurnCleanupSupport(session: string, expectedBrowserId?: string): Promise<string> {
+  const status = await bridge.request("status", { sessionId: session, ...(expectedBrowserId === undefined ? {} : { expectedBrowserId }) });
+  const target = readBrowserTarget(status);
+  if (target === undefined) throw new Error("Browser status did not identify an active browser target; turn cleanup was not attempted");
+  if (expectedBrowserId !== undefined && target.browserId !== expectedBrowserId) {
+    throw new Error(`Browser target changed during turn cleanup; expected ${expectedBrowserId} but the active target is ${target.browserId}`);
+  }
+  const capabilities = status && typeof status === "object" ? (status as Record<string, unknown>).capabilities : undefined;
+  const missing = TURN_CLEANUP_CAPABILITIES.filter((name) => !capabilities || typeof capabilities !== "object" || (capabilities as Record<string, unknown>)[name] !== true);
+  if (missing.length > 0) throw new Error(`The connected extension does not support turn cleanup (${missing.join(", ")}); reload pi-control-chrome`);
+  cleanupTargetIds.set(session, target.browserId);
+  return target.browserId;
+}
 
 async function requestCleanup(session: string, params: Record<string, unknown> = {}): Promise<unknown> {
-  const existing = cleanupFlights.get(session);
-  if (existing !== undefined) return existing;
+  const previous = cleanupFlights.get(session);
   const run = (async () => {
+    if (previous !== undefined) await previous.catch(() => undefined);
+    let retryParams = { ...params };
+    let retryPriority = cleanupIntentPriority(retryParams);
     try {
-      const value = await bridge.request("cleanup", { ...params, sessionId: session });
-      pendingCleanupSessionIds.delete(session);
+      const expectedBrowserId = typeof params.expectedBrowserId === "string" ? params.expectedBrowserId : cleanupTargetIds.get(session);
+      let cleanupParams = { ...params, sessionId: session, ...(expectedBrowserId === undefined ? {} : { expectedBrowserId }) };
+      retryParams = { ...cleanupParams };
+      retryPriority = cleanupIntentPriority(retryParams);
+      if (params.mode === "turn") {
+        const verifiedBrowserId = await verifyTurnCleanupSupport(session, expectedBrowserId);
+        cleanupParams = { ...cleanupParams, expectedBrowserId: verifiedBrowserId };
+        retryParams = { ...cleanupParams };
+        retryPriority = cleanupIntentPriority(retryParams);
+      }
+      const value = await bridge.request("cleanup", cleanupParams);
+      const failure = cleanupFailure(value);
+      if (failure !== undefined) throw failure;
+      const pendingIntent = pendingCleanupSessionIds.get(session);
+      if (pendingIntent === undefined || retryPriority >= pendingIntent.priority) pendingCleanupSessionIds.delete(session);
       return value;
     } catch (error) {
-      pendingCleanupSessionIds.add(session);
+      const previousIntent = pendingCleanupSessionIds.get(session);
+      if (previousIntent === undefined || retryPriority >= previousIntent.priority) {
+        pendingCleanupSessionIds.set(session, { params: retryParams, priority: retryPriority });
+      }
       throw error;
     } finally {
       if (cleanupFlights.get(session) === run) cleanupFlights.delete(session);
@@ -281,7 +405,7 @@ async function requestCleanup(session: string, params: Record<string, unknown> =
 }
 
 async function retryPendingCleanups(): Promise<void> {
-  await Promise.allSettled([...pendingCleanupSessionIds].map(session => requestCleanup(session)));
+  await Promise.allSettled([...pendingCleanupSessionIds.entries()].map(([session, intent]) => requestCleanup(session, intent.params)));
 }
 
 function textResult(value: unknown, details?: unknown) {
@@ -299,6 +423,12 @@ function errorResult(error: unknown) {
 type BrowserCallOptions = { allowInactive?: boolean };
 
 async function call(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}) {
+  const requestSessionId = sessionId;
+  const requestTurn = turnNumber;
+  const requestGeneration = lifecycleGeneration;
+  const assertCurrent = () => {
+    if (requestGeneration !== lifecycleGeneration || requestSessionId !== sessionId) throw new Error("Pi browser session changed while the request was in flight");
+  };
   if (!options.allowInactive && !browserToolsActive) {
     throw new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control");
   }
@@ -307,30 +437,52 @@ async function call(method: string, params: Record<string, unknown> = {}, option
   }
   if (method === "context_reset") return call("cleanup", params, options);
   if (method === "cleanup") {
-    if (!bridgeUsed && !browserActivation.cleanupRequired) return { removed: [], released: [] };
+    if (!bridgeUsed && !browserActivation.cleanupRequired && !turnCleanupArmed) return { removed: [], released: [], retained: [], failed: [] };
     bridgeUsed = true;
+    turnCleanupArmed = true;
     browserActivation.markUsed();
-    return requestCleanup(sessionId, params);
+    const value = await requestCleanup(requestSessionId, params);
+    assertCurrent();
+    if (!cleanupRetainsTabs(value)) turnCleanupArmed = false;
+    return value;
   }
   if (method === "status") {
     const { acknowledgeBrowserId, ...statusParams } = params;
     bridgeUsed = true;
+    turnCleanupArmed = true;
     browserActivation.markUsed();
-    const result = await bridge.request("status", { ...statusParams, sessionId });
+    const result = await bridge.request("status", { ...statusParams, sessionId: requestSessionId });
+    assertCurrent();
     const targetStability = observeBrowserTarget(result, typeof acknowledgeBrowserId === "string" ? acknowledgeBrowserId : undefined);
+    const target = readBrowserTarget(result);
+    if (target !== undefined && targetStability.acknowledged) cleanupTargetIds.set(requestSessionId, target.browserId);
     const base = result && typeof result === "object" ? result : { result };
-    try { return { ...base, targetStability, bridgeHealth: await bridge.health() }; } catch { return { ...base, targetStability }; }
+    try {
+      const bridgeHealth = await bridge.health();
+      assertCurrent();
+      return { ...base, targetStability, bridgeHealth };
+    } catch {
+      assertCurrent();
+      return { ...base, targetStability };
+    }
   }
   bridgeUsed = true;
+  turnCleanupArmed = true;
   browserActivation.markUsed();
-  const status = await bridge.request("status", { sessionId });
+  const status = await bridge.request("status", { sessionId: requestSessionId });
+  assertCurrent();
   const targetStability = observeBrowserTarget(status);
   const target = readBrowserTarget(status);
   if (targetStability.issue !== undefined || target === undefined) throw new Error("Browser status did not identify an active browser target; run browser_status");
   if (!targetStability.stable || !targetStability.acknowledged) {
     throw new Error(`Browser target changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`);
   }
-  return bridge.request(method, { ...params, sessionId, expectedBrowserId: target.browserId });
+  cleanupTargetIds.set(requestSessionId, target.browserId);
+  const turnParams = method === "mark_handoff" || method === "mark_deliverable" ? { turnId: requestTurn } : {};
+  assertCurrent();
+  const value = await bridge.request(method, { ...params, ...turnParams, sessionId: requestSessionId, expectedBrowserId: target.browserId });
+  assertCurrent();
+  return value;
 }
 
 function registerBrowserTools(pi: ExtensionAPI) {
@@ -787,7 +939,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_mark_handoff",
     label: "Keep Browser Handoff",
-    description: "Mark an Agent-owned tab to survive task finalize and Agent disposal for manual user handoff.",
+    description: "Mark an Agent-owned tab to survive the current turn cleanup for manual user handoff; repeat the mark in a later turn.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("mark_handoff", params)); } catch (error) { return errorResult(error); }
@@ -798,7 +950,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_mark_deliverable",
     label: "Keep Browser Deliverable",
-    description: "Mark an Agent-owned tab to survive cleanup as a user-facing deliverable.",
+    description: "Mark an Agent-owned tab to survive the current turn cleanup as a user-facing deliverable; repeat the mark in a later turn.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("mark_deliverable", params)); } catch (error) { return errorResult(error); }
@@ -812,7 +964,12 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs and release claims while keeping browser tools and the Bridge active.",
     parameters: Type.Object({}),
     async execute() {
-      return textResult(await call("cleanup"));
+      const generation = lifecycleGeneration;
+      const value = await call("cleanup");
+      if (generation !== lifecycleGeneration) throw new Error("Pi browser session changed while cleanup was completing");
+      bridgeUsed = false;
+      browserActivation.finalize();
+      return textResult(value);
     },
   });
 
@@ -823,7 +980,14 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Only after the user explicitly asks to reset or clear browser context: finalize resources and hide browser tools without stopping the shared Bridge.",
     parameters: Type.Object({}),
     async execute() {
-      return textResult(await call("context_reset"));
+      const generation = lifecycleGeneration;
+      const value = await call("context_reset");
+      if (generation !== lifecycleGeneration) throw new Error("Pi browser session changed while context reset was completing");
+      bridgeUsed = false;
+      turnCleanupArmed = false;
+      browserActivation.reset();
+      setBrowserTools(browserActivation.active);
+      return textResult(value);
     },
   });
 }
@@ -836,28 +1000,44 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   };
   const updateStatus = (ctx: ExtensionContext, text: string) => ctx.ui.setStatus("pi-control-chrome", text);
   const humanCall = (method: string, params: Record<string, unknown> = {}) => call(method, params, { allowInactive: true });
-  const resetSession = async (ctx: ExtensionContext, status: string) => {
+  const resetSessionNow = async (ctx: ExtensionContext, status: string, expectedSessionId?: string) => {
     const previousSessionId = sessionId;
-    const needsCleanup = bridgeUsed || browserActivation.cleanupRequired;
+    if (expectedSessionId !== undefined && expectedSessionId !== previousSessionId) return;
+    const resetGeneration = ++lifecycleGeneration;
+    sessionTransitionInFlight = true;
+    const needsCleanup = bridgeUsed || turnCleanupArmed || browserActivation.cleanupRequired;
     let cleanupSucceeded = !needsCleanup;
     if (needsCleanup) {
       try {
         await requestCleanup(previousSessionId);
+        cleanupSucceeded = true;
       } catch {
         cleanupSucceeded = false;
       }
     }
     await retryPendingCleanups();
+    if (lifecycleGeneration !== resetGeneration || sessionId !== previousSessionId) return;
     if (pendingCleanupSessionIds.has(previousSessionId)) cleanupSucceeded = false;
+    if (cleanupSucceeded) cleanupTargetIds.delete(previousSessionId);
     bridgeUsed = false;
+    turnCleanupArmed = false;
     browserActivation.reset();
     acknowledgedTarget = undefined;
     observedBrowserIds.clear();
     paused = false;
     sessionId = randomUUID();
+    turnNumber = 0;
+    sessionTransitionInFlight = false;
     browserSkillPaths.clear();
     setBrowserTools(!LAZY_TOOLS);
     updateStatus(ctx, cleanupSucceeded ? status : status + "; browser cleanup pending");
+  };
+  let sessionResetTail: Promise<void> = Promise.resolve();
+  const resetSession = (ctx: ExtensionContext, status: string): Promise<void> => {
+    const expectedSessionId = sessionId;
+    const run = sessionResetTail.then(() => resetSessionNow(ctx, status, expectedSessionId));
+    sessionResetTail = run.catch(() => undefined);
+    return run;
   };
 
   const skillPrompt = /<skill\s+name=["']pi-control-chrome["'](?:\s|>)/u;
@@ -878,21 +1058,12 @@ export default function piControlChrome(pi: ExtensionAPI): void {
       setBrowserTools(true);
       return;
     }
-    if (event.toolName === "browser_cleanup" && !event.isError) {
-      bridgeUsed = false;
-      browserActivation.finalize();
-      return;
-    }
-    if (event.toolName === "browser_context_reset" && !event.isError) {
-      bridgeUsed = false;
-      browserActivation.reset();
-      setBrowserTools(browserActivation.active);
-    }
   });
 
   pi.registerCommand("chrome", {
     description: "Control the connected Chrome/Edge browser",
     handler: async (args, ctx) => {
+      const generation = lifecycleGeneration;
       const [action = "status", ...rest] = args.trim().split(/\s+/);
       try {
         if (action === "status") {
@@ -903,17 +1074,21 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           return;
         }
         if (action === "connect") {
-          paused = false;
           await bridge.start();
           await retryPendingCleanups();
+          if (generation !== lifecycleGeneration) return;
+          paused = false;
           const result = await humanCall("status");
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
           return;
         }
         if (action === "restart") {
+          const generation = lifecycleGeneration;
           const result = await bridge.restart();
+          if (generation !== lifecycleGeneration) return;
           bridgeUsed = true;
+          turnCleanupArmed = true;
           browserActivation.markUsed();
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify(JSON.stringify(result), "info");
@@ -921,6 +1096,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         }
         if (action === "disconnect") {
           await bridge.stop();
+          if (generation !== lifecycleGeneration) return;
           updateStatus(ctx, "chrome: disconnected");
           ctx.ui.notify("Pi browser bridge disconnected; the local Bridge remains available for a later /chrome connect.", "info");
           return;
@@ -932,8 +1108,9 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           return;
         }
         if (action === "resume") {
-          paused = false;
           const result = await humanCall("status");
+          if (generation !== lifecycleGeneration) return;
+          paused = false;
           updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
           ctx.ui.notify("Pi browser control resumed.", "info");
           return;
@@ -943,7 +1120,10 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           return;
         }
         if (action === "cleanup") {
-          ctx.ui.notify(JSON.stringify(await humanCall("cleanup")), "info");
+          const generation = lifecycleGeneration;
+          const result = await humanCall("cleanup");
+          if (generation !== lifecycleGeneration) return;
+          ctx.ui.notify(JSON.stringify(result), "info");
           bridgeUsed = false;
           browserActivation.finalize();
           return;
@@ -968,6 +1148,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         }
         ctx.ui.notify("用法：/chrome status|connect|restart|disconnect|pause|resume|tabs|profile|group|setup|cleanup|release <tabId>", "warning");
       } catch (error) {
+        if (generation !== lifecycleGeneration) return;
         updateStatus(ctx, "chrome: offline");
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
       }
@@ -975,15 +1156,45 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    lifecycleGeneration += 1;
+    sessionTransitionInFlight = false;
     sessionId = randomUUID();
+    turnNumber = 0;
     browserSkillPaths.clear();
     acknowledgedTarget = undefined;
     observedBrowserIds.clear();
     bridgeUsed = false;
+    turnCleanupArmed = false;
     browserActivation.reset();
     paused = false;
     setBrowserTools(browserActivation.active);
-    updateStatus(ctx, "chrome: ready");
+    updateStatus(ctx, pendingCleanupSessionIds.size > 0 ? "chrome: ready; browser cleanup pending" : "chrome: ready");
+  });
+
+  pi.on("turn_start", event => {
+    if (sessionTransitionInFlight) return;
+    turnNumber = event.turnIndex;
+  });
+
+  pi.on("turn_end", async (event, ctx) => {
+    const generation = lifecycleGeneration;
+    const cleanupSessionId = sessionId;
+    const turn = event.turnIndex;
+    if (sessionTransitionInFlight) return;
+    turnNumber = turn;
+    if (turnCleanupArmed || bridgeUsed || browserActivation.cleanupRequired) {
+      try {
+        const value = await requestCleanup(cleanupSessionId, { mode: "turn", turnId: turn, detachDevtools: true });
+        if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || turnNumber !== turn) return;
+        bridgeUsed = false;
+        if (!cleanupRetainsTabs(value)) turnCleanupArmed = false;
+        browserActivation.finalize();
+      } catch {
+        if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || turnNumber !== turn) return;
+        ctx.ui.setStatus("pi-control-chrome", "chrome: turn cleanup pending");
+      }
+    }
+    if (generation === lifecycleGeneration && sessionId === cleanupSessionId && turnNumber === turn) turnNumber = turn + 1;
   });
 
   pi.on("session_before_switch", async (_event, ctx) => {

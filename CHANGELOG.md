@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.8 - 2026-08-26
+
+- Fixed Pi session transitions to report completed cleanup as successful instead of leaving a false browser-cleanup-pending status; added real-RPC lifecycle coverage for session switching, cleanup retry intent and stale Bridge sockets.
+
+- Aligned Pi and DSH browser lifecycle with Codex: turn end now closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease while preserving Bridge, browser tools, and Browser binding.
+
+- Made `browser_mark_handoff` and `browser_mark_deliverable` turn-scoped; the model must repeat a mark in a later turn when the tab is still needed.
+
+- Added lifecycle capability negotiation and browser-target fencing so an older extension or replaced browser cannot silently execute automatic turn cleanup.
+
+- Serialized ownership mutations and retained recovery state after failed tab removal or debugger detach.
+
+- Added FIFO barriers across browser operations, automatic turn cleanup and teardown; Bridge requests now isolate client ids and stale sockets, and failed cleanup intents retain their original lifecycle parameters for retry.
+
+- Required explicit `--session` (and retained-tab `--turn`) identities in managed Skill CLI workflows instead of deriving ownership from a process id.
+
+- Changed Console, Network, Dialog, upload, and other DevTools paths to use an idle debugger lease instead of keeping the browser debugging indicator attached until task cleanup.
+
+- Added a debugger screenshot fallback when Chromium cannot read back an active-tab `captureVisibleTab` image.
+
 ## 0.3.7 / 0.3.14 - 2026-08-25
 
 - Browser lifecycle is now session-sticky: task completion and ordinary turn end retain browser state by default; only an explicit user request triggers `browser_cleanup`, which finalizes resources while keeping tools active. `browser_context_reset` explicitly deactivates the lazy catalog. Cleanup failures retain recovery state and browser operations serialize per session.

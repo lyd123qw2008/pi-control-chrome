@@ -158,7 +158,7 @@ Never include the pairing token, cookies, passwords, access tokens, or unrelated
 
 ## Fast Common Workflows
 
-The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
+The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Managed `open`, `view`, and `cleanup` calls require an explicit `--session <id>`; `view` retention marks also require `--turn <n>`. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
 
 `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` remain explicit human diagnostics or lifecycle commands and do not activate model browser tools.
 
@@ -185,8 +185,8 @@ Use these tools when available:
 - `browser_console`, `browser_network`, and `browser_dialog`: inspect development events and handle JavaScript dialogs.
 - `browser_upload`, `browser_download`, and `browser_clipboard`: use only when required by the user's task.
 - `browser_claim_tab` and `browser_release`: take and release ownership of an existing user tab.
-- `browser_mark_handoff` and `browser_mark_deliverable`: preserve an Agent tab for the user after the current task.
-- `browser_cleanup`: after explicit user authorization, finalize the current browser task by closing allowed temporary Agent tabs and releasing claimed user tabs without hiding tools or stopping the Bridge.
+- `browser_mark_handoff` and `browser_mark_deliverable`: preserve an Agent tab through the current turn cleanup; repeat the mark in a later turn when it is still needed.
+- `browser_cleanup`: after explicit user authorization, immediately finalize the current browser task by closing allowed temporary Agent tabs and releasing claimed user tabs without hiding tools or stopping the Bridge.
 - `browser_context_reset`: explicitly finalize resources and reset the current browser context; use it only when the model needs browser tools deactivated.
 - `browser_close_tab`: close a tab only when it is Agent-owned or the user explicitly asks for it.
 
@@ -199,7 +199,7 @@ Use these tools when available:
 5. Prefer stable refs from the latest snapshot or semantic locators over coordinates.
 6. After navigation or a meaningful action, take a fresh snapshot because refs can become stale.
 7. Verify the visible result with a snapshot, extract, URL wait, or evaluation.
-8. Do not call `browser_cleanup` merely because the browser task appears complete. Call it only when the user explicitly asks to close temporary tabs, release claims, or clean the browser task; otherwise leave the browser state in place.
+8. Do not call `browser_cleanup` merely because the turn or browser task appears complete. The host performs Codex-style turn cleanup automatically; call `browser_cleanup` only when the user explicitly asks for immediate cleanup.
 
 Do not reuse a ref after navigation or a DOM-changing action. If a tab handle reports stale state, call `browser_tabs` again and obtain a fresh handle.
 
@@ -209,10 +209,11 @@ Do not reuse a ref after navigation or a DOM-changing action. If a tab handle re
 - Do not close, navigate, move, or claim an existing user tab unless the task requires it or the user explicitly asks.
 - Before claiming a user tab, use its current tab id, title, and URL snapshot. A changed title or URL means the handle is stale; refresh the tab list.
 - Prefer `browser_new_tab` for exploratory work so the user's current page is not disturbed.
-- Agent-created tabs are normally temporary and should be closed when the model finalizes the browser task or when Agent disposal applies the safety fallback.
-- Mark a tab as `handoff` when the user needs to continue using it manually.
-- Mark a tab as `deliverable` when it is a user-facing result that must remain open.
-- Keep browser state by default when the task is complete. Use `browser_cleanup` only after the user explicitly asks to close temporary tabs, release claims, or clean the browser task; it preserves handoff and deliverable tabs and releases claimed user tabs without closing them. Use `browser_context_reset` only after the user explicitly asks to reset or clear the browser context. Ordinary turn completion is a checkpoint and does not clean browser resources.
+- Agent-created tabs are temporary by default and the host closes unmarked ones at turn end.
+- Mark a tab as `handoff` when the user needs to continue using it manually; the mark applies to the current turn and must be repeated later.
+- Mark a tab as `deliverable` when it is a user-facing result that must remain open through the current turn cleanup.
+- Claimed user tabs are released at turn end and are never closed by turn cleanup.
+- Use `browser_cleanup` only after the user explicitly asks for immediate cleanup; it preserves currently marked tabs and releases claimed user tabs without closing them. Use `browser_context_reset` only after the user explicitly asks to reset or clear the browser context.
 - Never delete or alter the user's Pi tab group or unrelated tabs.
 
 ## Safety Boundaries

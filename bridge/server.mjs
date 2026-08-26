@@ -74,6 +74,7 @@ function extensionIdentity(value) {
     browserId,
     profile,
     ...(nonEmptyString(value.extensionVersion) ? { extensionVersion: value.extensionVersion } : {}),
+    ...(value.capabilities && typeof value.capabilities === "object" ? { capabilities: value.capabilities } : {}),
     ...(nonEmptyString(value.userAgent) ? { userAgent: value.userAgent } : {}),
   };
 }
@@ -92,6 +93,15 @@ function requestExpectedBrowserId(message) {
 
 function requestParams(message) {
   return message.params && typeof message.params === "object" ? message.params : {};
+}
+
+function missingExtensionCapabilities(message, extension) {
+  const params = requestParams(message);
+  const required = [];
+  if (message.method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery");
+  if ((message.method === "mark_handoff" || message.method === "mark_deliverable") && params.turnId !== undefined) required.push("turnScopedMarks");
+  const capabilities = extension.browserIdentity?.capabilities;
+  return required.filter((name) => capabilities?.[name] !== true);
 }
 
 function handleBridgeRestart(client, id, message) {
@@ -133,7 +143,13 @@ function rejectPendingForExtension(extension, code, message) {
     if (entry.extension !== extension) continue;
     clearTimeout(entry.timer);
     pending.delete(id);
-    sendError(entry.client, id, code, message);
+    if (entry.client) sendError(entry.client, entry.clientRequestId, code, message);
+  }
+}
+
+function detachPendingForClient(client) {
+  for (const entry of pending.values()) {
+    if (entry.client === client) entry.client = undefined;
   }
 }
 
@@ -164,8 +180,12 @@ function jsonResponse(res, status, value, extraHeaders = {}) {
 
 function send(client, message) {
   if (client?.readyState !== 1) return false;
-  client.send(JSON.stringify(message));
-  return true;
+  try {
+    client.send(JSON.stringify(message));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sendError(client, id, code, message) {
@@ -180,7 +200,20 @@ function handleMessage(client, message) {
   if (!message || typeof message !== "object") return;
 
   if (message.type === "request" && client.role === "pi") {
-    const id = String(message.id || `req-${++requestCounter}`);
+    const id = nonEmptyString(message.id);
+    if (!id) {
+      sendError(client, `req-${++requestCounter}`, "INVALID_REQUEST_ID", "request.id must be a non-empty string.");
+      return;
+    }
+    if ([...pending.values()].some((entry) => entry.client === client && entry.clientRequestId === id)) {
+      sendError(client, id, "DUPLICATE_REQUEST_ID", `A request with id ${id} is already pending on this client.`);
+      return;
+    }
+    if (typeof message.method !== "string" || message.method.length === 0) {
+      sendError(client, id, "INVALID_REQUEST", "request.method must be a non-empty string.");
+      return;
+    }
+    const bridgeRequestId = `${instanceId}:${++requestCounter}`;
     if (message.method === "bridge_restart") {
       handleBridgeRestart(client, id, message);
       return;
@@ -208,20 +241,30 @@ function handleMessage(client, message) {
       );
       return;
     }
-    pending.set(id, { client, extension: activeExtension, method: message.method, timer: setTimeout(() => {
-      pending.delete(id);
-      sendError(client, id, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
-    }, 120_000) });
-    if (!send(activeExtension, { type: "request", id, method: message.method, params: message.params ?? {} })) {
-      const entry = pending.get(id);
-      if (entry) clearTimeout(entry.timer);
-      pending.delete(id);
+    const missingCapabilities = missingExtensionCapabilities(message, activeExtension);
+    if (missingCapabilities.length > 0) {
+      sendError(client, id, "EXTENSION_CAPABILITY_MISSING", `The active extension does not support: ${missingCapabilities.join(", ")}. Reload the pi-control-chrome extension.`);
+      return;
+    }
+    const entry = { client, clientRequestId: id, extension: activeExtension, method: message.method, timer: undefined };
+    pending.set(bridgeRequestId, entry);
+    entry.timer = setTimeout(() => {
+      if (pending.get(bridgeRequestId) !== entry) return;
+      pending.delete(bridgeRequestId);
+      if (entry.client) sendError(entry.client, entry.clientRequestId, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
+    }, 120_000);
+    if (!send(activeExtension, { type: "request", id: bridgeRequestId, method: message.method, params: message.params ?? {} })) {
+      if (pending.get(bridgeRequestId) === entry) {
+        clearTimeout(entry.timer);
+        pending.delete(bridgeRequestId);
+      }
       sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected before the request was sent.");
     }
     return;
   }
 
   if (message.type === "hello" && client.role === "extension") {
+    if (extensionClient !== client) return;
     if (!setExtensionIdentity(client, message)) debug("extension hello did not contain a browser identity");
     return;
   }
@@ -232,12 +275,12 @@ function handleMessage(client, message) {
     if (entry.method === "status") setExtensionIdentity(client, message.result);
     clearTimeout(entry.timer);
     pending.delete(String(message.id));
-    send(entry.client, message);
+    if (entry.client) send(entry.client, { ...message, id: entry.clientRequestId });
     return;
   }
 
   if (message.type === "event" && client.role === "extension") {
-    broadcast(message);
+    if (extensionClient === client) broadcast(message);
   }
 }
 
@@ -255,6 +298,7 @@ const server = createServer((req, res) => {
 
   if (req.method === "GET" && requestUrl.pathname === "/health") {
     const identity = extensionClient?.browserIdentity;
+    const { capabilities: extensionCapabilities, ...identityFields } = identity || {};
     jsonResponse(res, 200, {
       ok: true,
       protocol: 1,
@@ -271,7 +315,8 @@ const server = createServer((req, res) => {
       },
       port,
       extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
-      ...(identity || {}),
+      ...identityFields,
+      ...(extensionCapabilities === undefined ? {} : { extensionCapabilities }),
     }, extensionCorsHeaders(req));
     return;
   }
@@ -303,11 +348,12 @@ wss.on("connection", (client, request) => {
   client.browserIdentity = undefined;
   clients.add(client);
   if (role === "extension") {
-    if (extensionClient && extensionClient !== client) {
-      rejectPendingForExtension(extensionClient, "BROWSER_TARGET_CHANGED", "The active Chrome/Edge extension was replaced by another browser extension.");
-      extensionClient.close(1012, "replaced");
-    }
+    const previousExtension = extensionClient;
     extensionClient = client;
+    if (previousExtension && previousExtension !== client) {
+      rejectPendingForExtension(previousExtension, "BROWSER_TARGET_CHANGED", "The active Chrome/Edge extension was replaced by another browser extension.");
+      previousExtension.close(1012, "replaced");
+    }
     debug("extension connected");
   } else {
     debug("pi client connected");
@@ -323,7 +369,7 @@ wss.on("connection", (client, request) => {
     startedBy,
     controlDomain: "local_user",
     capabilities: BRIDGE_CAPABILITIES,
-    extensionConnected: Boolean(extensionClient),
+    extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
   });
   broadcast({ type: "event", event: "connection", role, connected: true });
 
@@ -336,9 +382,11 @@ wss.on("connection", (client, request) => {
   });
   client.on("close", () => {
     clients.delete(client);
+    if (client.role === "pi") detachPendingForClient(client);
     if (client.role === "extension") rejectPendingForExtension(client, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected.");
-    if (extensionClient === client) extensionClient = undefined;
-    broadcast({ type: "event", event: "connection", role, connected: false });
+    const wasActiveExtension = extensionClient === client;
+    if (wasActiveExtension) extensionClient = undefined;
+    if (role !== "extension" || wasActiveExtension) broadcast({ type: "event", event: "connection", role, connected: false });
     debug(`${role} disconnected`);
   });
   client.on("error", (error) => debug(`${role} websocket error`, error.message));

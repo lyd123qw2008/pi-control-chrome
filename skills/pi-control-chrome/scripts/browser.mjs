@@ -21,17 +21,17 @@ function usage() {
   node browser.mjs status [--acknowledge-browser-id <id>] [--json]
   node browser.mjs tabs [--json]
   node browser.mjs group [--json]
-  node browser.mjs open <url> [--active|--inactive] [--session <id>] [--json]
-  node browser.mjs view <url> [--inactive] [--reuse-existing] [--screenshot <path>] [--json]
+  node browser.mjs open <url> --session <id> [--active|--inactive] [--turn <n>] [--json]
+  node browser.mjs view <url> --session <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--json]
   node browser.mjs snapshot <tabId> [--json]
   node browser.mjs extract <tabId> [--max-chars <n>] [--json]
   node browser.mjs screenshot <tabId> <path> [--full-page]
   node browser.mjs close <tabId> [--session <id>] [--json]
-  node browser.mjs cleanup [--session <id>] [--json]
+  node browser.mjs cleanup --session <id> [--json]
 
 Examples:
   node browser.mjs status
-  node browser.mjs view http://127.0.0.1:3000/ --screenshot C:\\Temp\\page.png
+  node browser.mjs view http://127.0.0.1:3000/ --session example-session --turn 1 --screenshot C:\\Temp\\page.png
   node browser.mjs tabs --json`);
 }
 
@@ -66,6 +66,16 @@ function numberOption(options, name, fallback) {
   const value = Number(options[name]);
   if (!Number.isFinite(value)) throw new Error(`Invalid numeric option --${name.replaceAll("_", "-")}`);
   return value;
+}
+
+function requiredSession(options, command) {
+  if (options.session === undefined || String(options.session).trim() === "") throw new Error(`${command} requires --session <id> for managed browser ownership`);
+  return String(options.session);
+}
+
+function requiredTurn(options, command) {
+  if (options.turn === undefined || String(options.turn).trim() === "") throw new Error(`${command} requires --turn <n> when marking a retained tab`);
+  return numberOption(options, "turn");
 }
 
 async function bridgeHealth() {
@@ -241,7 +251,8 @@ async function waitForGroupedTab(client, tabId, attempts = 12) {
 }
 
 async function openTab(client, url, options) {
-  const sessionId = String(options.session || `skill-${process.pid}`);
+  const sessionId = requiredSession(options, "open");
+  const turnId = options.turn === undefined ? undefined : numberOption(options, "turn");
   const active = boolOption(options, "active", !boolOption(options, "inactive", false));
   const created = await client.request("new_tab", { url, active, sessionId });
   const tabId = created?.tab?.id;
@@ -250,7 +261,7 @@ async function openTab(client, url, options) {
   const waited = await client.request("wait", { tabId, state: "load", timeoutMs: numberOption(options, "timeout_ms", 30_000) });
   const waitMs = Date.now() - waitStarted;
   const grouped = await waitForGroupedTab(client, tabId);
-  return { created, waited, tabId, waitMs, ...grouped, sessionId };
+  return { created, waited, tabId, waitMs, ...grouped, sessionId, turnId };
 }
 
 async function inspectTab(client, tabId, options) {
@@ -323,6 +334,15 @@ async function main() {
   const command = process.argv[2] || "status";
   if (["help", "--help", "-h"].includes(command)) { usage(); return; }
   const { positionals, options } = parseArgs(process.argv.slice(3));
+  if (command === "open") {
+    requiredSession(options, "open");
+    if (boolOption(options, "handoff", false) || boolOption(options, "deliverable", false)) requiredTurn(options, "open");
+  }
+  if (command === "view") {
+    if (!boolOption(options, "reuse_existing", false) || !boolOption(options, "temporary", false)) requiredSession(options, "view");
+    if (!boolOption(options, "temporary", false)) requiredTurn(options, "view");
+  }
+  if (command === "cleanup") requiredSession(options, "cleanup");
   const { client, health } = await createClient();
   try {
     if (command === "status") {
@@ -344,14 +364,14 @@ async function main() {
       if (!positionals[0]) throw new Error("open requires a URL");
       const result = await openTab(client, positionals[0], options);
       if (boolOption(options, "handoff", false)) {
-        await client.request("mark_handoff", { tabId: result.tabId, sessionId: result.sessionId });
+        await client.request("mark_handoff", { tabId: result.tabId, sessionId: result.sessionId, turnId: result.turnId });
         if (result.tab) result.tab.lifecycle = "handoff";
       }
       if (boolOption(options, "deliverable", false)) {
-        await client.request("mark_deliverable", { tabId: result.tabId, sessionId: result.sessionId });
+        await client.request("mark_deliverable", { tabId: result.tabId, sessionId: result.sessionId, turnId: result.turnId });
         if (result.tab) result.tab.lifecycle = "deliverable";
       }
-      printResult({ tab: tabSummary(result.tab), group: result.tabs?.groups?.find((entry) => entry.id === result.tab?.groupId), waitMs: result.waitMs }, options);
+      printResult({ tab: tabSummary(result.tab), group: result.tabs?.groups?.find((entry) => entry.id === result.tab?.groupId), waitMs: result.waitMs, sessionId: result.sessionId, turnId: result.turnId }, options);
       return;
     }
     if (command === "view") {
@@ -360,16 +380,18 @@ async function main() {
       if (boolOption(options, "reuse_existing", false)) {
         const tabs = await client.request("list_tabs");
         const existing = tabs.tabs.find((tab) => tab.url === positionals[0]);
-        if (existing) opened = { tabId: existing.id, tab: existing, tabs, waitMs: 0 };
+        if (existing) opened = { tabId: existing.id, tab: existing, tabs, waitMs: 0, sessionId: options.session === undefined ? existing.sessionId : String(options.session), turnId: numberOption(options, "turn", 0) };
       }
       if (!opened) opened = await openTab(client, positionals[0], { ...options, active: !boolOption(options, "inactive", false) });
       const inspected = await inspectTab(client, opened.tabId, options);
       if (!boolOption(options, "temporary", false) && opened.tab?.owner === "agent") {
-        await client.request("mark_handoff", { tabId: opened.tabId });
+        const sessionId = String(opened.sessionId || requiredSession(options, "view"));
+        const turnId = opened.turnId ?? requiredTurn(options, "view");
+        await client.request("mark_handoff", { tabId: opened.tabId, sessionId, turnId });
         inspected.tab.lifecycle = "handoff";
       }
       const group = opened.tabs?.groups?.find((entry) => entry.id === inspected.tab?.groupId);
-      printResult({ ...inspected, group, waitMs: opened.waitMs }, options);
+      printResult({ ...inspected, group, waitMs: opened.waitMs, sessionId: opened.sessionId, turnId: opened.turnId }, options);
       return;
     }
     if (command === "snapshot" || command === "extract") {
