@@ -12,7 +12,10 @@ Chrome/Edge MV3 Extension
           ↕ 127.0.0.1 + pairing token
 Local Bridge
   ├── pairing and lifecycle state
-  ├── request routing
+  ├── browser-target registry
+  ├── target-qualified request routing
+  ├── connection-generation fencing
+  ├── bounded diagnostics and recovery state
   └── browser target validation
           ↕ Pi Extension protocol
 Pi Extension
@@ -29,15 +32,28 @@ Pi Extension
 
 ```ts
 interface BrowserConnection {
-  id: string;
+  browserId: string;
+  connectionId: string;
+  connectionGeneration: number;
   family: "chrome" | "edge" | "chromium" | "brave";
-  profileId?: string;
+  profileId: string;
   profileName?: string;
-  extensionVersion: string;
-  connectedAt: number;
+  extensionVersion?: string;
+  state: "ready" | "disconnected" | "replaced";
+  connectedAt?: number;
   capabilities: string[];
 }
 ```
+
+### Browser target and connection
+
+A logical browser target identifies one browser Profile and remains stable across extension reconnects. The current protocol uses `browserId` as that identity and reports the browser family and Profile identifier with it. A WebSocket is a physical connection to that target, not the target identity itself. Each target connection receives a `connectionId` and monotonic `connectionGeneration`; Bridge requests may include these fields to reject stale sockets and stale operation routes.
+
+A Bridge can keep multiple targets ready at the same time. A request without a target is accepted only when exactly one ready target is available. When multiple targets are ready, Pi, DSH, and the managed Skill CLI require an explicit `browserId`; they never select the newest connection, active window, or first list entry implicitly. One Agent session binds to one target at a time. A target replacement or disconnect does not transfer ownership to another target.
+
+### Recovery and observability
+
+Bridge health exposes the target registry, target state, connection generation, capability metadata, bounded metrics, and recent non-sensitive lifecycle diagnostics. `list_targets` returns the target inventory, and `doctor` returns target-independent Bridge recovery information. Target disconnects preserve the logical target record and pending recovery state while requests routed to that target fail with a deterministic error. Side-effecting browser operations are not automatically replayed after a timeout or connection change; callers must inspect the current page before retrying.
 
 ### Tab handle
 
@@ -67,6 +83,6 @@ The Bridge still needs two mechanical protocol protections: bind to loopback by 
 
 ## Current implementation boundary
 
-The current implementation covers local pairing, Bridge request routing, one active extension target, tab and group ownership, stale-handle checks, page snapshots, locator and DOM operations, CUA, native CDP, screenshots, Console, Network, Dialog, Upload, Download and Clipboard controls. DSH and Pi expose separate host adapters over the same Bridge protocol.
+The current implementation covers local pairing, Bridge target registry and target-qualified routing, connection-generation fencing, one-target-per-session binding, tab and group ownership, stale-handle checks, page snapshots, locator and DOM operations, CUA, native CDP, screenshots, Console, Network, Dialog, Upload, Download and Clipboard controls. DSH and Pi expose separate host adapters over the same target-qualified Bridge protocol. Health, target inventory, doctor diagnostics, target disconnect state, and bounded Bridge metrics are available for recovery.
 
-Deferred scope includes multiple browser Profiles, WebMCP, GSuite export, history APIs, media-specific downloads, capability discovery and browser-store packaging. The feature matrix records the remaining product scope.
+Deferred scope includes simultaneous multi-target control within one session, WebMCP, GSuite export, history APIs, media-specific downloads, broader capability discovery and browser-store packaging. The feature matrix records the remaining product scope.

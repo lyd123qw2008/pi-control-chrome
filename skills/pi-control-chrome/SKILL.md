@@ -10,7 +10,7 @@ Use this Skill only when the user explicitly asks to use the existing Chrome or 
 
 ## Connection Check
 
-After this Skill has loaded and the `browser_*` tools are visible, start with `browser_status`. Browser tools remain active across later turns in the current Pi session; do not reload this Skill after every turn. `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are explicit human diagnostics or lifecycle commands; do not use them as a substitute for loading this Skill or as a reason to start browser control for an ordinary task.
+After this Skill has loaded and the `browser_*` tools are visible, start with `browser_status`. Browser tools remain active across later turns in the current Pi session; do not reload this Skill after every turn. `/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are explicit human diagnostics or lifecycle commands; do not use them as a substitute for loading this Skill or as a reason to start browser control for an ordinary task.
 
 The expected healthy state is:
 
@@ -28,10 +28,14 @@ Treat a browser obstacle as a diagnosis problem, not a reason to repeat the last
 
 - Run `browser_status` before acting when the target browser is not already confirmed.
 - If `browser` or `browserId` is not the browser the user requested, stop. Do not use its tab ids or handles.
-- One Bridge endpoint accepts one active extension connection. If Chrome and Edge both connect to `127.0.0.1:17318`, the newer connection replaces the older one and reconnect attempts can make the target alternate.
-- If `browserId` changes during a task, stop the task, refresh `browser_status`, and ask the user which browser should remain connected.
+- A Bridge may expose multiple connected browser targets. When more than one target is ready, select one with `browser_status` and its `browserId`, `/chrome profile <browserId>`, or the managed CLI `--browser-id`; never choose the newest connection, active window, or first list entry by assumption.
+- If `browserId` changes during a task, stop the task, refresh `browser_status`, and ask the user which browser should remain connected unless the user explicitly selected the new `browserId`.
 - Never recover by closing, navigating, or moving an existing user tab. Prefer an Agent tab.
 - Do not expose pairing tokens, cookies, passwords, access tokens, private keys, or unrelated page data in a diagnostic report.
+
+### Multiple browser targets
+
+`browser_status` includes the selected target and, on a multi-target Bridge, the available target list and connection generation. Use `browser_status` without a selection to discover targets. Once the user or workflow selects a `browserId`, continue using that target; a target connection replacement is a recovery event, not permission to replay a side-effecting operation. Refresh status, inspect the current page, and retry only read-only inspection when the outcome of the interrupted operation is unknown.
 
 ### Wrong browser or a flapping connection
 
@@ -160,7 +164,7 @@ Never include the pairing token, cookies, passwords, access tokens, or unrelated
 
 The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Managed `open`, `view`, and `cleanup` calls require an explicit `--session <id>`; `view` retention marks also require `--turn <n>`. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
 
-`/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` remain explicit human diagnostics or lifecycle commands and do not activate model browser tools.
+`/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` remain explicit human diagnostics or lifecycle commands and do not activate model browser tools.
 
 ## Tool Selection
 

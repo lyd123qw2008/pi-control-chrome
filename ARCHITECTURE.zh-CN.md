@@ -14,7 +14,10 @@ Chrome / Edge Manifest V3 扩展
           ↕ 127.0.0.1 + 配对 Token
 本地 Bridge
   ├── 配对和生命周期状态
-  ├── 请求路由
+  ├── 浏览器目标注册表
+  ├── 目标限定请求路由
+  ├── connection generation fence
+  ├── 有界诊断和恢复状态
   └── 浏览器目标校验
           ↕ Pi Extension 协议
 Pi Extension
@@ -66,10 +69,11 @@ Bridge 只监听本机回环地址：
 主要职责：
 
 - 接收 Pi Extension 请求；
-- 转发请求到 Chrome/Edge 扩展；
-- 为 Pi 会话分配 session ID；
-- 维护扩展连接状态；
-- 处理断线和重连；
+- 维护浏览器目标注册表；
+- 按 `browserId` 转发请求；
+- 为目标连接分配 connection ID 和 connection generation；
+- 转发目标限定事件；
+- 维护有界诊断、metrics、断线和重连状态；
 - 校验本地配对 Token；
 - 拒绝普通网页读取配对和健康响应中的跨源数据。
 
@@ -399,6 +403,14 @@ Chrome/Edge 扩展安装权限
 - prompt；
 - beforeunload。
 
+## 九点五、浏览器目标和恢复
+
+逻辑浏览器目标表示一个浏览器 Profile，在扩展重连后仍保持稳定。协议使用 `browserId` 表示这个身份，并同时报告浏览器类型和 Profile 标识。WebSocket 是该目标的一次物理连接，不是目标本身；每次连接都有 `connectionId` 和递增的 `connectionGeneration`。请求可以携带这些字段，以拒绝旧连接或旧请求路径。
+
+同一个 Bridge 可以同时保持多个 ready 目标。只有在恰好一个目标 ready 时，请求才允许省略目标；多个目标 ready 时，Pi、DSH 和 Skill CLI 必须明确提供 `browserId`，不会根据最新连接、活动窗口或列表第一项猜测。一个 Agent session 一次只绑定一个目标。目标断线或替换不会把 ownership 转移给另一个目标。
+
+Bridge health 会暴露目标注册表、目标状态、connection generation、能力信息、有界 metrics 和最近的非敏感生命周期诊断。`list_targets` 返回目标清单，`doctor` 返回与具体目标无关的 Bridge 恢复信息。目标断线会保留逻辑目标记录和恢复状态，但发送到该目标的请求会返回确定性的错误。超时或连接变化后的有副作用浏览器操作不会自动重放；调用方必须先检查当前页面，再决定是否重试。
+
 ## 十、会话和用户交接
 
 每个浏览器控制任务需要有短名称，例如：
@@ -434,7 +446,7 @@ Browser session 和 Pi session 绑定，但 Tab Handle 不能只依赖数字 tab
 
 已完成 Chrome/Edge 扩展、本地 Bridge、Pi Extension、一次性配对、状态/标签页、claim/release、Pi 分组、snapshot、Locator、DOM/坐标 CUA、导航和页面交互、截图、Clipboard、Upload/Download、Dialog、Console/Network、原生 CDP 以及 session/turn 清理。
 
-### 第 3 阶段：扩展能力
+### 第 3 阶段：扩展能力（已完成当前基础实现）
 
 1. `Runtime.evaluate`；
 2. Console；
@@ -442,14 +454,15 @@ Browser session 和 Pi session 绑定，但 Tab Handle 不能只依赖数字 tab
 4. Dialog；
 5. Upload；
 6. Download；
-7. CDP 能力白名单。
+7. 原生 CDP；
+8. 多浏览器目标注册表、目标路由、connection generation fence 和恢复诊断。
 
-### 第 4 阶段：Codex 体验对齐
+### 第 4 阶段：Codex 体验对齐和延期能力
 
 1. handoff；
 2. deliverable；
 3. 后台/前台显示；
 4. stale handle；
-5. 多窗口和 Profile；
+5. 同一 session 同时控制多个目标；
 6. WebMCP；
 7. 完整安全确认策略。

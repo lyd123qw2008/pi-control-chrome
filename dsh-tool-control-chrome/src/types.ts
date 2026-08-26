@@ -37,6 +37,23 @@ export interface ResolvedConfig {
 /** JSON-compatible result returned by the browser Bridge. */
 export type BrowserResult = Record<string, unknown>
 
+/** Logical browser target selected for a session. */
+export interface BrowserTarget {
+  readonly browser: string
+  readonly browserId: string
+  readonly profile: string
+  readonly state?: string
+  readonly connectionId?: string
+  readonly connectionGeneration?: number
+}
+
+/** Physical Bridge connection fence for a logical browser target. */
+export interface BrowserTargetRoute {
+  readonly browserId: string
+  readonly connectionId?: string
+  readonly connectionGeneration?: number
+}
+
 /** Screenshot result after optional attachment admission. */
 export interface ScreenshotResult extends BrowserResult {
   readonly data?: string

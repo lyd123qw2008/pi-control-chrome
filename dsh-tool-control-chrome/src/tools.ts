@@ -17,7 +17,7 @@ import {
 import type { BrowserBridgeClient } from './bridge.js'
 import { bridgeRecovery, unavailableBridgeRecovery } from './diagnostics.js'
 import { BROWSER_SKILL_NAME } from './skill.js'
-import type { ResolvedConfig, ScreenshotResult } from './types.js'
+import type { BrowserTarget, BrowserTargetRoute, ResolvedConfig, ScreenshotResult } from './types.js'
 
 const TAB_ID: ParameterPropertySpec = { type: 'number', description: 'Browser tab id. Omit to use the selected tab.' }
 const SELECTOR: ParameterPropertySpec = { type: 'string', description: 'Optional CSS selector. Prefer a ref from browser_snapshot.' }
@@ -28,23 +28,21 @@ const OPTIONAL_BOOLEAN: ParameterPropertySpec = { type: 'boolean' }
 const EMPTY_PARAMETERS: ParameterSchemaSpec = {}
 const TURN_CLEANUP_CAPABILITIES = ['turnCleanup', 'turnScopedMarks', 'retainedCleanup', 'debuggerLeaseRecovery'] as const
 
-type BrowserTarget = {
-  readonly browser: string
-  readonly browserId: string
-  readonly profile: string
-}
-
 type TargetStability = {
   readonly stable: boolean
   readonly changed: boolean
   readonly acknowledged: boolean
   readonly requiresAcknowledgement: boolean
-  readonly competition: 'unknown' | 'stable_observed' | 'changed'
+  readonly connectionChanged: boolean
+  readonly competition: 'unknown' | 'stable_observed' | 'changed' | 'reconnected'
   readonly browser?: string
   readonly browserId?: string
   readonly profile?: string
+  readonly connectionId?: string
+  readonly connectionGeneration?: number
   readonly previousBrowser?: string
   readonly previousBrowserId?: string
+  readonly previousConnectionGeneration?: number
   readonly observedBrowserIds: readonly string[]
   readonly issue?: string
 }
@@ -55,7 +53,10 @@ function readBrowserTarget(value: unknown): BrowserTarget | undefined {
   const browserId = value.browserId
   const profile = value.profile
   if (typeof browser !== 'string' || browser.length === 0 || typeof browserId !== 'string' || browserId.length === 0 || typeof profile !== 'string' || profile.length === 0) return undefined
-  return { browser, browserId, profile }
+  const state = typeof value.state === 'string' && value.state.length > 0 ? value.state : undefined
+  const connectionId = typeof value.connectionId === 'string' && value.connectionId.length > 0 ? value.connectionId : undefined
+  const connectionGeneration = typeof value.connectionGeneration === 'number' && Number.isInteger(value.connectionGeneration) && value.connectionGeneration > 0 ? value.connectionGeneration : undefined
+  return { browser, browserId, profile, ...(state === undefined ? {} : { state }), ...(connectionId === undefined ? {} : { connectionId }), ...(connectionGeneration === undefined ? {} : { connectionGeneration }) }
 }
 
 function sameBrowserTarget(left: BrowserTarget, right: BrowserTarget): boolean {
@@ -74,6 +75,7 @@ class BrowserTargetTracker {
         changed: false,
         acknowledged: false,
         requiresAcknowledgement: false,
+        connectionChanged: false,
         competition: 'unknown',
         observedBrowserIds: [...this.observed.keys()],
         issue: 'status_missing_browser_target',
@@ -81,6 +83,11 @@ class BrowserTargetTracker {
     }
     const previous = this.acknowledged
     const changed = previous !== undefined && !sameBrowserTarget(previous, target)
+    const connectionChanged = previous !== undefined
+      && previous.browserId === target.browserId
+      && previous.connectionGeneration !== undefined
+      && target.connectionGeneration !== undefined
+      && previous.connectionGeneration !== target.connectionGeneration
     const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId
     this.observed.add(target.browserId)
     if (acknowledged) this.acknowledged = target
@@ -89,17 +96,40 @@ class BrowserTargetTracker {
       changed,
       acknowledged,
       requiresAcknowledgement: changed && !acknowledged,
-      competition: previous === undefined ? 'unknown' : changed ? 'changed' : 'stable_observed',
+      connectionChanged,
+      competition: previous === undefined ? 'unknown' : changed ? 'changed' : connectionChanged ? 'reconnected' : 'stable_observed',
       browser: target.browser,
       browserId: target.browserId,
       profile: target.profile,
+      ...(target.connectionId === undefined ? {} : { connectionId: target.connectionId }),
+      ...(target.connectionGeneration === undefined ? {} : { connectionGeneration: target.connectionGeneration }),
       observedBrowserIds: [...this.observed.keys()],
-      ...(!changed || previous === undefined ? {} : { previousBrowser: previous.browser, previousBrowserId: previous.browserId }),
+      ...(previous === undefined ? {} : {
+        previousBrowser: previous.browser,
+        previousBrowserId: previous.browserId,
+        ...(previous.connectionGeneration === undefined ? {} : { previousConnectionGeneration: previous.connectionGeneration }),
+      }),
     }
   }
 
   expectedBrowserId(): string | undefined {
     return this.acknowledged?.browserId
+  }
+
+  route(): BrowserTargetRoute | undefined {
+    const target = this.acknowledged
+    if (target === undefined || (target.connectionId === undefined && target.connectionGeneration === undefined)) return undefined
+    return { browserId: target.browserId }
+  }
+
+  fencedRoute(): BrowserTargetRoute | undefined {
+    const target = this.acknowledged
+    if (target === undefined || (target.connectionId === undefined && target.connectionGeneration === undefined)) return undefined
+    return {
+      browserId: target.browserId,
+      ...(target.connectionId === undefined ? {} : { connectionId: target.connectionId }),
+      ...(target.connectionGeneration === undefined ? {} : { connectionGeneration: target.connectionGeneration }),
+    }
   }
 
   assertStable(value: unknown): BrowserTarget {
@@ -165,6 +195,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     name: 'browser_status',
     description: 'Return the connected Chrome/Edge browser, active browser target stability and local Bridge status.',
     parameters: {
+      browserId: { type: 'string', description: 'Select a connected browser target by browserId.' },
       acknowledgeBrowserId: { type: 'string', description: 'Explicitly acknowledge this browserId after the user confirms a browser switch.' },
     },
     method: 'status',
@@ -601,6 +632,28 @@ function bridgeErrorCode(error: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined
 }
 
+function targetRecords(value: unknown): BrowserTarget[] {
+  if (!isRecord(value) || !Array.isArray(value.targets)) return []
+  return value.targets
+    .map(readBrowserTarget)
+    .filter((target): target is BrowserTarget => target !== undefined)
+}
+
+function readyTargetRecords(value: unknown): BrowserTarget[] {
+  return targetRecords(value).filter(target => target.state === undefined || target.state === 'ready')
+}
+
+function requestWithTarget(
+  bridge: BrowserBridgeClient,
+  method: string,
+  params: Record<string, unknown>,
+  signal?: AbortSignal,
+  target?: BrowserTargetRoute,
+): Promise<unknown> {
+  if (target !== undefined) return bridge.request(method, params, signal, target)
+  return signal === undefined ? bridge.request(method, params) : bridge.request(method, params, signal)
+}
+
 const EXTENSION_READY_INTERVAL_MS = 150
 
 async function waitForExtension(
@@ -632,6 +685,8 @@ async function waitForExtension(
 
 type BrowserConnection =
   | { readonly state: 'connected'; readonly status: unknown; readonly bridgeHealth: Record<string, unknown> }
+  | { readonly state: 'target_required'; readonly bridgeHealth: Record<string, unknown>; readonly targets: readonly BrowserTarget[] }
+  | { readonly state: 'target_unavailable'; readonly bridgeHealth: Record<string, unknown>; readonly targets: readonly BrowserTarget[]; readonly target?: BrowserTargetRoute }
   | { readonly state: 'bridge_only'; readonly bridgeHealth: Record<string, unknown>; readonly error?: unknown }
   | { readonly state: 'bridge_offline'; readonly error: unknown }
 
@@ -640,6 +695,7 @@ async function readBrowserConnection(
   sessionId: string,
   signal: AbortSignal,
   extensionReadyTimeoutMs: number,
+  target?: BrowserTargetRoute,
 ): Promise<BrowserConnection> {
   try {
     await bridge.start()
@@ -662,16 +718,59 @@ async function readBrowserConnection(
   try {
     return {
       state: 'connected',
-      status: await bridge.request('status', { sessionId }, signal),
+      status: await requestWithTarget(bridge, 'status', { sessionId }, signal, target),
       bridgeHealth,
     }
   } catch (error) {
+    if (bridgeErrorCode(error) === 'TARGET_REQUIRED') {
+      return { state: 'target_required', bridgeHealth, targets: readyTargetRecords(bridgeHealth) }
+    }
+    if (bridgeErrorCode(error) === 'TARGET_UNAVAILABLE') return { state: 'target_unavailable', bridgeHealth, targets: targetRecords(bridgeHealth), ...(target === undefined ? {} : { target }) }
     if (bridgeErrorCode(error) === 'EXTENSION_OFFLINE') return { state: 'bridge_only', bridgeHealth, error }
     throw error
   }
 }
 
 function connectionResult(connection: Exclude<BrowserConnection, { readonly state: 'connected' }>): JsonValue {
+  if (connection.state === 'target_unavailable') {
+    return asJsonValue({
+      ok: false,
+      connected: false,
+      state: connection.state,
+      targetRequired: false,
+      completed: false,
+      retryable: true,
+      nextAction: 'browser_status',
+      recommendation: 'refresh_browser_targets',
+      error: {
+        code: 'TARGET_UNAVAILABLE',
+        message: 'The selected browser target is disconnected or being replaced; refresh browser_status before retrying.',
+      },
+      ...(connection.target === undefined ? {} : { target: connection.target }),
+      targets: connection.targets,
+      bridgeHealth: connection.bridgeHealth,
+      recovery: bridgeRecovery(connection.bridgeHealth),
+    })
+  }
+  if (connection.state === 'target_required') {
+    return asJsonValue({
+      ok: false,
+      connected: false,
+      state: connection.state,
+      targetRequired: true,
+      completed: false,
+      retryable: true,
+      nextAction: 'browser_status',
+      recommendation: 'select_browser_target',
+      error: {
+        code: 'TARGET_REQUIRED',
+        message: 'Multiple browser targets are connected; call browser_status with browserId to select one.',
+      },
+      targets: connection.targets,
+      bridgeHealth: connection.bridgeHealth,
+      recovery: bridgeRecovery(connection.bridgeHealth),
+    })
+  }
   if (connection.state === 'bridge_only') {
     return asJsonValue({
       ok: false,
@@ -705,48 +804,59 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
   })
 }
 
-async function operationDisconnectedResult(bridge: BrowserBridgeClient): Promise<JsonValue> {
+async function operationDisconnectedResult(
+  bridge: BrowserBridgeClient,
+  code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' = 'EXTENSION_OFFLINE',
+): Promise<JsonValue> {
   let bridgeHealth: Record<string, unknown> | undefined
   try {
     bridgeHealth = await bridge.health()
   } catch {
     // Preserve the operation uncertainty even if the Bridge also went offline.
   }
+  const targetLoss = code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED'
   return asJsonValue({
     ok: false,
     completed: false,
     actionState: 'unknown',
     retryable: false,
+    ...(targetLoss ? { nextAction: 'browser_status', recommendation: 'refresh_browser_targets' } : {}),
     error: {
-      code: 'extension_disconnected_during_operation',
-      message: 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.',
+      code: targetLoss ? code : 'extension_disconnected_during_operation',
+      message: targetLoss
+        ? 'The selected browser target is unavailable or its connection changed during the browser operation. Inspect the current page before retrying.'
+        : 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.',
     },
-    ...(bridgeHealth === undefined ? {} : { bridgeHealth }),
+    ...(bridgeHealth === undefined ? {} : { bridgeHealth, recovery: bridgeRecovery(bridgeHealth) }),
   })
 }
 
 type BrowserOperationResponse =
   | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false }
+  | { readonly ok: false; readonly code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' }
 
 async function requestBrowserOperation(
   bridge: BrowserBridgeClient,
   method: string,
   params: Record<string, JsonValue>,
   signal: AbortSignal,
+  target?: BrowserTargetRoute,
 ): Promise<BrowserOperationResponse> {
   try {
-    return { ok: true, value: await bridge.request(method, params, signal) }
+    return { ok: true, value: await requestWithTarget(bridge, method, params, signal, target) }
   } catch (error) {
-    if (bridgeErrorCode(error) === 'EXTENSION_OFFLINE') return { ok: false }
+    const code = bridgeErrorCode(error)
+    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED') return { ok: false, code }
     throw error
   }
 }
 
 async function bridgeTargetHealth(bridge: BrowserBridgeClient, target: BrowserTarget): Promise<Record<string, unknown>> {
   const health = await bridge.health()
-  if (health.browserId !== target.browserId) {
-    throw new Error('Browser Bridge does not expose the active browser identity required for atomic target routing; run browser_doctor to inspect recovery availability')
+  const healthBrowserId = typeof health.browserId === 'string' ? health.browserId : undefined
+  const targets = readyTargetRecords(health)
+  if (healthBrowserId !== target.browserId && !targets.some(candidate => candidate.browserId === target.browserId)) {
+    throw new Error('Browser Bridge does not expose the selected browser identity required for atomic target routing; run browser_doctor to inspect recovery availability')
   }
   return health
 }
@@ -758,10 +868,12 @@ async function browserStatus(
   signal: AbortSignal,
   extensionReadyTimeoutMs: number,
   acknowledgeBrowserId?: string,
+  requestedBrowserId?: string,
 ): Promise<JsonValue> {
-  const connection = await readBrowserConnection(bridge, sessionId, signal, extensionReadyTimeoutMs)
+  const route = requestedBrowserId === undefined ? tracker.route() : { browserId: requestedBrowserId }
+  const connection = await readBrowserConnection(bridge, sessionId, signal, extensionReadyTimeoutMs, route)
   if (connection.state !== 'connected') return connectionResult(connection)
-  const targetStability = tracker.observe(connection.status, acknowledgeBrowserId)
+  const targetStability = tracker.observe(connection.status, typeof acknowledgeBrowserId === 'string' ? acknowledgeBrowserId : requestedBrowserId)
   const base = isRecord(connection.status) ? connection.status : { result: connection.status }
   try {
     return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: await bridge.health() })
@@ -797,6 +909,12 @@ async function browserDoctor(
       recovery: bridgeRecovery(bridgeHealth),
       issues: [{ code: 'extension_not_connected', message: 'The local Bridge is healthy but no browser extension is connected.' }],
     })
+  }
+  try {
+    const diagnosis = await bridge.request('doctor', {}, signal)
+    if (isRecord(diagnosis) && ('bridgeHealth' in diagnosis || 'targets' in diagnosis)) return asJsonValue(diagnosis)
+  } catch {
+    // Fall back to the status-based diagnosis for older Bridge versions.
   }
 
   let status: unknown
@@ -1095,18 +1213,18 @@ export function registerBrowserTools(
     session: AgentSession,
     params: Record<string, unknown>,
     signal?: AbortSignal,
+    targetRoute?: BrowserTargetRoute,
   ): Promise<unknown> => {
     const id = sessionId(session)
     const previous = wireBarriers.get(id)
     const request = (previous ?? Promise.resolve()).then(async () => {
       if (signal?.aborted) throw signal.reason ?? new Error('Browser cleanup request aborted')
       let cleanupParams = params
+      let selectedRoute = targetRoute
       if (params.mode === 'turn') {
-        const expectedBrowserId = typeof params.expectedBrowserId === 'string' ? params.expectedBrowserId : undefined
-        const statusParams = { sessionId: id, ...(expectedBrowserId === undefined ? {} : { expectedBrowserId }) }
-        const status = signal === undefined
-          ? await bridge.request('status', statusParams)
-          : await bridge.request('status', statusParams, signal)
+        const expectedBrowserId = typeof params.expectedBrowserId === 'string' ? params.expectedBrowserId : targetRoute?.browserId
+        const statusRoute = expectedBrowserId === undefined ? undefined : { browserId: expectedBrowserId }
+        const status = await requestWithTarget(bridge, 'status', { sessionId: id, ...(expectedBrowserId === undefined ? {} : { expectedBrowserId }) }, signal, statusRoute)
         const target = readBrowserTarget(status)
         if (target === undefined) throw new Error('Browser status did not identify an active browser target; turn cleanup was not attempted')
         if (expectedBrowserId !== undefined && target.browserId !== expectedBrowserId) {
@@ -1116,10 +1234,15 @@ export function registerBrowserTools(
         const missing = TURN_CLEANUP_CAPABILITIES.filter(name => capabilities?.[name] !== true)
         if (missing.length > 0) throw new Error(`The connected extension does not support turn cleanup (${missing.join(', ')}); reload pi-control-chrome`)
         cleanupParams = { ...params, expectedBrowserId: target.browserId }
+        selectedRoute = target.connectionId === undefined && target.connectionGeneration === undefined
+          ? undefined
+          : {
+            browserId: target.browserId,
+            ...(target.connectionId === undefined ? {} : { connectionId: target.connectionId }),
+            ...(target.connectionGeneration === undefined ? {} : { connectionGeneration: target.connectionGeneration }),
+          }
       }
-      return signal === undefined
-        ? bridge.request('cleanup', cleanupParams)
-        : bridge.request('cleanup', cleanupParams, signal)
+      return requestWithTarget(bridge, 'cleanup', cleanupParams, signal, selectedRoute)
     })
     const barrier = request.then(() => undefined, () => undefined)
     wireBarriers.set(id, barrier)
@@ -1147,13 +1270,14 @@ export function registerBrowserTools(
           }
           return { ok: true, value: { removed: [], released: [], retained: [], failed: [] } }
         }
-        const expectedBrowserId = trackerFor(session).expectedBrowserId()
+        const tracker = trackerFor(session)
+        const expectedBrowserId = tracker.expectedBrowserId()
         const value = await requestCleanup(session, {
           sessionId: sessionId(session),
           mode,
           ...(mode === 'turn' ? { turnId: turnIdOverride ?? turnNumberFor(session) } : {}),
           ...(expectedBrowserId === undefined ? {} : { expectedBrowserId }),
-        }, signal)
+        }, signal, tracker.fencedRoute())
         const failure = cleanupFailure(value)
         if (failure !== undefined) throw failure
         if (mode === 'turn') {
@@ -1299,16 +1423,18 @@ export function registerBrowserTools(
         if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, exec.signal)
         if (spec.name === 'browser_status') {
           const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
-          return await browserStatus(bridge, tracker, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId)
+          const requestedBrowserId = typeof args.browserId === 'string' ? args.browserId : undefined
+          return await browserStatus(bridge, tracker, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId, requestedBrowserId)
         }
-        const connection = await readBrowserConnection(bridge, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs)
+        const connection = await readBrowserConnection(bridge, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, tracker.route())
         if (connection.state !== 'connected') return connectionResult(connection)
         const target = await assertStableBrowserTarget(bridge, tracker, connection)
+        const targetRoute = tracker.fencedRoute()
         params = { ...params, expectedBrowserId: target.browserId }
         let method = spec.method
         if (spec.name === 'browser_accessibility_snapshot') {
-          const result = await requestBrowserOperation(bridge, 'snapshot', params, exec.signal)
-          if (!result.ok) return await operationDisconnectedResult(bridge)
+          const result = await requestBrowserOperation(bridge, 'snapshot', params, exec.signal, targetRoute)
+          if (!result.ok) return await operationDisconnectedResult(bridge, result.code)
           return prepareAccessibility(result.value)
         }
         if (spec.name === 'browser_console') {
@@ -1320,12 +1446,12 @@ export function registerBrowserTools(
           params = network.params
         }
         if (spec.name === 'browser_screenshot') {
-          const result = await requestBrowserOperation(bridge, method, params, exec.signal)
-          if (!result.ok) return await operationDisconnectedResult(bridge)
+          const result = await requestBrowserOperation(bridge, method, params, exec.signal, targetRoute)
+          if (!result.ok) return await operationDisconnectedResult(bridge, result.code)
           return prepareScreenshot(result.value, params, attachments)
         }
-        const result = await requestBrowserOperation(bridge, method, params, exec.signal)
-        if (!result.ok) return await operationDisconnectedResult(bridge)
+        const result = await requestBrowserOperation(bridge, method, params, exec.signal, targetRoute)
+        if (!result.ok) return await operationDisconnectedResult(bridge, result.code)
         return asJsonValue(result.value)
       } finally {
         releaseOperation()

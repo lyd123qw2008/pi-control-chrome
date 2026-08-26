@@ -97,7 +97,6 @@ describe('dsh-tool-control-chrome real load path', () => {
     })
     expect(definition?.content).toBe(controlChrome.BROWSER_SKILL_CONTENT)
     expect(definition?.content).not.toMatch(/^---/u)
-    expect(definition?.content).not.toContain('/chrome profile')
     expect(definition?.content).not.toContain('/chrome group')
     expect(definition?.content).not.toContain('/chrome cleanup')
     await fiber.dispose()

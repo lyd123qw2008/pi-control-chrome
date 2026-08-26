@@ -132,7 +132,7 @@ If the Profile contains `overrides.pi-control-chrome: <old-version>`, update it 
 
 Restart DSH after the Profile install. Load the separate `pi-control-chrome` Skill before browser operations, then verify:
 
-- `/chrome status` or `browser_status` reports `connected: true`;
+- `/chrome status` or `browser_status` reports `connected: true` for the selected target; use `/chrome targets` and `/chrome profile <browserId>` when multiple targets are ready;
 - Bridge health reports the target root version;
 - the extension is connected;
 - `targetStability.stable: true`;

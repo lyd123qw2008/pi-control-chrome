@@ -1,6 +1,6 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Codex-aligned Chrome and Edge browser control for Pi",
   "type": "module",
   "license": "MIT",
@@ -39,6 +39,7 @@
     "README.md",
     "README-zh-CN.md",
     "SECURITY.md",
+    "docs/*.md",
     "bridge",
     "extension",
     "pi-extension",
@@ -58,6 +59,7 @@
     "test:all": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:skill",
     "bridge": "node bridge/server.mjs",
     "smoke:e2e": "node tests/e2e-browser.mjs",
+    "smoke:e2e:multi-profile": "node tests/e2e-multi-profile.mjs",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {

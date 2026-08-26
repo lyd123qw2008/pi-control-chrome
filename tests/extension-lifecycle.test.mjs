@@ -110,6 +110,24 @@ function record(tabId, lifecycle = "temporary") {
   return { tabId, windowId: 1, sessionId: "session-test", createdAt: 1, groupId: 1, owner: "agent", lifecycle };
 }
 
+function storedRecords(fixture) {
+  const stored = fixture.storage[ownedTabsKey];
+  return stored?.records || stored || {};
+}
+
+function storedRecord(fixture, tabId) {
+  return Object.values(storedRecords(fixture)).find((entry) => Number(entry?.tabId) === Number(tabId));
+}
+
+test("migrates legacy ownership records into a target-qualified schema", async () => {
+  const fixture = loadExtension();
+  fixture.storage[ownedTabsKey] = { "301": record(301) };
+
+  await fixture.api.handleRequest("list_tabs", {});
+  assert.equal(fixture.storage[ownedTabsKey].version, 2);
+  assert.equal(storedRecord(fixture, 301).browserId, "edge:test-extension:profile-id");
+});
+
 test("extension falls back to debugger capture after visible screenshot readback fails", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(7, { id: 7, windowId: 1, title: "active", url: "about:blank", active: true });
@@ -129,14 +147,14 @@ test("extension retains a tab record after failed turn cleanup and retries it", 
   assert.deepEqual(Array.from(first.removed), []);
   assert.deepEqual(Array.from(first.retained), [101]);
   assert.deepEqual(Array.from(first.failed, (entry) => ({ tabId: Number(entry.tabId), error: String(entry.error) })), [{ tabId: 101, error: "Error: simulated tab close failure" }]);
-  assert.ok(fixture.storage[ownedTabsKey]["101"]);
+  assert.ok(storedRecord(fixture, 101));
 
   fixture.removeFailures.delete(101);
   const second = await fixture.api.handleRequest("cleanup", { sessionId: "session-test", mode: "turn", turnId: 2 });
   assert.deepEqual(Array.from(second.removed), [101]);
   assert.deepEqual(Array.from(second.retained), []);
   assert.deepEqual(Array.from(second.failed), []);
-  assert.equal(fixture.storage[ownedTabsKey]["101"], undefined);
+  assert.equal(storedRecord(fixture, 101), undefined);
 });
 
 test("non-turn cleanup transfers retained tab control without closing it", async () => {
@@ -150,9 +168,26 @@ test("non-turn cleanup transfers retained tab control without closing it", async
   assert.deepEqual(Array.from(result.retained), []);
   assert.deepEqual(Array.from(result.failed), []);
   assert.equal(fixture.tabs.has(111), true);
-  assert.equal(fixture.storage[ownedTabsKey]["111"], undefined);
+  assert.equal(storedRecord(fixture, 111), undefined);
 });
 
+test("cleanup leaves another target's ownership record untouched", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(101, { id: 101, windowId: 1, title: "edge", url: "about:blank" });
+  fixture.tabs.set(202, { id: 202, windowId: 2, title: "chrome", url: "about:blank" });
+  fixture.storage[ownedTabsKey] = {
+    version: 2,
+    records: {
+      "edge:test-extension:profile-id::101": { ...record(101), browserId: "edge:test-extension:profile-id" },
+      "chrome:other-profile::202": { ...record(202), browserId: "chrome:other-profile" },
+    },
+  };
+
+  const result = await fixture.api.handleRequest("cleanup", { sessionId: "session-test" });
+  assert.deepEqual(Array.from(result.removed), [101]);
+  assert.equal(storedRecord(fixture, 101), undefined);
+  assert.equal(storedRecord(fixture, 202).browserId, "chrome:other-profile");
+});
 test("extension serializes concurrent ownership mutations", async () => {
   const fixture = loadExtension();
   fixture.storage[ownedTabsKey] = { "201": record(201), "202": record(202) };
@@ -160,10 +195,10 @@ test("extension serializes concurrent ownership mutations", async () => {
     fixture.api.handleRequest("mark_handoff", { tabId: 201, sessionId: "session-test", turnId: 3 }),
     fixture.api.handleRequest("mark_deliverable", { tabId: 202, sessionId: "session-test", turnId: 3 }),
   ]);
-  assert.equal(fixture.storage[ownedTabsKey]["201"].lifecycle, "handoff");
-  assert.equal(fixture.storage[ownedTabsKey]["202"].lifecycle, "deliverable");
-  assert.equal(fixture.storage[ownedTabsKey]["201"].markTurn, "3");
-  assert.equal(fixture.storage[ownedTabsKey]["202"].markTurn, "3");
+  assert.equal(storedRecord(fixture, 201).lifecycle, "handoff");
+  assert.equal(storedRecord(fixture, 202).lifecycle, "deliverable");
+  assert.equal(storedRecord(fixture, 201).markTurn, "3");
+  assert.equal(storedRecord(fixture, 202).markTurn, "3");
 });
 
 test("extension keeps a failed debugger detach retryable", async () => {
@@ -171,9 +206,9 @@ test("extension keeps a failed debugger detach retryable", async () => {
   await fixture.api.attachDebugger(7, "session-test");
   fixture.setDetachFailure(true);
   await assert.rejects(() => fixture.api.detachDebugger(7, "session-test"), /simulated debugger detach failure/);
-  assert.equal(fixture.api.persistentDebuggers.get(7).detachPending, true);
+  assert.equal([...fixture.api.persistentDebuggers.values()].find((entry) => entry.tabId === 7)?.detachPending, true);
 
   fixture.setDetachFailure(false);
   await fixture.api.detachDebugger(7, "session-test");
-  assert.equal(fixture.api.persistentDebuggers.has(7), false);
+  assert.equal([...fixture.api.persistentDebuggers.values()].some((entry) => entry.tabId === 7), false);
 });

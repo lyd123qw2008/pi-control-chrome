@@ -8,7 +8,7 @@
 
 用户可以直接修改复选框、调整优先级或添加备注。
 
-> 实现状态（2026-08-17）：阶段 1/2 核心代码已经完成。当前仓库已实现并验证 Chrome/Edge 扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。以下复选框保留原始产品规划，不作为当前实现状态的唯一来源；当前能力以 README、架构文档和测试为准。第三阶段能力（多 Profile、WebMCP、GSuite、历史记录、发布包等）仍未实现。
+> 实现状态（2026-08-17，按当前仓库持续更新）：阶段 1/2 核心代码已经完成。当前仓库已实现并验证 Chrome/Edge 扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。当前 Bridge 还支持多个已识别浏览器目标、target-qualified routing、connection-generation fencing、每 session 单目标绑定、目标断线状态、Bridge `list_targets`/`doctor` 诊断和有界 metrics。以下复选框保留原始产品规划，不作为当前实现状态的唯一来源；当前能力以 README、架构文档和测试为准。WebMCP、GSuite、历史记录、媒体下载、浏览器商店发布包和同一 session 同时控制多个目标仍未实现。
 
 ---
 
@@ -339,7 +339,7 @@
 - **已决定**：claim 后允许用户授权的页面继续导航、点击和输入；release 时不关闭。
 - **已决定**：按 Codex 默认生命周期处理：turn 结束关闭未标记的 Agent 临时页面、release claimed user Tab、detach debugger lease；handoff/deliverable 只保留当前 turn 标记的页面。
 - **已决定**：`handoff` 和 `deliverable` 按 Codex 语义保留。
-- **已决定**：Chrome 和 Edge 第一版同时支持；多 Profile 排在后续阶段。
+- **已决定**：Chrome 和 Edge 第一版同时支持；Bridge 可同时保持多个目标连接，多个 ready 目标必须显式选择 `browserId`，同一 session 同时控制多个目标排在后续阶段。
 - **已决定**：扩展安装/配对一次，后续不逐次授权。
 - **已决定**：第一版采用 Trusted Local Mode，不实现浏览器专用 action-time confirmation。
 - **决定**：WebMCP、GSuite 导出、历史记录、媒体下载和 Brave/Chromium 先作为后续扩展能力，不阻塞核心版本。

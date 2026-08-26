@@ -34,6 +34,19 @@ describe('DSH /chrome command', () => {
     expect(request).toHaveBeenCalledWith('status', { sessionId: 'session-test' }, expect.any(AbortSignal))
   })
 
+  it('lists targets and routes profile status to the requested browserId', async () => {
+    const request = vi.fn(async (method: string) => method === 'list_targets'
+      ? { targets: [{ browser: 'edge', browserId: 'edge:profile-a', profile: 'profile-a', state: 'ready' }] }
+      : { connected: true, browser: 'edge', browserId: 'edge:profile-a', profile: 'profile-a' })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const { handler } = setup({ request, health, start: vi.fn(), stop: vi.fn(), restart: vi.fn() })
+    const targets = await handler(invocation('targets'))
+    expect(targets.kind).toBe('success')
+    expect(request).toHaveBeenCalledWith('list_targets', {}, expect.any(AbortSignal))
+    const selected = await handler(invocation('profile edge:profile-a'))
+    expect(selected.kind).toBe('success')
+    expect(request).toHaveBeenLastCalledWith('status', { sessionId: 'session-test' }, expect.any(AbortSignal), { browserId: 'edge:profile-a' })
+  })
   it('allows a human restart command without launcher-label checks', async () => {
     const restart = vi.fn(async () => ({ ok: true, restarted: true, bridgeHealth: { extensionConnected: true, startedBy: 'pi' } }))
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, startedBy: 'pi' }))
@@ -96,7 +109,7 @@ describe('DSH /chrome command', () => {
     const stop = vi.fn()
     const { handler } = setup({ request, health, start, stop, restart })
     const result = await handler(invocation('restart now'))
-    expect(result).toEqual({ kind: 'error', text: 'Usage: /chrome status|connect|disconnect|doctor|restart|tabs' })
+    expect(result).toEqual({ kind: 'error', text: 'Usage: /chrome status|targets|profile [browserId]|connect|disconnect|doctor|restart|tabs' })
     expect(request).not.toHaveBeenCalled()
     expect(health).not.toHaveBeenCalled()
     expect(restart).not.toHaveBeenCalled()
