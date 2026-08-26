@@ -382,6 +382,57 @@ describe('DSH browser tool catalog', () => {
     expect(result).toMatchObject({ ok: false, recommendation: 'refresh_browser_status', issues: [{ code: 'status_missing_browser_target' }] })
   })
 
+  it('requires explicit browser selection when multiple targets are connected and fences operations after selection', async () => {
+    const targetHealth = {
+      ok: true,
+      protocol: 1,
+      extensionConnected: true,
+      targetAmbiguous: true,
+      targets: [
+        { browser: 'edge', browserId: 'edge:profile-a', profile: 'profile-a', state: 'ready', connectionId: 'edge-connection', connectionGeneration: 3 },
+        { browser: 'chrome', browserId: 'chrome:profile-b', profile: 'profile-b', state: 'ready', connectionId: 'chrome-connection', connectionGeneration: 2 },
+      ],
+    }
+    const request = vi.fn(async (method: string, params: Record<string, unknown>, _signal?: AbortSignal, target?: { browserId: string; connectionId?: string; connectionGeneration?: number }) => {
+      if (method === 'status' && target?.browserId === undefined) {
+        const error = new Error('multiple browser targets') as Error & { code?: string }
+        error.code = 'TARGET_REQUIRED'
+        throw error
+      }
+      if (method === 'status') return { connected: true, browser: 'chrome', browserId: 'chrome:profile-b', profile: 'profile-b', connectionId: 'chrome-connection', connectionGeneration: 2, capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }
+      return { method, params }
+    })
+    const health = vi.fn(async () => targetHealth)
+    const harness = setup({ request, health })
+    const ambiguous = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(ambiguous).toMatchObject({ state: 'target_required', recommendation: 'select_browser_target', targets: [{ browserId: 'edge:profile-a' }, { browserId: 'chrome:profile-b' }] })
+    const selected = await harness.tools.get('browser_status')?.execute({ browserId: 'chrome:profile-b' }, execution(harness.agent))
+    expect(selected).toMatchObject({ browserId: 'chrome:profile-b', targetStability: { connectionGeneration: 2 } })
+    await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
+    expect(request).toHaveBeenLastCalledWith('interaction', expect.objectContaining({ expectedBrowserId: 'chrome:profile-b' }), expect.any(AbortSignal), {
+      browserId: 'chrome:profile-b',
+      connectionId: 'chrome-connection',
+      connectionGeneration: 2,
+    })
+  })
+  it('returns structured recovery guidance when the selected target is unavailable', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') {
+        const error = new Error('target disconnected') as Error & { code?: string }
+        error.code = 'TARGET_UNAVAILABLE'
+        throw error
+      }
+      return { targets: [] }
+    })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      targets: [{ browser: 'edge', browserId: 'edge:profile-a', profile: 'profile-a', state: 'disconnected', connectionId: 'edge-connection', connectionGeneration: 4 }],
+    }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_status')?.execute({ browserId: 'edge:profile-a' }, execution(harness.agent))
+    expect(result).toMatchObject({ state: 'target_unavailable', recommendation: 'refresh_browser_targets', error: { code: 'TARGET_UNAVAILABLE' }, target: { browserId: 'edge:profile-a' } })
+  })
   it('blocks browser operations when the active browser target changes until explicitly acknowledged', async () => {
     let browser = 'edge'
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
@@ -438,6 +489,29 @@ describe('DSH browser tool catalog', () => {
       actionState: 'unknown',
       retryable: false,
       error: { code: 'extension_disconnected_during_operation' },
+    })
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
+  })
+
+
+  it('reports target-qualified recovery when the operation connection changes', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.7', capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }
+      const error = new Error('Browser target edge:test connection changed.') as Error & { code?: string }
+      error.code = 'TARGET_CONNECTION_CHANGED'
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'unknown',
+      retryable: false,
+      nextAction: 'browser_status',
+      recommendation: 'refresh_browser_targets',
+      error: { code: 'TARGET_CONNECTION_CHANGED' },
     })
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })

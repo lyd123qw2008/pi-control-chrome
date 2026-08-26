@@ -139,7 +139,7 @@ function cleanupValue() {
   return { removed: [], released: [], retained: [], failed: [] };
 }
 
-async function createMockBridge() {
+async function createMockBridge({ targets = [] } = {}) {
   const requests = [];
   const scripts = new Map();
   const waiters = [];
@@ -182,7 +182,7 @@ async function createMockBridge() {
         if (socket.readyState !== 1) return;
         socket.send(JSON.stringify({ type: "response", id: message.id, ...(error ? { error } : { result }) }));
       };
-      const defaultResult = message.method === "status" ? statusValue() : message.method === "cleanup" ? cleanupValue() : {};
+      const defaultResult = message.method === "status" ? statusValue() : message.method === "list_targets" ? { targets } : message.method === "cleanup" ? cleanupValue() : {};
       Promise.resolve(script ? script(message, respond) : respond(defaultResult)).catch(error => respond(undefined, { message: String(error) }));
     });
   });
@@ -303,6 +303,51 @@ test("BridgeClient stops before open and reconnects without stale socket state",
   }
 });
 
+test("Pi requires explicit target selection and routes later operations with the selected connection fence", async () => {
+  const mock = await createMockBridge({
+    targets: [
+      { browser: "edge", browserId: "edge:profile-a", profile: "profile-a", state: "ready", connectionId: "edge-connection", connectionGeneration: 3 },
+      { browser: "chrome", browserId: "chrome:profile-b", profile: "profile-b", state: "ready", connectionId: "chrome-connection", connectionGeneration: 7 },
+    ],
+  });
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  const selectedStatus = async (_message, respond) => respond({ ...statusValue("chrome:profile-b"), browser: "chrome", profile: "profile-b", connectionId: "chrome-connection", connectionGeneration: 7 });
+  mock.enqueue("status", async (message, respond) => {
+    if (!message.target) {
+      respond(undefined, { code: "TARGET_REQUIRED", message: "multiple targets" });
+      return;
+    }
+    await selectedStatus(message, respond);
+  });
+  mock.enqueue("status", selectedStatus);
+  mock.enqueue("status", selectedStatus);
+  try {
+    await harness.emit("session_start", {}, context);
+    const ambiguousResult = await harness.tools.get("browser_status").execute("ambiguous", {});
+    const ambiguous = JSON.parse(ambiguousResult.content[0].text);
+    assert.equal(ambiguous.error.code, "TARGET_REQUIRED");
+    assert.deepEqual(ambiguous.targets.map(target => target.browserId), ["edge:profile-a", "chrome:profile-b"]);
+
+    const selectedResult = await harness.tools.get("browser_status").execute("selected", { browserId: "chrome:profile-b" });
+    const selected = JSON.parse(selectedResult.content[0].text);
+    assert.equal(selected.browserId, "chrome:profile-b");
+    assert.equal(selected.targetStability.connectionGeneration, 7);
+
+    await harness.tools.get("browser_click").execute("click", { tabId: 7, ref: "e4" });
+    const interaction = mock.requests.filter(message => message.method === "interaction").at(-1);
+    assert.deepEqual(interaction.target, { browserId: "chrome:profile-b", connectionId: "chrome-connection", connectionGeneration: 7 });
+    assert.equal(interaction.params.expectedBrowserId, "chrome:profile-b");
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
 test("Pi lifecycle fencing rejects stale completions and retries the original turn cleanup intent", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();

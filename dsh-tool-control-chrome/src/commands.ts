@@ -16,7 +16,7 @@ function sessionId(invocation: CommandInvocation): string {
 function usage(): CommandResult {
   return {
     kind: 'error',
-    text: 'Usage: /chrome status|connect|disconnect|doctor|restart|tabs',
+    text: 'Usage: /chrome status|targets|profile [browserId]|connect|disconnect|doctor|restart|tabs',
   }
 }
 
@@ -75,6 +75,7 @@ function extensionOffline(bridgeHealth: Record<string, unknown>): CommandResult 
 async function browserStatus(
   bridge: BrowserBridgeClient,
   invocation: CommandInvocation,
+  browserId?: string,
 ): Promise<CommandResult> {
   await bridge.start()
   const bridgeHealth = await bridge.health()
@@ -84,7 +85,9 @@ async function browserStatus(
       text: render({ status: { connected: false }, bridgeHealth }),
     }
   }
-  const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+  const status = browserId === undefined
+    ? await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)
+    : await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal, { browserId })
   return {
     kind: 'success',
     text: render({
@@ -131,19 +134,36 @@ export function registerChromeCommand(ctx: Context, bridge: BrowserBridgeClient)
   ctx.commands.register({
     name: 'chrome',
     description: 'Connect, inspect, or restart the local Chrome/Edge Bridge.',
-    input: { hint: 'status|connect|disconnect|doctor|restart|tabs' },
+    input: { hint: 'status|targets|profile [browserId]|connect|disconnect|doctor|restart|tabs' },
     handler: async invocation => {
       const parts = invocation.rawInput.trim().split(/\s+/u).filter(Boolean)
       const action = parts[0] ?? 'status'
-      if (parts.length > 1) return usage()
+      if (parts.length > 1 && action !== 'profile') return usage()
       try {
         if (action === 'status') return browserStatus(bridge, invocation)
+        if (action === 'targets') {
+          await bridge.start()
+          const targets = await bridge.request('list_targets', {}, invocation.signal)
+          return { kind: 'success', text: render(targets) }
+        }
+        if (action === 'profile') {
+          if (parts[1] === undefined) {
+            await bridge.start()
+            const targets = await bridge.request('list_targets', {}, invocation.signal)
+            return { kind: 'success', text: render(targets) }
+          }
+          return browserStatus(bridge, invocation, parts[1])
+        }
         if (action === 'connect') return connectBrowser(bridge, invocation)
         if (action === 'disconnect') {
           await bridge.stop()
           return { kind: 'success', text: render({ ok: true, disconnected: true, bridge: 'left running for later /chrome connect' }) }
         }
         if (action === 'doctor') {
+          const diagnosis = await bridge.request('doctor', {}, invocation.signal)
+          if (typeof diagnosis === 'object' && diagnosis !== null && ('bridgeHealth' in diagnosis || 'targets' in diagnosis)) {
+            return { kind: 'success', text: render(diagnosis) }
+          }
           const bridgeHealth = await bridge.health()
           const status = bridgeHealth.extensionConnected === true
             ? await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)

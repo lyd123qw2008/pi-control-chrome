@@ -27,6 +27,7 @@ Run the high-coverage browser smoke test with an isolated test profile:
 
 ```powershell
 npm run smoke:e2e
+npm run smoke:e2e:multi-profile
 ```
 
 Do not commit browser profiles, Bridge tokens, credentials, screenshots containing private data, or generated session files.

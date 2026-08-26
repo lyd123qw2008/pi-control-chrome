@@ -28,9 +28,7 @@ Chrome 和 Edge 使用同一套 Manifest V3 扩展代码。业务逻辑不分叉
 
 ### Profile
 
-第一版支持当前选中的 Chrome/Edge Profile，连接信息会记录 Profile 标识。
-
-多 Profile 同时并行操作放到 P1，不阻塞第一版。
+Bridge 可以同时保持多个 Chrome/Edge Profile 的逻辑目标连接。每个目标使用稳定的 `browserId`，每次物理连接使用 `connectionId` 和递增的 `connectionGeneration`。Pi、DSH 和 Skill CLI 在多个 ready 目标存在时必须显式选择 `browserId`；一个 Agent session 一次只绑定一个目标。相同 session 内同时控制多个目标仍放到后续阶段，不阻塞当前目标路由、恢复和可观测性。
 
 ## 3. 标签页分组
 
@@ -159,15 +157,13 @@ browser_cleanup
 
 ```text
 /chrome status
+/chrome targets
+/chrome profile [browserId]
 /chrome connect
 /chrome disconnect
-/chrome pause
-/chrome resume
-/chrome setup
+/chrome doctor
+/chrome restart
 /chrome tabs
-/chrome profile
-/chrome group
-/chrome cleanup
 ```
 
 ## 8. 实现顺序
@@ -202,7 +198,7 @@ browser_cleanup
 
 ### 阶段 3：扩展能力
 
-1. 多 Profile；
+1. 同一 session 同时控制多个浏览器目标；
 2. WebMCP；
 3. GSuite 导出；
 4. 历史记录；

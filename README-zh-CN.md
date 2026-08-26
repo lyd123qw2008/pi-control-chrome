@@ -109,11 +109,11 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 
 项目同时包含 `skills/pi-control-chrome/SKILL.md`。该 Skill 会指导 Pi 优先使用本项目的 `browser_*` 工具控制已连接的 Chrome/Edge，并遵循标签页 ownership、handoff 和 cleanup 规则。
 
-同一个 Bridge 当前只接受一个活动中的扩展连接。Chrome 和 Edge 可以同时打开，但如果两个浏览器都加载这套扩展并连接到同一个 Bridge，后连接的扩展会替换先连接的扩展，Pi 的控制目标可能在两个浏览器之间切换。实际使用时请为一个 Bridge 只连接一个受控浏览器。
+同一个 Bridge 现在可以同时保持多个已识别的浏览器目标连接。每个目标使用稳定的 `browserId` 标识，请求通过目标路由和 connection generation fence 发送；Profile A 的新连接不会替换 Profile B，也不能满足 Profile A 的旧请求。多个目标同时存在时，必须通过 `/chrome profile <browserId>`、`browser_status` 或 Skill CLI 的 `--browser-id` 明确选择，运行时不会根据最新连接或活动窗口猜测目标。
 
 ## DSH 集成
 
-仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。默认 `lazyTools: true` 时，插件只注册 `pi-control-chrome` Skill 的名称和描述；Skill 成功加载后，把完整的 39 个 `browser_*` 工具注册到当前 Agent，并在该 Agent session 的连续 turn 中保持激活。按 Codex 默认生命周期，turn 结束时宿主关闭未标记的 Agent 临时 Tab、release claimed user Tab、detach debugger lease，但不停止 Bridge、移除工具或重新加载 Skill。模型需要保留页面时，应在当前 turn 调用 `browser_mark_handoff` 或 `browser_mark_deliverable`，下一 turn 仍需保留时重新标记。只有用户明确要求立即关闭临时 Tab、释放 claim 或清理浏览器任务时，才调用 `browser_cleanup`；它会保留工具和健康 Bridge。`browser_context_reset` 是单独的显式用户请求操作，用于 finalize 资源并停用惰性工具。Agent disposal 和插件关闭会重试最终清理；清理恢复失败时，复用同一 session ID 的替代 Agent 会保持阻塞，直到清理成功。设置 `lazyTools: false` 可保留插件加载即显示工具的兼容行为。Pi 使用同一批原生工具定义和 active-tool 隐藏机制。DSH 还提供人工使用的 `/chrome status`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart` 和 `/chrome tabs` 命令；这些命令不替代 Skill 激活。
+仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。默认 `lazyTools: true` 时，插件只注册 `pi-control-chrome` Skill 的名称和描述；Skill 成功加载后，把完整的 39 个 `browser_*` 工具注册到当前 Agent，并在该 Agent session 的连续 turn 中保持激活。按 Codex 默认生命周期，turn 结束时宿主关闭未标记的 Agent 临时 Tab、release claimed user Tab、detach debugger lease，但不停止 Bridge、移除工具或重新加载 Skill。模型需要保留页面时，应在当前 turn 调用 `browser_mark_handoff` 或 `browser_mark_deliverable`，下一 turn 仍需保留时重新标记。只有用户明确要求立即关闭临时 Tab、释放 claim 或清理浏览器任务时，才调用 `browser_cleanup`；它会保留工具和健康 Bridge。`browser_context_reset` 是单独的显式用户请求操作，用于 finalize 资源并停用惰性工具。Agent disposal 和插件关闭会重试最终清理；清理恢复失败时，复用同一 session ID 的替代 Agent 会保持阻塞，直到清理成功。设置 `lazyTools: false` 可保留插件加载即显示工具的兼容行为。Pi 使用同一批原生工具定义和 active-tool 隐藏机制。DSH 还提供人工使用的 `/chrome status`、`/chrome targets`、`/chrome profile [browserId]`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart` 和 `/chrome tabs` 命令；这些命令不替代 Skill 激活。
 
 在 DSH Profile 中安装该包，把它的 `config/cordis.patch.yml.example` 中的 `insert` 条目合并到现有 `cordis.patch.yml`，不要覆盖其他 patch 条目，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH Profile 应包含标准的 `@deepseek-ai/dsh-skill` 服务，以便使用运行时 Skill 注册表和 `skill` 工具；浏览器插件本身不强制注入该可选服务。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
 
@@ -145,6 +145,7 @@ npm run test:skill
 npm run test:all
 npm run pack:check
 npm run smoke:e2e
+npm run smoke:e2e:multi-profile
 ```
 
 `smoke:e2e` 默认使用 Edge，也可以指定 Chrome for Testing：
@@ -154,7 +155,7 @@ $env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
 npm run smoke:e2e
 ```
 
-该测试使用隔离的临时浏览器 Profile，不会修改用户日常 Profile。部分已安装的 Google Chrome 版本会拒绝命令行加载 unpacked extension 的参数；验证正常 Chrome Profile 时，应在 `chrome://extensions` 中手动加载 `extension/`。
+`smoke:e2e:multi-profile` 会启动两个隔离的临时 Edge/Chrome Profile，验证显式目标路由、一个目标断线时另一个目标继续可用，以及同一 Profile 重连后的 connection generation fence。两个测试都不会修改用户日常 Profile。部分已安装的 Google Chrome 版本会拒绝命令行加载 unpacked extension 的参数；验证正常 Chrome Profile 时，应在 `chrome://extensions` 中手动加载 `extension/`。
 
 ## 对齐基线
 

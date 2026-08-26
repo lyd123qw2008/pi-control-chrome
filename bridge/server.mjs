@@ -20,6 +20,10 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   atomicTargetRouting: true,
   cooperativeRestart: true,
   localUserRestart: true,
+  multiTargetRouting: true,
+  targetList: true,
+  connectionGeneration: true,
+  targetScopedEvents: true,
 });
 const BRIDGE_VERSION = (() => {
   try {
@@ -55,7 +59,20 @@ function ensureToken() {
 const token = ensureToken();
 const clients = new Set();
 const pending = new Map();
-let extensionClient;
+const extensionTargets = new Map();
+const targetGenerations = new Map();
+const diagnostics = [];
+const MAX_DIAGNOSTICS = 100;
+const startedAt = Date.now();
+const metrics = {
+  requests: 0,
+  routedRequests: 0,
+  requestTimeouts: 0,
+  requestErrors: 0,
+  targetConnections: 0,
+  targetReconnects: 0,
+  targetReplacements: 0,
+};
 let requestCounter = 0;
 let restarting = false;
 
@@ -79,16 +96,215 @@ function extensionIdentity(value) {
   };
 }
 
+function publicTarget(record) {
+  const { client: _client, ...target } = record;
+  return target;
+}
+
+function recordDiagnostic(event, fields = {}) {
+  diagnostics.push({ event, at: Date.now(), ...fields });
+  if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.splice(0, diagnostics.length - MAX_DIAGNOSTICS);
+}
+
+function targetForClient(client) {
+  const browserId = client.browserIdentity?.browserId;
+  const record = browserId ? extensionTargets.get(browserId) : undefined;
+  return record?.client === client ? record : undefined;
+}
+
+function targetEvent(record, event, extra = {}) {
+  return {
+    type: "event",
+    event,
+    ...extra,
+    target: {
+      browserId: record.browserId,
+      connectionId: record.connectionId,
+      connectionGeneration: record.connectionGeneration,
+    },
+  };
+}
+
+function broadcastTargetEvent(record, event, extra = {}) {
+  const message = targetEvent(record, event, extra);
+  for (const client of clients) {
+    if (client.role === "pi") send(client, message);
+  }
+}
+
 function setExtensionIdentity(client, value) {
   const identity = extensionIdentity(value);
   if (!identity) return false;
+  const previousIdentity = client.browserIdentity;
+  const existing = extensionTargets.get(identity.browserId);
+  if (existing?.client === client) {
+    client.browserIdentity = identity;
+    existing.extensionVersion = identity.extensionVersion;
+    existing.profile = identity.profile;
+    existing.browser = identity.browser;
+    existing.capabilities = identity.capabilities;
+    existing.userAgent = identity.userAgent;
+    existing.state = "ready";
+    existing.lastSeenAt = Date.now();
+    return true;
+  }
+
+  if (previousIdentity && previousIdentity.browserId !== identity.browserId) {
+    const previous = extensionTargets.get(previousIdentity.browserId);
+    if (previous?.client === client) {
+      previous.client = undefined;
+      previous.state = "replaced";
+      previous.lastSeenAt = Date.now();
+      previous.lastError = "The extension identified a different browser target.";
+      broadcastTargetEvent(previous, "target_replaced", { previousBrowserId: previous.browserId, browserId: identity.browserId });
+    }
+  }
+
+  const previousConnection = existing?.client;
+  const generation = (targetGenerations.get(identity.browserId) ?? 0) + 1;
+  targetGenerations.set(identity.browserId, generation);
+  const record = {
+    ...identity,
+    client,
+    connectionId: randomUUID(),
+    connectionGeneration: generation,
+    state: "ready",
+    connectedAt: Date.now(),
+    lastSeenAt: Date.now(),
+  };
+  if (previousConnection && previousConnection !== client) {
+    metrics.targetReplacements += 1;
+    const previousRecord = existing;
+    if (previousRecord) {
+      previousRecord.client = undefined;
+      previousRecord.state = "replaced";
+      previousRecord.lastSeenAt = Date.now();
+      previousRecord.lastError = "The browser target connection was replaced by a newer connection.";
+      rejectPendingForExtension(previousConnection, "TARGET_CONNECTION_CHANGED", "The browser target connection was replaced by a newer connection.");
+      broadcastTargetEvent(previousRecord, "target_replaced", { connectionGeneration: generation });
+    }
+    if (previousConnection.readyState === 1) previousConnection.close(1012, "replaced");
+  } else if (targetGenerations.get(identity.browserId) > 1) {
+    metrics.targetReconnects += 1;
+  } else {
+    metrics.targetConnections += 1;
+  }
   client.browserIdentity = identity;
+  client.connectionId = record.connectionId;
+  client.connectionGeneration = record.connectionGeneration;
+  extensionTargets.set(identity.browserId, record);
+  recordDiagnostic("target_connected", {
+    browserId: record.browserId,
+    connectionId: record.connectionId,
+    connectionGeneration: record.connectionGeneration,
+    browser: record.browser,
+  });
+  broadcastTargetEvent(record, generation > 1 ? "target_reconnected" : "target_connected");
   return true;
 }
 
-function requestExpectedBrowserId(message) {
-  if (!message.params || typeof message.params !== "object") return undefined;
-  return nonEmptyString(message.params.expectedBrowserId);
+function connectionGeneration(value) {
+  if (value === undefined) return undefined;
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function requestTargetSelector(message) {
+  const params = requestParams(message);
+  const target = message.target;
+  if (target !== undefined && (!target || typeof target !== "object" || Array.isArray(target))) {
+    return { error: "target must be an object." };
+  }
+  const targetObject = target && typeof target === "object" ? target : {};
+  const envelopeBrowserId = targetObject.browserId;
+  const parameterBrowserId = params.targetBrowserId ?? params.expectedBrowserId;
+  if (envelopeBrowserId !== undefined && parameterBrowserId !== undefined && envelopeBrowserId !== parameterBrowserId) {
+    return { error: "target.browserId conflicts with params.expectedBrowserId." };
+  }
+  const explicitTarget = envelopeBrowserId ?? parameterBrowserId;
+  if (explicitTarget !== undefined && !nonEmptyString(explicitTarget)) {
+    return { error: "browserId must be a non-empty string." };
+  }
+  const envelopeGeneration = targetObject.connectionGeneration;
+  const parameterGeneration = params.expectedConnectionGeneration;
+  if (envelopeGeneration !== undefined && parameterGeneration !== undefined && envelopeGeneration !== parameterGeneration) {
+    return { error: "target.connectionGeneration conflicts with params.expectedConnectionGeneration." };
+  }
+  const envelopeConnectionId = targetObject.connectionId;
+  const parameterConnectionId = params.expectedConnectionId;
+  if (envelopeConnectionId !== undefined && parameterConnectionId !== undefined && envelopeConnectionId !== parameterConnectionId) {
+    return { error: "target.connectionId conflicts with params.expectedConnectionId." };
+  }
+  const rawGeneration = envelopeGeneration ?? parameterGeneration;
+  const expectedConnectionGeneration = connectionGeneration(rawGeneration);
+  if (rawGeneration !== undefined && expectedConnectionGeneration === undefined) {
+    return { error: "connectionGeneration must be a positive integer." };
+  }
+  const rawConnectionId = envelopeConnectionId ?? parameterConnectionId;
+  const expectedConnectionId = nonEmptyString(rawConnectionId);
+  if (rawConnectionId !== undefined && expectedConnectionId === undefined) {
+    return { error: "connectionId must be a non-empty string." };
+  }
+  return {
+    browserId: nonEmptyString(explicitTarget),
+    expectedConnectionId,
+    expectedConnectionGeneration,
+    explicit: explicitTarget !== undefined,
+  };
+}
+
+function readyTargets() {
+  return [...extensionTargets.values()].filter(record => record.state === "ready" && record.client?.readyState === 1);
+}
+
+function listTargets() {
+  return [...extensionTargets.values()].map(publicTarget);
+}
+
+function selectExtension(message) {
+  const selector = requestTargetSelector(message);
+  if (selector.error) return { errorCode: "INVALID_BROWSER_TARGET", errorMessage: selector.error };
+  if (selector.browserId) {
+    const target = extensionTargets.get(selector.browserId);
+    if (!target || target.state !== "ready" || target.client?.readyState !== 1) {
+      return { errorCode: "TARGET_UNAVAILABLE", errorMessage: `Browser target ${selector.browserId} is not connected.` };
+    }
+    if (selector.expectedConnectionId !== undefined && selector.expectedConnectionId !== target.connectionId) {
+      return { errorCode: "TARGET_CONNECTION_CHANGED", errorMessage: `Browser target ${selector.browserId} connection changed.` };
+    }
+    if (selector.expectedConnectionGeneration !== undefined && selector.expectedConnectionGeneration !== target.connectionGeneration) {
+      return { errorCode: "TARGET_CONNECTION_CHANGED", errorMessage: `Browser target ${selector.browserId} connection generation changed.` };
+    }
+    return { target };
+  }
+  const available = readyTargets();
+  if (available.length === 1) {
+    const target = available[0];
+    if (selector.expectedConnectionId !== undefined && selector.expectedConnectionId !== target.connectionId) {
+      return { errorCode: "TARGET_CONNECTION_CHANGED", errorMessage: `Browser target ${target.browserId} connection changed.` };
+    }
+    if (selector.expectedConnectionGeneration !== undefined && selector.expectedConnectionGeneration !== target.connectionGeneration) {
+      return { errorCode: "TARGET_CONNECTION_CHANGED", errorMessage: `Browser target ${target.browserId} connection generation changed.` };
+    }
+    return { target };
+  }
+  if (available.length > 1) {
+    return { errorCode: "TARGET_REQUIRED", errorMessage: "Multiple browser targets are connected; select a browserId before sending browser requests." };
+  }
+  const anonymous = [...clients].filter(client => client.role === "extension" && client.readyState === 1 && !client.browserIdentity);
+  if (anonymous.length === 1 && !selector.explicit) return { anonymous: anonymous[0] };
+  if (anonymous.length > 1) return { errorCode: "TARGET_REQUIRED", errorMessage: "Multiple unidentified browser extensions are connected; reload the extensions and select a browser target." };
+  return { errorCode: "EXTENSION_OFFLINE", errorMessage: "Chrome/Edge extension is not connected." };
+}
+
+function decorateTargetResult(value, target) {
+  if (!target || !value || typeof value !== "object" || Array.isArray(value)) return value;
+  return {
+    ...value,
+    browserId: value.browserId ?? target.browserId,
+    profile: value.profile ?? target.profile,
+    connectionId: target.connectionId,
+    connectionGeneration: target.connectionGeneration,
+  };
 }
 
 function requestParams(message) {
@@ -100,7 +316,7 @@ function missingExtensionCapabilities(message, extension) {
   const required = [];
   if (message.method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery");
   if ((message.method === "mark_handoff" || message.method === "mark_deliverable") && params.turnId !== undefined) required.push("turnScopedMarks");
-  const capabilities = extension.browserIdentity?.capabilities;
+  const capabilities = extension.browserIdentity?.capabilities ?? extension.capabilities;
   return required.filter((name) => capabilities?.[name] !== true);
 }
 
@@ -200,17 +416,39 @@ function handleMessage(client, message) {
   if (!message || typeof message !== "object") return;
 
   if (message.type === "request" && client.role === "pi") {
+    metrics.requests += 1;
     const id = nonEmptyString(message.id);
     if (!id) {
+      metrics.requestErrors += 1;
       sendError(client, `req-${++requestCounter}`, "INVALID_REQUEST_ID", "request.id must be a non-empty string.");
       return;
     }
     if ([...pending.values()].some((entry) => entry.client === client && entry.clientRequestId === id)) {
+      metrics.requestErrors += 1;
       sendError(client, id, "DUPLICATE_REQUEST_ID", `A request with id ${id} is already pending on this client.`);
       return;
     }
     if (typeof message.method !== "string" || message.method.length === 0) {
+      metrics.requestErrors += 1;
       sendError(client, id, "INVALID_REQUEST", "request.method must be a non-empty string.");
+      return;
+    }
+    if (message.method === "list_targets") {
+      send(client, {
+        type: "response",
+        id,
+        result: {
+          ok: true,
+          protocol: 1,
+          instanceId,
+          targets: listTargets(),
+          extensionConnected: [...clients].some(entry => entry.role === "extension" && entry.readyState === 1),
+        },
+      });
+      return;
+    }
+    if (message.method === "doctor") {
+      send(client, { type: "response", id, result: bridgeDoctor() });
       return;
     }
     const bridgeRequestId = `${instanceId}:${++requestCounter}`;
@@ -219,69 +457,213 @@ function handleMessage(client, message) {
       return;
     }
     if (rejectWhileRestarting(client, id)) return;
-    const activeExtension = extensionClient;
-    if (!activeExtension || activeExtension.readyState !== 1) {
+    const selected = selectExtension(message);
+    if (selected.errorCode) {
+      metrics.requestErrors += 1;
+      recordDiagnostic("request_rejected", {
+        method: message.method,
+        errorCode: selected.errorCode,
+        browserId: nonEmptyString(requestTargetSelector(message).browserId),
+      });
+      sendError(client, id, selected.errorCode, selected.errorMessage);
+      return;
+    }
+    const target = selected.target;
+    const extension = target?.client ?? selected.anonymous;
+    if (!extension || extension.readyState !== 1) {
+      metrics.requestErrors += 1;
       sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension is not connected.");
       return;
     }
-    const expectedBrowserId = requestExpectedBrowserId(message);
-    if (message.params && typeof message.params === "object" && message.params.expectedBrowserId !== undefined && !expectedBrowserId) {
-      sendError(client, id, "INVALID_BROWSER_TARGET", "expectedBrowserId must be a non-empty string.");
-      return;
-    }
-    if (expectedBrowserId && activeExtension.browserIdentity?.browserId !== expectedBrowserId) {
-      const actual = activeExtension.browserIdentity?.browserId;
-      sendError(
-        client,
-        id,
-        actual ? "BROWSER_TARGET_CHANGED" : "BROWSER_TARGET_UNAVAILABLE",
-        actual
-          ? `Browser target changed; expected ${expectedBrowserId} but the active extension is ${actual}.`
-          : "The active extension has not identified its browser target yet.",
-      );
-      return;
-    }
-    const missingCapabilities = missingExtensionCapabilities(message, activeExtension);
+    const missingCapabilities = missingExtensionCapabilities(message, extension);
     if (missingCapabilities.length > 0) {
-      sendError(client, id, "EXTENSION_CAPABILITY_MISSING", `The active extension does not support: ${missingCapabilities.join(", ")}. Reload the pi-control-chrome extension.`);
+      metrics.requestErrors += 1;
+      sendError(client, id, "EXTENSION_CAPABILITY_MISSING", `The selected browser target does not support: ${missingCapabilities.join(", ")}. Reload the pi-control-chrome extension.`);
       return;
     }
-    const entry = { client, clientRequestId: id, extension: activeExtension, method: message.method, timer: undefined };
+    if (target && requestTargetSelector(message).expectedConnectionGeneration !== undefined && requestTargetSelector(message).expectedConnectionGeneration !== target.connectionGeneration) {
+      metrics.requestErrors += 1;
+      sendError(client, id, "TARGET_CONNECTION_CHANGED", `Browser target ${target.browserId} connection generation changed.`);
+      return;
+    }
+    const entry = {
+      client,
+      clientRequestId: id,
+      extension,
+      method: message.method,
+      target,
+      connectionId: target?.connectionId,
+      connectionGeneration: target?.connectionGeneration,
+      timer: undefined,
+    };
     pending.set(bridgeRequestId, entry);
     entry.timer = setTimeout(() => {
       if (pending.get(bridgeRequestId) !== entry) return;
       pending.delete(bridgeRequestId);
+      metrics.requestTimeouts += 1;
+      recordDiagnostic("request_timeout", {
+        method: message.method,
+        browserId: target?.browserId,
+        connectionId: target?.connectionId,
+        connectionGeneration: target?.connectionGeneration,
+      });
       if (entry.client) sendError(entry.client, entry.clientRequestId, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
     }, 120_000);
-    if (!send(activeExtension, { type: "request", id: bridgeRequestId, method: message.method, params: message.params ?? {} })) {
+    const forwarded = {
+      type: "request",
+      id: bridgeRequestId,
+      method: message.method,
+      params: message.params ?? {},
+      ...(target === undefined ? {} : {
+        target: {
+          browserId: target.browserId,
+          connectionId: target.connectionId,
+          connectionGeneration: target.connectionGeneration,
+        },
+      }),
+    };
+    if (target) {
+      metrics.routedRequests += 1;
+      recordDiagnostic("request_routed", {
+        method: message.method,
+        browserId: target.browserId,
+        connectionId: target.connectionId,
+        connectionGeneration: target.connectionGeneration,
+      });
+    }
+    if (!send(extension, forwarded)) {
       if (pending.get(bridgeRequestId) === entry) {
         clearTimeout(entry.timer);
         pending.delete(bridgeRequestId);
       }
+      metrics.requestErrors += 1;
       sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected before the request was sent.");
     }
     return;
   }
 
   if (message.type === "hello" && client.role === "extension") {
-    if (extensionClient !== client) return;
     if (!setExtensionIdentity(client, message)) debug("extension hello did not contain a browser identity");
     return;
   }
 
   if (message.type === "response" && client.role === "extension") {
     const entry = pending.get(String(message.id));
-    if (!entry || entry.extension !== client) return;
-    if (entry.method === "status") setExtensionIdentity(client, message.result);
+    if (!entry || entry.extension !== client || (entry.connectionId !== undefined && client.connectionId !== entry.connectionId) || (entry.connectionGeneration !== undefined && client.connectionGeneration !== entry.connectionGeneration)) return;
+    const resultBrowserId = message.result && typeof message.result === "object" && !Array.isArray(message.result) ? nonEmptyString(message.result.browserId) : undefined;
+    if (entry.target && resultBrowserId !== undefined && resultBrowserId !== entry.target.browserId) {
+      clearTimeout(entry.timer);
+      pending.delete(String(message.id));
+      metrics.requestErrors += 1;
+      recordDiagnostic("response_rejected", {
+        method: entry.method,
+        browserId: entry.target.browserId,
+        responseBrowserId: resultBrowserId,
+        connectionId: entry.connectionId,
+        connectionGeneration: entry.connectionGeneration,
+      });
+      if (entry.client) sendError(entry.client, entry.clientRequestId, "INVALID_BROWSER_TARGET", `The extension response identified ${resultBrowserId}, expected ${entry.target.browserId}.`);
+      return;
+    }
+    if (entry.method === "status" && !setExtensionIdentity(client, message.result)) debug("extension status did not contain a browser identity");
     clearTimeout(entry.timer);
     pending.delete(String(message.id));
-    if (entry.client) send(entry.client, { ...message, id: entry.clientRequestId });
+    if (entry.client) {
+      if (message.error) metrics.requestErrors += 1;
+      send(entry.client, {
+        ...message,
+        id: entry.clientRequestId,
+        ...(message.error ? {} : { result: decorateTargetResult(message.result, entry.target) }),
+      });
+    }
     return;
   }
 
   if (message.type === "event" && client.role === "extension") {
-    if (extensionClient === client) broadcast(message);
+    const target = targetForClient(client);
+    if (target) {
+      target.lastSeenAt = Date.now();
+      broadcastTargetEvent(target, message.event || "browser_event", { payload: message.payload, data: message.data, ...message });
+    }
   }
+}
+
+function extensionConnections() {
+  return [...clients].filter(client => client.role === "extension" && client.readyState === 1);
+}
+
+function healthDocument() {
+  const targets = listTargets();
+  const ready = readyTargets();
+  const singleTarget = ready.length === 1 ? ready[0] : undefined;
+  return {
+    ok: true,
+    protocol: 1,
+    service: BRIDGE_SERVICE,
+    bridgeVersion: BRIDGE_VERSION,
+    instanceId,
+    startedBy,
+    controlDomain: "local_user",
+    capabilities: {
+      ...BRIDGE_CAPABILITIES,
+      multiTargetRouting: true,
+      targetList: true,
+      connectionGeneration: true,
+      targetScopedEvents: true,
+    },
+    restart: {
+      available: true,
+      method: "cooperative_restart",
+      controlDomain: "local_user",
+    },
+    port,
+    extensionConnected: extensionConnections().length > 0,
+    targetCount: targets.length,
+    readyTargetCount: ready.length,
+    targetAmbiguous: ready.length > 1,
+    targets,
+    ...(singleTarget === undefined ? {} : {
+      browser: singleTarget.browser,
+      browserId: singleTarget.browserId,
+      profile: singleTarget.profile,
+      extensionVersion: singleTarget.extensionVersion,
+      userAgent: singleTarget.userAgent,
+      extensionCapabilities: singleTarget.capabilities,
+      connectionId: singleTarget.connectionId,
+      connectionGeneration: singleTarget.connectionGeneration,
+    }),
+    unidentifiedExtensionConnections: extensionConnections().filter(client => !client.browserIdentity).length,
+    observability: {
+      startedAt,
+      pendingRequests: pending.size,
+      metrics: { ...metrics },
+      recentEvents: diagnostics.slice(-20),
+    },
+  };
+}
+
+function bridgeDoctor() {
+  const health = healthDocument();
+  const issues = [];
+  const notices = [];
+  if (health.extensionConnected !== true) {
+    issues.push({ code: "extension_not_connected", message: "The local Bridge is healthy but no browser extension is connected." });
+  }
+  if (health.targetAmbiguous === true) {
+    notices.push({ code: "multiple_browser_targets", message: "Multiple browser targets are connected; bind a session to one browserId before sending browser operations." });
+  }
+  if (health.unidentifiedExtensionConnections > 0) {
+    notices.push({ code: "unidentified_browser_target", message: "At least one extension connection has not completed its browser identity handshake." });
+  }
+  return {
+    ok: issues.length === 0,
+    state: health.extensionConnected === true ? "connected" : "bridge_only",
+    bridgeHealth: health,
+    targets: health.targets,
+    issues,
+    notices,
+    recommendation: issues.length > 0 ? "reload_or_connect_extension" : health.targetAmbiguous ? "select_browser_target" : "ready",
+  };
 }
 
 const server = createServer((req, res) => {
@@ -297,27 +679,7 @@ const server = createServer((req, res) => {
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/health") {
-    const identity = extensionClient?.browserIdentity;
-    const { capabilities: extensionCapabilities, ...identityFields } = identity || {};
-    jsonResponse(res, 200, {
-      ok: true,
-      protocol: 1,
-      service: BRIDGE_SERVICE,
-      bridgeVersion: BRIDGE_VERSION,
-      instanceId,
-      startedBy,
-      controlDomain: "local_user",
-      capabilities: BRIDGE_CAPABILITIES,
-      restart: {
-        available: true,
-        method: "cooperative_restart",
-        controlDomain: "local_user",
-      },
-      port,
-      extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
-      ...identityFields,
-      ...(extensionCapabilities === undefined ? {} : { extensionCapabilities }),
-    }, extensionCorsHeaders(req));
+    jsonResponse(res, 200, healthDocument(), extensionCorsHeaders(req));
     return;
   }
 
@@ -346,18 +708,10 @@ wss.on("connection", (client, request) => {
 
   client.role = role;
   client.browserIdentity = undefined;
+  client.connectionId = undefined;
+  client.connectionGeneration = undefined;
   clients.add(client);
-  if (role === "extension") {
-    const previousExtension = extensionClient;
-    extensionClient = client;
-    if (previousExtension && previousExtension !== client) {
-      rejectPendingForExtension(previousExtension, "BROWSER_TARGET_CHANGED", "The active Chrome/Edge extension was replaced by another browser extension.");
-      previousExtension.close(1012, "replaced");
-    }
-    debug("extension connected");
-  } else {
-    debug("pi client connected");
-  }
+  debug(`${role} client connected`);
 
   send(client, {
     type: "hello",
@@ -368,10 +722,17 @@ wss.on("connection", (client, request) => {
     instanceId,
     startedBy,
     controlDomain: "local_user",
-    capabilities: BRIDGE_CAPABILITIES,
-    extensionConnected: Boolean(extensionClient && extensionClient.readyState === 1),
+    capabilities: {
+      ...BRIDGE_CAPABILITIES,
+      multiTargetRouting: true,
+      targetList: true,
+      connectionGeneration: true,
+      targetScopedEvents: true,
+    },
+    extensionConnected: extensionConnections().length > 0,
+    targets: listTargets(),
   });
-  broadcast({ type: "event", event: "connection", role, connected: true });
+  if (role !== "extension") broadcast({ type: "event", event: "connection", role, connected: true });
 
   client.on("message", (raw) => {
     try {
@@ -382,11 +743,26 @@ wss.on("connection", (client, request) => {
   });
   client.on("close", () => {
     clients.delete(client);
-    if (client.role === "pi") detachPendingForClient(client);
-    if (client.role === "extension") rejectPendingForExtension(client, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected.");
-    const wasActiveExtension = extensionClient === client;
-    if (wasActiveExtension) extensionClient = undefined;
-    if (role !== "extension" || wasActiveExtension) broadcast({ type: "event", event: "connection", role, connected: false });
+    if (client.role === "pi") {
+      detachPendingForClient(client);
+      broadcast({ type: "event", event: "connection", role: "pi", connected: false });
+    }
+    if (client.role === "extension") {
+      rejectPendingForExtension(client, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected.");
+      const target = targetForClient(client);
+      if (target) {
+        target.client = undefined;
+        target.state = "disconnected";
+        target.lastSeenAt = Date.now();
+        target.lastError = "The browser extension connection closed.";
+        recordDiagnostic("target_disconnected", {
+          browserId: target.browserId,
+          connectionId: target.connectionId,
+          connectionGeneration: target.connectionGeneration,
+        });
+        broadcastTargetEvent(target, "target_disconnected", { reason: "socket_closed" });
+      }
+    }
     debug(`${role} disconnected`);
   });
   client.on("error", (error) => debug(`${role} websocket error`, error.message));

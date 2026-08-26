@@ -18,16 +18,17 @@ const DEFAULT_MAX_CHARS = 8_000;
 
 function usage() {
   console.log(`Usage:
-  node browser.mjs status [--acknowledge-browser-id <id>] [--json]
-  node browser.mjs tabs [--json]
-  node browser.mjs group [--json]
-  node browser.mjs open <url> --session <id> [--active|--inactive] [--turn <n>] [--json]
-  node browser.mjs view <url> --session <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--json]
-  node browser.mjs snapshot <tabId> [--json]
-  node browser.mjs extract <tabId> [--max-chars <n>] [--json]
-  node browser.mjs screenshot <tabId> <path> [--full-page]
-  node browser.mjs close <tabId> [--session <id>] [--json]
-  node browser.mjs cleanup --session <id> [--json]
+  node browser.mjs status [--browser-id <id>] [--acknowledge-browser-id <id>] [--json]
+  node browser.mjs targets [--json]
+  node browser.mjs tabs --browser-id <id> [--json]
+  node browser.mjs group --browser-id <id> [--json]
+  node browser.mjs open <url> --session <id> --browser-id <id> [--active|--inactive] [--turn <n>] [--json]
+  node browser.mjs view <url> --session <id> --browser-id <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--json]
+  node browser.mjs snapshot <tabId> --browser-id <id> [--json]
+  node browser.mjs extract <tabId> --browser-id <id> [--max-chars <n>] [--json]
+  node browser.mjs screenshot <tabId> <path> --browser-id <id> [--full-page]
+  node browser.mjs close <tabId> --browser-id <id> [--session <id>] [--json]
+  node browser.mjs cleanup --session <id> --browser-id <id> [--json]
 
 Examples:
   node browser.mjs status
@@ -95,12 +96,15 @@ async function pairingToken() {
 function browserTarget(value) {
   if (!value || typeof value !== "object") return undefined;
   if (typeof value.browser !== "string" || !value.browser || typeof value.browserId !== "string" || !value.browserId || typeof value.profile !== "string" || !value.profile) return undefined;
-  return { browser: value.browser, browserId: value.browserId, profile: value.profile };
+  const connectionId = typeof value.connectionId === "string" && value.connectionId ? value.connectionId : undefined;
+  const connectionGeneration = Number.isInteger(value.connectionGeneration) && value.connectionGeneration > 0 ? value.connectionGeneration : undefined;
+  return { browser: value.browser, browserId: value.browserId, profile: value.profile, ...(connectionId === undefined ? {} : { connectionId }), ...(connectionGeneration === undefined ? {} : { connectionGeneration }) };
 }
 
 class BridgeClient {
-  constructor(token) {
+  constructor(token, selectedBrowserId) {
     this.token = token;
+    this.selectedBrowserId = selectedBrowserId;
     this.socket = undefined;
     this.sequence = 0;
     this.pending = new Map();
@@ -142,11 +146,14 @@ class BridgeClient {
     if (!entry) return;
     clearTimeout(entry.timer);
     this.pending.delete(message.id);
-    if (message.error) entry.reject(new Error(message.error.message || "Browser request failed"));
-    else entry.resolve(message.result);
+    if (message.error) {
+      const error = new Error(message.error.message || "Browser request failed");
+      if (typeof message.error.code === "string") error.code = message.error.code;
+      entry.reject(error);
+    } else entry.resolve(message.result);
   }
 
-  rawRequest(method, params = {}, timeoutMs = DEFAULT_TIMEOUT) {
+  rawRequest(method, params = {}, timeoutMs = DEFAULT_TIMEOUT, target) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("Bridge WebSocket is not connected"));
     }
@@ -157,18 +164,29 @@ class BridgeClient {
         rejectRequest(new Error(`Browser request timed out: ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
-      this.socket.send(JSON.stringify({ type: "request", id, method, params }));
+      this.socket.send(JSON.stringify({ type: "request", id, method, params, ...(target === undefined ? {} : { target }) }));
     });
+  }
+
+  targetRoute(target = this.acknowledgedTarget) {
+    if (!target) return this.selectedBrowserId === undefined ? undefined : { browserId: this.selectedBrowserId };
+    return {
+      browserId: target.browserId,
+      ...(target.connectionId === undefined ? {} : { connectionId: target.connectionId }),
+      ...(target.connectionGeneration === undefined ? {} : { connectionGeneration: target.connectionGeneration }),
+    };
   }
 
   async request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT) {
     if (method === "status") {
-      const { acknowledgeBrowserId, ...statusParams } = params;
-      const result = await this.rawRequest("status", statusParams, timeoutMs);
+      const { acknowledgeBrowserId, browserId, ...statusParams } = params;
+      const selectedBrowserId = browserId || this.selectedBrowserId;
+      const route = selectedBrowserId === undefined ? undefined : { browserId: selectedBrowserId };
+      const result = await this.rawRequest("status", statusParams, timeoutMs, route);
       const target = browserTarget(result);
       const previous = this.acknowledgedTarget;
       const changed = previous !== undefined && previous.browserId !== target?.browserId;
-      const acknowledged = target !== undefined && (previous === undefined || !changed || acknowledgeBrowserId === target.browserId);
+      const acknowledged = target !== undefined && (previous === undefined || !changed || acknowledgeBrowserId === target.browserId || selectedBrowserId === target.browserId);
       if (target !== undefined && acknowledged) this.acknowledgedTarget = target;
       return {
         ...result,
@@ -180,19 +198,22 @@ class BridgeClient {
           browser: target?.browser,
           browserId: target?.browserId,
           profile: target?.profile,
+          ...(target?.connectionId === undefined ? {} : { connectionId: target.connectionId }),
+          ...(target?.connectionGeneration === undefined ? {} : { connectionGeneration: target.connectionGeneration }),
           ...(previous === undefined ? {} : { previousBrowser: previous.browser, previousBrowserId: previous.browserId }),
         },
       };
     }
-    const status = await this.rawRequest("status", {}, timeoutMs);
+    const route = this.targetRoute();
+    const status = await this.rawRequest("status", {}, timeoutMs, route);
     const target = browserTarget(status);
     const previous = this.acknowledgedTarget;
-    if (target === undefined) throw new Error("Browser status did not identify an active browser target; run status");
+    if (target === undefined) throw new Error("Browser status did not identify an active browser target; run status --browser-id <id>");
     if (previous !== undefined && previous.browserId !== target.browserId) {
       throw new Error(`Browser target changed from ${previous.browser} (${previous.browserId}) to ${target.browser} (${target.browserId}); run status with --acknowledge-browser-id after disabling the other browser extension`);
     }
     if (previous === undefined) this.acknowledgedTarget = target;
-    return this.rawRequest(method, { ...params, expectedBrowserId: target.browserId }, timeoutMs);
+    return this.rawRequest(method, { ...params, expectedBrowserId: target.browserId }, timeoutMs, this.targetRoute(target));
   }
 
   close() {
@@ -200,10 +221,10 @@ class BridgeClient {
   }
 }
 
-async function createClient() {
+async function createClient(selectedBrowserId, requireExtension = true) {
   const health = await bridgeHealth();
-  if (!health.extensionConnected) throw new Error("Chrome/Edge extension is not connected. Run /chrome status and reload the unpacked extension if needed.");
-  const client = new BridgeClient(await pairingToken());
+  if (requireExtension && !health.extensionConnected) throw new Error("Chrome/Edge extension is not connected. Run /chrome status and reload the unpacked extension if needed.");
+  const client = new BridgeClient(await pairingToken(), selectedBrowserId);
   await client.connect();
   return { client, health };
 }
@@ -343,11 +364,17 @@ async function main() {
     if (!boolOption(options, "temporary", false)) requiredTurn(options, "view");
   }
   if (command === "cleanup") requiredSession(options, "cleanup");
-  const { client, health } = await createClient();
+  const requiresExtension = command !== "status" && command !== "targets";
+  const { client, health } = await createClient(options.browser_id, requiresExtension);
   try {
     if (command === "status") {
       const status = await client.request("status", options.acknowledge_browser_id ? { acknowledgeBrowserId: String(options.acknowledge_browser_id) } : {});
       printResult({ status, health }, options);
+      return;
+    }
+    if (command === "targets") {
+      const result = await client.rawRequest("list_targets");
+      printResult(result, options);
       return;
     }
     if (command === "tabs") {
@@ -432,6 +459,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`pi-control-chrome: ${error.message}`);
+  const code = typeof error?.code === "string" ? `[${error.code}] ` : "";
+  console.error(`pi-control-chrome: ${code}${error.message}`);
   process.exitCode = 1;
 });

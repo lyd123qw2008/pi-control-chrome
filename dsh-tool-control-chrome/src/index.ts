@@ -10,7 +10,7 @@ import { registerBrowserTools } from './tools.js'
 import { registerBrowserSkill } from './skill.js'
 import type { Config as ControlChromeConfig } from './types.js'
 
-export type { BrowserResult, ResolvedConfig, ScreenshotResult } from './types.js'
+export type { BrowserResult, BrowserTarget, BrowserTargetRoute, ResolvedConfig, ScreenshotResult } from './types.js'
 export interface Config extends ControlChromeConfig {}
 export { BrowserBridgeClient, resolveConfig } from './bridge.js'
 export { BROWSER_TOOL_NAMES, browserToolCatalog } from './tools.js'

@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join, resolve as resolvePath } from 'node:path'
 import WebSocket from 'ws'
-import type { Config, ResolvedConfig } from './types.js'
+import type { BrowserTargetRoute, Config, ResolvedConfig } from './types.js'
 import { bridgeRecovery } from './diagnostics.js'
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -165,7 +165,7 @@ export class BrowserBridgeClient {
   }
 
   /** Send one browser method request and preserve caller cancellation locally. */
-  async request(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
+  async request(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal, target?: BrowserTargetRoute): Promise<unknown> {
     if (signal?.aborted) throw new Error(`Browser request aborted: ${method}`)
     await this.connect()
     const config = this.resolveConfig()
@@ -197,7 +197,7 @@ export class BrowserBridgeClient {
       })
       signal?.addEventListener('abort', onAbort, { once: true })
       try {
-        socket.send(JSON.stringify({ type: 'request', id, method, params }))
+        socket.send(JSON.stringify({ type: 'request', id, method, params, ...(target === undefined ? {} : { target }) }))
       } catch (error) {
         this.settlePending(id, errorMessage(error, 'Browser request failed'))
       }

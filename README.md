@@ -58,7 +58,7 @@ The package registers the Pi extension and the bundled Skill through its `packag
 
 This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, merge the `insert` entry from its `config/cordis.patch.yml.example` into the existing `cordis.patch.yml`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
-The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 39 `browser_*` tools are registered in that Agent and remain active across turns in the current Agent session. At turn end, the host closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease. Bridge, browser tools, and Browser binding remain available for later turns. A model must call `browser_mark_handoff` or `browser_mark_deliverable` to preserve an Agent tab through the current turn cleanup, and repeat the mark in a later turn when needed. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it performs immediate task cleanup while retaining the lazy tools and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and deactivates lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. Set `lazyTools: false` for eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 39 `browser_*` tools are registered in that Agent and remain active across turns in the current Agent session. At turn end, the host closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease. Bridge, browser tools, and Browser binding remain available for later turns. A model must call `browser_mark_handoff` or `browser_mark_deliverable` to preserve an Agent tab through the current turn cleanup, and repeat the mark in a later turn when needed. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it performs immediate task cleanup while retaining the lazy tools and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and deactivates lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. Set `lazyTools: false` for eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
 
 ## Load the browser extension
 
@@ -74,21 +74,23 @@ Check the connection in Pi:
 
 ```text
 /chrome status
+/chrome targets
+/chrome profile <browserId>
 /chrome tabs
 ```
 
-The extension is shared by Chrome and Edge and uses Chromium Manifest V3 capability detection rather than separate browser-specific implementations. One Bridge endpoint currently accepts one active extension connection. Chrome and Edge may both remain open, but loading the shared extension in both against the same Bridge makes the newer connection replace the older one; use one controlled browser per Bridge.
+The extension is shared by Chrome and Edge and uses Chromium Manifest V3 capability detection rather than separate browser-specific implementations. One Bridge can now keep multiple identified browser targets connected at once. Each target is keyed by its stable `browserId`; requests use target-qualified routing and connection-generation fencing, so a newer connection for Profile A cannot replace Profile B or satisfy Profile A's stale requests. When multiple targets are available, select one explicitly with `/chrome profile <browserId>` or `browser_status`/the Skill CLI `--browser-id`; the runtime never guesses from the newest connection or active window.
 
 ## Skill CLI
 
 The bundled scripts are for explicit human/developer workflows and automated tests. They connect to the Bridge directly and must not be invoked by a model shell as a substitute for the Skill-gated native tools:
 
 ```powershell
-node skills/pi-control-chrome/scripts/browser.mjs status
-node skills/pi-control-chrome/scripts/browser.mjs tabs --json
-node skills/pi-control-chrome/scripts/browser.mjs group --json
-node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --session example-session --turn 1 --screenshot "$env:TEMP\example.png"
-node skills/pi-control-chrome/scripts/browser.mjs cleanup --session <session-id>
+node skills/pi-control-chrome/scripts/browser.mjs status --browser-id <browserId>
+node skills/pi-control-chrome/scripts/browser.mjs tabs --browser-id <browserId> --json
+node skills/pi-control-chrome/scripts/browser.mjs group --browser-id <browserId> --json
+node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --browser-id <browserId> --session example-session --turn 1 --screenshot "$env:TEMP\example.png"
+node skills/pi-control-chrome/scripts/browser.mjs cleanup --browser-id <browserId> --session <session-id>
 ```
 
 Managed CLI commands use explicit lifecycle identity: `open` and `cleanup` require `--session <id>`, and `view` requires both `--session <id>` and `--turn <n>` unless it is explicitly temporary. The CLI does not derive ownership from a process id, so a later invocation can address the same tabs safely.
@@ -120,6 +122,12 @@ npm run pack:check
 
 ```powershell
 npm run smoke:e2e
+```
+
+The multi-target acceptance test launches two isolated temporary Edge/Chrome profiles and verifies explicit routing, target disconnect isolation, and same-Profile reconnection fencing:
+
+```powershell
+npm run smoke:e2e:multi-profile
 ```
 
 The smoke test defaults to Edge. Run the same coverage against Chrome for Testing with:
@@ -158,12 +166,12 @@ This uses an isolated temporary browser profile and does not touch the normal us
 
 The following items are planned for later stages and do not block the current browser-control loop:
 
-- Parallel control of multiple browser profiles.
 - WebMCP, GSuite export, and browsing history APIs.
 - Dedicated media-download interfaces.
-- Capability discovery.
+- Capability discovery beyond the current Bridge target and extension capability handshake.
 - Chrome Web Store and Edge Add-ons release packages.
 - Dedicated Brave and Chromium acceptance coverage.
+- Cross-Bridge orchestration and simultaneous multi-target control within one session.
 
 ## License
 

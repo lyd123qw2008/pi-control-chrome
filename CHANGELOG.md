@@ -4,6 +4,20 @@
 
 - Added a maintainer release Skill and a package/version matrix covering Pi, the browser extension, DSH, npm Trusted Publishing, lockfiles, Profile overrides, and post-release runtime verification.
 
+- Added a target registry that keeps multiple Chrome/Edge browser Profiles connected to one Bridge, with explicit `browserId` selection, connection IDs, monotonic connection generations, target-scoped events, and stale-route rejection.
+
+- Added target inventory and structured Bridge diagnostics through `health`, `list_targets`, and `doctor`, including bounded non-sensitive lifecycle events and request metrics.
+
+- Extended Pi, DSH, and the managed Skill CLI with explicit browser-target selection and connection-fenced requests while preserving single-target protocol compatibility.
+
+- Qualified browser tab handles, ownership records, cleanup, and target status with the logical browser identity; target disconnects remain recoverable and side-effecting operations are not automatically replayed after an uncertain connection failure.
+
+- Added multi-target Bridge and DSH routing tests, target replacement fencing, disconnected-target recovery coverage, and explicit target selection tests.
+
+- Included the referenced Markdown documentation in the Pi npm tarball without shipping the unrelated documentation screenshots, so packaged README links remain usable.
+
+- Fixed MV3 ownership persistence for real Chrome/Edge storage by avoiding undefined storage defaults and stale read-side writes; live claim and cleanup state now survives concurrent tab-list requests.
+
 ## 0.3.8 - 2026-08-26
 
 - Fixed Pi session transitions to report completed cleanup as successful instead of leaving a false browser-cleanup-pending status; added real-RPC lifecycle coverage for session switching, cleanup retry intent and stale Bridge sockets.

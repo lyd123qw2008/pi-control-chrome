@@ -279,7 +279,7 @@ control-chrome:
 
 ### 兼容诊断
 
-`/chrome status`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart`、`/chrome tabs` 等人工命令不受模型 Skill gate 限制。`connect` 复用或启动 Bridge 并等待扩展连接，`disconnect` 只断开当前 DSH 客户端，`restart` 重启 Bridge 并等待扩展恢复。它们仍然是用户主动执行的诊断或生命周期入口，但不能作为模型自动使用浏览器的理由。
+`/chrome status`、`/chrome targets`、`/chrome profile [browserId]`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart`、`/chrome tabs` 等人工命令不受模型 Skill gate 限制。`connect` 复用或启动 Bridge 并等待扩展连接，`disconnect` 只断开当前 DSH 客户端，`restart` 重启 Bridge 并等待扩展恢复。它们仍然是用户主动执行的诊断或生命周期入口，但不能作为模型自动使用浏览器的理由。
 
 ## 9. 测试计划
 

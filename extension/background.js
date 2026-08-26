@@ -1,5 +1,6 @@
 const BRIDGE_ORIGIN = "http://127.0.0.1:17318";
 const BRIDGE_WS = "ws://127.0.0.1:17318/ws";
+const OWNED_TABS_SCHEMA_VERSION = 2;
 const OWNED_TABS_KEY = "piControlChromeOwnedTabs";
 const PROFILE_ID_KEY = "piControlChromeProfileId";
 const GROUP_TITLE = "Pi";
@@ -10,6 +11,8 @@ const EXTENSION_CAPABILITIES = Object.freeze({
   turnScopedMarks: true,
   retainedCleanup: true,
   debuggerLeaseRecovery: true,
+  targetQualifiedHandles: true,
+  targetScopedState: true,
 });
 
 const DEBUGGER_LEASE_IDLE_MS = 15_000;
@@ -37,9 +40,13 @@ function boundedPush(list, value) {
   if (list.length > MAX_EVENTS) list.splice(0, list.length - MAX_EVENTS);
 }
 
+function downloadStateKey(downloadId) {
+  return `${browserIdentity().browserId}::download::${Number(downloadId)}`;
+}
+
 function stateForTab(tabId) {
-  const id = Number(tabId);
-  let state = devtoolsState.get(id);
+  const key = targetStateKey(tabId);
+  let state = devtoolsState.get(key);
   if (!state) {
     state = {
       console: [],
@@ -48,7 +55,7 @@ function stateForTab(tabId) {
       dialog: undefined,
       fileChooser: undefined,
     };
-    devtoolsState.set(id, state);
+    devtoolsState.set(key, state);
   }
   return state;
 }
@@ -154,24 +161,25 @@ chrome.debugger?.onDetach?.addListener((source, reason) => {
   if (source?.tabId !== undefined) {
     log(`debugger detached for tab ${source.tabId}`, reason);
     const id = Number(source.tabId);
-    const record = persistentDebuggers.get(id);
+    const record = persistentDebuggers.get(targetStateKey(id));
     if (record?.releaseTimer !== undefined) clearTimeout(record.releaseTimer);
-    persistentDebuggers.delete(id);
+    persistentDebuggers.delete(targetStateKey(id));
   }
 });
 
 chrome.tabs?.onRemoved?.addListener((tabId) => {
   const id = Number(tabId);
-  const record = persistentDebuggers.get(id);
+  const record = persistentDebuggers.get(targetStateKey(id));
   if (record?.releaseTimer !== undefined) clearTimeout(record.releaseTimer);
-  devtoolsState.delete(id);
-  persistentDebuggers.delete(id);
+  devtoolsState.delete(targetStateKey(id));
+  persistentDebuggers.delete(targetStateKey(id));
   forgetOwnedTabRecord(id).catch((error) => log("could not forget closed tab ownership", error));
 });
 
 chrome.downloads?.onCreated?.addListener((item) => {
-  downloadState.set(item.id, {
+  downloadState.set(downloadStateKey(item.id), {
     id: item.id,
+    browserId: browserIdentity().browserId,
     url: item.url,
     filename: item.filename,
     state: item.state,
@@ -187,8 +195,8 @@ chrome.downloads?.onCreated?.addListener((item) => {
 chrome.downloads?.onChanged?.addListener(async (delta) => {
   const item = await chrome.downloads.search({ id: delta.id });
   if (item[0]) {
-    const current = downloadState.get(delta.id) || { id: delta.id };
-    downloadState.set(delta.id, {
+    const current = downloadState.get(downloadStateKey(delta.id)) || { id: delta.id, browserId: browserIdentity().browserId };
+    downloadState.set(downloadStateKey(delta.id), {
       ...current,
       filename: item[0].filename,
       url: item[0].url,
@@ -268,12 +276,21 @@ async function connect() {
         id = message.id;
         if (message.type !== "request") return;
         const response = await enqueueBridgeRequest(async () => {
-          const expectedBrowserId = message.params?.expectedBrowserId;
+          const target = message.target;
+          if (target !== undefined && (!target || typeof target !== "object" || Array.isArray(target))) {
+            return { ok: false, error: { code: "INVALID_BROWSER_TARGET", message: "target must be an object" } };
+          }
+          const envelopeBrowserId = target?.browserId;
+          const parameterBrowserId = message.params?.expectedBrowserId;
+          if (envelopeBrowserId !== undefined && parameterBrowserId !== undefined && envelopeBrowserId !== parameterBrowserId) {
+            return { ok: false, error: { code: "INVALID_BROWSER_TARGET", message: "target.browserId conflicts with expectedBrowserId" } };
+          }
+          const expectedBrowserId = envelopeBrowserId ?? parameterBrowserId;
           if (expectedBrowserId !== undefined && (typeof expectedBrowserId !== "string" || expectedBrowserId.length === 0)) {
-            return { ok: false, error: { code: "INVALID_BROWSER_TARGET", message: "expectedBrowserId must be a non-empty string" } };
+            return { ok: false, error: { code: "INVALID_BROWSER_TARGET", message: "expected browserId must be a non-empty string" } };
           }
           if (expectedBrowserId !== undefined && expectedBrowserId !== browserIdentity().browserId) {
-            return { ok: false, error: { code: "BROWSER_TARGET_CHANGED", message: `Browser target changed; expected ${expectedBrowserId} but this extension is ${browserIdentity().browserId}` } };
+            return { ok: false, error: { code: "INVALID_BROWSER_TARGET", message: `Browser target mismatch; expected ${expectedBrowserId} but this extension is ${browserIdentity().browserId}` } };
           }
           return { ok: true, result: await handleRequest(message.method, message.params || {}) };
         });
@@ -320,9 +337,32 @@ function enqueueBridgeRequest(task) {
   return run;
 }
 
+function targetStateKey(tabId, browserId = browserIdentity().browserId) {
+  return `${browserId}::${Number(tabId)}`;
+}
+
+function recordTabId(record, key) {
+  const tabId = Number(record?.tabId);
+  return Number.isFinite(tabId) ? tabId : Number(String(key).split("::").at(-1));
+}
+
 async function ownedTabs() {
-  const data = await chrome.storage.local.get({ [OWNED_TABS_KEY]: {} });
-  return data[OWNED_TABS_KEY] || {};
+  await ensureProfileIdentity();
+  const data = await chrome.storage.local.get({ [OWNED_TABS_KEY]: null });
+  const stored = data[OWNED_TABS_KEY];
+  if (stored && stored.version === OWNED_TABS_SCHEMA_VERSION && stored.records && typeof stored.records === "object") return stored.records;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return {};
+  const currentBrowserId = browserIdentity().browserId;
+  const records = {};
+  for (const [legacyKey, value] of Object.entries(stored)) {
+    if (!value || typeof value !== "object") continue;
+    const tabId = Number(value.tabId ?? legacyKey);
+    if (!Number.isFinite(tabId)) continue;
+    const browserId = typeof value.browserId === "string" && value.browserId.length > 0 ? value.browserId : currentBrowserId;
+    records[targetStateKey(tabId, browserId)] = { ...value, tabId, browserId };
+  }
+  await saveOwnedTabs(records);
+  return records;
 }
 
 function sessionKey(sessionId) {
@@ -331,17 +371,18 @@ function sessionKey(sessionId) {
 
 async function ownedTabForSession(tabId, sessionId, action, required = false, allowOtherSession = false) {
   const owned = await ownedTabs();
-  const record = owned[String(tabId)];
+  const record = owned[targetStateKey(tabId)];
   if (!record) {
     if (required) throw new Error(`Cannot ${action} tab ${tabId}; it is not owned by an Agent session`);
     return undefined;
   }
+  if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another browser target`);
   if (record.sessionId !== sessionKey(sessionId) && !allowOtherSession) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another Agent session`);
   return record;
 }
 
 async function saveOwnedTabs(value) {
-  await chrome.storage.local.set({ [OWNED_TABS_KEY]: value });
+  await chrome.storage.local.set({ [OWNED_TABS_KEY]: { version: OWNED_TABS_SCHEMA_VERSION, records: value } });
 }
 
 function mutateOwnedTabs(mutator) {
@@ -357,15 +398,15 @@ function mutateOwnedTabs(mutator) {
 
 async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temporary") {
   await mutateOwnedTabs((owned) => {
-    owned[String(tab.id)] = {
+    owned[targetStateKey(tab.id)] = {
       tabId: tab.id,
+      browserId: browserIdentity().browserId,
       windowId: tab.windowId,
       sessionId: sessionKey(sessionId),
       createdAt: Date.now(),
       groupId: tab.groupId,
       owner,
       lifecycle,
-      markTurn: undefined,
       title: tab.title || "",
       url: tab.url || "",
     };
@@ -374,9 +415,10 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
 
 async function updateOwnedTab(tabId, patch, sessionId) {
   return mutateOwnedTabs((owned) => {
-    const key = String(tabId);
+    const key = targetStateKey(tabId);
     const record = owned[key];
     if (!record) throw new Error(`Agent-owned tab not found: ${tabId}`);
+    if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw new Error(`Cannot update tab ${tabId}; it belongs to another browser target`);
     if (record.sessionId !== sessionKey(sessionId)) throw new Error(`Cannot update tab ${tabId}; it belongs to another Agent session`);
     owned[key] = { ...record, ...patch };
     return owned[key];
@@ -385,8 +427,11 @@ async function updateOwnedTab(tabId, patch, sessionId) {
 
 async function forgetOwnedTab(tabId, sessionId, allowOtherSession = false) {
   return mutateOwnedTabs((owned) => {
-    const key = String(tabId);
+    const key = targetStateKey(tabId);
     const record = owned[key];
+    if (record?.browserId !== undefined && record.browserId !== browserIdentity().browserId && !allowOtherSession) {
+      throw new Error(`Cannot forget tab ${tabId}; it belongs to another browser target`);
+    }
     if (record && record.sessionId !== sessionKey(sessionId) && !allowOtherSession) {
       throw new Error(`Cannot forget tab ${tabId}; it belongs to another Agent session`);
     }
@@ -396,7 +441,7 @@ async function forgetOwnedTab(tabId, sessionId, allowOtherSession = false) {
 
 async function forgetOwnedTabRecord(tabId) {
   return mutateOwnedTabs((owned) => {
-    delete owned[String(tabId)];
+    delete owned[targetStateKey(tabId)];
   });
 }
 
@@ -405,6 +450,12 @@ async function getTab(tabId, handle = {}) {
     ? await chrome.tabs.get(Number(tabId))
     : (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
   if (!tab) throw new Error("No active browser tab is available");
+  if (handle.expectedBrowserId !== undefined && String(handle.expectedBrowserId) !== browserIdentity().browserId) {
+    throw new Error(`Tab handle belongs to browser target ${handle.expectedBrowserId}; current target is ${browserIdentity().browserId}`);
+  }
+  if (handle.browserId !== undefined && String(handle.browserId) !== browserIdentity().browserId) {
+    throw new Error(`Tab handle belongs to browser target ${handle.browserId}; current target is ${browserIdentity().browserId}`);
+  }
   if (handle.expectedTitle !== undefined && String(handle.expectedTitle) !== String(tab.title || "")) {
     throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   }
@@ -433,25 +484,29 @@ async function listTabs() {
   return {
     browserId: identity.browserId,
     profile: identity.profile,
-    tabs: tabs.map((tab) => ({
-      id: tab.id,
-      browserId: identity.browserId,
-      favicon: tab.favIconUrl || "",
-      windowId: tab.windowId,
-      index: tab.index,
-      active: Boolean(tab.active),
-      pinned: Boolean(tab.pinned),
-      title: tab.title || "",
-      url: tab.url || "",
-      status: tab.status,
-      groupId: tab.groupId,
-      owner: owned[String(tab.id)]?.owner === "agent" ? "agent" : "user",
-      ownership: owned[String(tab.id)]?.owner,
-      sessionId: owned[String(tab.id)]?.sessionId,
-      lifecycle: owned[String(tab.id)]?.lifecycle,
-      handle: { tabId: tab.id, windowId: tab.windowId, title: tab.title || "", url: tab.url || "", groupId: tab.groupId, sessionId: owned[String(tab.id)]?.sessionId },
-      stale: owned[String(tab.id)] ? ((owned[String(tab.id)].url !== (tab.url || "") || owned[String(tab.id)].title !== (tab.title || "")) && owned[String(tab.id)].owner === "claimed") : false,
-    })),
+    tabs: tabs.map((tab) => {
+      const stored = owned[targetStateKey(tab.id)];
+      const record = stored && (stored.browserId === undefined || stored.browserId === identity.browserId) ? stored : undefined;
+      return {
+        id: tab.id,
+        browserId: identity.browserId,
+        favicon: tab.favIconUrl || "",
+        windowId: tab.windowId,
+        index: tab.index,
+        active: Boolean(tab.active),
+        pinned: Boolean(tab.pinned),
+        title: tab.title || "",
+        url: tab.url || "",
+        status: tab.status,
+        groupId: tab.groupId,
+        owner: record?.owner === "agent" ? "agent" : "user",
+        ownership: record?.owner,
+        sessionId: record?.sessionId,
+        lifecycle: record?.lifecycle,
+        handle: { tabId: tab.id, browserId: identity.browserId, windowId: tab.windowId, title: tab.title || "", url: tab.url || "", groupId: tab.groupId, sessionId: record?.sessionId },
+        stale: record ? ((record.url !== (tab.url || "") || record.title !== (tab.title || "")) && record.owner === "claimed") : false,
+      };
+    }),
     groups: await listGroups(),
   };
 }
@@ -825,11 +880,11 @@ function clearDebuggerLease(record) {
 
 function scheduleDebuggerDetachRetry(tabId, sessionId) {
   const id = Number(tabId);
-  const record = persistentDebuggers.get(id);
+  const record = persistentDebuggers.get(targetStateKey(id));
   if (!record || record.sessionId !== sessionKey(sessionId) || Number(record.activeUsers || 0) > 0 || (record.lease !== true && record.detachPending !== true)) return;
   clearDebuggerLease(record);
   record.releaseTimer = setTimeout(() => {
-    const current = persistentDebuggers.get(id);
+    const current = persistentDebuggers.get(targetStateKey(id));
     if (!current || current !== record || current.sessionId !== sessionKey(sessionId) || Number(current.activeUsers || 0) > 0 || current.detaching) return;
     detachDebugger(id, sessionId).catch((error) => {
       log("debugger detach retry failed", error);
@@ -840,7 +895,7 @@ function scheduleDebuggerDetachRetry(tabId, sessionId) {
 
 function scheduleDebuggerRelease(tabId, sessionId) {
   const id = Number(tabId);
-  const record = persistentDebuggers.get(id);
+  const record = persistentDebuggers.get(targetStateKey(id));
   if (!record || record.lease !== true || record.sessionId !== sessionKey(sessionId) || Number(record.activeUsers || 0) > 0) return;
   scheduleDebuggerDetachRetry(id, sessionId);
 }
@@ -848,7 +903,7 @@ function scheduleDebuggerRelease(tabId, sessionId) {
 async function attachDebugger(tabId, sessionId, options = {}) {
   const id = Number(tabId);
   const requestedSession = sessionKey(sessionId);
-  const existing = persistentDebuggers.get(id);
+  const existing = persistentDebuggers.get(targetStateKey(id));
   if (existing) {
     if (existing.detaching) {
       await existing.detaching;
@@ -866,14 +921,16 @@ async function attachDebugger(tabId, sessionId, options = {}) {
     }
     return;
   }
-  const inFlight = debuggerAttachers.get(id);
+  const inFlight = debuggerAttachers.get(targetStateKey(id));
   if (inFlight) {
     await inFlight.promise;
     return attachDebugger(id, sessionId, options);
   }
   const attaching = (async () => {
     await chrome.debugger.attach({ tabId: id }, "1.3");
-    persistentDebuggers.set(id, {
+    persistentDebuggers.set(targetStateKey(id), {
+      tabId: id,
+      browserId: browserIdentity().browserId,
       attachedAt: Date.now(),
       sessionId: requestedSession,
       lease: options.lease === true,
@@ -882,18 +939,18 @@ async function attachDebugger(tabId, sessionId, options = {}) {
       releaseTimer: undefined,
     });
   })();
-  debuggerAttachers.set(id, { sessionId: requestedSession, promise: attaching });
+  debuggerAttachers.set(targetStateKey(id), { tabId: id, browserId: browserIdentity().browserId, sessionId: requestedSession, promise: attaching });
   try {
     await attaching;
   } finally {
-    if (debuggerAttachers.get(id)?.promise === attaching) debuggerAttachers.delete(id);
+    if (debuggerAttachers.get(targetStateKey(id))?.promise === attaching) debuggerAttachers.delete(targetStateKey(id));
   }
 }
 
 async function acquireDebugger(tabId, sessionId) {
   const id = Number(tabId);
   await attachDebugger(id, sessionId, { lease: true });
-  const record = persistentDebuggers.get(id);
+  const record = persistentDebuggers.get(targetStateKey(id));
   if (!record || record.sessionId !== sessionKey(sessionId)) throw new Error(`DevTools for tab ${id} is no longer attached`);
   clearDebuggerLease(record);
   record.activeUsers = Number(record.activeUsers || 0) + 1;
@@ -901,7 +958,7 @@ async function acquireDebugger(tabId, sessionId) {
 
 async function releaseDebugger(tabId, sessionId) {
   const id = Number(tabId);
-  const record = persistentDebuggers.get(id);
+  const record = persistentDebuggers.get(targetStateKey(id));
   if (!record) return;
   if (sessionKey(sessionId) !== record.sessionId) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
   record.activeUsers = Math.max(0, Number(record.activeUsers || 0) - 1);
@@ -915,7 +972,7 @@ async function releaseDebugger(tabId, sessionId) {
 
 async function detachDebugger(tabId, sessionId) {
   const id = Number(tabId);
-  const record = persistentDebuggers.get(id);
+  const record = persistentDebuggers.get(targetStateKey(id));
   if (!record) return;
   if (sessionKey(sessionId) !== record.sessionId) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
   if (record.detaching) {
@@ -928,21 +985,21 @@ async function detachDebugger(tabId, sessionId) {
     return;
   }
   const detaching = (async () => {
-    if (persistentDebuggers.get(id) !== record || Number(record.activeUsers || 0) > 0) return;
+    if (persistentDebuggers.get(targetStateKey(id)) !== record || Number(record.activeUsers || 0) > 0) return;
     try {
       await chrome.debugger.detach({ tabId: id });
     } catch (error) {
-      if (persistentDebuggers.get(id) === record) record.detachPending = true;
+      if (persistentDebuggers.get(targetStateKey(id)) === record) record.detachPending = true;
       throw error;
     }
-    if (persistentDebuggers.get(id) === record) persistentDebuggers.delete(id);
+    if (persistentDebuggers.get(targetStateKey(id)) === record) persistentDebuggers.delete(targetStateKey(id));
   })();
   record.detaching = detaching;
   try {
     await detaching;
   } finally {
     if (record.detaching === detaching) record.detaching = undefined;
-    if (persistentDebuggers.get(id) === record && record.detachPending === true) scheduleDebuggerDetachRetry(id, sessionId);
+    if (persistentDebuggers.get(targetStateKey(id)) === record && record.detachPending === true) scheduleDebuggerDetachRetry(id, sessionId);
   }
 }
 
@@ -996,18 +1053,20 @@ async function createTab(params) {
 
 async function settleDebuggerAttaches(sessionId, detach) {
   const requestedSession = sessionKey(sessionId);
-  for (const [tabId, pending] of [...debuggerAttachers.entries()]) {
+  for (const pending of [...debuggerAttachers.values()]) {
     if (pending.sessionId !== requestedSession) continue;
     await pending.promise.catch(() => {});
-    if (detach) await detachDebugger(tabId, sessionId);
+    if (detach) await detachDebugger(pending.tabId, sessionId);
   }
 }
 
 async function cleanup(params) {
+  await ensureProfileIdentity();
   const sessionId = sessionKey(params.sessionId);
   const detachDevtools = params.detachDevtools !== false;
   const turnCleanup = params.mode === "turn";
   const turnId = params.turnId === undefined || params.turnId === null ? undefined : String(params.turnId);
+  const targetId = browserIdentity().browserId;
   if (turnCleanup && turnId === undefined) throw new Error("Turn cleanup requires turnId");
   await settleDebuggerAttaches(sessionId, detachDevtools);
   const result = await mutateOwnedTabs(async (owned) => {
@@ -1015,39 +1074,41 @@ async function cleanup(params) {
     const released = [];
     const failed = [];
     for (const [key, record] of Object.entries(owned)) {
+      if (record.browserId !== undefined && record.browserId !== targetId) continue;
       if (record.sessionId !== sessionId) continue;
+      const tabId = recordTabId(record, key);
       if (record.owner === "claimed") {
-        released.push(Number(key));
+        released.push(tabId);
         delete owned[key];
         continue;
       }
       if (record.owner !== "agent") continue;
       const markedForTurn = turnCleanup && turnId !== undefined && ["handoff", "deliverable"].includes(record.lifecycle) && String(record.markTurn || "") === turnId;
       if (!turnCleanup && ["handoff", "deliverable"].includes(record.lifecycle)) {
-        released.push(Number(key));
+        released.push(tabId);
         delete owned[key];
         continue;
       }
       const removable = ["temporary", "created"].includes(record.lifecycle) || (turnCleanup && !markedForTurn);
       if (!removable) continue;
       try {
-        await chrome.tabs.remove(Number(key));
-        removed.push(Number(key));
+        await chrome.tabs.remove(tabId);
+        removed.push(tabId);
         delete owned[key];
       } catch (error) {
-        failed.push({ tabId: Number(key), error: error instanceof Error ? error.message : String(error) });
-        log(`could not close tab ${key} during cleanup`, error);
+        failed.push({ tabId, error: error instanceof Error ? error.message : String(error) });
+        log(`could not close tab ${tabId} during cleanup`, error);
       }
     }
     const retained = Object.entries(owned)
-      .filter(([, record]) => record.sessionId === sessionId)
-      .map(([key]) => Number(key));
+      .filter(([, record]) => record.sessionId === sessionId && (record.browserId === undefined || record.browserId === targetId))
+      .map(([key, record]) => recordTabId(record, key));
     return { removed, released, retained, failed };
   });
   if (detachDevtools) {
-    for (const [tabId, record] of [...persistentDebuggers.entries()]) {
+    for (const record of [...persistentDebuggers.values()]) {
       if (record.sessionId !== sessionKey(sessionId)) continue;
-      await detachDebugger(tabId, sessionId);
+      await detachDebugger(record.tabId, sessionId);
     }
   }
   return result;
@@ -1359,7 +1420,7 @@ async function handleRequest(method, params) {
     if (params.tabId === undefined) throw new Error("tabId is required");
     const lifecycle = method === "mark_handoff" ? "handoff" : "deliverable";
     const markTurn = params.turnId === undefined || params.turnId === null ? undefined : String(params.turnId);
-    return { tab: await updateOwnedTab(params.tabId, { lifecycle, markTurn }, params.sessionId) };
+    return { tab: await updateOwnedTab(params.tabId, { lifecycle, ...(markTurn === undefined ? {} : { markTurn }) }, params.sessionId) };
   }
   if (method === "cleanup") return cleanup(params);
   throw new Error(`Unsupported browser method: ${method}`);

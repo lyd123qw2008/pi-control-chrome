@@ -25,6 +25,7 @@ test("browser CLI sends session and turn context with retention marks", async ()
   let nextTabId = 40;
   const tabs = new Map();
   const markRequests = [];
+  const routedRequests = [];
   const server = createServer((request, response) => {
     response.setHeader("Content-Type", "application/json");
     if (request.url === "/health") {
@@ -43,9 +44,10 @@ test("browser CLI sends session and turn context with retention marks", async ()
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString());
       if (message.type !== "request") return;
+      routedRequests.push(message);
       let result;
       if (message.method === "status") {
-        result = { connected: true, browser: "edge", browserId: "edge:test", profile: "profile", capabilities };
+        result = { connected: true, browser: "edge", browserId: "edge:test", profile: "profile", connectionId: "edge-connection", connectionGeneration: 5, capabilities };
       } else if (message.method === "new_tab") {
         const tab = { id: ++nextTabId, title: "CLI test", url: message.params.url, active: false, owner: "agent", lifecycle: "temporary", groupId: 1, windowId: 1, sessionId: message.params.sessionId };
         tabs.set(tab.id, tab);
@@ -68,11 +70,14 @@ test("browser CLI sends session and turn context with retention marks", async ()
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   try {
-    const { stdout } = await runScript(port, "open", "https://example.test/", "--inactive", "--session", "cli-session", "--turn", "4", "--handoff", "--json");
+    const { stdout } = await runScript(port, "open", "https://example.test/", "--inactive", "--browser-id", "edge:test", "--session", "cli-session", "--turn", "4", "--handoff", "--json");
     const output = JSON.parse(stdout);
     assert.equal(output.tab.lifecycle, "handoff");
     assert.equal(output.sessionId, "cli-session");
     assert.equal(output.turnId, 4);
+     assert.ok(routedRequests.length > 0);
+     assert.ok(routedRequests.every(message => message.target?.browserId === "edge:test"));
+     assert.ok(routedRequests.filter(message => message.method !== "status").every(message => message.target?.connectionId === "edge-connection" && message.target?.connectionGeneration === 5));
     assert.deepEqual(markRequests, [{
       method: "mark_handoff",
       params: { tabId: 41, sessionId: "cli-session", turnId: 4, expectedBrowserId: "edge:test" },
