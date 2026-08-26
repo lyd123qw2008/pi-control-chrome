@@ -2,7 +2,7 @@
 
 配套执行 Skill：[`skills/pi-control-chrome-release/SKILL.md`](../skills/pi-control-chrome-release/SKILL.md)。执行发布任务时先加载该 Skill，再按本清单核对。
 
-这份清单适用于同时维护 Pi 根包、Manifest V3 浏览器扩展和 DSH 集成包的发布流程。发布前必须逐项核对包名、目标版本、依赖版本、lockfile、发布 workflow 和 active DSH Profile，不能只修改或发布其中一个包。
+这份清单适用于同时维护 Pi 根包、Manifest V3 浏览器扩展、DSH 集成包和私有 `dsh-profile-config` Profile 配置仓库的发布流程。发布前必须逐项核对包名、目标版本、依赖版本、lockfile、发布 workflow 和 active DSH Profile，不能只修改或发布其中一个包。`dsh-profile-config` 是新机器 bootstrap 使用的私有配置源，不是 npm 发布面；`<DSH_HOME>/profiles/web` 是安装后的运行副本，两者都要检查。
 
 ## 发布面清单
 
@@ -11,6 +11,7 @@
 | Pi 根包 `pi-control-chrome` | `package.json` | `package-lock.json`、`CHANGELOG.md` | `.github/workflows/publish-pi-control-chrome.yml` |
 | 浏览器扩展 | `extension/manifest.json` | `extension/background.js`、根包版本说明 | 随 Pi 根包发布；Manifest 版本号是否同步必须在发布矩阵中明确确认 |
 | DSH 包 `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `dsh-tool-control-chrome/pnpm-lock.yaml`、`dsh-tool-control-chrome/pnpm-workspace.yaml`、`dsh-tool-control-chrome/README.md` | `.github/workflows/publish-dsh-tool-control-chrome.yml` |
+| 私有 DSH Profile 配置仓库 | `dsh-profile-config/profiles/web/package.json` | `profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`README.md`、bootstrap 脚本 | 只提交并合并独立 Profile 配置 PR，不发布 npm 包 |
 | active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile 的 `pnpm-lock.yaml`、`pnpm-workspace.yaml` | 不属于仓库发布；在 npm 发布成功后单独更新并重启 DSH |
 
 根包版本、扩展 Manifest 版本、DSH 包版本和 active Profile 版本不是同一个字段。不能因为其中一个版本已经 bump，就假设其他发布面已经更新。
@@ -24,6 +25,7 @@
 pi-control-chrome                   <read>         <confirm>       <read>         publish-pi-control-chrome.yml
 extension/manifest.json             <read>         <confirm>       n/a            随根包或单独确认
 @lyd123qw2008/dsh-tool-control-chrome <read>       <confirm>       pi-control-chrome <target> publish-dsh-tool-control-chrome.yml
+私有 dsh-profile-config Profile      <read>         <confirm>       DSH <target>  独立 Profile PR（不发布 npm）
 active DSH Profile                  <read>         <confirm>       pi-control-chrome <target> 本地安装
 ```
 
@@ -60,6 +62,17 @@ npm view @lyd123qw2008/dsh-tool-control-chrome version dist-tags --json
    ```powershell
    npm view @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> version dist-tags dependencies --json
    ```
+
+10. 在私有 `dsh-profile-config` 仓库中更新 `profiles/web/package.json`、`profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml` 和 README 中的包版本。该仓库的 bootstrap 脚本会从 npm 安装发布包；只更新 active Profile 不会更新新机器的配置源，也不能把这个仓库当作 npm 发布包。
+11. 从 `dsh-profile-config` 的 `profiles/web` 运行安装和依赖解析检查，创建并合并独立的私有 Profile 配置 PR；不要为该仓库触发 npm 发布：
+
+    ```powershell
+    corepack pnpm --dir profiles/web install --frozen-lockfile
+    corepack pnpm --dir profiles/web list @lyd123qw2008/dsh-tool-control-chrome --depth 0
+    corepack pnpm --dir profiles/web why pi-control-chrome
+    ```
+
+12. 配置 PR 合并后，重新 bootstrap 或把配置同步到 `<DSH_HOME>`，再重启 DSH 做运行验证。
 
 已发布的 npm 版本不可覆盖。如果发现包内容或依赖遗漏，使用新的修订版本修复，不要尝试重新发布同一个版本号。
 
