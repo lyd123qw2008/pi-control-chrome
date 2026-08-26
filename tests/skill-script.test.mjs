@@ -68,7 +68,7 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.equal(screenshot.tabId, openedTabId);
     assert.ok(statSync(screenshotPath).size > 100);
 
-    const viewed = await runScript("view", fixture.url, "--inactive", "--temporary", "--max-chars", "500", "--json");
+    const viewed = await runScript("view", fixture.url, "--inactive", "--temporary", "--session", `${sessionId}-view`, "--max-chars", "500", "--json");
     viewedTabId = viewed.tab.id;
     assert.equal(viewed.tab.owner, "agent");
     assert.equal(viewed.tab.lifecycle, "temporary");

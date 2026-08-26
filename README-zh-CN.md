@@ -23,7 +23,7 @@
 - [浏览器能力显式激活方案](./BROWSER-ACTIVATION-DESIGN.zh-CN.md)
 - [Codex 对齐的浏览器生命周期实施方案](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md)
 
-本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。
+本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。用于管理标签页的 CLI `open` 和 `cleanup` 必须显式提供 `--session <id>`；非临时 `view` 还必须提供 `--turn <n>`，不再使用进程 PID 作为会话标识。
 
 ## 重点目标
 
@@ -39,8 +39,8 @@
 - claim/release 用户标签页；
 - Agent 创建的页面自动进入 Pi 专属分组；
 - Agent 页面带有 session ownership；
-- 任务完成后释放或关闭 Agent 页面；
-- 支持 handoff 和 deliverable 页面保留；
+- 每个 turn 结束时自动 release claimed user Tab，并关闭未标记的 Agent 临时页面；
+- 当前 turn 标记的 handoff 和 deliverable 页面跨 turn 保留，后续仍需保留时重新标记；
 - 不误关闭其他 Pi 会话和用户页面。
 
 ### 页面和 CDP
@@ -70,6 +70,7 @@
 - `pi-extension/`：Pi 原生浏览器工具和 `/chrome` 命令；
 - `dsh-tool-control-chrome/`：DSH `browser_*` 工具和 `/chrome status|doctor|restart|tabs` 命令；
 - `tests/bridge.test.mjs`：Bridge 单元/协议测试；
+- `tests/pi-lifecycle.test.mjs`：Pi session-generation、cleanup retry intent 和 BridgeClient 重连竞态测试；
 - `tests/skill-script.test.mjs`：Skill 快速脚本的实时 Bridge 集成测试；
 - `tests/e2e-browser.mjs`：真实 Edge/Chrome for Testing + 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。
 
@@ -110,7 +111,7 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 
 ## DSH 集成
 
-仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。默认 `lazyTools: true` 时，插件只注册 `pi-control-chrome` Skill 的名称和描述；Skill 成功加载后，把完整的 39 个 `browser_*` 工具注册到当前 Agent，并在该 Agent session 的连续 turn 中保持激活。任务完成和普通 turn 结束默认保留浏览器状态：不会关闭或 release Tab、断开 Bridge、移除工具、重新加载 Skill 或自动调用 cleanup。只有用户明确要求关闭临时 Tab、释放 claim 或清理浏览器任务时，才调用 `browser_cleanup`；它会保留工具和健康 Bridge。`browser_context_reset` 是单独的显式用户请求操作，用于 finalize 资源并停用惰性工具。Agent disposal 和插件关闭会重试最终清理；清理恢复失败时，复用同一 session ID 的替代 Agent 会保持阻塞，直到清理成功。设置 `lazyTools: false` 可保留插件加载即显示工具的兼容行为。Pi 使用同一批原生工具定义和 active-tool 隐藏机制。DSH 还提供人工使用的 `/chrome status`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart` 和 `/chrome tabs` 命令；这些命令不替代 Skill 激活。
+仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。默认 `lazyTools: true` 时，插件只注册 `pi-control-chrome` Skill 的名称和描述；Skill 成功加载后，把完整的 39 个 `browser_*` 工具注册到当前 Agent，并在该 Agent session 的连续 turn 中保持激活。按 Codex 默认生命周期，turn 结束时宿主关闭未标记的 Agent 临时 Tab、release claimed user Tab、detach debugger lease，但不停止 Bridge、移除工具或重新加载 Skill。模型需要保留页面时，应在当前 turn 调用 `browser_mark_handoff` 或 `browser_mark_deliverable`，下一 turn 仍需保留时重新标记。只有用户明确要求立即关闭临时 Tab、释放 claim 或清理浏览器任务时，才调用 `browser_cleanup`；它会保留工具和健康 Bridge。`browser_context_reset` 是单独的显式用户请求操作，用于 finalize 资源并停用惰性工具。Agent disposal 和插件关闭会重试最终清理；清理恢复失败时，复用同一 session ID 的替代 Agent 会保持阻塞，直到清理成功。设置 `lazyTools: false` 可保留插件加载即显示工具的兼容行为。Pi 使用同一批原生工具定义和 active-tool 隐藏机制。DSH 还提供人工使用的 `/chrome status`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart` 和 `/chrome tabs` 命令；这些命令不替代 Skill 激活。
 
 在 DSH Profile 中安装该包，把它的 `config/cordis.patch.yml.example` 中的 `insert` 条目合并到现有 `cordis.patch.yml`，不要覆盖其他 patch 条目，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH Profile 应包含标准的 `@deepseek-ai/dsh-skill` 服务，以便使用运行时 Skill 注册表和 `skill` 工具；浏览器插件本身不强制注入该可选服务。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
 
@@ -137,6 +138,7 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 ```powershell
 npm run check
 npm test
+npm run test:pi:lifecycle
 npm run test:skill
 npm run test:all
 npm run pack:check

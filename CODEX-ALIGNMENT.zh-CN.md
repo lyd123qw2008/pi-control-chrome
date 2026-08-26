@@ -66,11 +66,11 @@ browser.tabs.selected()
 - 如果同一 Profile 存在多个 Pi session，分组标题可以显示为 `Pi · <session name>`；
 - 用户已有标签页不自动移动到 Pi 分组；
 - Agent 页面默认是临时页面；
-- 普通 turn 结束只做 checkpoint，不关闭页面、不 release claim、不停止 Bridge；
-- 用户明确要求 task finalize 时，关闭允许关闭的临时页面；任务完成本身不触发清理；
-- `markDeliverable()` 页面保留为用户交付结果；
-- `markHandoff()` 页面保留，等待用户后续操作；
-- claim 的用户页面在用户明确要求 task finalize 或 Agent disposal 时 release，不关闭；
+- 普通 turn 结束自动关闭未标记的临时页面，并 release 当前 Agent claim 的用户页面；
+- 用户页面只 release，不关闭；Bridge 和 browser tools 跨 turn 保持；
+- 用户明确要求 task finalize 时，立即关闭允许关闭的临时页面；
+- `markDeliverable()` 和 `markHandoff()` 只保留当前 turn 标记的页面，下一 turn 仍需保留时重新标记；
+- debugger lease 在操作空闲或 turn 结束时 detach，不因页面标记而常驻；
 - cleanup 只处理当前 Agent session 自己创建或 claim 的页面；
 - 清理操作幂等，不能误删其他 Pi session 或用户页面；
 - `browser_context_reset` 单独负责清除当前浏览器上下文和停用惰性工具。
@@ -271,8 +271,8 @@ browser_cdp
 - 页面变化后重新 snapshot；
 - 浏览器重启后自动重连；
 - 登录、验证码、支付、权限弹窗等流程可以进入 handoff；
-- handoff 页面不自动清理；
-- deliverable 页面不自动清理；
+- 当前 turn 标记的 handoff 页面跨越当前 turn 保留，后续仍需保留时重新标记；
+- 当前 turn 标记的 deliverable 页面跨越当前 turn 保留，后续仍需保留时重新标记；
 - 用户接管后，Pi 释放页面控制但保留页面。
 
 ## 十、明确的 Pi 版本差异
@@ -284,7 +284,7 @@ browser_cdp
 3. 使用 Chrome/Edge MV3 扩展和本地 Bridge；
 4. 浏览器页面通过 Pi 工具名暴露，而不是 Codex Node API；
 5. 第一版采用用户决定的 Trusted Local Mode，不实现 Codex 文档中的浏览器动作确认策略；
-6. 任务完成默认保留浏览器状态，只有用户明确要求时才执行 task finalize 或 context reset。
+6. 未标记的 Agent 临时页面在 turn 结束时自动清理；用户明确要求时才额外执行即时 task finalize 或 context reset。
 
 除以上明确差异外，行为、Tab 生命周期、claim/release、handoff、deliverable、清理和能力范围均以 Codex 为默认基线。
 
@@ -298,7 +298,7 @@ browser_cdp
 - Console、Network、Dialog、Upload、Download；
 - claim/release；
 - Agent 页面分组；
-- Agent 页面在用户明确要求 task finalize 或 Agent disposal 时按 ownership 自动回收；
+- Agent 临时页面在 turn 结束时按 ownership 自动回收：未标记页面关闭，当前 turn 标记的 handoff/deliverable 页面保留；
 - handoff/deliverable；
 - stale tab 处理；
 - Chrome/Edge 双浏览器；

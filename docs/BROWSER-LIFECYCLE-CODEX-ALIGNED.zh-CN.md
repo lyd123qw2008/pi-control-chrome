@@ -2,7 +2,7 @@
 
 ## 目标
 
-浏览器运行时应当跨多个 turn 复用。普通 turn 结束不应关闭 Tab、断开 Bridge、清除浏览器上下文或要求模型再次加载 Skill。
+浏览器 session、Browser binding、Bridge 和 browser tools 应当跨多个 turn 复用。普通 turn 结束执行 Codex 对齐的资源清理：关闭未标记的 Agent 临时 Tab、release 当前 Agent 的用户 Tab claim，并释放 debugger lease；不关闭用户 Tab、不停止 Bridge、不清除浏览器上下文，也不要求模型再次加载 Skill。
 
 模型负责表达浏览器任务的资源意图，运行时负责校验 ownership、执行安全操作、处理并发和提供最终兜底。Tab、浏览器上下文、Bridge 和工具激活不是同一个生命周期。
 
@@ -10,21 +10,23 @@
 
 ## 核心决策
 
-### Turn 不是浏览器任务边界
+### Turn 是资源清理边界，不是 Browser session 边界
 
-turn 结束只表示一次模型调用完成，不表示浏览器任务完成。浏览器任务可以跨多个 turn 继续使用同一组 Tab、同一浏览器 target 和同一 Bridge 连接。
+turn 结束表示一次模型调用完成，也是 Codex 对齐的临时资源清理边界，但不表示 Browser session、Bridge 或 browser tools 结束。浏览器任务可以跨多个 turn 继续使用同一浏览器 binding、同一浏览器 target 和同一 Bridge 连接。
 
-普通 turn 结束执行轻量 checkpoint，不执行破坏性清理：
+普通 turn 结束由宿主执行内部 `turn_end_cleanup`，不调用模型可见的 `browser_cleanup`，不产生聊天 transcript 消息：
 
-- 不关闭 Tab 或 Tab group；
-- 不 release claim；
+- 关闭当前 Agent 创建且未标记为 handoff 或 deliverable 的临时 Tab；
+- release 当前 Agent claim 的用户 Tab，但不关闭用户 Tab；
+- 保留 handoff 和 deliverable Tab；
+- detach 当前 Agent 的 debugger lease，包括保留的 Tab；
+- 不关闭用户已有 Tab 或其他 session 的资源；
 - 不断开 Bridge；
 - 不清除浏览器插件上下文；
 - 不隐藏或注销 browser tools；
-- 不向聊天 transcript 注入清理消息；
 - 不自动重新加载 Skill。
 
-checkpoint 只更新运行时状态，例如最后使用时间、活动请求和浏览器 target 的观察结果。checkpoint 没有模型可见的工具结果。
+宿主只更新运行时状态，例如最后使用时间、活动请求、Tab ownership 和浏览器 target 的观察结果。turn cleanup 没有模型可见的工具结果。
 
 ### Skill activation 是 Session 级状态
 
@@ -34,21 +36,28 @@ checkpoint 只更新运行时状态，例如最后使用时间、活动请求和
 
 工具 schema 仍可能出现在后续模型请求中。减少 schema token 成本属于工具目录分层或工具 facade 的优化，不通过每个 turn 清除并重新激活来解决。
 
-### 模型决定任务级资源意图
+### 模型表达资源保留意图
 
-任务完成默认保留浏览器状态，不自动调用 finalize。只有用户明确要求关闭临时 Tab、释放 claim 或清理浏览器任务时，模型才调用浏览器 finalize 操作。模型的请求不是对浏览器 API 的无条件授权，运行时必须根据 ownership 和资源状态执行或拒绝。
+模型不在普通 turn 结束时调用 `browser_cleanup`。模型只在页面需要跨 turn 保留时表达意图：
 
-建议保留现有 browser_cleanup 名称以减少工具迁移成本，但将其语义定义为用户明确要求后执行的 task finalize，而不是任务完成时自动调用，也不是工具注销或 session reset：
+- 对用户交付结果调用 `browser_mark_deliverable`；
+- 对等待用户接管、登录、审批、支付或 CAPTCHA 的流程调用 `browser_mark_handoff`；
+- 未标记的 Agent 临时 Tab 在 turn 结束时由宿主自动关闭；
+- claimed user Tab 在 turn 结束时由宿主 release，但不关闭。
 
-- 关闭当前 Agent 创建且允许关闭的临时 Tab；
+`markDeliverable` 和 `markHandoff` 按 Codex 语义为 turn-scoped，最新标记覆盖同一 turn 中的旧标记。下一 turn 仍需保留时，模型必须重新标记。运行时不能依据聊天文本猜测保留意图。
+
+保留现有 `browser_cleanup` 名称以减少工具迁移成本，但将其定义为用户明确要求后执行的即时 task finalize，而不是普通 turn cleanup、工具注销或 session reset：
+
+- 关闭当前 Agent 创建且未标记保留的临时 Tab；
 - 释放当前 Agent 对用户 Tab 的 claim，但不关闭用户 Tab；
 - 保留 handoff 和 deliverable Tab；
-- 按请求释放 DevTools lease；
+- detach 当前 Agent 的 debugger lease；
 - 保留当前 session 的 browser tools；
 - 保留健康的 Bridge 连接；
 - 返回紧凑的结构化结果，不生成额外聊天说明。
 
-如果需要清除浏览器上下文或隐藏 browser tools，模型必须调用单独的显式 context reset 操作。task finalize 不应隐式执行 context reset。
+如果需要清除浏览器上下文或隐藏 browser tools，模型必须调用单独的显式 context reset 操作。task finalize 和 turn cleanup 都不应隐式执行 context reset。
 
 ### Bridge 是宿主资源
 
@@ -62,6 +71,17 @@ Bridge 通常由多个浏览器操作和可能的多个 session 共享。模型�
 - Bridge 断开时自动重连或重建客户端连接；
 - 插件卸载、宿主退出或人工生命周期命令负责停止 Bridge；
 - 如果提供模型可见的 disconnect 操作，它只能断开当前客户端，并必须检查活动请求和共享使用者。
+
+### 机制性实现差异
+
+实现只保留外部 Chrome/Edge Bridge 和 Pi/DSH 宿主所必需的差异：
+
+- Pi 和 DSH 通过宿主的 turn-end 事件调用内部 `turn_end_cleanup`，不让模型调用工具模拟 turn cleanup；
+- Bridge 请求、cleanup、turn cleanup 和 disposal 按 session 串行化，并保留失败后的 recovery state；
+- 浏览器 target、browserId 和 ownership 由扩展记录验证，不能从聊天文本推断；
+- Bridge 在扩展 hello/status 中协商 turn cleanup、turn-scoped mark、retained cleanup 和 debugger lease recovery 能力；缺少任一能力时，宿主拒绝执行自动 turn cleanup；
+- 外部 debugger API 采用 idle lease 和显式 detach，解决浏览器调试标识无法由 Codex 内置 Browser 直接管理的问题；
+- 这些机制差异不改变 Codex 的用户可见默认行为。
 
 ## 资源所有权
 
@@ -82,13 +102,14 @@ Bridge 通常由多个浏览器操作和可能的多个 session 共享。模型�
 
 模型可以请求关闭 Tab 或 Tab group，但运行时必须执行以下规则：
 
-| 资源 | finalize 时的默认处理 |
+| 资源 | turn cleanup / task finalize / disposal 的默认处理 |
 | --- | --- |
-| 当前 Agent 创建的临时 Tab | 模型请求关闭且没有保留标记时可以关闭 |
+| 当前 Agent 创建且未标记的临时 Tab | turn 结束时关闭 |
+| 当前 Agent 创建且标记为 handoff 或 deliverable 的 Tab | 保留，按标记语义继续可用 |
 | 当前 Agent claim 的用户 Tab | release，保留页面和用户原有分组 |
 | 用户已有 Tab | 不关闭 |
-| handoff Tab | 保留并释放控制权 |
-| deliverable Tab | 保留并释放控制权 |
+| handoff Tab | 保留页面，并释放旧 session 的 ownership metadata |
+| deliverable Tab | 保留页面，并释放旧 session 的 ownership metadata |
 | 其他 session 的 Tab | 拒绝操作 |
 | 混合 ownership 的 Tab group | 不关闭整个 group，只处理明确属于当前 Agent 的 Tab，或返回需要人工确认的结果 |
 
@@ -106,6 +127,19 @@ Agent disposal、session switch/fork 和插件卸载是宿主生命周期边界�
 - 不影响其他 Agent、session 或共享 Bridge。
 
 如果模型在 disposal 前没有表达 handoff 或 deliverable 意图，运行时只能依据已记录的 ownership 状态执行兜底规则，不能依据聊天文本猜测。
+
+### Debugger lease 生命周期
+
+Debugger attach 是操作级资源，不随 Tab 保留标记持续存在：
+
+- `browser_evaluate`、`browser_cdp`、screenshot、Console、Network 和 Dialog 等需要 DevTools 的操作，使用当前 session 的 debugger lease；
+- 当前操作完成后减少活动引用；没有活动引用时启动 idle detach；
+- idle detach 应在可配置的短暂空闲窗口后执行，默认不超过一个普通浏览器操作间隔；
+- turn cleanup 无论 Tab 是否为 handoff 或 deliverable，都 detach 当前 Agent 的 debugger lease；
+- 用户手动取消调试只清除 debugger attach 状态，不关闭 Tab、不 release claim、不清除 ownership；
+- 下一次需要 DevTools 的操作按需重新 attach；不在后台反复 attach；
+- debugger detach 失败保留 recovery record，并在下一次操作或 disposal 时重试；
+- Debugger 状态和 Tab lifecycle 必须分别记录，不能用 Tab 保留推断 debugger 应保持连接。
 
 ## 生命周期状态
 
@@ -126,7 +160,9 @@ Agent disposal、session switch/fork 和插件卸载是宿主生命周期边界�
     no-resources
       -> browser operation
     owned
-      -> model finalize
+      -> turn cleanup decision
+    retained
+      -> next turn / repeated mark
     finalizing
       -> cleanup success
     released
@@ -136,7 +172,7 @@ Agent disposal、session switch/fork 和插件卸载是宿主生命周期边界�
     cleanup-unknown
       -> retry or disposal cleanup
 
-只有 cleanup 明确成功时，资源才可以从 owned 或 cleanup-unknown 转为 released。失败不能清除 ownership 记录，也不能把资源标记为 clean。
+turn cleanup 对未标记的 Agent 临时 Tab 执行 close，对 claimed user Tab 执行 release，对 handoff/deliverable Tab 保持 ownership 记录。task finalize、context reset 和 disposal 保留 handoff/deliverable 页面，但在非 turn cleanup 中释放旧 session 的 ownership metadata。只有具体 close 或 release 操作明确成功时，资源才可以从 owned、retained 或 cleanup-unknown 转为 released。失败不能清除 ownership 记录，也不能把资源标记为 clean。
 
 ### Bridge 状态
 
@@ -187,7 +223,7 @@ Bridge 状态变化不应自动改变 browser tools activation，也不应自动
 - 清除已完成的 task ownership 状态；
 - 隐藏或注销 browser tools；
 - 保留健康 Bridge，除非调用方明确要求断开当前客户端；
-- 保留 handoff 和 deliverable Tab。
+- 保留 handoff 和 deliverable Tab，并释放旧 session 的 ownership metadata。
 
 context reset 必须先完成可执行的 resource finalize。cleanup 失败时不得清除 recovery record 或伪造成功结果。
 
@@ -224,8 +260,9 @@ Pi 的工具错误必须通过 Pi 认可的错误通道传播。仅返回普通�
 Pi 继续使用 pi.registerTool() 和 pi.setActiveTools()，但需要调整生命周期：
 
 - Skill 成功后保持 active tool set，直到 session 或显式 context reset；
-- turn_end 只做 checkpoint，不调用 cleanup；
-- browser_cleanup 只 finalize 任务资源，不 reset activation；
+- turn_end 调用内部 `turn_end_cleanup`，关闭未标记的 Agent 临时 Tab、release claimed user Tab、detach debugger lease，但不 reset activation；
+- turn_end 不调用模型可见的 `browser_cleanup`，也不生成 lifecycle transcript 消息；
+- browser_cleanup 只在用户明确要求时 finalize 任务资源，不 reset activation；
 - 只有成功的 browser_context_reset、session teardown 或 plugin disposal 才隐藏 browser tools；
 - 浏览器工具必须串行执行，或通过 session-local operation queue 保护共享状态；
 - errorResult 不能让 cleanup 失败在 tool_result 中表现为成功；
@@ -237,7 +274,8 @@ Pi 继续使用 pi.registerTool() 和 pi.setActiveTools()，但需要调整生�
 DSH 继续使用 Agent-scoped dynamic registration 和 registration disposer：
 
 - Skill 成功后注册当前 Agent 的 browser tools；
-- 普通 session/event turn/end 不调用浏览器 cleanup，也不调用 disposer；
+- 普通 session/event turn/end 调用内部 `turn_end_cleanup`，关闭未标记的 Agent 临时 Tab、release claimed user Tab、detach debugger lease，但不调用 disposer；
+- turn cleanup 不调用模型可见的 `browser_cleanup`；
 - task finalize 清理资源但保留 activation；
 - context reset 成功后才调用当前 activation 的 disposer；
 - Agent disposal 和 plugin disposal 执行最终 cleanup；
@@ -268,8 +306,8 @@ DSH 继续使用 Agent-scoped dynamic registration 和 registration disposer：
 ### 生命周期单元测试
 
 1. Skill 成功后 browser tools 在连续多个 turn 保持激活；
-2. 普通 turn 结束不关闭 Tab、不 release claim、不停止 Bridge；
-3. task finalize 只处理当前 Agent 有权处理的资源；
+2. turn cleanup 关闭未标记的 Agent 临时 Tab、release claimed user Tab，但不停止 Bridge；
+3. turn cleanup 和 task finalize 只处理当前 Agent 有权处理的资源；
 4. claimed user Tab 被 release 而不是 close；
 5. handoff 和 deliverable Tab 始终保留；
 6. 混合 ownership 的 Tab group 不会整体关闭；
@@ -299,7 +337,7 @@ DSH 继续使用 Agent-scoped dynamic registration 和 registration disposer：
 1. 新建 session，不请求浏览器，确认没有 browser tools；
 2. 明确请求浏览器，确认 Skill 只加载一次；
 3. 连续多个 turn 操作同一个 Tab，确认 Tab、Bridge 和 browser tools 持续可用；
-4. 普通 turn 结束后检查没有自动 close、release、disconnect 或 lifecycle transcript 噪音；
+4. 普通 turn 结束后检查未标记临时 Tab 自动 close、claimed user Tab release、debugger detach，且没有 lifecycle transcript 噪音；
 5. 模型调用 task finalize，确认指定资源按 ownership 处理，但 browser tools 仍可用；
 6. 模型调用 context reset，确认工具状态按显式请求重置；
 7. 不调用 finalize 直接销毁 Agent，确认宿主兜底 cleanup 生效；

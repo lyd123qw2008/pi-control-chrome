@@ -25,6 +25,7 @@ type PendingEntry = {
   readonly timer: ReturnType<typeof setTimeout>
   readonly signal?: AbortSignal
   readonly onAbort?: () => void
+  readonly socket: WebSocket
 }
 
 type BridgeResponse = {
@@ -192,6 +193,7 @@ export class BrowserBridgeClient {
         timer,
         ...(signal === undefined ? {} : { signal }),
         onAbort,
+        socket,
       })
       signal?.addEventListener('abort', onAbort, { once: true })
       try {
@@ -214,7 +216,7 @@ export class BrowserBridgeClient {
     }
     if (this.connecting !== undefined) return this.connecting
     const lifecycle = this.lifecycle
-    this.connecting = (async () => {
+    const attempt = (async () => {
       await this.ensureBridgeProcess(config)
       const pairing = await localJsonRequest(config, '/pair', 2_000)
       if (pairing.status !== 200 || typeof pairing.value !== 'object' || pairing.value === null) {
@@ -223,10 +225,12 @@ export class BrowserBridgeClient {
       const token = (pairing.value as { token?: unknown }).token
       if (typeof token !== 'string' || token.length === 0) throw new Error('Browser Bridge pairing response did not contain a token')
       await this.openSocket(config, token, lifecycle)
-    })().finally(() => {
-      this.connecting = undefined
+    })()
+    const tracked = attempt.finally(() => {
+      if (this.connecting === tracked) this.connecting = undefined
     })
-    return this.connecting
+    this.connecting = tracked
+    return tracked
   }
 
   private async openSocket(config: ResolvedConfig, token: string, lifecycle: number): Promise<void> {
@@ -262,7 +266,7 @@ export class BrowserBridgeClient {
         if (this.socket === socket) {
           this.socket = undefined
           this.socketKey = undefined
-          this.rejectPending(new Error('Browser Bridge disconnected'))
+          this.rejectPendingForSocket(socket, new Error('Browser Bridge disconnected'))
         }
         if (!settled) {
           clearTimeout(timeout)
@@ -277,9 +281,9 @@ export class BrowserBridgeClient {
           reject(errorMessage(error, 'Browser Bridge websocket failed'))
           return
         }
-        if (this.socket === socket) this.rejectPending(errorMessage(error, 'Browser Bridge websocket failed'))
+        if (this.socket === socket) this.rejectPendingForSocket(socket, errorMessage(error, 'Browser Bridge websocket failed'))
       })
-      socket.on('message', raw => this.handleMessage(raw.toString()))
+      socket.on('message', raw => this.handleMessage(raw.toString(), socket))
     })
   }
 
@@ -411,7 +415,8 @@ export class BrowserBridgeClient {
     }
   }
 
-  private handleMessage(raw: string): void {
+  private handleMessage(raw: string, source: WebSocket): void {
+    if (this.socket !== source) return;
     let message: BridgeResponse
     try {
       message = JSON.parse(raw) as BridgeResponse
@@ -443,5 +448,11 @@ export class BrowserBridgeClient {
 
   private rejectPending(error: Error): void {
     for (const id of this.pending.keys()) this.settlePending(id, error)
+  }
+
+  private rejectPendingForSocket(socket: WebSocket, error: Error): void {
+    for (const [id, entry] of this.pending.entries()) {
+      if (entry.socket === socket) this.settlePending(id, error)
+    }
   }
 }

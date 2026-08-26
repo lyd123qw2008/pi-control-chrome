@@ -12,7 +12,7 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Lets Pi inspect and claim explicitly selected existing tabs without moving them by default.
 - Places Agent-created tabs in a dedicated blue `Pi` tab group.
 - Tracks Agent ownership, sessions, `handoff`, and `deliverable` lifecycle states.
-- Keeps temporary Agent tabs across turns, then closes allowed temporary tabs only after explicit user-authorized task finalize or Agent disposal while preserving user, handoff, and deliverable tabs.
+- Closes unmarked Agent temporary tabs at turn end, releases claimed user tabs without closing them, and preserves only handoff or deliverable tabs marked for the current turn.
 - Provides DOM, accessibility, locator, coordinate, and native CDP controls.
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text.
 - Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
@@ -58,7 +58,7 @@ The package registers the Pi extension and the bundled Skill through its `packag
 
 This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, merge the `insert` entry from its `config/cordis.patch.yml.example` into the existing `cordis.patch.yml`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
-The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 39 `browser_*` tools are registered in that Agent and remain active across turns in the current Agent session. Ordinary turn end and task completion retain browser state by default: they do not close or release tabs, disconnect the Bridge, remove tools, reload the Skill, or call cleanup. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it retains the lazy tools and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and deactivates lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. Set `lazyTools: false` for eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 39 `browser_*` tools are registered in that Agent and remain active across turns in the current Agent session. At turn end, the host closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease. Bridge, browser tools, and Browser binding remain available for later turns. A model must call `browser_mark_handoff` or `browser_mark_deliverable` to preserve an Agent tab through the current turn cleanup, and repeat the mark in a later turn when needed. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it performs immediate task cleanup while retaining the lazy tools and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and deactivates lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. Set `lazyTools: false` for eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
 
 ## Load the browser extension
 
@@ -87,16 +87,20 @@ The bundled scripts are for explicit human/developer workflows and automated tes
 node skills/pi-control-chrome/scripts/browser.mjs status
 node skills/pi-control-chrome/scripts/browser.mjs tabs --json
 node skills/pi-control-chrome/scripts/browser.mjs group --json
-node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --screenshot "$env:TEMP\example.png"
+node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --session example-session --turn 1 --screenshot "$env:TEMP\example.png"
 node skills/pi-control-chrome/scripts/browser.mjs cleanup --session <session-id>
 ```
 
-The CLI reuses the currently connected browser and supports these environment variables:
+Managed CLI commands use explicit lifecycle identity: `open` and `cleanup` require `--session <id>`, and `view` requires both `--session <id>` and `--turn <n>` unless it is explicitly temporary. The CLI does not derive ownership from a process id, so a later invocation can address the same tabs safely.
+
+The bundled scripts support these environment variables. The Pi extension also accepts `PI_CONTROL_CHROME_BRIDGE_PORT` when the local Bridge uses another loopback port:
 
 ```text
 PI_CONTROL_CHROME_BRIDGE_HOST
 PI_CONTROL_CHROME_BRIDGE_PORT
 ```
+
+The Pi extension keeps the default port at `17318`; set `PI_CONTROL_CHROME_BRIDGE_PORT` only when the local Bridge uses another loopback port.
 
 Use the native `browser_*` Pi or DSH tools for model browser work. They preserve the current Agent session, target identity, and tab ownership protections.
 
@@ -107,6 +111,7 @@ cd <path-to>/pi-control-chrome
 npm install
 npm run check
 npm test
+npm run test:pi:lifecycle
 npm run test:skill
 npm run pack:check
 ```

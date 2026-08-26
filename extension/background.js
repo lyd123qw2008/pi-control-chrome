@@ -5,10 +5,17 @@ const PROFILE_ID_KEY = "piControlChromeProfileId";
 const GROUP_TITLE = "Pi";
 const GROUP_COLOR = "blue";
 const MAX_EVENTS = 500;
+const EXTENSION_CAPABILITIES = Object.freeze({
+  turnCleanup: true,
+  turnScopedMarks: true,
+  retainedCleanup: true,
+  debuggerLeaseRecovery: true,
+});
 
 const DEBUGGER_LEASE_IDLE_MS = 15_000;
 
 let socket;
+let connecting;
 let reconnectTimer;
 let connectedAt;
 let cachedToken;
@@ -18,6 +25,8 @@ const persistentDebuggers = new Map();
 const debuggerAttachers = new Map();
 const devtoolsState = new Map();
 const downloadState = new Map();
+let bridgeRequestTail = Promise.resolve();
+let ownedTabsMutationTail = Promise.resolve();
 
 function log(...args) {
   if (globalThis.PI_CONTROL_CHROME_DEBUG) console.debug("[pi-control-chrome]", ...args);
@@ -141,8 +150,9 @@ chrome.debugger?.onEvent?.addListener((source, method, params = {}) => {
   }
 });
 
-chrome.debugger?.onDetach?.addListener((source) => {
+chrome.debugger?.onDetach?.addListener((source, reason) => {
   if (source?.tabId !== undefined) {
+    log(`debugger detached for tab ${source.tabId}`, reason);
     const id = Number(source.tabId);
     const record = persistentDebuggers.get(id);
     if (record?.releaseTimer !== undefined) clearTimeout(record.releaseTimer);
@@ -156,6 +166,7 @@ chrome.tabs?.onRemoved?.addListener((tabId) => {
   if (record?.releaseTimer !== undefined) clearTimeout(record.releaseTimer);
   devtoolsState.delete(id);
   persistentDebuggers.delete(id);
+  forgetOwnedTabRecord(id).catch((error) => log("could not forget closed tab ownership", error));
 });
 
 chrome.downloads?.onCreated?.addListener((item) => {
@@ -238,49 +249,75 @@ function browserIdentity() {
 
 async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-  await ensureProfileIdentity();
-  const token = await getPairingToken();
-  const next = new WebSocket(`${BRIDGE_WS}?role=extension&token=${encodeURIComponent(token)}`);
-  socket = next;
-  next.addEventListener("open", () => {
-    connectedAt = Date.now();
-    send({ type: "hello", role: "extension", protocol: 1, ...browserIdentity() });
-    log("connected to Pi bridge");
-  });
-  next.addEventListener("message", async (event) => {
-    let id;
-    try {
-      const message = JSON.parse(event.data);
-      id = message.id;
-      if (message.type !== "request") return;
-      const expectedBrowserId = message.params?.expectedBrowserId;
-       if (expectedBrowserId !== undefined && (typeof expectedBrowserId !== "string" || expectedBrowserId.length === 0)) {
-         send({ type: "response", id, error: { code: "INVALID_BROWSER_TARGET", message: "expectedBrowserId must be a non-empty string" } });
-         return;
-       }
-       if (expectedBrowserId !== undefined && expectedBrowserId !== browserIdentity().browserId) {
-         send({ type: "response", id, error: { code: "BROWSER_TARGET_CHANGED", message: `Browser target changed; expected ${expectedBrowserId} but this extension is ${browserIdentity().browserId}` } });
-         return;
-       }
-       const result = await handleRequest(message.method, message.params || {});
-      send({ type: "response", id, result });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      send({ type: "response", id, error: { code: "BROWSER_ERROR", message } });
-    }
-  });
-  next.addEventListener("close", () => {
-    connectedAt = undefined;
-    if (socket === next) socket = undefined;
-    scheduleReconnect();
-  });
-  next.addEventListener("error", (error) => log("bridge websocket error", error));
+  if (connecting) return connecting;
+  const attempt = (async () => {
+    await ensureProfileIdentity();
+    const token = await getPairingToken();
+    const next = new WebSocket(`${BRIDGE_WS}?role=extension&token=${encodeURIComponent(token)}`);
+    socket = next;
+    next.addEventListener("open", () => {
+      connectedAt = Date.now();
+      send({ type: "hello", role: "extension", protocol: 1, capabilities: EXTENSION_CAPABILITIES, ...browserIdentity() }, next);
+      log("connected to Pi bridge");
+    });
+    next.addEventListener("message", async (event) => {
+      if (socket !== next) return;
+      let id;
+      try {
+        const message = JSON.parse(event.data);
+        id = message.id;
+        if (message.type !== "request") return;
+        const response = await enqueueBridgeRequest(async () => {
+          const expectedBrowserId = message.params?.expectedBrowserId;
+          if (expectedBrowserId !== undefined && (typeof expectedBrowserId !== "string" || expectedBrowserId.length === 0)) {
+            return { ok: false, error: { code: "INVALID_BROWSER_TARGET", message: "expectedBrowserId must be a non-empty string" } };
+          }
+          if (expectedBrowserId !== undefined && expectedBrowserId !== browserIdentity().browserId) {
+            return { ok: false, error: { code: "BROWSER_TARGET_CHANGED", message: `Browser target changed; expected ${expectedBrowserId} but this extension is ${browserIdentity().browserId}` } };
+          }
+          return { ok: true, result: await handleRequest(message.method, message.params || {}) };
+        });
+        if (!response.ok) {
+          send({ type: "response", id, error: response.error }, next);
+          return;
+        }
+        send({ type: "response", id, result: response.result }, next);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        send({ type: "response", id, error: { code: "BROWSER_ERROR", message } }, next);
+      }
+    });
+    next.addEventListener("close", () => {
+      if (socket !== next) return;
+      connectedAt = undefined;
+      socket = undefined;
+      scheduleReconnect();
+    });
+    next.addEventListener("error", (error) => log("bridge websocket error", error));
+  })();
+  connecting = attempt;
+  try {
+    await attempt;
+  } finally {
+    if (connecting === attempt) connecting = undefined;
+  }
 }
 
-function send(message) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  socket.send(JSON.stringify(message));
-  return true;
+function send(message, target = socket) {
+  if (!target || target.readyState !== WebSocket.OPEN) return false;
+  try {
+    target.send(JSON.stringify(message));
+    return true;
+  } catch (error) {
+    log("WebSocket send failed", error);
+    return false;
+  }
+}
+
+function enqueueBridgeRequest(task) {
+  const run = bridgeRequestTail.then(task);
+  bridgeRequestTail = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 async function ownedTabs() {
@@ -307,38 +344,60 @@ async function saveOwnedTabs(value) {
   await chrome.storage.local.set({ [OWNED_TABS_KEY]: value });
 }
 
+function mutateOwnedTabs(mutator) {
+  const run = ownedTabsMutationTail.then(async () => {
+    const owned = await ownedTabs();
+    const result = await mutator(owned);
+    await saveOwnedTabs(owned);
+    return result;
+  });
+  ownedTabsMutationTail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temporary") {
-  const owned = await ownedTabs();
-  owned[String(tab.id)] = {
-    tabId: tab.id,
-    windowId: tab.windowId,
-    sessionId: sessionKey(sessionId),
-    createdAt: Date.now(),
-    groupId: tab.groupId,
-    owner,
-    lifecycle,
-    title: tab.title || "",
-    url: tab.url || "",
-  };
-  await saveOwnedTabs(owned);
+  await mutateOwnedTabs((owned) => {
+    owned[String(tab.id)] = {
+      tabId: tab.id,
+      windowId: tab.windowId,
+      sessionId: sessionKey(sessionId),
+      createdAt: Date.now(),
+      groupId: tab.groupId,
+      owner,
+      lifecycle,
+      markTurn: undefined,
+      title: tab.title || "",
+      url: tab.url || "",
+    };
+  });
 }
 
 async function updateOwnedTab(tabId, patch, sessionId) {
-  const owned = await ownedTabs();
-  const key = String(tabId);
-  const record = owned[key];
-  if (!record) throw new Error(`Agent-owned tab not found: ${tabId}`);
-  if (record.sessionId !== sessionKey(sessionId)) throw new Error(`Cannot update tab ${tabId}; it belongs to another Agent session`);
-  owned[key] = { ...record, ...patch };
-  await saveOwnedTabs(owned);
-  return owned[key];
+  return mutateOwnedTabs((owned) => {
+    const key = String(tabId);
+    const record = owned[key];
+    if (!record) throw new Error(`Agent-owned tab not found: ${tabId}`);
+    if (record.sessionId !== sessionKey(sessionId)) throw new Error(`Cannot update tab ${tabId}; it belongs to another Agent session`);
+    owned[key] = { ...record, ...patch };
+    return owned[key];
+  });
 }
 
 async function forgetOwnedTab(tabId, sessionId, allowOtherSession = false) {
-  await ownedTabForSession(tabId, sessionId, "forget", false, allowOtherSession);
-  const owned = await ownedTabs();
-  delete owned[String(tabId)];
-  await saveOwnedTabs(owned);
+  return mutateOwnedTabs((owned) => {
+    const key = String(tabId);
+    const record = owned[key];
+    if (record && record.sessionId !== sessionKey(sessionId) && !allowOtherSession) {
+      throw new Error(`Cannot forget tab ${tabId}; it belongs to another Agent session`);
+    }
+    delete owned[key];
+  });
+}
+
+async function forgetOwnedTabRecord(tabId) {
+  return mutateOwnedTabs((owned) => {
+    delete owned[String(tabId)];
+  });
 }
 
 async function getTab(tabId, handle = {}) {
@@ -764,16 +823,26 @@ function clearDebuggerLease(record) {
   }
 }
 
-function scheduleDebuggerRelease(tabId, sessionId) {
+function scheduleDebuggerDetachRetry(tabId, sessionId) {
   const id = Number(tabId);
   const record = persistentDebuggers.get(id);
-  if (!record || record.lease !== true || record.sessionId !== sessionKey(sessionId) || record.activeUsers > 0) return;
+  if (!record || record.sessionId !== sessionKey(sessionId) || Number(record.activeUsers || 0) > 0 || (record.lease !== true && record.detachPending !== true)) return;
   clearDebuggerLease(record);
   record.releaseTimer = setTimeout(() => {
     const current = persistentDebuggers.get(id);
-    if (!current || current !== record || current.lease !== true || current.sessionId !== sessionKey(sessionId) || current.activeUsers > 0) return;
-    detachDebugger(id, sessionId).catch((error) => log("debugger lease release failed", error));
+    if (!current || current !== record || current.sessionId !== sessionKey(sessionId) || Number(current.activeUsers || 0) > 0 || current.detaching) return;
+    detachDebugger(id, sessionId).catch((error) => {
+      log("debugger detach retry failed", error);
+      scheduleDebuggerDetachRetry(id, sessionId);
+    });
   }, DEBUGGER_LEASE_IDLE_MS);
+}
+
+function scheduleDebuggerRelease(tabId, sessionId) {
+  const id = Number(tabId);
+  const record = persistentDebuggers.get(id);
+  if (!record || record.lease !== true || record.sessionId !== sessionKey(sessionId) || Number(record.activeUsers || 0) > 0) return;
+  scheduleDebuggerDetachRetry(id, sessionId);
 }
 
 async function attachDebugger(tabId, sessionId, options = {}) {
@@ -782,11 +851,15 @@ async function attachDebugger(tabId, sessionId, options = {}) {
   const existing = persistentDebuggers.get(id);
   if (existing) {
     if (existing.detaching) {
-      await existing.detaching.catch(() => {});
+      await existing.detaching;
       return attachDebugger(id, sessionId, options);
     }
     if (existing.sessionId !== requestedSession) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
-    if (options.lease !== true) {
+    existing.detachPending = false;
+    if (options.lease === true) {
+      existing.lease = true;
+      existing.closeWhenIdle = false;
+    } else {
       clearDebuggerLease(existing);
       existing.lease = false;
       existing.closeWhenIdle = false;
@@ -846,7 +919,7 @@ async function detachDebugger(tabId, sessionId) {
   if (!record) return;
   if (sessionKey(sessionId) !== record.sessionId) throw new Error(`DevTools for tab ${id} belongs to another Agent session`);
   if (record.detaching) {
-    await record.detaching.catch(() => {});
+    await record.detaching;
     return;
   }
   clearDebuggerLease(record);
@@ -856,11 +929,21 @@ async function detachDebugger(tabId, sessionId) {
   }
   const detaching = (async () => {
     if (persistentDebuggers.get(id) !== record || Number(record.activeUsers || 0) > 0) return;
-    try { await chrome.debugger.detach({ tabId: id }); } catch {}
+    try {
+      await chrome.debugger.detach({ tabId: id });
+    } catch (error) {
+      if (persistentDebuggers.get(id) === record) record.detachPending = true;
+      throw error;
+    }
     if (persistentDebuggers.get(id) === record) persistentDebuggers.delete(id);
   })();
   record.detaching = detaching;
-  await detaching;
+  try {
+    await detaching;
+  } finally {
+    if (record.detaching === detaching) record.detaching = undefined;
+    if (persistentDebuggers.get(id) === record && record.detachPending === true) scheduleDebuggerDetachRetry(id, sessionId);
+  }
 }
 
 async function debuggerCommand(tabId, method, params = {}) {
@@ -876,11 +959,15 @@ async function withDebugger(tabId, callback, sessionId) {
 
 async function enableDevtools(tabId, domains = ["Runtime", "Log", "Network", "Page"], sessionId) {
   const id = Number(tabId);
-  await attachDebugger(id, sessionId);
-  for (const domain of domains) {
-    try { await debuggerCommand(id, `${domain}.enable`); } catch (error) { log(`could not enable ${domain}`, error); }
+  await acquireDebugger(id, sessionId);
+  try {
+    for (const domain of domains) {
+      try { await debuggerCommand(id, `${domain}.enable`); } catch (error) { log(`could not enable ${domain}`, error); }
+    }
+    return { tabId: id, enabled: domains, attached: true };
+  } finally {
+    await releaseDebugger(id, sessionId);
   }
-  return { tabId: id, enabled: domains, attached: true };
 }
 
 async function disableDevtools(tabId, sessionId) {
@@ -917,32 +1004,53 @@ async function settleDebuggerAttaches(sessionId, detach) {
 }
 
 async function cleanup(params) {
-  const owned = await ownedTabs();
   const sessionId = sessionKey(params.sessionId);
-  const removed = [];
-  const released = [];
-  const kept = { ...owned };
   const detachDevtools = params.detachDevtools !== false;
+  const turnCleanup = params.mode === "turn";
+  const turnId = params.turnId === undefined || params.turnId === null ? undefined : String(params.turnId);
+  if (turnCleanup && turnId === undefined) throw new Error("Turn cleanup requires turnId");
   await settleDebuggerAttaches(sessionId, detachDevtools);
-  for (const [key, record] of Object.entries(owned)) {
-    if (record.sessionId !== sessionId) continue;
-    if (record.owner === "claimed") {
-      released.push(Number(key));
-      delete kept[key];
-      continue;
+  const result = await mutateOwnedTabs(async (owned) => {
+    const removed = [];
+    const released = [];
+    const failed = [];
+    for (const [key, record] of Object.entries(owned)) {
+      if (record.sessionId !== sessionId) continue;
+      if (record.owner === "claimed") {
+        released.push(Number(key));
+        delete owned[key];
+        continue;
+      }
+      if (record.owner !== "agent") continue;
+      const markedForTurn = turnCleanup && turnId !== undefined && ["handoff", "deliverable"].includes(record.lifecycle) && String(record.markTurn || "") === turnId;
+      if (!turnCleanup && ["handoff", "deliverable"].includes(record.lifecycle)) {
+        released.push(Number(key));
+        delete owned[key];
+        continue;
+      }
+      const removable = ["temporary", "created"].includes(record.lifecycle) || (turnCleanup && !markedForTurn);
+      if (!removable) continue;
+      try {
+        await chrome.tabs.remove(Number(key));
+        removed.push(Number(key));
+        delete owned[key];
+      } catch (error) {
+        failed.push({ tabId: Number(key), error: error instanceof Error ? error.message : String(error) });
+        log(`could not close tab ${key} during cleanup`, error);
+      }
     }
-    if (record.owner !== "agent" || !["temporary", "created"].includes(record.lifecycle)) continue;
-    try { await chrome.tabs.remove(Number(key)); removed.push(Number(key)); } catch {}
-    delete kept[key];
-  }
-  await saveOwnedTabs(kept);
+    const retained = Object.entries(owned)
+      .filter(([, record]) => record.sessionId === sessionId)
+      .map(([key]) => Number(key));
+    return { removed, released, retained, failed };
+  });
   if (detachDevtools) {
     for (const [tabId, record] of [...persistentDebuggers.entries()]) {
       if (record.sessionId !== sessionKey(sessionId)) continue;
       await detachDebugger(tabId, sessionId);
     }
   }
-  return { removed, released };
+  return result;
 }
 
 async function listDownloads(params = {}) {
@@ -1053,10 +1161,14 @@ async function coordinateAction(tabId, params) {
 async function captureScreenshot(tab, params) {
   const format = params.format || "png";
   if (params.fullPage !== true && tab.active && (format === "png" || format === "jpeg")) {
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format });
-    const separator = dataUrl.indexOf(",");
-    if (separator < 0) throw new Error("Visible-tab screenshot did not return a data URL");
-    return { tabId: tab.id, data: dataUrl.slice(separator + 1), mimeType: `image/${format}` };
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format });
+      const separator = dataUrl.indexOf(",");
+      if (separator < 0) throw new Error("Visible-tab screenshot did not return a data URL");
+      return { tabId: tab.id, data: dataUrl.slice(separator + 1), mimeType: `image/${format}` };
+    } catch (error) {
+      log("visible-tab screenshot failed; falling back to debugger capture", error);
+    }
   }
   const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.captureScreenshot", { format, captureBeyondViewport: params.fullPage === true }), params.sessionId);
   return { tabId: tab.id, data: result.data, mimeType: `image/${format}` };
@@ -1064,7 +1176,7 @@ async function captureScreenshot(tab, params) {
 
 async function handleRequest(method, params) {
   if (method === "status") {
-    return { connected: true, ...browserIdentity(), bridge: BRIDGE_ORIGIN, connectedAt };
+    return { connected: true, ...browserIdentity(), capabilities: EXTENSION_CAPABILITIES, bridge: BRIDGE_ORIGIN, connectedAt };
   }
   if (method === "list_tabs") return listTabs();
   if (method === "selected_tab") {
@@ -1175,25 +1287,38 @@ async function handleRequest(method, params) {
   }
   if (method === "network_response_body") {
     const tab = await getTab(params.tabId, params);
-    await enableDevtools(tab.id, ["Network"], params.sessionId);
-    return { tabId: tab.id, result: await debuggerCommand(tab.id, "Network.getResponseBody", { requestId: String(params.requestId) }) };
+    const result = await withDebugger(tab.id, async (sendCommand) => {
+      await sendCommand("Network.enable");
+      return sendCommand("Network.getResponseBody", { requestId: String(params.requestId) });
+    }, params.sessionId);
+    return { tabId: tab.id, result };
   }
   if (method === "dialog") {
     const tab = await getTab(params.tabId, params);
     const state = stateForTab(tab.id);
-    if (params.action === "get") return { tabId: tab.id, dialog: state.dialog };
+    if (params.action === "get") {
+      if (state.dialog) return { tabId: tab.id, dialog: state.dialog };
+      const dialog = await withDebugger(tab.id, async (sendCommand) => {
+        try {
+          await sendCommand("Page.enable");
+        } catch (error) {
+          log("could not enable Page for dialog observation", error);
+        }
+        return state.dialog;
+      }, params.sessionId);
+      return { tabId: tab.id, dialog };
+    }
     if (!["accept", "dismiss"].includes(params.action)) throw new Error("dialog action must be get, accept or dismiss");
-    const debuggerRecord = persistentDebuggers.get(Number(tab.id));
-    if (debuggerRecord && debuggerRecord.sessionId !== sessionKey(params.sessionId)) throw new Error(`DevTools for tab ${tab.id} belongs to another Agent session`);
-    if (!debuggerRecord) await enableDevtools(tab.id, ["Page"], params.sessionId);
-    await debuggerCommand(tab.id, "Page.handleJavaScriptDialog", { accept: params.action === "accept", promptText: params.promptText });
-    const dialog = state.dialog;
-    state.dialog = undefined;
+    const dialog = await withDebugger(tab.id, async (sendCommand) => {
+      await sendCommand("Page.handleJavaScriptDialog", { accept: params.action === "accept", promptText: params.promptText });
+      const current = state.dialog;
+      state.dialog = undefined;
+      return current;
+    }, params.sessionId);
     return { tabId: tab.id, handled: params.action, dialog };
   }
   if (method === "upload") {
     const tab = await getTab(params.tabId, params);
-    await enableDevtools(tab.id, ["Page"], params.sessionId);
     return uploadFiles(tab.id, params);
   }
   if (method === "clipboard") {
@@ -1233,7 +1358,8 @@ async function handleRequest(method, params) {
   if (method === "mark_handoff" || method === "mark_deliverable") {
     if (params.tabId === undefined) throw new Error("tabId is required");
     const lifecycle = method === "mark_handoff" ? "handoff" : "deliverable";
-    return { tab: await updateOwnedTab(params.tabId, { lifecycle }, params.sessionId) };
+    const markTurn = params.turnId === undefined || params.turnId === null ? undefined : String(params.turnId);
+    return { tab: await updateOwnedTab(params.tabId, { lifecycle, markTurn }, params.sessionId) };
   }
   if (method === "cleanup") return cleanup(params);
   throw new Error(`Unsupported browser method: ${method}`);
