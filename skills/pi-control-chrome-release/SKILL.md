@@ -27,7 +27,7 @@ The full Chinese checklist is [`docs/RELEASE-CHECKLIST.zh-CN.md`](../../docs/REL
 | `pi-control-chrome` | `package.json` | `package-lock.json`, `CHANGELOG.md` | `publish-pi-control-chrome.yml` |
 | MV3 extension | `extension/manifest.json` | `extension/background.js`; confirm whether its version follows the root package | Ships with the Pi package; do not silently assume its version is identical |
 | `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `pnpm-lock.yaml`, `pnpm-workspace.yaml`, README install examples | `publish-dsh-tool-control-chrome.yml` |
-| Private `dsh-profile-config` source | `profiles/web/package.json` | `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, README, bootstrap scripts | Update in a separate private Profile configuration PR after npm publication; never publish it |
+| Private `dsh-profile-config` source | `profiles/web/package.json`, `.agent-presets/` | `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, `.agent-presets/*/preset.yml`, `.agent-presets/*/agent.cordis.yml`, README, bootstrap scripts | Update in a separate private Profile configuration PR after npm publication; never publish it |
 | Active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile lockfile and `pnpm-workspace.yaml` overrides | Update only after npm publication, then restart DSH |
 
 ## Phase 1: inspect before editing
@@ -44,7 +44,7 @@ npm view pi-control-chrome version dist-tags --json
 npm view @lyd123qw2008/dsh-tool-control-chrome version dist-tags --json
 ```
 
-If a `dsh-profile-config` checkout is present, also read `profiles/web/package.json`, `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, the README package list, and the bootstrap scripts before choosing a target. Read all package manifests, lockfiles, `CHANGELOG.md`, and both publish workflows. Build this matrix before editing:
+If a `dsh-profile-config` checkout is present, also read `profiles/web/package.json`, `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, `.agent-presets/*/preset.yml`, `.agent-presets/*/agent.cordis.yml`, the README package list, and the bootstrap scripts before choosing a target. Read all package manifests, lockfiles, `CHANGELOG.md`, and both publish workflows. Build this matrix before editing:
 
 ```text
 surface/package                         current       target        dependency target       workflow
@@ -98,9 +98,10 @@ The workflow must pass its install, typecheck, test, build, pack, and publish st
 
 `dsh-profile-config` is a separate private repository and the source of truth for new-machine bootstrap. It is not an npm package and must not be published. After the public Pi and DSH packages are visible on npm:
 
-1. Update `profiles/web/package.json`, `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, README package examples, and bootstrap-related documentation in the private repository.
-2. Inspect any `pi-control-chrome` override and update it to the target root version; add the target to `minimumReleaseAgeExclude` when that policy is enabled.
-3. Run the Profile checks from that repository:
+1. Update `profiles/web/package.json`, `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, `.agent-presets/*/preset.yml`, `.agent-presets/*/agent.cordis.yml`, README package examples, and bootstrap-related documentation in the private repository.
+2. Ensure both bootstrap scripts copy `.agent-presets/` into `DSH_HOME/.agent-presets` without deleting unrelated user presets.
+3. Inspect any `pi-control-chrome` override and update it to the target root version; add the target to `minimumReleaseAgeExclude` when that policy is enabled.
+4. Run the Profile checks from that repository:
 
    ```powershell
    corepack pnpm --dir profiles/web install --frozen-lockfile
@@ -108,7 +109,7 @@ The workflow must pass its install, typecheck, test, build, pack, and publish st
    corepack pnpm --dir profiles/web why pi-control-chrome
    ```
 
-4. Create and merge a separate private Profile configuration PR. Do not mix its files into the public `pi-control-chrome` release PR and do not trigger an npm publish for this repository.
+5. Create and merge a separate private Profile configuration PR. Do not mix its files into the public `pi-control-chrome` release PR and do not trigger an npm publish for this repository.
 
 ## Phase 4: update and verify active DSH Profile
 

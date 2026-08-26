@@ -11,7 +11,7 @@
 | Pi 根包 `pi-control-chrome` | `package.json` | `package-lock.json`、`CHANGELOG.md` | `.github/workflows/publish-pi-control-chrome.yml` |
 | 浏览器扩展 | `extension/manifest.json` | `extension/background.js`、根包版本说明 | 随 Pi 根包发布；Manifest 版本号是否同步必须在发布矩阵中明确确认 |
 | DSH 包 `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `dsh-tool-control-chrome/pnpm-lock.yaml`、`dsh-tool-control-chrome/pnpm-workspace.yaml`、`dsh-tool-control-chrome/README.md` | `.github/workflows/publish-dsh-tool-control-chrome.yml` |
-| 私有 DSH Profile 配置仓库 | `dsh-profile-config/profiles/web/package.json` | `profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`README.md`、bootstrap 脚本 | 只提交并合并独立 Profile 配置 PR，不发布 npm 包 |
+| 私有 DSH Profile 配置仓库 | `dsh-profile-config/profiles/web/package.json`、`.agent-presets/` | `profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/*/preset.yml`、`.agent-presets/*/agent.cordis.yml`、`README.md`、bootstrap 脚本 | 只提交并合并独立 Profile 配置 PR，不发布 npm 包 |
 | active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile 的 `pnpm-lock.yaml`、`pnpm-workspace.yaml` | 不属于仓库发布；在 npm 发布成功后单独更新并重启 DSH |
 
 根包版本、扩展 Manifest 版本、DSH 包版本和 active Profile 版本不是同一个字段。不能因为其中一个版本已经 bump，就假设其他发布面已经更新。
@@ -63,7 +63,7 @@ npm view @lyd123qw2008/dsh-tool-control-chrome version dist-tags --json
    npm view @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> version dist-tags dependencies --json
    ```
 
-10. 在私有 `dsh-profile-config` 仓库中更新 `profiles/web/package.json`、`profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml` 和 README 中的包版本。该仓库的 bootstrap 脚本会从 npm 安装发布包；只更新 active Profile 不会更新新机器的配置源，也不能把这个仓库当作 npm 发布包。
+10. 在私有 `dsh-profile-config` 仓库中更新 `profiles/web/package.json`、`profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/` 下的自定义 preset composition 和 `preset.yml` 元数据，以及 README 和 bootstrap 相关说明。该仓库的 bootstrap 脚本会从 npm 安装发布包并复制自定义 presets；只更新 active Profile 不会更新新机器的配置源，也不能把这个仓库当作 npm 发布包。
 11. 从 `dsh-profile-config` 的 `profiles/web` 运行安装和依赖解析检查，创建并合并独立的私有 Profile 配置 PR；不要为该仓库触发 npm 发布：
 
     ```powershell
