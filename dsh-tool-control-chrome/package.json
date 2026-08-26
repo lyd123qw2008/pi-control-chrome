@@ -67,7 +67,7 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
-    "pi-control-chrome": "^0.3.7",
+    "pi-control-chrome": "^0.3.8",
     "ws": "^8.18.0",
     "yaml": "2.9.0"
   },
