@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added a maintainer release Skill and a package/version matrix covering Pi, the browser extension, DSH, npm Trusted Publishing, lockfiles, Profile overrides, and post-release runtime verification.
+
 ## 0.3.8 - 2026-08-26
 
 - Fixed Pi session transitions to report completed cleanup as successful instead of leaving a false browser-cleanup-pending status; added real-RPC lifecycle coverage for session switching, cleanup retry intent and stale Bridge sockets.
