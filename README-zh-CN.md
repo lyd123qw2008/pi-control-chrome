@@ -19,6 +19,8 @@
 - [中文架构说明](./ARCHITECTURE.zh-CN.md)
 - [英文架构说明](./ARCHITECTURE.md)
 - [变更记录](./CHANGELOG.md)
+- [发布与依赖更新检查清单](./docs/RELEASE-CHECKLIST.zh-CN.md)
+- [发布 Skill](./skills/pi-control-chrome-release/SKILL.md)
 - [Pi Skill](./skills/pi-control-chrome/SKILL.md)
 - [浏览器能力显式激活方案](./BROWSER-ACTIVATION-DESIGN.zh-CN.md)
 - [Codex 对齐的浏览器生命周期实施方案](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md)

@@ -147,6 +147,8 @@ This uses an isolated temporary browser profile and does not touch the normal us
 - [`FEATURES.md`](./FEATURES.md) — feature scope and future work.
 - [`CODEX-ALIGNMENT.zh-CN.md`](./CODEX-ALIGNMENT.zh-CN.md) — Codex behavior alignment notes.
 - [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md) — project decisions.
+- [`docs/RELEASE-CHECKLIST.zh-CN.md`](./docs/RELEASE-CHECKLIST.zh-CN.md) — package/version, dependency, PR, npm publication and active DSH Profile release checklist.
+- [`skills/pi-control-chrome-release/SKILL.md`](./skills/pi-control-chrome-release/SKILL.md) — executable release procedure for Pi and DSH packages.
 - [`skills/pi-control-chrome/SKILL.md`](./skills/pi-control-chrome/SKILL.md) — bundled Pi Skill.
 - [`CHANGELOG.md`](./CHANGELOG.md) — release history.
 - [`BROWSER-ACTIVATION-DESIGN.zh-CN.md`](./BROWSER-ACTIVATION-DESIGN.zh-CN.md) — browser capability activation and on-demand Skill design.

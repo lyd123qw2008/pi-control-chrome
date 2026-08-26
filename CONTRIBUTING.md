@@ -31,9 +31,11 @@ npm run smoke:e2e
 
 Do not commit browser profiles, Bridge tokens, credentials, screenshots containing private data, or generated session files.
 
-## Publishing the DSH package
+## Publishing and release checklist
 
-The DSH package is published from GitHub Actions, not from the local npm login. Update `dsh-tool-control-chrome/package.json`, run `corepack pnpm run pack:check` from `dsh-tool-control-chrome/`, push `main`, and manually trigger the existing [`Publish DSH Chrome Control Package`](.github/workflows/publish-dsh-tool-control-chrome.yml) workflow. Do not create a second npm publishing workflow. The npm package must have this GitHub workflow configured as its npm Trusted Publisher; the workflow uses the `id-token: write` permission. Verify the result with `npm view @lyd123qw2008/dsh-tool-control-chrome version`.
+Before any version bump, release commit, pull request, merge, npm publication, or active-Profile dependency update, follow [`skills/pi-control-chrome-release/SKILL.md`](./skills/pi-control-chrome-release/SKILL.md) and the detailed [`docs/RELEASE-CHECKLIST.zh-CN.md`](./docs/RELEASE-CHECKLIST.zh-CN.md). Inspect the Pi root package, extension Manifest, DSH package, lockfiles, `pnpm-workspace.yaml` overrides, active DSH Profile, and both publish workflows as one release matrix. Do not infer versions or assume that publishing one package publishes the other.
+
+The Pi and DSH packages are published from GitHub Actions, not from a local npm login. The existing workflows are [`Publish Pi Control Chrome`](.github/workflows/publish-pi-control-chrome.yml) and [`Publish DSH Chrome Control Package`](.github/workflows/publish-dsh-tool-control-chrome.yml); do not create a second npm publishing workflow. Verify each result with `npm view <package>@<version> version dist-tags dependencies --json`. Update the active DSH Profile only after the npm package is visible, inspect and correct any old `pi-control-chrome` override, install with a frozen lockfile when appropriate, and restart DSH before runtime verification. The npm packages must have these GitHub workflows configured as their npm Trusted Publishers; the workflows use the `id-token: write` permission.
 
 ## Pull requests
 
