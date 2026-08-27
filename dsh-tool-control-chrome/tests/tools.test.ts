@@ -224,6 +224,23 @@ describe('DSH browser tool catalog', () => {
     expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(1)
   })
 
+  it('treats blank browserId values as omitted during single-target status lookup', async () => {
+    const request = vi.fn(async (method: string, _params: Record<string, unknown>, _signal?: AbortSignal, target?: { browserId: string }) => {
+      if (method === 'status') {
+        expect(target).toBeUndefined()
+        return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.7', capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }
+      }
+      return { method }
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    for (const browserId of ['', '   ']) {
+      const result = await harness.tools.get('browser_status')?.execute({ browserId }, execution(harness.agent))
+      expect(result).toMatchObject({ state: 'connected', browserId: 'edge:test' })
+    }
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
   it('cleans a used eager session on Agent disposal', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
@@ -404,7 +421,7 @@ describe('DSH browser tool catalog', () => {
     })
     const health = vi.fn(async () => targetHealth)
     const harness = setup({ request, health })
-    const ambiguous = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    const ambiguous = await harness.tools.get('browser_status')?.execute({ browserId: '' }, execution(harness.agent))
     expect(ambiguous).toMatchObject({ state: 'target_required', recommendation: 'select_browser_target', targets: [{ browserId: 'edge:profile-a' }, { browserId: 'chrome:profile-b' }] })
     const selected = await harness.tools.get('browser_status')?.execute({ browserId: 'chrome:profile-b' }, execution(harness.agent))
     expect(selected).toMatchObject({ browserId: 'chrome:profile-b', targetStability: { connectionGeneration: 2 } })
