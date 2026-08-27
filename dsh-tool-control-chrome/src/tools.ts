@@ -59,6 +59,12 @@ function readBrowserTarget(value: unknown): BrowserTarget | undefined {
   return { browser, browserId, profile, ...(state === undefined ? {} : { state }), ...(connectionId === undefined ? {} : { connectionId }), ...(connectionGeneration === undefined ? {} : { connectionGeneration }) }
 }
 
+function optionalBrowserId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const browserId = value.trim()
+  return browserId.length === 0 ? undefined : browserId
+}
+
 function sameBrowserTarget(left: BrowserTarget, right: BrowserTarget): boolean {
   return left.browser === right.browser && left.browserId === right.browserId && left.profile === right.profile
 }
@@ -195,7 +201,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     name: 'browser_status',
     description: 'Return the connected Chrome/Edge browser, active browser target stability and local Bridge status.',
     parameters: {
-      browserId: { type: 'string', description: 'Select a connected browser target by browserId.' },
+      browserId: { type: 'string', description: 'Select a connected browser target by browserId. Omit or leave blank for automatic discovery; choose one explicitly when multiple targets are connected.' },
       acknowledgeBrowserId: { type: 'string', description: 'Explicitly acknowledge this browserId after the user confirms a browser switch.' },
     },
     method: 'status',
@@ -1422,8 +1428,8 @@ export function registerBrowserTools(
         const tracker = trackerFor(session)
         if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, exec.signal)
         if (spec.name === 'browser_status') {
-          const acknowledgeBrowserId = typeof args.acknowledgeBrowserId === 'string' ? args.acknowledgeBrowserId : undefined
-          const requestedBrowserId = typeof args.browserId === 'string' ? args.browserId : undefined
+          const acknowledgeBrowserId = optionalBrowserId(args.acknowledgeBrowserId)
+          const requestedBrowserId = optionalBrowserId(args.browserId)
           return await browserStatus(bridge, tracker, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId, requestedBrowserId)
         }
         const connection = await readBrowserConnection(bridge, sessionId, exec.signal, resolveSettings().extensionReadyTimeoutMs, tracker.route())
