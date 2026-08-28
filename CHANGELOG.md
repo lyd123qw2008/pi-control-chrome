@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-28
+
 - Added semantic element targets for common click, fill, type, keypress, locator, and wait operations. Targets support role/name, label, placeholder, text, test id, explicit indexing, and legacy ref/CSS compatibility with strict ambiguity handling.
 
 - Added durable tab fences, document incarnations, debugger lease persistence and explicit stale-runtime recovery. Navigation and lifecycle races now invalidate old page, loader, dialog, file-chooser and DOM state; Network response bodies require the matching `loaderId` from the current listing; uncertain side effects require inspection instead of automatic replay.
