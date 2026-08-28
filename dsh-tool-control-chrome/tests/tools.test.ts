@@ -284,6 +284,138 @@ describe('DSH browser tool catalog', () => {
     expect(locatorResult).toEqual({ method: 'locator', params: { action: 'count', target, sessionId: 'session-test', expectedBrowserId: 'edge:test', locator: target } })
   })
 
+  it('drops blank legacy ref fields beside a semantic interaction target', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { semanticTargets: true, tabIncarnationFence: true } }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_click')?.execute({
+      handle: { tabId: 7, browserId: 'edge:test', incarnation: '' },
+      ref: '',
+      selector: '',
+      snapshotId: '',
+      tabId: 7,
+      target: { role: 'button' },
+    }, execution(harness.agent))
+    expect(result).toEqual({
+      method: 'interaction',
+      params: {
+        handle: { tabId: 7, browserId: 'edge:test' },
+        operation: 'click',
+        tabId: 7,
+        target: { role: 'button' },
+        sessionId: 'session-test',
+        expectedBrowserId: 'edge:test',
+      },
+    })
+  })
+
+  it('normalizes model-emitted empty locator fields and legacy fields beside a target', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { semanticTargets: true, snapshotRefs: true, tabIncarnationFence: true } }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, snapshotRefs: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_locator')?.execute({
+      action: 'count',
+      exact: true,
+      handle: {
+        tabId: 7,
+        browserId: 'edge:test',
+        incarnation: '',
+        name: '提交',
+        snapshotId: 'snapshot-1',
+        strategy: 'role',
+        target: { role: 'button' },
+      },
+      name: '提交',
+      strategy: 'role',
+      target: {
+        exact: true,
+        hasSelector: '',
+        hasText: '',
+        index: -1,
+        name: '提交',
+        role: 'button',
+        selector: '',
+        text: '',
+      },
+      tabId: 7,
+    }, execution(harness.agent))
+    const filterResult = await harness.tools.get('browser_locator')?.execute({ action: 'filter', target: { role: 'button' }, value: '设置' }, execution(harness.agent))
+    expect(filterResult).toEqual({
+      method: 'locator',
+      params: {
+        action: 'filter',
+        target: { role: 'button' },
+        value: '设置',
+        sessionId: 'session-test',
+        expectedBrowserId: 'edge:test',
+        locator: { role: 'button' },
+      },
+    })
+  })
+
+  it('drops empty wait targets, blank snapshot fields and empty handle incarnations', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { pageWaitStates: true, semanticTargets: true, tabIncarnationFence: true } }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { pageWaitStates: true, semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_wait')?.execute({
+      exact: true,
+      handle: { tabId: 7, browserId: 'edge:test', incarnation: '' },
+      snapshotId: '',
+      state: 'text',
+      target: { exact: false, index: 0, label: '', ref: '', role: '', text: '' },
+      tabId: 7,
+      text: '设置',
+      timeoutMs: 5000,
+      url: '',
+      urlIncludes: '',
+    }, execution(harness.agent))
+    expect(result).toEqual({
+      method: 'wait',
+      params: {
+        exact: true,
+        handle: { tabId: 7, browserId: 'edge:test' },
+        state: 'text',
+        tabId: 7,
+        text: '设置',
+        timeoutMs: 5000,
+        sessionId: 'session-test',
+        expectedBrowserId: 'edge:test',
+      },
+    })
+  })
+
+  it('prefers nested exact matching for a visible wait target', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { pageWaitStates: true, semanticTargets: true, tabIncarnationFence: true } }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { pageWaitStates: true, semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_wait')?.execute({
+      exact: true,
+      handle: { tabId: 7, browserId: 'edge:test', incarnation: '' },
+      state: 'visible',
+      target: { exact: false, index: 0, ref: 'e18', selector: '' },
+      tabId: 7,
+    }, execution(harness.agent))
+    expect(result).toEqual({
+      method: 'wait',
+      params: {
+        handle: { tabId: 7, browserId: 'edge:test' },
+        state: 'visible',
+        target: { exact: false, index: 0, ref: 'e18' },
+        tabId: 7,
+        sessionId: 'session-test',
+        expectedBrowserId: 'edge:test',
+      },
+    })
+  })
+
   it('reports an actionable diagnosis when the Bridge has no extension', async () => {
     const request = vi.fn(async () => ({ connected: false }))
     const health = vi.fn(async () => ({ ok: true, protocol: 1, extensionConnected: false }))

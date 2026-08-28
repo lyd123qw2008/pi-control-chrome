@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.4.0
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.4.1
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.4.0"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.4.1"
   }
 }
 ```
@@ -47,7 +47,7 @@ Put deployment settings in `<DSH_HOME>/settings.yaml`; copy the `control-chrome`
 
 The plugin uses the active DSH Agent session id as the browser ownership session id. `browser_cleanup` therefore only handles tabs created or claimed by that Agent session. An explicit `recoverStale: true` cleanup request forgets ownership records from an unknown extension runtime without closing those tabs and returns their ids in `recovered`; use it only after a human-approved recovery decision.
 
-Tab handles carry a tab fence and, when document scripting is available, a document incarnation. Navigation invalidates snapshot refs, DOM-CUA nodes, dialog/file-chooser observations, and Network loader mappings. To retrieve a Network response body, pass both `requestId` and its matching `loaderId` from the same current `browser_network` listing. Debugger lease identity is persisted across an MV3 worker restart; ordinary cleanup does not detach an untracked target, and stale-runtime recovery detaches only a persisted lease whose tab fence and CDP target identity remain verified before and after detach.
+Tab handles carry a tab fence and, when document scripting is available, a document incarnation. Title-only updates within the same document do not invalidate a complete handle; navigation invalidates snapshot refs, DOM-CUA nodes, dialog/file-chooser observations, and Network loader mappings. A new tab may initially be the restricted `about:blank` page, which has tab identity but no document incarnation; navigate it to a script-accessible URL before using page operations. To retrieve a Network response body, pass both `requestId` and its matching `loaderId` from the same current `browser_network` listing. Debugger lease identity is persisted across an MV3 worker restart; ordinary cleanup does not detach an untracked target, and stale-runtime recovery detaches only a persisted lease whose tab fence and CDP target identity remain verified before and after detach.
 
 ## Tools
 
@@ -67,7 +67,7 @@ The package defines the complete browser-control surface, but default `lazyTools
 
 ### Semantic targets and waits
 
-`browser_click`, `browser_double_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_locator`, and `browser_wait` accept a nested `target`. Prefer `role` with `name`, then `label`, `placeholder`, `text`, or `testId`; `ref` and CSS `selector` remain available for compatibility. A semantic action waits for one visible match and fails closed when no element or multiple elements match. Use `index` only when the ambiguity is intentional. `browser_wait` supports `load`, `url`, `text`, `text_gone`, `visible`, `hidden`, and `enabled`; text conditions use `text`, while element conditions use `target`. `hidden` succeeds when no visible match exists, including an absent target or multiple hidden matches; `visible` and `enabled` fail closed on multiple visible matches. `url` and `urlIncludes` remain available as URL filters. If an interaction loses its injected result during navigation, it reports an uncertain outcome and is not replayed automatically.
+`browser_click`, `browser_double_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_locator`, and `browser_wait` accept a nested `target`. Prefer `role` with `name`, then `label`, `placeholder`, `text`, or `testId`; `ref` and CSS `selector` remain available for compatibility. A semantic action waits for one visible match and fails closed when no element or multiple elements match. Use `index` only when the ambiguity is intentional. `browser_wait` supports `load`, `url`, `text`, `text_gone`, `visible`, `hidden`, and `enabled`; text conditions use `text`, while element conditions use `target`. `hidden` succeeds when no visible match exists, including an absent target or multiple hidden matches; `visible` and `enabled` fail closed on multiple visible matches. `url` and `urlIncludes` remain available as URL filters. The DSH adapter treats blank optional fields and the generated `index: -1` sentinel as omitted, keeps locator fields out of tab handles, and reconciles duplicate legacy locator fields with a nested target before dispatch. If an interaction loses its injected result during navigation, it reports an uncertain outcome and is not replayed automatically.
 
 Example:
 
