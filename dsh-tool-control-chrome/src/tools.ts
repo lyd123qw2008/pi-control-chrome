@@ -26,23 +26,25 @@ const OPTIONAL_NUMBER: ParameterPropertySpec = { type: 'number' }
 const NETWORK_REQUEST_ID: ParameterPropertySpec = { type: 'string', description: 'Required for response_body; copy from the current Network listing.' }
 const NETWORK_LOADER_ID: ParameterPropertySpec = { type: 'string', description: 'Required for response_body; copy the matching loaderId from the current Network listing.' }
 const TIMEOUT_MS: ParameterPropertySpec = { type: 'number', description: 'Optional positive timeout in milliseconds.' }
-const INDEX: ParameterPropertySpec = { type: 'integer', description: 'Optional zero-based non-negative element index.' }
+const INDEX: ParameterPropertySpec = { type: 'integer', description: 'Optional zero-based non-negative element index. Omit it when not selecting a specific match; never use -1 as a sentinel.' }
 const OPTIONAL_BOOLEAN: ParameterPropertySpec = { type: 'boolean' }
+const WAIT_EXACT: ParameterPropertySpec = { type: 'boolean', description: 'For text/text_gone waits only. For visible/hidden/enabled waits, put exact inside target.' }
 const SELECTOR: ParameterPropertySpec = { type: 'string', description: 'Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot.' }
+const TAB_HANDLE_PROPERTIES: ParameterSchemaSpec = {
+  tabId: { type: 'number', required: true },
+  browserId: OPTIONAL_STRING,
+  windowId: OPTIONAL_NUMBER,
+  title: OPTIONAL_STRING,
+  url: OPTIONAL_STRING,
+  tabFence: OPTIONAL_STRING,
+  incarnation: OPTIONAL_STRING,
+  sessionId: OPTIONAL_STRING,
+  groupId: OPTIONAL_NUMBER,
+}
 const TAB_HANDLE: ParameterPropertySpec = {
   type: 'object',
-  description: 'Complete tab handle returned by browser_tabs; use it after a claimed tab changes.',
-  properties: {
-    tabId: { type: 'number', required: true },
-    browserId: OPTIONAL_STRING,
-    windowId: OPTIONAL_NUMBER,
-    title: OPTIONAL_STRING,
-    url: OPTIONAL_STRING,
-    tabFence: OPTIONAL_STRING,
-    incarnation: OPTIONAL_STRING,
-    sessionId: OPTIONAL_STRING,
-    groupId: OPTIONAL_NUMBER,
-  },
+  description: 'Complete tab identity returned by browser_tabs; keep locators in target or the documented top-level fields, never inside handle.',
+  properties: TAB_HANDLE_PROPERTIES,
   additionalProperties: false,
 }
 const WAIT_STATE: ParameterPropertySpec = {
@@ -59,7 +61,7 @@ const DOM_CUA_ACTION: ParameterPropertySpec = {
 }
 const ELEMENT_TARGET: ParameterPropertySpec = {
   type: 'object',
-  description: 'Element target. Prefer role + name, label, placeholder or text before ref or CSS selector.',
+  description: 'Use exactly one primary locator: role (optionally with name), label, placeholder, text, testId, ref, or selector. Do not put target fields inside handle.',
   properties: {
     ref: OPTIONAL_STRING,
     selector: SELECTOR,
@@ -74,6 +76,27 @@ const ELEMENT_TARGET: ParameterPropertySpec = {
     scopeSelector: OPTIONAL_STRING,
     hasText: OPTIONAL_STRING,
     hasSelector: OPTIONAL_STRING,
+  },
+  additionalProperties: false,
+}
+const LEGACY_LOCATOR_PARAMETERS: ParameterSchemaSpec = {
+  strategy: { type: 'string', description: 'Legacy compatibility only. Prefer one nested target and do not combine legacy fields with it.' },
+  selector: { type: 'string', description: 'Legacy CSS selector compatibility only. Prefer target.selector.' },
+  value: JSON_VALUE,
+  exact: { type: 'boolean', description: 'Legacy compatibility only. Prefer target.exact when target is present.' },
+  name: { type: 'string', description: 'Legacy role-name compatibility only. Prefer target.name with target.role.' },
+  index: INDEX,
+  hasText: { type: 'string', description: 'Legacy filter compatibility only. Prefer target.hasText.' },
+  hasSelector: { type: 'string', description: 'Legacy filter compatibility only. Prefer target.hasSelector.' },
+}
+const LOCATOR_TAB_HANDLE: ParameterPropertySpec = {
+  type: 'object',
+  description: 'Complete tab identity returned by browser_tabs. Locator fields belong in target, not handle; misplaced legacy fields are accepted for recovery.',
+  properties: {
+    ...TAB_HANDLE_PROPERTIES,
+    target: ELEMENT_TARGET,
+    snapshotId: OPTIONAL_STRING,
+    ...LEGACY_LOCATOR_PARAMETERS,
   },
   additionalProperties: false,
 }
@@ -343,7 +366,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_wait',
-    description: 'Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; ref targets require the matching snapshotId.',
+    description: 'Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state. For text states use text; for element states use target. Keep tab identity in handle and locator fields in target.',
     parameters: {
       tabId: TAB_ID,
       state: WAIT_STATE,
@@ -352,7 +375,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
       text: OPTIONAL_STRING,
       target: ELEMENT_TARGET,
       snapshotId: OPTIONAL_STRING,
-      exact: OPTIONAL_BOOLEAN,
+      exact: WAIT_EXACT,
       timeoutMs: TIMEOUT_MS,
     },
     method: 'wait',
@@ -493,20 +516,13 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
 const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
   {
     name: 'browser_locator',
-    description: 'Use Playwright-style locator operations with semantic targets, css, role, text, label, placeholder and testid strategies; ref locators require the matching snapshotId.',
+    description: 'Use locator operations with one target object (role/name, label, placeholder, text, testId, ref, or CSS selector); keep tab identity in handle and never put locator fields there. Legacy top-level locator fields remain accepted.',
     parameters: {
       tabId: TAB_ID,
       action: requiredString('Locator action such as count, click, fill, text or attribute.'),
       target: ELEMENT_TARGET,
       snapshotId: OPTIONAL_STRING,
-      strategy: OPTIONAL_STRING,
-      selector: SELECTOR,
-      value: JSON_VALUE,
-      exact: OPTIONAL_BOOLEAN,
-      name: OPTIONAL_STRING,
-      index: INDEX,
-      hasText: OPTIONAL_STRING,
-      hasSelector: OPTIONAL_STRING,
+      ...LEGACY_LOCATOR_PARAMETERS,
       other: JSON_VALUE,
       attribute: OPTIONAL_STRING,
       key: OPTIONAL_STRING,
@@ -636,6 +652,153 @@ export const BROWSER_TOOL_NAMES = [...CORE_TOOLS, ...ADVANCED_TOOLS].map(tool =>
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const TAB_HANDLE_KEYS = new Set([
+  'tabId', 'browserId', 'windowId', 'title', 'url', 'tabFence', 'incarnation', 'sessionId', 'groupId',
+])
+const TAB_HANDLE_OPTIONAL_STRING_KEYS = new Set(['browserId', 'title', 'url', 'tabFence', 'incarnation', 'sessionId'])
+const ELEMENT_TARGET_OPTIONAL_STRING_KEYS = new Set([
+  'ref', 'selector', 'role', 'name', 'label', 'placeholder', 'text', 'testId', 'scopeSelector', 'hasText', 'hasSelector',
+])
+const ELEMENT_TARGET_PRIMARY_KEYS = ['ref', 'selector', 'role', 'label', 'placeholder', 'text', 'testId'] as const
+const LOCATOR_LEGACY_KEYS = ['strategy', 'selector', 'exact', 'name', 'index', 'hasText', 'hasSelector', 'value'] as const
+const SEMANTIC_INTERACTION_TOOLS = new Set(['browser_click', 'browser_double_click', 'browser_fill', 'browser_type', 'browser_press_key'])
+
+function isBlankString(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length === 0
+}
+
+function normalizeTabHandle(value: unknown): unknown {
+  if (!isRecord(value)) return value
+  const normalized: Record<string, JsonValue> = {}
+  for (const key of TAB_HANDLE_KEYS) {
+    if (!Object.hasOwn(value, key)) continue
+    const entry = value[key]
+    if (TAB_HANDLE_OPTIONAL_STRING_KEYS.has(key) && isBlankString(entry)) continue
+    normalized[key] = entry as JsonValue
+  }
+  return normalized
+}
+
+function normalizeElementTarget(value: unknown, dropEmpty = false): unknown {
+  if (!isRecord(value)) return value
+  const normalized: Record<string, JsonValue> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (ELEMENT_TARGET_OPTIONAL_STRING_KEYS.has(key) && isBlankString(entry)) continue
+    if (key === 'index' && entry === -1) continue
+    normalized[key] = entry as JsonValue
+  }
+  if (dropEmpty && ELEMENT_TARGET_PRIMARY_KEYS.every(key => normalized[key] === undefined)) {
+    const hasMeaningfulNarrowing = Object.keys(normalized).some(key => !['exact', 'index'].includes(key))
+    const hasExplicitMatchOption = normalized.exact === true || (normalized.index !== undefined && normalized.index !== 0)
+    if (!hasMeaningfulNarrowing && !hasExplicitMatchOption) return undefined
+  }
+  return normalized
+}
+
+function deleteBlankFields(params: Record<string, JsonValue>, keys: readonly string[]): void {
+  for (const key of keys) if (isBlankString(params[key])) delete params[key]
+}
+
+function primaryTargetKey(target: Record<string, unknown>): string | undefined {
+  return ELEMENT_TARGET_PRIMARY_KEYS.find(key => target[key] !== undefined)
+}
+
+function mergeLegacyLocatorFields(target: Record<string, JsonValue>, params: Record<string, JsonValue>): void {
+  const primary = primaryTargetKey(target)
+  const strategy = typeof params.strategy === 'string' && !isBlankString(params.strategy) ? params.strategy.toLowerCase() : undefined
+  const strategyKey = strategy === 'css' ? 'selector'
+    : strategy === 'role' ? 'role'
+      : strategy === 'text' ? 'text'
+        : strategy === 'label' ? 'label'
+          : strategy === 'placeholder' ? 'placeholder'
+            : strategy === 'testid' ? 'testId'
+              : undefined
+  if (strategyKey !== undefined && primary !== undefined && primary !== strategyKey) throw new Error('locator target conflicts with legacy locator strategy')
+  if (strategyKey !== undefined && target[strategyKey] === undefined && params.value !== undefined) target[strategyKey] = params.value
+  if (strategyKey === 'role' && params.name !== undefined && target.name === undefined) target.name = params.name
+  for (const key of ['exact', 'index', 'hasText', 'hasSelector'] as const) {
+    if (params[key] === undefined) continue
+    if (target[key] !== undefined && target[key] !== params[key]) throw new Error(`locator target conflicts with legacy ${key}`)
+    if (target[key] === undefined) target[key] = params[key]
+  }
+  if (params.selector !== undefined) {
+    if (target.selector !== undefined && target.selector !== params.selector) throw new Error('locator target conflicts with legacy selector')
+    if (primary !== undefined && primary !== 'selector') throw new Error('locator target conflicts with legacy selector')
+    if (target.selector === undefined) target.selector = params.selector
+  }
+  if (params.name !== undefined) {
+    if (target.name !== undefined && target.name !== params.name) throw new Error('locator target conflicts with legacy name')
+    if (primary !== undefined && primary !== 'role') throw new Error('locator target name narrowing requires role')
+    if (target.name === undefined) target.name = params.name
+  }
+}
+
+function absorbLocatorHandle(params: Record<string, JsonValue>): void {
+  const handle = isRecord(params.handle) ? params.handle : undefined
+  if (handle === undefined) return
+  for (const key of ['snapshotId', ...LOCATOR_LEGACY_KEYS] as const) {
+    const entry = handle[key]
+    if (entry === undefined) continue
+    if (params[key] === undefined || isBlankString(params[key])) params[key] = entry as JsonValue
+  }
+  const handleTarget = normalizeElementTarget(handle.target)
+  if (params.target === undefined && handleTarget !== undefined) params.target = handleTarget as JsonValue
+  params.handle = normalizeTabHandle(handle) as JsonValue
+}
+
+function normalizeLocatorParams(params: Record<string, JsonValue>): void {
+  absorbLocatorHandle(params)
+  if (params.index === -1) delete params.index
+  deleteBlankFields(params, ['snapshotId', 'strategy', 'selector', 'name', 'hasText', 'hasSelector'])
+  if (params.target !== undefined) {
+    const target = normalizeElementTarget(params.target)
+    if (target !== undefined && isRecord(target)) {
+      mergeLegacyLocatorFields(target as Record<string, JsonValue>, params)
+      params.target = target as JsonValue
+      for (const key of LOCATOR_LEGACY_KEYS) {
+        if (key === 'value' && params.strategy === undefined) continue
+        delete params[key]
+      }
+    } else {
+      delete params.target
+    }
+  }
+}
+
+function normalizeWaitParams(params: Record<string, JsonValue>): void {
+  deleteBlankFields(params, ['snapshotId', 'url', 'urlIncludes', 'text'])
+  if (params.target !== undefined) {
+    const target = normalizeElementTarget(params.target, true)
+    if (target === undefined) delete params.target
+    else params.target = target as JsonValue
+  }
+  const state = params.state === undefined ? 'load' : String(params.state)
+  if (['visible', 'hidden', 'enabled'].includes(state) && params.target !== undefined && params.exact !== undefined) {
+    const target = params.target
+    if (isRecord(target)) {
+      if (target.exact === undefined) target.exact = params.exact
+      delete params.exact
+    }
+  }
+}
+
+function normalizeBrowserToolArgs(name: string, raw: Record<string, JsonValue>): Record<string, JsonValue> {
+  const params = { ...raw }
+  deleteBlankFields(params, ['snapshotId', 'incarnation'])
+  if (SEMANTIC_INTERACTION_TOOLS.has(name)) {
+    deleteBlankFields(params, ['ref', 'selector'])
+    if (params.target !== undefined) {
+      const target = normalizeElementTarget(params.target, true)
+      if (target === undefined) delete params.target
+      else params.target = target as JsonValue
+    }
+  }
+  if (params.handle !== undefined && name !== 'browser_locator') params.handle = normalizeTabHandle(params.handle) as JsonValue
+  if (name === 'browser_locator') normalizeLocatorParams(params)
+  if (name === 'browser_wait') normalizeWaitParams(params)
+  return params
 }
 
 function validateElementIndex(value: unknown): void {
@@ -1710,7 +1873,9 @@ export function registerBrowserTools(
   const toolFor = (spec: BrowserToolSpec): ReturnType<typeof defineTool> => defineTool({
     name: spec.name,
     description: spec.description,
-    parameters: TAB_HANDLE_METHODS.has(spec.method) ? { ...spec.parameters, handle: TAB_HANDLE } : spec.parameters,
+    parameters: TAB_HANDLE_METHODS.has(spec.method)
+      ? { ...spec.parameters, handle: spec.name === 'browser_locator' ? LOCATOR_TAB_HANDLE : TAB_HANDLE }
+      : spec.parameters,
     output: {
       schema: { type: 'json' },
       render: renderResult,
@@ -1745,7 +1910,7 @@ export function registerBrowserTools(
         const activation = lazyTools ? activations.get(session) : undefined
         if (lazyTools && activation === undefined) throw inactiveBrowserError()
         await waitForWireBarrier(session, operationSignal)
-        let params = { ...args, sessionId } as Record<string, JsonValue>
+        let params = normalizeBrowserToolArgs(spec.name, { ...args, sessionId })
         if (spec.name === 'browser_mark_handoff' || spec.name === 'browser_mark_deliverable') params.turnId = turnNumberFor(session)
         validateRequestNumbers(params)
         if (spec.name === 'browser_wait') validateWaitRequest(params)
