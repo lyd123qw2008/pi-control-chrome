@@ -29,8 +29,9 @@ Treat a browser obstacle as a diagnosis problem, not a reason to repeat the last
 - Run `browser_status` before acting when the target browser is not already confirmed.
 - If `browser` or `browserId` is not the browser the user requested, stop. Do not use its tab ids or handles.
 - A Bridge may expose multiple connected browser targets. When more than one target is ready, select one with `browser_status` and its `browserId`, `/chrome profile <browserId>`, or the managed CLI `--browser-id`; never choose the newest connection, active window, or first list entry by assumption.
-- If `browserId` changes during a task, stop the task, refresh `browser_status`, and ask the user which browser should remain connected unless the user explicitly selected the new `browserId`.
-- Never recover by closing, navigating, or moving an existing user tab. Prefer an Agent tab.
+- Every complete tab handle includes `tabFence` and, when the page is script-accessible, a document `incarnation` made from URL, `performance.timeOrigin`, and a per-document token. Navigation invalidates snapshot refs, DOM-CUA node ids, dialog/file-chooser observations, and Network request-loader ids; reacquire the relevant snapshot or observation before acting.
+- A page operation checks the document identity before and after execution. If a side-effecting operation cannot prove that it ran against one document, treat `BROWSER_OPERATION_UNCERTAIN` as unknown and inspect before retrying; do not replay it automatically.
+- Debugger leases include the browser target, tab fence, attach epoch, and CDP target id. Ordinary cleanup will not detach a debugger target that is not tracked by the current extension runtime. Use stale-runtime recovery only after the user explicitly authorizes recovery; it verifies the persisted lease identity before and after detach.
 - Do not expose pairing tokens, cookies, passwords, access tokens, private keys, or unrelated page data in a diagnostic report.
 
 ### Multiple browser targets
@@ -121,7 +122,7 @@ After a navigation or DOM-changing action, obtain a fresh snapshot. Do not switc
 - For an upload, confirm the target file input and use `browser_upload`; never reveal unrelated local paths.
 - For a download, use `browser_download` to inspect status before retrying; do not repeatedly start a download whose completion is uncertain.
 - For clipboard failures, confirm the selected tab and retry only the requested clipboard operation.
-- For Console or Network data, enable the relevant capture on the current tab and report only data needed for the task.
+- For Console or Network data, enable the relevant capture on the current tab and report only data needed for the task. To retrieve a Network response body, pass both `requestId` and its matching `loaderId` from the current listing; reacquire both after navigation.
 - If a CDP method fails, prefer the higher-level browser tool before trying another raw method.
 
 ### Ownership, handoff, and cleanup trouble
@@ -176,13 +177,13 @@ Use these tools when available:
 - `browser_selected`: inspect the selected tab without changing it.
 - `browser_new_tab`: create an Agent-owned tab. Prefer `active: false` unless the user needs to see it.
 - `browser_select_tab`: select an existing tab explicitly.
-- `browser_snapshot`: inspect the page and obtain stable element refs before interacting.
-- `browser_accessibility_snapshot`: inspect semantic roles and accessible names.
+- `browser_snapshot`: inspect the page and obtain snapshot-scoped element refs before interacting; pass its `snapshotId` with any ref action.
+- `browser_accessibility_snapshot`: inspect semantic roles and accessible names; it returns the current snapshot's `snapshotId` for subsequent ref actions.
 - `browser_extract`: read bounded visible page text and simple Markdown.
-- `browser_locator`: use role, label, placeholder, text, test id, or CSS locators.
-- `browser_click`, `browser_double_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_scroll`: perform page actions.
+- `browser_locator`: use role + name, label, placeholder, text, test id, or CSS locators; require a single match or an explicit `index`.
+- `browser_click`, `browser_double_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_scroll`: perform page actions with a semantic `target`, a ref plus its matching `snapshotId`, or a CSS selector.
 - `browser_dom_cua` and `browser_cua`: use visible DOM or coordinate actions when a locator is not sufficient.
-- `browser_wait`: wait for page load, URL, or other tab state.
+- `browser_wait`: wait for page load, URL, text, text disappearance, or an element to become visible, hidden, or enabled. Use `text` for page text and `target` for element conditions. `hidden` succeeds when no visible match exists; `visible` and `enabled` require one visible match and reject multiple visible matches.
 - `browser_screenshot`: capture the current tab, saving it only when a path is needed.
 - `browser_evaluate`: run narrowly scoped page JavaScript when the supported browser tools are insufficient.
 - `browser_cdp`: use a specific CDP method only when the higher-level tool does not expose the required capability.
@@ -190,7 +191,7 @@ Use these tools when available:
 - `browser_upload`, `browser_download`, and `browser_clipboard`: use only when required by the user's task.
 - `browser_claim_tab` and `browser_release`: take and release ownership of an existing user tab.
 - `browser_mark_handoff` and `browser_mark_deliverable`: preserve an Agent tab through the current turn cleanup; repeat the mark in a later turn when it is still needed.
-- `browser_cleanup`: after explicit user authorization, immediately finalize the current browser task by closing allowed temporary Agent tabs and releasing claimed user tabs without hiding tools or stopping the Bridge.
+- `browser_cleanup`: after explicit user authorization, immediately finalize the current browser task by closing allowed temporary Agent tabs and releasing claimed user tabs without hiding tools or stopping the Bridge. If an extension runtime changed, pass `recoverStale: true` only after an explicit recovery decision; this forgets unknown-incarnation ownership records without closing those tabs and returns their ids in `recovered` for manual inspection.
 - `browser_context_reset`: explicitly finalize resources and reset the current browser context; use it only when the model needs browser tools deactivated.
 - `browser_close_tab`: close a tab only when it is Agent-owned or the user explicitly asks for it.
 
@@ -200,10 +201,11 @@ Use these tools when available:
 2. Run `browser_tabs` or `browser_selected` to identify the target tab.
 3. For an existing user tab, confirm its title and URL before acting.
 4. Run `browser_snapshot` or `browser_accessibility_snapshot` before clicking or filling.
-5. Prefer stable refs from the latest snapshot or semantic locators over coordinates.
-6. After navigation or a meaningful action, take a fresh snapshot because refs can become stale.
-7. Verify the visible result with a snapshot, extract, URL wait, or evaluation.
-8. Do not call `browser_cleanup` merely because the turn or browser task appears complete. The host performs Codex-style turn cleanup automatically; call `browser_cleanup` only when the user explicitly asks for immediate cleanup.
+5. Prefer semantic targets (`role` + `name`, `label`, `placeholder`, `text`, or `testId`) for common interactions; use a ref from the latest snapshot only with that snapshot's `snapshotId`, or use a CSS selector when appropriate.
+6. Use `browser_wait` for asynchronous text or element states before proceeding; include `url` or `urlIncludes` when the page identity matters.
+7. After navigation or a meaningful action, take a fresh snapshot because refs can become stale.
+8. Verify the visible result with a snapshot, extract, URL wait, or evaluation.
+9. Do not call `browser_cleanup` merely because the turn or browser task appears complete. The host performs turn cleanup automatically; call it only when the user explicitly asks for immediate cleanup.
 
 Do not reuse a ref after navigation or a DOM-changing action. If a tab handle reports stale state, call `browser_tabs` again and obtain a fresh handle.
 

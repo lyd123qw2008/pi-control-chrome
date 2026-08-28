@@ -16,7 +16,15 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Provides DOM, accessibility, locator, coordinate, and native CDP controls.
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text.
 - Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
+- Persists debugger lease identity across an MV3 worker restart. Ordinary cleanup reports an unverified old lease instead of detaching an untracked target; explicit stale recovery verifies the current tab fence and CDP target identity before detaching it.
+- Fences tab handles with a tab incarnation and document identity. Navigation invalidates page snapshots, locator refs, DOM-CUA node ids, dialog/file-chooser observations, and Network request-loader mappings; side-effecting operations that lose that identity return an uncertain result and are not replayed automatically.
 - Includes a reusable `pi-control-chrome` Skill. Browser tool schemas are hidden until that Skill is explicitly loaded for the current session; the bundled CLI remains available for explicit human/developer workflows and tests.
+
+## Semantic page interaction
+
+The common click and form tools accept a semantic `target` such as `{ "role": "button", "name": "Submit" }`, `{ "label": "Email" }`, `{ "placeholder": "Search" }`, `{ "text": "Next" }`, or `{ "testId": "submit-button" }`. Semantic interactions wait for one visible match and fail closed when a target is missing, hidden, disabled, or ambiguous; use an explicit zero-based `index` only when multiple matches are intentional. `browser_snapshot` returns snapshot-scoped `eN` refs and a `snapshotId`; pass that `snapshotId` with every ref-based interaction or element-state wait. CSS selectors remain supported.
+
+Text targets used by action and element-state locators project a matching text leaf to its nearest actionable ancestor, so `isEnabled` and `browser_wait` report the state of the control that receives the action. `browser_wait` supports `load`, `url`, `text`, `text_gone`, `visible`, `hidden`, and `enabled`. Text conditions use `text`; element conditions use the same semantic `target` accepted by interactions. `url` and `urlIncludes` can constrain every wait condition. `hidden` succeeds when the target has no visible matches, including an absent target or multiple hidden matches; `visible` and `enabled` require one visible match, and multiple visible matches fail closed. Browser page matching runs inside the selected tab, while the Bridge continues to enforce the existing browser target and connection-generation fence. If a side-effecting interaction loses its injected result after navigation, it reports an uncertain outcome and is never replayed automatically.
 
 ## Architecture
 
@@ -30,7 +38,7 @@ Chrome / Edge Manifest V3 Extension
 Current Chromium Profile
 ```
 
-The Bridge binds to loopback and requires a local pairing token. Host-launched instances expose a non-secret instance id, launcher label and capability list; any paired DSH or Pi Host in the same local-user control domain may request a cooperative restart when the Bridge exposes `capabilities.localUserRestart: true` and has no pending browser request. The instance id prevents stale restart races, and a restart lock serializes concurrent requests. Unknown legacy Bridges remain untouched when they do not expose the local-user capability. Installing the extension and completing local pairing are the trust steps; normal browser operations do not request repeated per-action authorization.
+The Bridge binds to loopback and requires a local pairing token for WebSocket operations. Its `/pair` bootstrap response is intentionally available to any caller on that loopback port so an unpacked extension can pair without reading the host token file; any local process or installed extension that can reach the port is therefore trusted with browser control. Keep the Bridge port off network proxies. Host-launched instances expose a non-secret instance id, launcher label and capability list; any paired DSH or Pi Host in the same local-user control domain may request a cooperative restart when the Bridge exposes `capabilities.localUserRestart: true` and has no pending browser request. The instance id prevents stale restart races, and a restart lock serializes concurrent requests. Unknown legacy Bridges remain untouched when they do not expose the local-user capability. Installing the extension and completing local pairing are the trust steps; normal browser operations do not request repeated per-action authorization.
 
 ## Installation
 
@@ -90,19 +98,19 @@ node skills/pi-control-chrome/scripts/browser.mjs status --browser-id <browserId
 node skills/pi-control-chrome/scripts/browser.mjs tabs --browser-id <browserId> --json
 node skills/pi-control-chrome/scripts/browser.mjs group --browser-id <browserId> --json
 node skills/pi-control-chrome/scripts/browser.mjs view https://example.com --browser-id <browserId> --session example-session --turn 1 --screenshot "$env:TEMP\example.png"
-node skills/pi-control-chrome/scripts/browser.mjs cleanup --browser-id <browserId> --session <session-id>
+node skills/pi-control-chrome/scripts/browser.mjs cleanup --browser-id <browserId> --session <session-id> [--recover-stale]
 ```
 
-Managed CLI commands use explicit lifecycle identity: `open` and `cleanup` require `--session <id>`, and `view` requires both `--session <id>` and `--turn <n>` unless it is explicitly temporary. The CLI does not derive ownership from a process id, so a later invocation can address the same tabs safely.
+Managed CLI commands use explicit lifecycle identity: `open` and `cleanup` require `--session <id>`, and `view` requires both `--session <id>` and `--turn <n>` unless it is explicitly temporary. The CLI does not derive ownership from a process id, so a later invocation can address the same tabs safely. Use `cleanup --recover-stale` only for an explicit recovery decision after an extension runtime change; it forgets matching unknown-incarnation ownership records without closing those tabs and reports their ids in `recovered` for manual inspection.
 
-The bundled scripts support these environment variables. The Pi extension also accepts `PI_CONTROL_CHROME_BRIDGE_PORT` when the local Bridge uses another loopback port:
+The bundled scripts support these environment variables. The Pi extension also accepts `PI_CONTROL_CHROME_BRIDGE_PORT` when the local Bridge uses another loopback port; its host remains `127.0.0.1`:
 
 ```text
-PI_CONTROL_CHROME_BRIDGE_HOST
-PI_CONTROL_CHROME_BRIDGE_PORT
+PI_CONTROL_CHROME_BRIDGE_HOST   # bundled CLI only
+PI_CONTROL_CHROME_BRIDGE_PORT   # bundled CLI and Pi extension
 ```
 
-The Pi extension keeps the default port at `17318`; set `PI_CONTROL_CHROME_BRIDGE_PORT` only when the local Bridge uses another loopback port.
+The checked-in browser extension still connects to `127.0.0.1:17318` and its manifest CSP allowlist is fixed to that endpoint. Use a matching rebuilt extension and CSP before pointing the Pi extension or DSH client at another endpoint.
 
 Use the native `browser_*` Pi or DSH tools for model browser work. They preserve the current Agent session, target identity, and tab ownership protections.
 
@@ -137,7 +145,7 @@ $env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
 npm run smoke:e2e
 ```
 
-This uses an isolated temporary browser profile and does not touch the normal user profile. The installed Google Chrome may reject command-line unpacked-extension flags; load `extension/` manually from `chrome://extensions` for a normal-profile check.
+This requests a unique temporary `--user-data-dir` rather than the normal user profile. The harness fails if the browser process exits before the extension handshake, which detects common Windows singleton delegation; Chrome for Testing provides the most reliable isolated executable. The installed Google Chrome may reject command-line unpacked-extension flags; load `extension/` manually from `chrome://extensions` for a normal-profile check.
 
 ## Design principles
 

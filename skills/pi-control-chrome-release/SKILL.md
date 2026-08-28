@@ -136,7 +136,7 @@ Restart DSH after the Profile install. Load the separate `pi-control-chrome` Ski
 - Bridge health reports the target root version;
 - the extension is connected;
 - `targetStability.stable: true`;
-- `turnCleanup`, `turnScopedMarks`, `retainedCleanup`, and `debuggerLeaseRecovery` are available;
+- `turnCleanup`, `turnScopedMarks`, `retainedCleanup`, `debuggerLeaseRecovery`, and `tabIncarnationFence` are available;
 - a read-only browser operation succeeds.
 
 The extension Manifest version may differ from the npm root package version. Use Bridge health, Profile dependency resolution, and npm metadata together.

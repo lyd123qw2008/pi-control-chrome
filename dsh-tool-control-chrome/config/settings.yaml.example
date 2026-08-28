@@ -1,6 +1,7 @@
 # Copy this section to <DSH_HOME>/settings.yaml.
 # Keep the pairing token in the referenced file; never paste the token here.
 control-chrome:
+  # The checked-in extension connects to 127.0.0.1:17318; custom values require a matching extension build and CSP.
   bridgeHost: 127.0.0.1
   bridgePort: 17318
   tokenFile: C:/Users/<user>/.pi/agent/pi-control-chrome.token

@@ -10,7 +10,7 @@ import { WebSocketServer } from "ws";
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("..", import.meta.url));
 const script = join(root, "skills", "pi-control-chrome", "scripts", "browser.mjs");
-const capabilities = { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true };
+const capabilities = { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true };
 
 function runScript(port, ...args) {
   return execFileAsync(process.execPath, [script, ...args], {
@@ -23,6 +23,7 @@ function runScript(port, ...args) {
 
 test("browser CLI sends session and turn context with retention marks", async () => {
   let nextTabId = 40;
+  let groupingReady = true;
   const tabs = new Map();
   const markRequests = [];
   const routedRequests = [];
@@ -55,7 +56,7 @@ test("browser CLI sends session and turn context with retention marks", async ()
       } else if (message.method === "wait") {
         result = { tab: tabs.get(Number(message.params.tabId)) };
       } else if (message.method === "list_tabs") {
-        result = { browser: "edge", browserId: "edge:test", profile: "profile", tabs: [...tabs.values()], groups: [{ id: 1, title: "Pi", color: "blue" }] };
+        result = { browser: "edge", browserId: "edge:test", profile: "profile", tabs: [...tabs.values()].map(tab => ({ ...tab, groupId: groupingReady ? 1 : -1 })), groups: [{ id: 1, title: "Pi", color: "blue" }] };
       } else if (message.method === "mark_handoff" || message.method === "mark_deliverable") {
         markRequests.push({ method: message.method, params: message.params });
         const tab = tabs.get(Number(message.params.tabId));
@@ -82,6 +83,11 @@ test("browser CLI sends session and turn context with retention marks", async ()
       method: "mark_handoff",
       params: { tabId: 41, sessionId: "cli-session", turnId: 4, expectedBrowserId: "edge:test" },
     }]);
+     groupingReady = false;
+     await assert.rejects(
+       runScript(port, "open", "https://example.test/not-grouped", "--inactive", "--browser-id", "edge:test", "--session", "cli-session", "--json"),
+       error => error.stderr.includes("did not reach the Agent-owned Pi group"),
+     );
   } finally {
     websocket.close();
     await new Promise((resolve) => server.close(resolve));

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, get as httpGet } from "node:http";
+import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -11,8 +12,25 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const bridge = join(root, "bridge", "server.mjs");
 const extensionSource = process.env.PI_CONTROL_CHROME_EXTENSION || join(root, "extension");
 const browserExecutable = process.env.PI_CONTROL_CHROME_BROWSER || "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
-const bridgePort = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
-const pagePort = 18180;
+
+async function freeTcpPort() {
+  const probe = createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  const port = address && typeof address !== "string" ? address.port : undefined;
+  await new Promise((resolve) => probe.close(resolve));
+  if (!port) throw new Error("Could not reserve a free Bridge port");
+  return port;
+}
+
+const configuredBridgePort = process.env.PI_CONTROL_CHROME_BRIDGE_PORT;
+const bridgePort = configuredBridgePort === undefined ? await freeTcpPort() : Number(configuredBridgePort);
+if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65535) throw new Error("PI_CONTROL_CHROME_BRIDGE_PORT must be a valid TCP port");
+const bridgeStartupMarker = `e2e-${process.pid}-${randomUUID()}`;
+let pagePort;
 
 if (!existsSync(browserExecutable)) {
   console.log(`SKIP: browser executable not found: ${browserExecutable}`);
@@ -28,7 +46,44 @@ const backgroundFile = join(extension, "background.js");
 writeFileSync(backgroundFile, readFileSync(backgroundFile, "utf8").replaceAll("127.0.0.1:17318", `127.0.0.1:${bridgePort}`));
 const manifestFile = join(extension, "manifest.json");
 writeFileSync(manifestFile, readFileSync(manifestFile, "utf8").replaceAll("127.0.0.1:17318", `127.0.0.1:${bridgePort}`));
-const site = `<!doctype html><title>Pi Control Chrome E2E</title><h1>Pi Control Chrome E2E</h1><label>Name <input id="name" placeholder="Name"></label><label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label><label><input id="agree" type="checkbox"> Agree</label><input id="file" type="file"><button id="go" data-testid="submit-button">Submit</button><button id="dialog" type="button">Dialog</button><div id="out"></div><script>document.querySelector('#go').addEventListener('click',()=>document.querySelector('#out').textContent='Hello '+document.querySelector('#name').value);document.querySelector('#dialog').addEventListener('click',()=>setTimeout(()=>alert('e2e-dialog'),0));console.log('page-ready');</script>`;
+const site = `<!doctype html>
+<title>Pi Control Chrome E2E</title>
+<style>#delayed-action,#ambiguous-a,#ambiguous-b,#hidden-action{display:none}</style>
+<h1>Pi Control Chrome E2E</h1>
+<div id="async-status">Loading...</div>
+<label>Name <input id="name" placeholder="Name"></label>
+<label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label>
+<label><input id="agree" type="checkbox"> Agree</label>
+<label for="email">Email</label><input id="email" placeholder="Email">
+<input id="readonly" value="secret-value" readonly>
+<label for="editor">Editor</label><div id="editor" role="textbox" contenteditable></div>
+<input id="file" type="file">
+<button id="go" data-testid="submit-button">Submit</button>
+<button id="dialog" type="button">Dialog</button>
+<span id="aria-name">Accessible action</span><button id="aria-button" aria-labelledby="aria-name">Icon</button>
+<button id="aria-label-button" aria-label="Labelled action">Icon</button>
+<button id="hidden-action">Hidden action</button>
+<main><button id="text-action">Text <span>target</span><br>now</button></main>
+<button id="delayed-action" data-testid="delayed-button">Ready action</button>
+<button id="disabled-action" disabled>Disabled action</button>
+<button id="disabled-nested" disabled data-probe="disabled-button"><span>Disabled nested</span></button>
+<div id="nested-editor" contenteditable><span>Nested editor</span></div>
+<button id="ambiguous-a">Ambiguous</button><button id="ambiguous-b">Ambiguous</button>
+<div id="out"></div>
+<script>
+const marker = new URLSearchParams(location.search).get('marker');
+if (marker) document.querySelector('h1').textContent = marker;
+const out = document.querySelector('#out');
+document.querySelector('#go').addEventListener('click', () => { out.textContent = 'Hello ' + document.querySelector('#name').value; });
+document.querySelector('#dialog').addEventListener('click', () => setTimeout(() => alert('e2e-dialog'), 0));
+console.log('page-ready');
+setTimeout(() => {
+  document.querySelector('#async-status').textContent = 'Async ready';
+  document.querySelector('#delayed-action').style.display = 'block';
+  document.querySelector('#ambiguous-a').style.display = 'block';
+  document.querySelector('#ambiguous-b').style.display = 'block';
+}, 350);
+</script>`;
 const uploadPath = join(temp, "upload.txt");
 writeFileSync(join(temp, "index.html"), site);
 writeFileSync(uploadPath, "pi-control-chrome upload test");
@@ -54,9 +109,38 @@ function spawnProcess(command, args) {
   return spawn(command, args, { stdio: "ignore", windowsHide: true });
 }
 
-function stopProcess(child) {
+function waitForExit(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      child.off("exit", finish);
+      child.off("error", finish);
+      resolve();
+    };
+    child.once("exit", finish);
+    child.once("error", finish);
+    timer = setTimeout(finish, timeoutMs);
+  });
+}
+
+async function stopProcess(child) {
   if (!child?.pid) return;
-  spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+  await new Promise((resolve) => {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    killer.once("close", resolve);
+    killer.once("error", resolve);
+  });
+  await waitForExit(child);
+}
+
+async function closeSocket(client) {
+  if (!client || client.readyState === WebSocket.CLOSED) return;
+  await new Promise((resolve) => {
+    client.once("close", resolve);
+    client.close();
+  });
 }
 
 const siteServer = createServer((req, res) => {
@@ -70,17 +154,46 @@ const siteServer = createServer((req, res) => {
     res.end("downloaded by pi-control-chrome");
     return;
   }
+  if (req.url?.startsWith("/slow")) {
+    setTimeout(() => {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(site);
+    }, 400);
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(site);
 });
-await new Promise((resolve) => siteServer.listen(pagePort, "127.0.0.1", resolve));
-const bridgeProcess = spawnProcess(process.execPath, [bridge, "--port", String(bridgePort), "--token-file", tokenFile]);
+await new Promise((resolve, reject) => {
+  siteServer.once("error", reject);
+  siteServer.listen(0, "127.0.0.1", () => {
+    const address = siteServer.address();
+    if (!address || typeof address === "string") {
+      reject(new Error("E2E site server did not expose a TCP port"));
+      return;
+    }
+    pagePort = address.port;
+    resolve();
+  });
+});
+const bridgeProcess = spawnProcess(process.execPath, [bridge, "--port", String(bridgePort), "--token-file", tokenFile, "--started-by", "pi", "--startup-marker", bridgeStartupMarker]);
 let edgeProcess;
+let socket;
 try {
+  let bridgeHealth;
   for (let i = 0; i < 50; i++) {
-    try { if ((await localGet("/health")).body.ok) break; } catch {}
+    try {
+      if (bridgeProcess.exitCode !== null) throw new Error(`Bridge process exited before binding to port ${bridgePort}; isolated launch failed (exit=${bridgeProcess.exitCode})`);
+      bridgeHealth = (await localGet("/health")).body;
+      if (bridgeHealth.ok === true && bridgeHealth.startupMarker === bridgeStartupMarker && typeof bridgeHealth.instanceId === "string" && bridgeHealth.instanceId.length > 0) break;
+    } catch {}
     await sleep(100);
   }
+  assert.equal(bridgeHealth?.ok, true, `Bridge did not become healthy on port ${bridgePort}: ${JSON.stringify(bridgeHealth)}`);
+  assert.equal(typeof bridgeHealth.instanceId, "string");
+  assert.ok(bridgeHealth.instanceId.length > 0);
+   assert.equal(bridgeHealth.startupMarker, bridgeStartupMarker);
+   assert.equal(bridgeHealth.startedBy, "pi");
 
   edgeProcess = spawnProcess(browserExecutable, [
     `--user-data-dir=${profile}`,
@@ -94,32 +207,42 @@ try {
   let health;
   for (let i = 0; i < 120; i++) {
     await sleep(250);
+    if (edgeProcess.exitCode !== null) throw new Error(`browser process exited before extension handshake; isolated launch may have been delegated (exit=${edgeProcess.exitCode})`);
     try {
       health = (await localGet("/health")).body;
       if (health.extensionConnected) break;
     } catch {}
   }
+  if (edgeProcess.exitCode !== null) throw new Error(`browser process exited before extension handshake; isolated launch may have been delegated (exit=${edgeProcess.exitCode})`);
   assert.equal(health?.extensionConnected, true, `extension did not connect: ${JSON.stringify(health)}`);
+  assert.equal(health.instanceId, bridgeHealth.instanceId);
+  assert.equal(health.port, bridgePort);
   await sleep(1500);
 
   const token = readFileSync(tokenFile, "utf8").trim();
-  const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=pi&token=${encodeURIComponent(token)}`);
+  socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=pi&token=${encodeURIComponent(token)}`);
   await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
   let sequence = 0;
   const request = (method, params = {}) => {
-    const id = `e2e-${++sequence}`;
+    const requestParams = params.sessionId === undefined ? { ...params, sessionId: "e2e-session" } : params;
+     const id = `e2e-${++sequence}`;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`request timeout: ${method}`)), 15000);
+      const timer = setTimeout(() => reject(new Error(`request timeout: ${method} ${JSON.stringify(params)}`)), 15000);
       const onMessage = (raw) => {
         const message = JSON.parse(raw.toString());
         if (message.type !== "response" || message.id !== id) return;
         clearTimeout(timer);
         socket.off("message", onMessage);
-        if (message.error) reject(new Error(message.error.message));
+        if (message.error) {
+          const error = new Error(message.error.message);
+          error.code = message.error.code;
+          error.details = message.error.details;
+          reject(error);
+        }
         else resolve(message.result);
       };
       socket.on("message", onMessage);
-      socket.send(JSON.stringify({ type: "request", id, method, params }));
+      socket.send(JSON.stringify({ type: "request", id, method, params: requestParams }));
     });
   };
 
@@ -135,10 +258,81 @@ try {
   });
   assert.equal(claimed.claimed.owner, "user");
   assert.equal(claimed.claimed.ownership, "claimed");
+  const orderedNavigation = request("navigate", { tabId: selected.tab.id, url: `http://127.0.0.1:${pagePort}/slow?marker=Ordered%20page`, wait: true, timeoutMs: 5000 });
+  const orderedWait = request("wait", { state: "text", text: "Ordered page", exact: true, timeoutMs: 5000 });
+  const [, orderedResult] = await Promise.all([orderedNavigation, orderedWait]);
+  assert.equal(orderedResult.matched, true);
   await request("navigate", { tabId: selected.tab.id, url: `http://127.0.0.1:${pagePort}/`, wait: true });
   await request("wait", { tabId: selected.tab.id, state: "url", urlIncludes: `127.0.0.1:${pagePort}`, timeoutMs: 5000 });
-  await sleep(600);
-  const snapshot = await request("snapshot", { tabId: selected.tab.id });
+  const loadingGone = await request("wait", { tabId: selected.tab.id, state: "text_gone", text: "Loading...", timeoutMs: 5000 });
+  assert.equal(loadingGone.matched, true);
+  const asyncReady = await request("wait", { tabId: selected.tab.id, state: "text", text: "Async ready", exact: true, timeoutMs: 5000 });
+  assert.equal(asyncReady.matched, true);
+  const exactText = await request("wait", { tabId: selected.tab.id, state: "text", text: "Text target now", exact: true, timeoutMs: 5000 });
+  assert.equal(exactText.matched, true);
+  const nestedTextTarget = { text: "Disabled nested", exact: true };
+  const nestedTextCount = await request("locator", { tabId: selected.tab.id, target: nestedTextTarget, locator: nestedTextTarget, action: "count" });
+  assert.equal(nestedTextCount.result, 1);
+  const nestedTextAttribute = await request("locator", { tabId: selected.tab.id, target: nestedTextTarget, locator: nestedTextTarget, action: "getAttribute", attribute: "data-probe" });
+  assert.equal(nestedTextAttribute.result, null);
+  const nestedTextEnabled = await request("locator", { tabId: selected.tab.id, target: nestedTextTarget, locator: nestedTextTarget, action: "isEnabled" });
+  assert.equal(nestedTextEnabled.result, false);
+  await assert.rejects(() => request("wait", {
+    tabId: selected.tab.id,
+    state: "enabled",
+    target: nestedTextTarget,
+    timeoutMs: 400,
+  }), /Timed out waiting for page condition enabled/);
+  const nestedEditorTarget = { role: "textbox", hasText: "Nested editor", exact: true };
+  const nestedEditorCount = await request("locator", { tabId: selected.tab.id, target: nestedEditorTarget, locator: nestedEditorTarget, action: "count" });
+  assert.equal(nestedEditorCount.result, 1);
+  await request("locator", { tabId: selected.tab.id, target: nestedEditorTarget, locator: nestedEditorTarget, action: "fill", value: "Nested updated", timeoutMs: 5000 });
+  const canceledWait = assert.rejects(() => request("wait", {
+    tabId: selected.tab.id,
+    state: "text",
+    text: "Cancellation target never appears",
+    sessionId: "cancellation-session",
+    timeoutMs: 10000,
+  }), /Browser wait aborted by lifecycle cleanup/);
+  await sleep(150);
+  const cleanupStarted = Date.now();
+  const cancellationCleanup = await request("cleanup", { sessionId: "cancellation-session", mode: "task" });
+  assert.ok(Date.now() - cleanupStarted < 3000);
+  assert.deepEqual(cancellationCleanup.failed, []);
+  await canceledWait;
+  const delayedVisible = await request("wait", {
+    tabId: selected.tab.id,
+    state: "visible",
+    target: { role: "button", name: "Ready action", exact: true },
+    timeoutMs: 5000,
+  });
+  assert.equal(delayedVisible.matched, true);
+  const submitEnabled = await request("wait", {
+    tabId: selected.tab.id,
+    state: "enabled",
+    target: { role: "button", name: "Submit", exact: true },
+    timeoutMs: 5000,
+  });
+  assert.equal(submitEnabled.matched, true);
+  const absentHidden = await request("wait", {
+    tabId: selected.tab.id,
+    state: "hidden",
+    target: { text: "Never rendered", exact: true },
+    timeoutMs: 5000,
+  });
+  assert.equal(absentHidden.matched, true);
+  await assert.rejects(() => request("wait", {
+    tabId: selected.tab.id,
+    state: "enabled",
+    target: { role: "button", name: "Disabled action", exact: true },
+    timeoutMs: 300,
+  }), /Timed out waiting for page condition enabled/);
+  await sleep(100);
+  const staleSnapshot = await request("snapshot", { tabId: selected.tab.id });
+   const staleButton = staleSnapshot.snapshot.elements.find((element) => element.tag === "button");
+   await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-stale-test', '1')" });
+   await assert.rejects(() => request("interaction", { tabId: selected.tab.id, operation: "click", ref: staleButton.ref, snapshotId: staleSnapshot.snapshot.snapshotId }), /Snapshot is stale/);
+   const snapshot = await request("snapshot", { tabId: selected.tab.id });
   const input = snapshot.snapshot.elements.find((element) => element.tag === "input");
   const button = snapshot.snapshot.elements.find((element) => element.tag === "button");
   assert.ok(input?.ref);
@@ -146,10 +340,40 @@ try {
   assert.ok(snapshot.snapshot.accessibility?.children?.some((node) => node.role === "button"));
   const extracted = await request("extract", { tabId: selected.tab.id });
   assert.match(extracted.content.markdown, /Pi Control Chrome E2E/);
-  await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: input.ref, value: "Pi" });
-  await request("interaction", { tabId: selected.tab.id, operation: "click", ref: button.ref });
+  await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: input.ref, snapshotId: snapshot.snapshot.snapshotId, value: "Pi" });
+  const afterFillSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const afterFillButton = afterFillSnapshot.snapshot.elements.find((element) => element.tag === "button");
+  await request("interaction", { tabId: selected.tab.id, operation: "click", ref: afterFillButton.ref, snapshotId: afterFillSnapshot.snapshot.snapshotId });
   const after = await request("snapshot", { tabId: selected.tab.id });
   assert.match(after.snapshot.text, /Hello Pi/);
+  const semanticFill = await request("interaction", {
+    tabId: selected.tab.id,
+    operation: "fill",
+    target: { label: "Name", exact: true },
+    value: "Semantic",
+    timeoutMs: 5000,
+  });
+  assert.equal(semanticFill.result?.element?.tag, "input");
+  const semanticInput = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').value" });
+  assert.equal(semanticInput.result?.result?.value, "Semantic");
+  await request("interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    target: { role: "button", name: "Submit", exact: true },
+    timeoutMs: 5000,
+  });
+  const semanticAfter = await request("snapshot", { tabId: selected.tab.id });
+  assert.match(semanticAfter.snapshot.text, /Hello Semantic/);
+  await assert.rejects(() => request("interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    target: { role: "button", name: "Ambiguous", exact: true },
+    timeoutMs: 1000,
+  }), (error) => {
+    assert.equal(error.code, "ELEMENT_TARGET_AMBIGUOUS");
+    assert.equal(error.details?.count, 2);
+    return true;
+  });
   const evaluated = await request("evaluate", { tabId: selected.tab.id, expression: "document.title" });
   assert.equal(evaluated.result?.result?.value, "Pi Control Chrome E2E");
 
@@ -165,6 +389,65 @@ try {
     action: "count",
   });
   assert.equal(placeholderCount.result, 1);
+  const semanticAriaLabelledByCount = await request("locator", {
+    tabId: selected.tab.id,
+    locator: { role: "button", name: "Accessible action", exact: true },
+    action: "count",
+  });
+  assert.equal(semanticAriaLabelledByCount.result, 1);
+  const semanticAriaLabelCount = await request("locator", {
+    tabId: selected.tab.id,
+    locator: { role: "button", name: "Labelled action", exact: true },
+    action: "count",
+  });
+  assert.equal(semanticAriaLabelCount.result, 1);
+  const semanticEmailFill = await request("interaction", {
+    tabId: selected.tab.id,
+    operation: "fill",
+    target: { label: "Email", exact: true },
+    value: "email@example.test",
+    timeoutMs: 5000,
+  });
+  assert.equal(semanticEmailFill.result?.element?.tag, "input");
+  const semanticEmail = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#email').value" });
+  assert.equal(semanticEmail.result?.result?.value, "email@example.test");
+  const semanticLabelCount = await request("locator", {
+    tabId: selected.tab.id,
+    locator: { label: "Name", exact: true },
+    action: "count",
+  });
+  assert.equal(semanticLabelCount.result, 1);
+  const textLocator = { text: "Text target now", exact: true };
+  const textLocatorCount = await request("locator", { tabId: selected.tab.id, target: textLocator, locator: textLocator, action: "count" });
+  assert.equal(textLocatorCount.result, 1);
+  const textLocatorClick = await request("locator", { tabId: selected.tab.id, target: textLocator, locator: textLocator, action: "click", timeoutMs: 5000 });
+  assert.equal(textLocatorClick.result?.element?.tag, "button");
+  const ariaLocator = { role: "button", name: "Labelled action", exact: true };
+  const ariaLocatorClick = await request("locator", { tabId: selected.tab.id, target: ariaLocator, locator: ariaLocator, action: "click", timeoutMs: 5000 });
+  assert.equal(ariaLocatorClick.result?.element?.tag, "button");
+  const hiddenLocator = { role: "button", name: "Hidden action", exact: true };
+  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: hiddenLocator, locator: hiddenLocator, action: "click", timeoutMs: 300 }), /Timed out waiting for visible element target/);
+  const disabledLocator = { role: "button", name: "Disabled action", exact: true };
+  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: disabledLocator, locator: disabledLocator, action: "click", timeoutMs: 300 }), /Element target is disabled/);
+  const readonlyLocator = { selector: "#readonly" };
+  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: readonlyLocator, locator: readonlyLocator, action: "fill", value: "changed", timeoutMs: 5000 }), /Element target is not editable/);
+  const ambiguousLocatorTarget = { role: "button", name: "Ambiguous", exact: true };
+  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: ambiguousLocatorTarget, locator: ambiguousLocatorTarget, action: "click", timeoutMs: 1000 }), (error) => {
+    assert.equal(error.code, "ELEMENT_TARGET_AMBIGUOUS");
+    assert.equal(error.details?.count, 2);
+    return true;
+  });
+  const editorFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", target: { label: "Editor", exact: true }, value: "Editable", timeoutMs: 5000 });
+  assert.equal(editorFill.result?.element?.tag, "div");
+  const editorValue = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#editor').textContent" });
+  assert.equal(editorValue.result?.result?.value, "Editable");
+  assert.equal(semanticLabelCount.result, 1);
+  const semanticTestIdCount = await request("locator", {
+    tabId: selected.tab.id,
+    locator: { testId: "submit-button" },
+    action: "count",
+  });
+  assert.equal(semanticTestIdCount.result, 1);
   const filteredLocator = await request("locator", {
     tabId: selected.tab.id,
     locator: { strategy: "css", value: "label" },
@@ -192,10 +475,17 @@ try {
   const controlState = await request("evaluate", { tabId: selected.tab.id, expression: "JSON.stringify({choice:document.querySelector('#choice').value,checked:document.querySelector('#agree').checked})" });
   assert.deepEqual(JSON.parse(controlState.result?.result?.value), { choice: "two", checked: true });
 
-  const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+  const staleVisibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+   const staleDomButton = staleVisibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
+           await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-dom-stale-test', '1')" });
+           await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: staleDomButton.node_id, snapshotId: staleVisibleDom.dom.snapshotId }), /DOM snapshot is stale/);
+   const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
   const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
   assert.ok(domButton?.node_id);
-  await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domButton.node_id });
+  await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domButton.node_id, snapshotId: visibleDom.dom.snapshotId });
+   const freshDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+   const freshButton = freshDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
+   await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "type", nodeId: freshButton.node_id, snapshotId: freshDom.dom.snapshotId, value: "invalid" }), /not editable/);
   const inputRect = input.rect;
   await request("cua", { tabId: selected.tab.id, action: "click", x: inputRect.x + 4, y: inputRect.y + 4 });
   await request("cua", { tabId: selected.tab.id, action: "type", text: " CUA" });
@@ -210,7 +500,7 @@ try {
   const network = await request("network_requests", { tabId: selected.tab.id });
   const apiResponse = network.requests.find((entry) => entry.event === "response" && entry.url.endsWith("/api/data") && entry.status === 200);
   assert.ok(apiResponse?.requestId);
-  const responseBody = await request("network_response_body", { tabId: selected.tab.id, requestId: apiResponse.requestId });
+  const responseBody = await request("network_response_body", { tabId: selected.tab.id, requestId: apiResponse.requestId, loaderId: apiResponse.loaderId });
   assert.match(responseBody.result?.body || "", /pi-control-chrome|e2e/);
 
   await request("evaluate", { tabId: selected.tab.id, expression: "setTimeout(()=>alert('e2e-dialog'),100); 'scheduled'" });
@@ -261,7 +551,7 @@ try {
   assert.equal(group.color, "blue");
 
   await assert.rejects(() => request("close_tab", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
-  await assert.rejects(() => request("mark_handoff", { tabId: created.tab.id, sessionId: "other-session" }), /another Agent session/);
+  await assert.rejects(() => request("mark_handoff", { tabId: created.tab.id, sessionId: "other-session", turnId: 1 }), /another Agent session/);
   await assert.rejects(() => request("release", { tabId: selected.tab.id, sessionId: "other-session" }), /another Agent session/);
   await request("mark_handoff", { tabId: created.tab.id, sessionId: "e2e-session", turnId: 1 });
   const temporary = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-session" });
@@ -279,7 +569,7 @@ try {
   const staleMarkCleanup = await request("cleanup", { sessionId: "e2e-session", mode: "turn", turnId: 2, expectedBrowserId: listed.browserId });
   assert.equal(staleMarkCleanup.removed.includes(created.tab.id), true);
 
-  socket.close();
+  await closeSocket(socket);
   console.log(JSON.stringify({
     passed: true,
     initialTabs: initial.tabs.length,
@@ -292,9 +582,9 @@ try {
     staleMarkCleanup,
   }));
 } finally {
-  siteServer.close();
-  stopProcess(edgeProcess);
-  stopProcess(bridgeProcess);
-  await sleep(1000);
+  await closeSocket(socket);
+  await new Promise((resolve) => siteServer.close(resolve));
+  await stopProcess(edgeProcess);
+  await stopProcess(bridgeProcess);
   try { rmSync(temp, { recursive: true, force: true }); } catch {}
 }

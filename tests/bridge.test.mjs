@@ -1,4 +1,4 @@
-import test from "node:test";
+import nodeTest from "node:test";
 import assert from "node:assert/strict";
 import { get as httpGet } from "node:http";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -10,6 +10,7 @@ import WebSocket from "ws";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const serverPath = join(root, "bridge", "server.mjs");
+const test = (name, fn) => nodeTest(name, { concurrency: false }, fn);
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -28,10 +29,18 @@ function getJson(port, path, headers = {}) {
   });
 }
 
-function stopProcess(child) {
+async function stopProcess(child) {
   if (!child?.pid) return;
+  const exited = new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("exit", resolve);
+  });
   if (process.platform === "win32") spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
   else child.kill("SIGTERM");
+  await Promise.race([exited, sleep(2000)]);
 }
 
 async function waitHealth(port) {
@@ -135,7 +144,117 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
   } finally {
     pi?.close();
     extension?.close();
-    stopProcess(child);
+    await stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("bridge forwards client cancellation to the selected extension", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-cancel-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let pi;
+  let extension;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = (role) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    extension = await connect("extension");
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:cancel", profile: "profile-cancel", capabilities: { semanticTargets: true, pageWaitStates: true, tabIncarnationFence: true } }));
+    await sleep(25);
+    pi = await connect("pi");
+    const forwarded = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("cancellation request was not forwarded")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "request") return;
+        clearTimeout(timer);
+        extension.off("message", onMessage);
+        resolve(message);
+      };
+      extension.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "request", id: "cancel-me", method: "wait", params: { state: "text", text: "never" } }));
+    });
+    assert.equal(forwarded.method, "wait");
+    const canceled = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("extension did not receive cancellation")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "cancel") return;
+        clearTimeout(timer);
+        extension.off("message", onMessage);
+        resolve(message);
+      };
+      extension.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "cancel", id: "cancel-me" }));
+    });
+    assert.equal((await canceled).id, forwarded.id);
+    await sleep(25);
+    assert.equal((await getJson(port, "/health")).body.observability.pendingRequests, 0);
+  } finally {
+    pi?.close();
+    extension?.close();
+    await stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("bridge rejects pending requests when an extension changes browser identity on one socket", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-identity-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let pi;
+  let extension;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = (role) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    extension = await connect("extension");
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:identity-a", profile: "profile-a" }));
+    await sleep(25);
+    pi = await connect("pi");
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("identity-change response timeout")), 3000);
+      pi.on("message", (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== "identity-pending") return;
+        clearTimeout(timer);
+        resolve(message);
+      });
+    });
+    const forwarded = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("identity-change request was not forwarded")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "request") return;
+        clearTimeout(timer);
+        extension.off("message", onMessage);
+        resolve(message);
+      };
+      extension.on("message", onMessage);
+    });
+    pi.send(JSON.stringify({ type: "request", id: "identity-pending", method: "probe", params: {} }));
+    const request = await forwarded;
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:identity-b", profile: "profile-b" }));
+    const result = await response;
+    assert.equal(result.error.code, "TARGET_CONNECTION_CHANGED");
+    assert.equal(request.method, "probe");
+  } finally {
+    pi?.close();
+    extension?.close();
+    await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }
@@ -157,7 +276,7 @@ test("bridge rejects turn cleanup when the extension capability is missing", asy
       socket.once("error", reject);
     });
     extension = await connect("extension");
-    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:old", profile: "profile-old", capabilities: { turnCleanup: true } }));
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:old", profile: "profile-old", capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }));
     await sleep(25);
     const extensionHealth = await getJson(port, "/health");
     assert.equal(extensionHealth.body.capabilities.cooperativeRestart, true);
@@ -190,11 +309,40 @@ test("bridge rejects turn cleanup when the extension capability is missing", asy
       pi.send(JSON.stringify({ type: "request", id: "missing-capability", method: "cleanup", params: { mode: "turn", sessionId: "session-test", turnId: 1, expectedBrowserId: "edge:old" } }));
     });
     assert.equal(response.error.code, "EXTENSION_CAPABILITY_MISSING");
+    assert.match(response.error.message, /tabIncarnationFence/);
     assert.equal(await forwarded, false);
+    const semanticResponse = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("semantic capability rejection timeout")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== "missing-semantic") return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "request", id: "missing-semantic", method: "interaction", params: { tabId: 1, operation: "click", target: { role: "button", name: "Submit" }, expectedBrowserId: "edge:old" } }));
+    });
+    assert.equal(semanticResponse.error.code, "EXTENSION_CAPABILITY_MISSING");
+    assert.match(semanticResponse.error.message, /semanticTargets/);
+    const recoveryResponse = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("recovery capability rejection timeout")), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== "missing-recovery") return;
+        clearTimeout(timer);
+        pi.off("message", onMessage);
+        resolve(message);
+      };
+      pi.on("message", onMessage);
+      pi.send(JSON.stringify({ type: "request", id: "missing-recovery", method: "cleanup", params: { sessionId: "session-test", recoverStale: true, expectedBrowserId: "edge:old" } }));
+    });
+    assert.equal(recoveryResponse.error.code, "EXTENSION_CAPABILITY_MISSING");
+    assert.match(recoveryResponse.error.message, /tabIncarnationFence/);
   } finally {
     pi?.close();
     extension?.close();
-    stopProcess(child);
+    await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }
@@ -229,7 +377,7 @@ test("bridge keeps independent browser targets connected", async () => {
   } finally {
     first?.close();
     second?.close();
-    stopProcess(child);
+    await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }
@@ -330,7 +478,7 @@ test("bridge routes explicit targets and fences disconnected generations", async
     first?.close();
     second?.close();
     replacement?.close();
-    stopProcess(child);
+    await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }
@@ -428,8 +576,8 @@ test("bridge allows a paired local Host to cooperatively restart its instance", 
   } finally {
     pi?.close();
     extension?.close();
-    stopProcess(child);
-    stopProcess(replacement);
+    await stopProcess(child);
+    await stopProcess(replacement);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }
@@ -511,7 +659,7 @@ test("bridge isolates same ids across Pi clients and survives Pi disconnects", a
     piB?.close();
     piC?.close();
     extension?.close();
-    stopProcess(child);
+    await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }
@@ -549,6 +697,46 @@ test("bridge rejects malformed and duplicate pending request ids", async () => {
     pi.send(JSON.stringify({ type: "request", id: 0, method: "status", params: {} }));
     assert.equal((await malformed).error.code, "INVALID_REQUEST_ID");
 
+    let malformedForwardedId;
+    const malformedForwarded = new Promise((resolve) => {
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "request" || message.method !== "malformed_probe") return;
+        extension.off("message", onMessage);
+        malformedForwardedId = message.id;
+        resolve();
+      };
+      extension.on("message", onMessage);
+    });
+    const malformedResponse = responseMatching(pi, (message) => message.type === "response" && message.id === "malformed-response");
+    pi.send(JSON.stringify({ type: "request", id: "malformed-response", method: "malformed_probe", params: {} }));
+    await malformedForwarded;
+    extension.send(JSON.stringify({ type: "response", id: malformedForwardedId }));
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:malformed", profile: "malformed", capabilities: { tabIncarnationFence: true } }));
+    await waitHealthTarget(port, "edge:malformed");
+    let malformedSideEffectId;
+    const malformedSideEffectForwarded = new Promise((resolve) => {
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "request" || message.method !== "new_tab") return;
+        extension.off("message", onMessage);
+        malformedSideEffectId = message.id;
+        resolve();
+      };
+      extension.on("message", onMessage);
+    });
+    const malformedSideEffectResponse = responseMatching(pi, (message) => message.type === "response" && message.id === "side-effect-malformed");
+    pi.send(JSON.stringify({ type: "request", id: "side-effect-malformed", method: "new_tab", params: { url: "about:blank", sessionId: "session-test" } }));
+    await malformedSideEffectForwarded;
+    extension.send(JSON.stringify({ type: "response", id: malformedSideEffectId }));
+    assert.equal((await malformedSideEffectResponse).error.code, "BROWSER_OPERATION_UNCERTAIN");
+    assert.equal((await getJson(port, "/health")).body.observability.drainingRequests, 1);
+    extension.send(JSON.stringify({ type: "response", id: malformedSideEffectId, result: { late: true } }));
+    await sleep(50);
+    const drainingDuplicate = responseMatching(pi, (message) => message.type === "response" && message.id === "side-effect-malformed");
+    pi.send(JSON.stringify({ type: "request", id: "side-effect-malformed", method: "new_tab", params: { url: "about:blank", sessionId: "session-test" } }));
+    assert.equal((await drainingDuplicate).error.code, "BROWSER_OPERATION_UNCERTAIN");
+
     let forwardedId;
     const forwarded = new Promise((resolve) => {
       extension.on("message", (raw) => {
@@ -562,15 +750,16 @@ test("bridge rejects malformed and duplicate pending request ids", async () => {
     pi.send(JSON.stringify({ type: "request", id: "duplicate", method: "duplicate_probe", params: {} }));
     await forwarded;
     const duplicate = responseMatching(pi, (message) => message.type === "response" && message.id === "duplicate" && message.error?.code === "DUPLICATE_REQUEST_ID");
+    const closed = new Promise((resolve) => pi.once("close", resolve));
     pi.send(JSON.stringify({ type: "request", id: "duplicate", method: "duplicate_probe", params: {} }));
     assert.equal((await duplicate).error.code, "DUPLICATE_REQUEST_ID");
-    const first = responseMatching(pi, (message) => message.type === "response" && message.id === "duplicate" && message.result?.ok === true);
+    await closed;
     extension.send(JSON.stringify({ type: "response", id: forwardedId, result: { ok: true } }));
-    assert.deepEqual((await first).result, { ok: true });
+    await sleep(50);
   } finally {
     pi?.close();
     extension?.close();
-    stopProcess(child);
+    await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });
   }

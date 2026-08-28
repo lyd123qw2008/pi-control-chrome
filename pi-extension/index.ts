@@ -20,9 +20,12 @@ const LAZY_TOOLS = process.env.PI_CONTROL_CHROME_LAZY_TOOLS !== "false";
 const browserActivation = createBrowserActivation({ lazyTools: LAZY_TOOLS });
 let browserToolsActive = browserActivation.active;
 let bridgeUsed = false;
+let browserTargetUsed = false;
 let turnCleanupArmed = false;
 let lifecycleGeneration = 0;
 let sessionTransitionInFlight = false;
+let sessionStartBlocked = false;
+const activeWaitControllers = new Set<AbortController>();
 const BRIDGE_WAIT_DELAY_MS = 100;
 const BRIDGE_WAIT_ATTEMPTS = 30;
 let paused = false;
@@ -56,6 +59,7 @@ type TargetStability = {
   connectionGeneration?: number;
   previousBrowser?: string;
   previousBrowserId?: string;
+  previousConnectionId?: string;
   previousConnectionGeneration?: number;
   issue?: string;
 };
@@ -76,6 +80,12 @@ function readBrowserTarget(value: unknown): BrowserTarget | undefined {
   };
 }
 
+function optionalBrowserId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const browserId = value.trim();
+  return browserId.length === 0 ? undefined : browserId;
+}
+
 function observeBrowserTarget(value: unknown, acknowledgeBrowserId?: string): TargetStability {
   const target = readBrowserTarget(value);
   if (!target) return { stable: false, changed: false, acknowledged: false, requiresAcknowledgement: false, connectionChanged: false, competition: "unknown", observedBrowserIds: [...observedBrowserIds], issue: "status_missing_browser_target" };
@@ -83,17 +93,15 @@ function observeBrowserTarget(value: unknown, acknowledgeBrowserId?: string): Ta
   const changed = previous !== undefined && previous.browserId !== target.browserId;
   const connectionChanged = previous !== undefined
     && previous.browserId === target.browserId
-    && previous.connectionGeneration !== undefined
-    && target.connectionGeneration !== undefined
-    && previous.connectionGeneration !== target.connectionGeneration;
-  const acknowledged = previous === undefined || !changed || acknowledgeBrowserId === target.browserId;
+    && (previous.connectionId !== target.connectionId || previous.connectionGeneration !== target.connectionGeneration);
+  const acknowledged = previous === undefined || (!changed && !connectionChanged) || acknowledgeBrowserId === target.browserId;
   observedBrowserIds.add(target.browserId);
   if (acknowledged) acknowledgedTarget = target;
   return {
-    stable: !changed,
+    stable: !changed && !connectionChanged,
     changed,
     acknowledged,
-    requiresAcknowledgement: changed && !acknowledged,
+    requiresAcknowledgement: (changed || connectionChanged) && !acknowledged,
     connectionChanged,
     competition: previous === undefined ? "unknown" : changed ? "changed" : connectionChanged ? "reconnected" : "stable_observed",
     browser: target.browser,
@@ -105,6 +113,7 @@ function observeBrowserTarget(value: unknown, acknowledgeBrowserId?: string): Ta
     ...(previous === undefined ? {} : {
       previousBrowser: previous.browser,
       previousBrowserId: previous.browserId,
+      ...(previous.connectionId === undefined ? {} : { previousConnectionId: previous.connectionId }),
       ...(previous.connectionGeneration === undefined ? {} : { previousConnectionGeneration: previous.connectionGeneration }),
     }),
   };
@@ -122,8 +131,67 @@ async function localJsonRequest(path: string, timeoutMs: number, origin = BRIDGE
   }
 }
 
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, fallback: string): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error(fallback));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason instanceof Error ? signal.reason : new Error(fallback));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then((value) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
+}
+
 const TAB_ID = Type.Optional(Type.Number({ description: "Chrome/Edge tab id. Omit to use the active tab." }));
-const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a ref from browser_snapshot." }));
+const TAB_HANDLE = Type.Optional(Type.Object({
+  tabId: Type.Number(),
+  browserId: Type.Optional(Type.String()),
+  windowId: Type.Optional(Type.Number()),
+  groupId: Type.Optional(Type.Number()),
+  title: Type.Optional(Type.String()),
+  url: Type.Optional(Type.String()),
+  tabFence: Type.Optional(Type.String()),
+  incarnation: Type.Optional(Type.String()),
+  sessionId: Type.Optional(Type.String()),
+}, { additionalProperties: false }));
+const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot." }));
+const WAIT_STATE = Type.Optional(Type.Union([
+  Type.Literal("load"),
+  Type.Literal("url"),
+  Type.Literal("text"),
+  Type.Literal("text_gone"),
+  Type.Literal("visible"),
+  Type.Literal("hidden"),
+  Type.Literal("enabled"),
+], { description: "Wait condition. Defaults to load when omitted." }));
+const TIMEOUT_MS = Type.Optional(Type.Number({ minimum: 1, description: "Optional positive timeout in milliseconds." }));
+const INDEX = Type.Optional(Type.Integer({ minimum: 0 }));
+const ELEMENT_TARGET = Type.Optional(Type.Object({
+  ref: Type.Optional(Type.String()),
+  selector: Type.Optional(Type.String()),
+  role: Type.Optional(Type.String()),
+  name: Type.Optional(Type.String()),
+  label: Type.Optional(Type.String()),
+  placeholder: Type.Optional(Type.String()),
+  text: Type.Optional(Type.String()),
+  testId: Type.Optional(Type.String()),
+  exact: Type.Optional(Type.Boolean()),
+  index: Type.Optional(Type.Integer({ minimum: 0 })),
+  scopeSelector: Type.Optional(Type.String()),
+  hasText: Type.Optional(Type.String()),
+  hasSelector: Type.Optional(Type.String()),
+}, { additionalProperties: false }));
 
 /** Client for the local Pi-to-Bridge WebSocket protocol. */
 export class BridgeClient {
@@ -131,8 +199,9 @@ export class BridgeClient {
   private readonly wsUrl: string;
   private readonly WebSocketCtor: typeof WebSocket;
   private socket?: WebSocket;
-  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; socket: WebSocket }>();
+  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; socket: WebSocket; method: string; params: Record<string, unknown>; removeAbort?: () => void }>();
   private connecting?: Promise<void>;
+  private restarting?: Promise<any>;
   private lifecycle = 0;
 
   constructor(options: { origin?: string; wsUrl?: string; WebSocketCtor?: typeof WebSocket } = {}) {
@@ -147,14 +216,22 @@ export class BridgeClient {
 
   async stop(): Promise<void> {
     this.lifecycle += 1;
-    for (const entry of this.pending.values()) {
+    for (const [id, entry] of this.pending) {
+      try {
+        if (entry.socket.readyState === this.WebSocketCtor.OPEN) entry.socket.send(JSON.stringify({ type: "cancel", id }));
+      } catch {
+        // The socket is already closing; disconnect cleanup still rejects the local request.
+      }
       clearTimeout(entry.timer);
-      entry.reject(new Error("Pi browser bridge stopped"));
+      entry.removeAbort?.();
+      entry.reject(localBrowserRequestError(entry.method, entry.params, new Error("Pi browser bridge stopped"), true));
     }
     this.pending.clear();
     const socket = this.socket;
     this.socket = undefined;
     socket?.close();
+    const restarting = this.restarting;
+    if (restarting !== undefined) await restarting.catch(() => {});
     const connecting = this.connecting;
     if (connecting !== undefined) await connecting.catch(() => {});
     // The bridge is intentionally left alive so a newly reloaded Pi session can
@@ -168,6 +245,17 @@ export class BridgeClient {
   }
 
   async restart(): Promise<any> {
+    if (this.restarting !== undefined) return this.restarting;
+    const operation = this.restartNow();
+    this.restarting = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.restarting === operation) this.restarting = undefined;
+    }
+  }
+
+  private async restartNow(): Promise<any> {
     const lifecycle = this.lifecycle;
     const assertLive = () => {
       if (lifecycle !== this.lifecycle) throw new Error("Pi browser bridge restart was stopped");
@@ -193,23 +281,45 @@ export class BridgeClient {
     return { ok: true, restarted: true, recovery: "cooperative_restart", previousInstanceId: instanceId, control, bridgeHealth: next };
   }
 
-  async request(method: string, params: Record<string, unknown> = {}, target?: BrowserTargetRoute): Promise<any> {
-    await this.connect();
+  async request(method: string, params: Record<string, unknown> = {}, target?: BrowserTargetRoute, signal?: AbortSignal): Promise<any> {
+    if (signal?.aborted) throw signal.reason ?? new Error(`Browser request aborted: ${method}`);
+    await raceAbort(this.connect(), signal, `Browser request aborted: ${method}`);
+    if (signal?.aborted) throw signal.reason ?? new Error(`Browser request aborted: ${method}`);
     const socket = this.socket;
     if (!socket || socket.readyState !== this.WebSocketCtor.OPEN) throw new Error("Pi browser bridge is not connected");
     const id = randomUUID();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let removeAbort: (() => void) | undefined;
+      const rejectRequest = (error: unknown, cancelRemote = false) => {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        if (cancelRemote) {
+          try {
+            if (entry.socket.readyState === this.WebSocketCtor.OPEN) entry.socket.send(JSON.stringify({ type: "cancel", id }));
+          } catch {
+            // The request is still rejected locally when the Bridge socket is closing.
+          }
+        }
+        clearTimeout(entry.timer);
+        removeAbort?.();
         this.pending.delete(id);
-        reject(new Error(`Browser request timed out: ${method}`));
-      }, 120_000);
-      this.pending.set(id, { resolve, reject, timer, socket });
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      const timer = setTimeout(() => rejectRequest(localBrowserRequestError(method, params, new Error(`Browser request timed out: ${method}`), true), true), 120_000);
+      this.pending.set(id, { resolve, reject, timer, socket, method, params, removeAbort: () => removeAbort?.() });
+      if (signal !== undefined) {
+        const onAbort = () => rejectRequest(localBrowserRequestError(method, params, signal.reason ?? new Error(`Browser request aborted: ${method}`), true), true);
+        if (signal.aborted) onAbort();
+        else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          removeAbort = () => signal.removeEventListener("abort", onAbort);
+        }
+      }
+      if (!this.pending.has(id)) return;
       try {
         socket.send(JSON.stringify({ type: "request", id, method, params, ...(target === undefined ? {} : { target }) }));
       } catch (error) {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        rejectRequest(localBrowserRequestError(method, params, error, true), true);
       }
     });
   }
@@ -336,38 +446,85 @@ export class BridgeClient {
   private rejectPendingForSocket(socket: WebSocket, error: Error): void {
     for (const [id, entry] of this.pending) {
       if (entry.socket !== socket) continue;
+      try {
+        if (socket.readyState === this.WebSocketCtor.OPEN) socket.send(JSON.stringify({ type: "cancel", id }));
+      } catch {
+        // The close event already represents the failed remote request.
+      }
       clearTimeout(entry.timer);
-      entry.reject(error);
+      entry.removeAbort?.();
+      entry.reject(localBrowserRequestError(entry.method, entry.params, error, true));
       this.pending.delete(id);
     }
+  }
+
+  private settlePending(id: string, error?: Error, value?: unknown, cancelRemote = false): void {
+    const entry = this.pending.get(id);
+    if (!entry) return;
+    if (cancelRemote) {
+      try {
+        if (entry.socket.readyState === this.WebSocketCtor.OPEN) entry.socket.send(JSON.stringify({ type: "cancel", id }));
+      } catch {
+        // The response is already invalid; local settlement still protects the caller.
+      }
+    }
+    this.pending.delete(id);
+    clearTimeout(entry.timer);
+    entry.removeAbort?.();
+    const settledError = error === undefined ? undefined : cancelRemote
+      ? localBrowserRequestError(entry.method, entry.params, error, true)
+      : error;
+    if (settledError !== undefined) entry.reject(settledError);
+    else entry.resolve(value);
   }
 
   private handleMessage(raw: string, source: WebSocket): void {
     if (this.socket !== source) return;
     try {
-      const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { code?: string; message?: string } };
+      const message = JSON.parse(raw) as { type?: string; id?: string; result?: unknown; error?: { code?: string; message?: string; details?: unknown } };
       if (message.type !== "response" || !message.id) return;
       const entry = this.pending.get(message.id);
       if (!entry) return;
-      clearTimeout(entry.timer);
-      this.pending.delete(message.id);
-      if (message.error) {
-        const error = new Error(message.error.message || "Browser request failed") as Error & { code?: string };
-        if (message.error.code) error.code = message.error.code;
-        entry.reject(error);
-      } else entry.resolve(message.result);
+      const hasResult = Object.prototype.hasOwnProperty.call(message, "result");
+      const hasError = message.error !== undefined;
+      if ((!hasResult && !hasError) || (hasResult && hasError)) {
+        this.settlePending(message.id, new Error("Browser Bridge returned a response without exactly one result or error"), undefined, true);
+        return;
+      }
+      if (message.error !== undefined) {
+        const rawError: unknown = message.error;
+        if (rawError === null || typeof rawError !== "object" || Array.isArray(rawError)) {
+          this.settlePending(message.id, new Error("Browser Bridge returned a malformed error response"), undefined, true);
+          return;
+        }
+        const errorPayload = rawError as { code?: unknown; message?: unknown; details?: unknown };
+        if (typeof errorPayload.code !== "string" || typeof errorPayload.message !== "string") {
+          this.settlePending(message.id, new Error("Browser Bridge returned a malformed error response"), undefined, true);
+          return;
+        }
+        const error = new Error(errorPayload.message) as Error & { code?: string; details?: unknown };
+        error.code = errorPayload.code;
+        if (errorPayload.details !== undefined) error.details = errorPayload.details;
+        this.settlePending(message.id, error);
+      } else this.settlePending(message.id, undefined, message.result);
     } catch {
-      // Ignore malformed bridge events; the next request will report connection state.
+      // A frame without a usable id cannot be associated with one pending request.
     }
   }
 }
 
 const bridge = new BridgeClient();
 
-type CleanupIntent = { readonly params: Record<string, unknown>; readonly priority: number };
+type CleanupIntent = { readonly params: Record<string, unknown>; readonly priority: number; readonly inspectFirst?: boolean };
 const pendingCleanupSessionIds = new Map<string, CleanupIntent>();
 const cleanupFlights = new Map<string, Promise<unknown>>();
 const cleanupTargetRoutes = new Map<string, BrowserTargetRoute>();
+let resumeBlockedSession: ((ctx?: ExtensionContext) => boolean) | undefined;
+
+function abortActiveBrowserWaits(): void {
+  for (const controller of activeWaitControllers) controller.abort(new Error("Browser wait aborted by lifecycle cleanup"));
+  activeWaitControllers.clear();
+}
 
 function targetRoute(target: BrowserTarget): BrowserTargetRoute {
   return {
@@ -381,8 +538,86 @@ function routeForBrowserId(browserId: string): BrowserTargetRoute {
   return { browserId };
 }
 
-function bridgeRequest(method: string, params: Record<string, unknown>, route?: BrowserTargetRoute): Promise<any> {
-  return route === undefined ? bridge.request(method, params) : bridge.request(method, params, route);
+function bridgeRequest(method: string, params: Record<string, unknown>, route?: BrowserTargetRoute, signal?: AbortSignal): Promise<any> {
+  return route === undefined ? bridge.request(method, params, undefined, signal) : bridge.request(method, params, route, signal);
+}
+
+function isTargetLocator(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (record.combine === "and" || record.combine === "or") return isTargetLocator(record.left) || isTargetLocator(record.right);
+  if (record.strategy !== undefined) return false;
+  return ["ref", "selector", "role", "label", "placeholder", "text", "testId"].some(key => record[key] !== undefined);
+}
+
+const TAB_INCARNATION_METHODS = new Set([
+  "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
+  "close_tab", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
+  "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard",
+  "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable", "download", "cleanup",
+]);
+
+function isSideEffectingBrowserRequest(method: string, params: Record<string, unknown>): boolean {
+  if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "dom_cua", "keypress", "cleanup"].includes(method)) return method !== "dom_cua" || params.action !== "get_visible_dom";
+  if (method === "interaction") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.operation || params.action || ""));
+  if (method === "locator") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || ""));
+  if (method === "download") return !["list", "wait"].includes(String(params.action || ""));
+  if (method === "clipboard") return params.action === "write";
+  if (method === "dialog") return ["accept", "dismiss"].includes(String(params.action || ""));
+  if (method === "console_logs" || method === "network_requests") return params.clear === true;
+  if (["devtools_enable", "devtools_disable", "evaluate", "cdp", "select_tab", "release", "claim_tab", "mark_handoff", "mark_deliverable"].includes(method)) return true;
+  return false;
+}
+
+function localBrowserRequestError(method: string, params: Record<string, unknown>, reason: unknown, outcomeUncertain: boolean): Error & { code?: string; details?: unknown } {
+  const sideEffecting = isSideEffectingBrowserRequest(method, params);
+  const source = reason instanceof Error ? reason : new Error(String(reason));
+  if (!outcomeUncertain) return source;
+  const error = sideEffecting
+    ? new Error(`Browser ${method} operation outcome is uncertain after cancellation; inspect the current browser state before retrying`)
+    : source;
+  const result = error as Error & { code?: string; details?: unknown };
+  if (sideEffecting) {
+    result.code = "BROWSER_OPERATION_UNCERTAIN";
+    result.details = { actionState: "unknown", retryable: false, inspectFirst: true };
+  } else if (result.code === undefined) {
+    result.code = "BROWSER_REQUEST_CANCELED";
+  }
+  return result;
+}
+
+function assertBridgeRequestCapabilities(method: string, params: Record<string, unknown>, health: unknown, status?: unknown): void {
+  const bridgeCapabilities = health && typeof health === "object" ? (health as { capabilities?: unknown }).capabilities : undefined;
+  const bridgeRecord = bridgeCapabilities && typeof bridgeCapabilities === "object" && !Array.isArray(bridgeCapabilities) ? bridgeCapabilities as Record<string, unknown> : {};
+  const extensionCapabilities = status && typeof status === "object" ? (status as { capabilities?: unknown }).capabilities : undefined;
+  const extensionRecord = extensionCapabilities && typeof extensionCapabilities === "object" && !Array.isArray(extensionCapabilities) ? extensionCapabilities as Record<string, unknown> : {};
+  const requiredBridge: string[] = [];
+  const requiredExtension: string[] = [];
+  const requireTargetSupport = () => {
+    requiredBridge.push("semanticTargetRequests");
+    requiredExtension.push("semanticTargets");
+  };
+  if (method === "interaction" && params.target !== undefined) requireTargetSupport();
+  if (method === "locator" && (params.target !== undefined || isTargetLocator(params.locator))) requireTargetSupport();
+  if (method === "wait") {
+    const state = String(params.state || "load");
+    if (params.target !== undefined) requireTargetSupport();
+    if (["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) {
+      requiredBridge.push("pageWaitStates");
+      requiredExtension.push("pageWaitStates");
+    }
+  }
+  if (TAB_INCARNATION_METHODS.has(method)) requiredExtension.push("tabIncarnationFence");
+  if (["interaction", "locator", "wait"].includes(method) && params.snapshotId !== undefined) requiredExtension.push("snapshotRefs");
+  const missing = [
+    ...requiredBridge.filter(name => bridgeRecord[name] !== true),
+    ...requiredExtension.filter(name => extensionRecord[name] !== true),
+  ];
+  if (missing.length > 0) {
+    const error = new Error(`The browser Bridge or extension does not support: ${[...new Set(missing)].join(", ")}; update pi-control-chrome before sending this request.`) as Error & { code?: string };
+    error.code = "BRIDGE_CAPABILITY_MISSING";
+    throw error;
+  }
 }
 
 function bridgeErrorCode(error: unknown): string | undefined {
@@ -432,17 +667,40 @@ function cleanupRetainsTabs(value: unknown): boolean {
 function cleanupFailure(value: unknown): Error | undefined {
   if (!value || typeof value !== "object" || !Array.isArray((value as { failed?: unknown }).failed) || (value as { failed: unknown[] }).failed.length === 0) return undefined;
   const failed = (value as { failed: unknown[] }).failed;
-  return new Error(`Browser cleanup failed for ${failed.length} tab(s): ${JSON.stringify(failed)}`);
+  const uncertain = failed.some(entry => entry && typeof entry === "object" && ((entry as { code?: unknown }).code === "BROWSER_OPERATION_UNCERTAIN" || (entry as { details?: { code?: unknown } }).details?.code === "BROWSER_OPERATION_UNCERTAIN"));
+  const error = new Error(`Browser cleanup failed for ${failed.length} tab(s): ${JSON.stringify(failed)}`) as Error & { code?: string; details?: unknown };
+  if (uncertain) {
+    error.code = "BROWSER_OPERATION_UNCERTAIN";
+    error.details = { actionState: "unknown", retryable: false, inspectFirst: true };
+  }
+  return error;
 }
 
 function cleanupIntentPriority(params: Record<string, unknown>): number {
+  if (params.recoverStale === true) return 5;
   if (params.mode === "turn") return 4;
   if (params.mode === "disposal") return 3;
   if (params.mode === "context") return 2;
   return 1;
 }
 
-const TURN_CLEANUP_CAPABILITIES = ["turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery"] as const;
+const TURN_CLEANUP_CAPABILITIES = ["turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery", "tabIncarnationFence"] as const;
+
+async function refreshCleanupRoute(session: string, browserId?: string, requireIncarnationFence = false): Promise<BrowserTargetRoute> {
+  const route = browserId === undefined ? undefined : routeForBrowserId(browserId);
+  const status = await bridgeRequest("status", { sessionId: session, ...(browserId === undefined ? {} : { expectedBrowserId: browserId }) }, route);
+  const target = readBrowserTarget(status);
+  if (target === undefined) throw new Error("Browser status did not identify an active browser target; cleanup was not attempted");
+  if (browserId !== undefined && target.browserId !== browserId) throw new Error(`Browser target changed during cleanup; expected ${browserId} but the active target is ${target.browserId}`);
+  if (requireIncarnationFence) {
+    const capabilities = status && typeof status === "object" ? (status as Record<string, unknown>).capabilities : undefined;
+    const missing = ["tabIncarnationFence", "debuggerLeaseRecovery"].filter(name => !capabilities || typeof capabilities !== "object" || (capabilities as Record<string, unknown>)[name] !== true);
+    if (missing.length > 0) throw new Error(`The connected extension does not support stale-runtime ownership recovery (${missing.join(", ")}); reload pi-control-chrome`);
+  }
+  const currentRoute = targetRoute(target);
+  cleanupTargetRoutes.set(session, currentRoute);
+  return currentRoute;
+}
 
 async function verifyTurnCleanupSupport(session: string, expectedBrowserId?: string): Promise<BrowserTargetRoute> {
   const storedRoute = cleanupTargetRoutes.get(session);
@@ -461,34 +719,52 @@ async function verifyTurnCleanupSupport(session: string, expectedBrowserId?: str
   return currentRoute;
 }
 
-async function requestCleanup(session: string, params: Record<string, unknown> = {}): Promise<unknown> {
+type CleanupRequestOptions = { readonly automatic?: boolean };
+
+function cleanupInspectionRequiredError(session: string): Error & { code?: string; details?: unknown } {
+  const error = new Error(`Browser cleanup for session ${session} requires inspection before retrying` ) as Error & { code?: string; details?: unknown };
+  error.code = "BROWSER_OPERATION_UNCERTAIN";
+  error.details = { actionState: "unknown", retryable: false, inspectFirst: true, inspectionRequired: true };
+  return error;
+}
+
+async function requestCleanup(session: string, params: Record<string, unknown> = {}, options: CleanupRequestOptions = {}): Promise<unknown> {
+  const existingIntent = pendingCleanupSessionIds.get(session);
+  if (options.automatic === true && existingIntent?.inspectFirst === true) throw cleanupInspectionRequiredError(session);
+  abortActiveBrowserWaits();
   const previous = cleanupFlights.get(session);
   const run = (async () => {
     if (previous !== undefined) await previous.catch(() => undefined);
-    let retryParams = { ...params };
+    const pendingIntent = pendingCleanupSessionIds.get(session);
+    const inheritedParams = pendingIntent?.params.recoverStale === true && params.recoverStale !== true
+      ? { ...params, recoverStale: true }
+      : params;
+    let retryParams = { ...inheritedParams };
     let retryPriority = cleanupIntentPriority(retryParams);
     try {
-      const expectedBrowserId = typeof params.expectedBrowserId === "string" ? params.expectedBrowserId : undefined;
+      if (options.automatic === true && pendingCleanupSessionIds.get(session)?.inspectFirst === true) throw cleanupInspectionRequiredError(session);
+      const expectedBrowserId = typeof inheritedParams.expectedBrowserId === "string" ? inheritedParams.expectedBrowserId : undefined;
       let route = expectedBrowserId === undefined ? cleanupTargetRoutes.get(session) : routeForBrowserId(expectedBrowserId);
-      let cleanupParams = { ...params, sessionId: session, ...(route === undefined ? {} : { expectedBrowserId: route.browserId }) };
+      const selectedBrowserId = expectedBrowserId ?? route?.browserId;
+      if (inheritedParams.mode === "turn") {
+        route = await verifyTurnCleanupSupport(session, selectedBrowserId);
+      } else {
+        route = await refreshCleanupRoute(session, selectedBrowserId, inheritedParams.recoverStale === true);
+      }
+      const cleanupParams = { ...inheritedParams, sessionId: session, ...(route === undefined ? {} : { expectedBrowserId: route.browserId }) };
       retryParams = { ...cleanupParams };
       retryPriority = cleanupIntentPriority(retryParams);
-      if (params.mode === "turn") {
-        route = await verifyTurnCleanupSupport(session, expectedBrowserId);
-        cleanupParams = { ...cleanupParams, expectedBrowserId: route.browserId };
-        retryParams = { ...cleanupParams };
-        retryPriority = cleanupIntentPriority(retryParams);
-      }
       const value = await bridgeRequest("cleanup", cleanupParams, route);
       const failure = cleanupFailure(value);
       if (failure !== undefined) throw failure;
-      const pendingIntent = pendingCleanupSessionIds.get(session);
-      if (pendingIntent === undefined || retryPriority >= pendingIntent.priority) pendingCleanupSessionIds.delete(session);
+      const currentIntent = pendingCleanupSessionIds.get(session);
+      if (currentIntent === undefined || retryPriority >= currentIntent.priority) pendingCleanupSessionIds.delete(session);
       return value;
     } catch (error) {
       const previousIntent = pendingCleanupSessionIds.get(session);
-      if (previousIntent === undefined || retryPriority >= previousIntent.priority) {
-        pendingCleanupSessionIds.set(session, { params: retryParams, priority: retryPriority });
+      const inspectFirst = bridgeErrorCode(error) === "BROWSER_OPERATION_UNCERTAIN";
+      if (previousIntent === undefined || retryPriority >= previousIntent.priority || inspectFirst) {
+        pendingCleanupSessionIds.set(session, { params: retryParams, priority: retryPriority, ...(inspectFirst ? { inspectFirst: true } : {}) });
       }
       throw error;
     } finally {
@@ -500,7 +776,7 @@ async function requestCleanup(session: string, params: Record<string, unknown> =
 }
 
 async function retryPendingCleanups(): Promise<void> {
-  await Promise.allSettled([...pendingCleanupSessionIds.entries()].map(([session, intent]) => requestCleanup(session, intent.params)));
+  await Promise.allSettled([...pendingCleanupSessionIds.entries()].filter(([, intent]) => intent.inspectFirst !== true).map(([session, intent]) => requestCleanup(session, intent.params, { automatic: true })));
 }
 
 function textResult(value: unknown, details?: unknown) {
@@ -512,12 +788,58 @@ function textResult(value: unknown, details?: unknown) {
 
 function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text", text: `Browser error: ${message}` }], details: { error: message } };
+  const record = error && typeof error === "object" ? error as { code?: unknown; details?: unknown } : {};
+  const code = typeof record.code === "string" ? record.code : undefined;
+  return {
+    content: [{ type: "text", text: `Browser error: ${message}` }],
+    details: { error: message, ...(code === undefined ? {} : { code }), ...(record.details === undefined ? {} : { details: record.details }) },
+  };
 }
 
 type BrowserCallOptions = { allowInactive?: boolean };
 
+function validateWaitRequest(params: Record<string, unknown>): void {
+  const state = params.state === undefined ? "load" : String(params.state);
+  if (!["load", "url", "text", "text_gone", "visible", "hidden", "enabled"].includes(state)) throw new Error(`Unsupported browser wait state: ${state}`);
+  const hasText = params.text !== undefined;
+  const hasTarget = params.target !== undefined;
+  if (state === "text" || state === "text_gone") {
+    if (hasTarget) throw new Error(`${state} wait cannot combine text with target`);
+    if (typeof params.text !== "string" || !params.text.trim()) throw new Error(`${state} wait requires text`);
+  } else if (["visible", "hidden", "enabled"].includes(state)) {
+    if (params.exact !== undefined) throw new Error(`${state} wait exact matching belongs inside target`);
+    if (hasText) throw new Error(`${state} wait cannot combine target with text`);
+    if (!hasTarget) throw new Error(`${state} wait requires target`);
+  } else if (state === "url") {
+    if (hasText || hasTarget) throw new Error("url wait cannot combine URL matching with text or target");
+    if ((typeof params.url !== "string" || !params.url) && (typeof params.urlIncludes !== "string" || !params.urlIncludes)) throw new Error("url wait requires url or urlIncludes");
+  } else if (hasText || hasTarget) {
+    throw new Error("load wait cannot combine load matching with text or target");
+  }
+}
+
+function validateLocatorRequest(params: Record<string, unknown>): void {
+  if (params.target === undefined) return;
+  if (["strategy", "selector", "exact", "name", "index", "hasText", "hasSelector"].some(key => params[key] !== undefined)) throw new Error("locator target cannot be combined with legacy locator fields");
+}
+
 async function call(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}) {
+  const lifecycleTracked = !["status", "doctor", "list_tabs", "selected_tab", "cleanup", "context_reset"].includes(method);
+  const waitTracked = method === "wait"
+    || (method === "navigate" && params.wait !== false)
+    || (method === "download" && (params.action === "wait" || (params.action === "start" && params.wait !== false)))
+    || (method === "locator" && params.action === "waitFor");
+  if (!lifecycleTracked || !waitTracked) return callBrowserRequest(method, params, options);
+  const controller = new AbortController();
+  activeWaitControllers.add(controller);
+  try {
+    return await callBrowserRequest(method, params, options, controller.signal);
+  } finally {
+    activeWaitControllers.delete(controller);
+  }
+}
+
+async function callBrowserRequest(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}, requestSignal?: AbortSignal) {
   const requestSessionId = sessionId;
   const requestTurn = turnNumber;
   const requestGeneration = lifecycleGeneration;
@@ -527,35 +849,70 @@ async function call(method: string, params: Record<string, unknown> = {}, option
   if (!options.allowInactive && !browserToolsActive) {
     throw new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control");
   }
+  if (sessionTransitionInFlight && method !== "cleanup") {
+    const error = new Error("Pi browser session transition is in progress; wait for cleanup to finish before retrying browser operations") as Error & { code?: string };
+    error.code = "BROWSER_SESSION_TRANSITION";
+    throw error;
+  }
   if (paused && !["status", "list_tabs", "selected_tab", "cleanup", "context_reset"].includes(method)) {
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
+  if (method === "wait") validateWaitRequest(params);
+  if (method === "locator") validateLocatorRequest(params);
   if (method === "context_reset") return call("cleanup", params, options);
   if (method === "doctor") {
-    const result = await bridgeRequest("doctor", { sessionId: requestSessionId });
+    const route = acknowledgedTarget === undefined ? undefined : routeForBrowserId(acknowledgedTarget.browserId);
+    const result = await bridgeRequest("doctor", { sessionId: requestSessionId }, route, requestSignal);
     assertCurrent();
-    return result;
+    try {
+      const status = await bridgeRequest("status", { sessionId: requestSessionId }, route, requestSignal);
+      assertCurrent();
+      const targetStability = observeBrowserTarget(status);
+      if (targetStability.connectionChanged || targetStability.changed) {
+        const base = result && typeof result === "object" ? result : { result };
+        const issue = targetStability.connectionChanged
+          ? {
+            code: "browser_connection_changed",
+            message: "The selected browser connection changed; run browser_status with acknowledgeBrowserId before retrying browser operations.",
+          }
+          : {
+            code: "browser_target_changed",
+            message: "The active browser target changed; run browser_status with acknowledgeBrowserId after confirming the intended target before retrying browser operations.",
+          };
+        return { ...base, ok: false, recommendation: targetStability.connectionChanged ? "acknowledge_browser_connection" : "acknowledge_browser_target", targetStability, issues: [issue] };
+      }
+      const base = result && typeof result === "object" ? result : { result };
+      return { ...base, targetStability };
+    } catch (error) {
+      if (requestSignal?.aborted) throw error;
+      return result;
+    }
   }
   if (method === "cleanup") {
-    if (!bridgeUsed && !browserActivation.cleanupRequired && !turnCleanupArmed) return { removed: [], released: [], retained: [], failed: [] };
+    if (!bridgeUsed && !browserActivation.cleanupRequired && !turnCleanupArmed && params.recoverStale !== true) return { removed: [], released: [], retained: [], failed: [], recovered: [] };
     bridgeUsed = true;
+    browserTargetUsed = true;
     turnCleanupArmed = true;
     browserActivation.markUsed();
     const value = await requestCleanup(requestSessionId, params);
     assertCurrent();
-    if (!cleanupRetainsTabs(value)) turnCleanupArmed = false;
+    if (!cleanupRetainsTabs(value)) {
+      turnCleanupArmed = false;
+      browserTargetUsed = false;
+      browserActivation.finalize();
+    }
     return value;
   }
   if (method === "status") {
     const { acknowledgeBrowserId, browserId, ...statusParams } = params;
-    const requestedBrowserId = typeof browserId === "string" ? browserId : typeof acknowledgeBrowserId === "string" ? acknowledgeBrowserId : acknowledgedTarget?.browserId;
+    const explicitBrowserId = optionalBrowserId(browserId);
+    const normalizedAcknowledgement = optionalBrowserId(acknowledgeBrowserId);
+    const selectionBrowserId = explicitBrowserId ?? normalizedAcknowledgement;
+    const requestedBrowserId = selectionBrowserId ?? acknowledgedTarget?.browserId;
     const route = requestedBrowserId === undefined ? undefined : routeForBrowserId(requestedBrowserId);
-    bridgeUsed = true;
-    turnCleanupArmed = true;
-    browserActivation.markUsed();
     let result;
     try {
-      result = await bridgeRequest("status", { ...statusParams, sessionId: requestSessionId }, route);
+      result = await bridgeRequest("status", { ...statusParams, sessionId: requestSessionId }, route, requestSignal);
     } catch (error) {
       assertCurrent();
       if (bridgeErrorCode(error) === "TARGET_REQUIRED") {
@@ -567,8 +924,31 @@ async function call(method: string, params: Record<string, unknown> = {}, option
       throw error;
     }
     assertCurrent();
-    const targetStability = observeBrowserTarget(result, typeof acknowledgeBrowserId === "string" ? acknowledgeBrowserId : requestedBrowserId);
+    const preview = observeBrowserTarget(result);
+    const previewTarget = readBrowserTarget(result);
+    if (browserTargetUsed
+      && preview.changed
+      && selectionBrowserId !== undefined
+      && previewTarget?.browserId === selectionBrowserId) {
+      const base = result && typeof result === "object" ? result : { result };
+      return {
+        ...base,
+        connected: false,
+        targetRequired: false,
+        state: "target_switch_requires_cleanup",
+        ok: false,
+        targetStability: preview,
+        recommendation: "cleanup_browser_target",
+        error: { code: "TARGET_OWNERSHIP_REQUIRES_CLEANUP", message: "Clean up the currently bound browser target before acknowledging a different browser target; ownership is not transferred." },
+      };
+    }
+    const targetStability = selectionBrowserId === undefined ? preview : observeBrowserTarget(result, selectionBrowserId);
     const target = readBrowserTarget(result);
+    if (target !== undefined) {
+      bridgeUsed = true;
+      turnCleanupArmed = true;
+      browserActivation.markUsed();
+    }
     if (target !== undefined && targetStability.acknowledged) {
       cleanupTargetRoutes.set(requestSessionId, targetRoute(target));
     }
@@ -582,13 +962,10 @@ async function call(method: string, params: Record<string, unknown> = {}, option
       return { ...base, targetStability };
     }
   }
-  bridgeUsed = true;
-  turnCleanupArmed = true;
-  browserActivation.markUsed();
   let status;
   const boundRoute = acknowledgedTarget === undefined ? undefined : routeForBrowserId(acknowledgedTarget.browserId);
   try {
-    status = await bridgeRequest("status", { sessionId: requestSessionId }, boundRoute);
+    status = await bridgeRequest("status", { sessionId: requestSessionId }, boundRoute, requestSignal);
   } catch (error) {
     assertCurrent();
     if (bridgeErrorCode(error) === "TARGET_REQUIRED") {
@@ -603,12 +980,28 @@ async function call(method: string, params: Record<string, unknown> = {}, option
   const target = readBrowserTarget(status);
   if (targetStability.issue !== undefined || target === undefined) throw new Error("Browser status did not identify an active browser target; run browser_status");
   if (!targetStability.stable || !targetStability.acknowledged) {
+    if (targetStability.connectionChanged) throw new Error("Browser connection changed for the selected target; run browser_status to inspect it and acknowledge the current connection before retrying");
     throw new Error(`Browser target changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`);
   }
   cleanupTargetRoutes.set(requestSessionId, targetRoute(target));
+  try {
+    const bridgeHealth = await bridge.health();
+    assertCurrent();
+    assertBridgeRequestCapabilities(method, params, bridgeHealth, status);
+  } catch (error) {
+    assertCurrent();
+    if (bridgeErrorCode(error) === "BRIDGE_CAPABILITY_MISSING") throw error;
+    const capabilityError = new Error("Cannot verify browser Bridge request capabilities before sending the browser operation.") as Error & { code?: string };
+    capabilityError.code = "BRIDGE_CAPABILITY_MISSING";
+    throw capabilityError;
+  }
+  bridgeUsed = true;
+  browserTargetUsed = true;
+  turnCleanupArmed = true;
+  browserActivation.markUsed();
   const turnParams = method === "mark_handoff" || method === "mark_deliverable" ? { turnId: requestTurn } : {};
   assertCurrent();
-  const value = await bridgeRequest(method, { ...params, ...turnParams, sessionId: requestSessionId, expectedBrowserId: target.browserId }, targetRoute(target));
+  const value = await bridgeRequest(method, { ...params, ...turnParams, sessionId: requestSessionId, expectedBrowserId: target.browserId }, targetRoute(target), requestSignal);
   assertCurrent();
   return value;
 }
@@ -665,9 +1058,10 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_claim_tab",
     label: "Claim Browser Tab",
-    description: "Claim an existing user tab using its current tab id and optional title/URL snapshot. Fails if the snapshot changed.",
+    description: "Claim an existing user tab using its tab id and optional title, URL, or windowId snapshot checks. Fails if any supplied snapshot value changed.",
     parameters: Type.Object({
       tabId: Type.Number(),
+      handle: TAB_HANDLE,
       windowId: Type.Optional(Type.Number()),
       title: Type.Optional(Type.String()),
       url: Type.Optional(Type.String()),
@@ -682,7 +1076,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_select_tab",
     label: "Select Browser Tab",
     description: "Select an existing browser tab by id, optionally focusing its window.",
-    parameters: Type.Object({ tabId: Type.Number(), focusWindow: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: Type.Number(), handle: TAB_HANDLE, focusWindow: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("select_tab", params)); } catch (error) { return errorResult(error); }
     },
@@ -696,6 +1090,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     parameters: Type.Object({
       url: Type.Optional(Type.String({ description: "Initial URL. Defaults to about:blank." })),
       active: Type.Optional(Type.Boolean({ description: "Whether to activate the new tab." })),
+      wait: Type.Optional(Type.Boolean()),
+      timeoutMs: Type.Optional(Type.Number()),
+      allowRedirects: Type.Optional(Type.Boolean()),
     }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("new_tab", params)); } catch (error) { return errorResult(error); }
@@ -706,8 +1103,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_snapshot",
     label: "Browser Snapshot",
-    description: "Read the active page title, URL, visible text and interactive elements with stable eN refs.",
-    parameters: Type.Object({ tabId: TAB_ID }),
+    description: "Read the active page title, URL, visible text and interactive elements with snapshot-scoped eN refs; ref actions require the returned snapshotId.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("snapshot", params)); } catch (error) { return errorResult(error); }
     },
@@ -718,7 +1115,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_extract",
     label: "Extract Browser Page",
     description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper.",
-    parameters: Type.Object({ tabId: TAB_ID }),
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("extract", params)); } catch (error) { return errorResult(error); }
     },
@@ -728,12 +1125,15 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_accessibility_snapshot",
     label: "Browser Accessibility Snapshot",
-    description: "Return the accessibility-oriented semantic tree included in the current page snapshot.",
-    parameters: Type.Object({ tabId: TAB_ID }),
+    description: "Return the accessibility-oriented semantic tree included in the current page snapshot, including its snapshotId for subsequent ref actions.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE }),
     async execute(_toolCallId, params) {
       try {
-        const result = await call("snapshot", params) as { snapshot?: { accessibility?: unknown } };
-        return textResult(result.snapshot?.accessibility ?? result);
+        const result = await call("snapshot", params) as { snapshot?: { accessibility?: unknown; snapshotId?: string } };
+        const accessibility = result.snapshot?.accessibility;
+        return textResult(accessibility && typeof accessibility === "object" && result.snapshot?.snapshotId
+          ? { ...accessibility, snapshotId: result.snapshot.snapshotId }
+          : accessibility ?? result);
       } catch (error) { return errorResult(error); }
     },
   });
@@ -742,26 +1142,29 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_locator",
     label: "Browser Locator",
-    description: "Playwright-style locator operations: css, role, text, label, placeholder and testid strategies plus count, first, last, nth, text, attributes and actions.",
+    description: "Playwright-style locator operations using semantic targets, css, role, text, label, placeholder and testid strategies plus count, first, last, nth, text, attributes and actions; ref locators require the matching snapshotId.",
     parameters: Type.Object({
       tabId: TAB_ID,
+      handle: TAB_HANDLE,
       action: Type.String(),
+      target: ELEMENT_TARGET,
+      snapshotId: Type.Optional(Type.String()),
       strategy: Type.Optional(Type.String()),
       selector: SELECTOR,
       value: Type.Optional(Type.Unknown()),
       exact: Type.Optional(Type.Boolean()),
       name: Type.Optional(Type.String()),
-      index: Type.Optional(Type.Number()),
+      index: INDEX,
       hasText: Type.Optional(Type.String()),
       hasSelector: Type.Optional(Type.String()),
       other: Type.Optional(Type.Unknown()),
       attribute: Type.Optional(Type.String()),
       key: Type.Optional(Type.String()),
-      timeoutMs: Type.Optional(Type.Number()),
+      timeoutMs: TIMEOUT_MS,
     }),
     async execute(_toolCallId, params) {
       try {
-        const locator = {
+        const locator = params.target ?? {
           strategy: params.strategy || (params.selector ? "css" : "css"),
           value: params.value ?? params.selector ?? "*",
           exact: params.exact,
@@ -780,7 +1183,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_navigate",
     label: "Navigate Browser",
     description: "Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete.",
-    parameters: Type.Object({ tabId: TAB_ID, url: Type.String(), wait: Type.Optional(Type.Boolean()), timeoutMs: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, url: Type.String(), wait: Type.Optional(Type.Boolean()), timeoutMs: TIMEOUT_MS, allowRedirects: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("navigate", params)); } catch (error) { return errorResult(error); }
     },
@@ -790,8 +1194,19 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_wait",
     label: "Wait for Browser Page",
-    description: "Wait for a selected browser tab to finish loading or reach a URL/URL fragment.",
-    parameters: Type.Object({ tabId: TAB_ID, state: Type.Optional(Type.String()), url: Type.Optional(Type.String()), urlIncludes: Type.Optional(Type.String()), timeoutMs: Type.Optional(Type.Number()) }),
+    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; ref targets require the matching snapshotId.",
+    parameters: Type.Object({
+      tabId: TAB_ID,
+      handle: TAB_HANDLE,
+      state: WAIT_STATE,
+      url: Type.Optional(Type.String()),
+      urlIncludes: Type.Optional(Type.String()),
+      text: Type.Optional(Type.String()),
+      target: ELEMENT_TARGET,
+      snapshotId: Type.Optional(Type.String()),
+      exact: Type.Optional(Type.Boolean()),
+      timeoutMs: TIMEOUT_MS,
+    }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("wait", params)); } catch (error) { return errorResult(error); }
     },
@@ -801,8 +1216,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_click",
     label: "Click Browser Element",
-    description: "Click an element by an eN ref from browser_snapshot or by CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR }),
+    description: "Click one visible element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "click" })); } catch (error) { return errorResult(error); }
     },
@@ -812,8 +1228,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_double_click",
     label: "Double Click Browser Element",
-    description: "Double-click an element by an eN ref or CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR }),
+    description: "Double-click one visible element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "double_click" })); } catch (error) { return errorResult(error); }
     },
@@ -823,8 +1240,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_fill",
     label: "Fill Browser Field",
-    description: "Fill an input, textarea or contenteditable element by eN ref or CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, value: Type.String() }),
+    description: "Fill one input, textarea or contenteditable element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, value: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "fill" })); } catch (error) { return errorResult(error); }
     },
@@ -834,8 +1252,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_type",
     label: "Type Browser Text",
-    description: "Type or append text into a focused browser field.",
-    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, value: Type.String() }),
+    description: "Type or append text into one focused browser field selected by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, value: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "type" })); } catch (error) { return errorResult(error); }
     },
@@ -845,8 +1264,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_press_key",
     label: "Press Browser Key",
-    description: "Dispatch a keyboard key to an eN ref or CSS selector.",
-    parameters: Type.Object({ tabId: TAB_ID, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, key: Type.String() }),
+    description: "Dispatch a keyboard key to one element selected by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, key: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "press" })); } catch (error) { return errorResult(error); }
     },
@@ -857,7 +1277,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_scroll",
     label: "Scroll Browser",
     description: "Scroll the selected page by a viewport delta.",
-    parameters: Type.Object({ tabId: TAB_ID, deltaX: Type.Optional(Type.Number()), deltaY: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, deltaX: Type.Optional(Type.Number()), deltaY: Type.Optional(Type.Number()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("interaction", { ...params, operation: "scroll" })); } catch (error) { return errorResult(error); }
     },
@@ -867,10 +1288,12 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_dom_cua",
     label: "Browser DOM CUA",
-    description: "Use visible DOM node ids for click, double-click, type, keypress and scroll operations.",
+    description: "Use visible DOM node ids from the latest browser_dom_cua snapshot; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations.",
     parameters: Type.Object({
       tabId: TAB_ID,
-      action: Type.String(),
+      handle: TAB_HANDLE,
+      action: Type.Union([Type.Literal("get_visible_dom"), Type.Literal("click"), Type.Literal("double_click"), Type.Literal("type"), Type.Literal("keypress"), Type.Literal("scroll")]),
+      snapshotId: Type.Optional(Type.String()),
       nodeId: Type.Optional(Type.String()),
       value: Type.Optional(Type.String()),
       key: Type.Optional(Type.String()),
@@ -889,6 +1312,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Use native CDP mouse and keyboard input at viewport coordinates, including click, move, scroll, drag, type and keypress.",
     parameters: Type.Object({
       tabId: TAB_ID,
+      handle: TAB_HANDLE,
       action: Type.String(),
       x: Type.Optional(Type.Number()),
       y: Type.Optional(Type.Number()),
@@ -911,7 +1335,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_screenshot",
     label: "Browser Screenshot",
     description: "Capture the selected browser tab and return it as an image.",
-    parameters: Type.Object({ tabId: TAB_ID, fullPage: Type.Optional(Type.Boolean()), path: Type.Optional(Type.String()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, fullPage: Type.Optional(Type.Boolean()), path: Type.Optional(Type.String()) }),
     async execute(_toolCallId, params) {
       try {
         const result = await call("screenshot", params) as { data: string; mimeType?: string; tabId?: number };
@@ -937,7 +1362,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_console",
     label: "Browser Console",
     description: "Enable and read Runtime console and Log entries captured from a browser tab.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, action: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
         if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Runtime", "Log"] }));
@@ -951,11 +1377,15 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_network",
     label: "Browser Network",
     description: "Enable and read Network request/response events and response bodies from a browser tab.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, action: Type.Optional(Type.String()), requestId: Type.Optional(Type.String({ description: "Required for response_body; copy from the current Network listing." })), loaderId: Type.Optional(Type.String({ description: "Required for response_body; copy the matching loaderId from the current Network listing." })), clear: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
         if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Network", "Page"] }));
-        if (params.action === "response_body") return textResult(await call("network_response_body", params));
+        if (params.action === "response_body") {
+          if (!params.requestId || !params.loaderId) throw new Error("browser_network response_body requires requestId and loaderId from the current Network listing");
+          return textResult(await call("network_response_body", params));
+        }
         return textResult(await call("network_requests", params));
       } catch (error) { return errorResult(error); }
     },
@@ -966,7 +1396,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_dialog",
     label: "Browser JavaScript Dialog",
     description: "Inspect and accept or dismiss alert, confirm and prompt dialogs using native CDP.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), promptText: Type.Optional(Type.String()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, action: Type.String(), promptText: Type.Optional(Type.String()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("dialog", params)); } catch (error) { return errorResult(error); }
     },
@@ -977,7 +1408,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_upload",
     label: "Browser File Upload",
     description: "Set local files on a page file input using native CDP DOM.setFileInputFiles in Trusted Local Mode.",
-    parameters: Type.Object({ tabId: TAB_ID, selector: SELECTOR, nodeId: Type.Optional(Type.Number()), files: Type.Union([Type.String(), Type.Array(Type.String())]) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, selector: SELECTOR, nodeId: Type.Optional(Type.Number()), incarnation: Type.Optional(Type.String()), files: Type.Union([Type.String(), Type.Array(Type.String())]) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("upload", params)); } catch (error) { return errorResult(error); }
     },
@@ -988,7 +1420,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_clipboard",
     label: "Browser Clipboard",
     description: "Read or write plain text through the selected tab's browser clipboard.",
-    parameters: Type.Object({ tabId: TAB_ID, action: Type.String(), text: Type.Optional(Type.String()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, action: Type.Union([Type.Literal("read"), Type.Literal("write")]), text: Type.Optional(Type.String()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("clipboard", params)); } catch (error) { return errorResult(error); }
     },
@@ -999,7 +1432,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_download",
     label: "Browser Download",
     description: "Start, wait for, list, cancel or erase browser downloads and return their paths/status.",
-    parameters: Type.Object({ action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: Type.Optional(Type.Number()) }),
+    parameters: Type.Object({ action: Type.String(), url: Type.Optional(Type.String()), filename: Type.Optional(Type.String()), saveAs: Type.Optional(Type.Boolean()), wait: Type.Optional(Type.Boolean()), downloadId: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("download", params)); } catch (error) { return errorResult(error); }
     },
@@ -1010,7 +1443,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_evaluate",
     label: "Evaluate Browser JavaScript",
     description: "Evaluate JavaScript in the selected page using the native CDP Runtime.evaluate path.",
-    parameters: Type.Object({ tabId: TAB_ID, expression: Type.String(), awaitPromise: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, expression: Type.String(), awaitPromise: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("evaluate", params)); } catch (error) { return errorResult(error); }
     },
@@ -1021,7 +1455,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_cdp",
     label: "Native Browser CDP",
     description: "Send a native Chrome DevTools Protocol command to the selected browser tab.",
-    parameters: Type.Object({ tabId: TAB_ID, method: Type.String(), params: Type.Optional(Type.Record(Type.String(), Type.Unknown())) }),
+    parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, method: Type.String(), params: Type.Optional(Type.Record(Type.String(), Type.Unknown())) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("cdp", params)); } catch (error) { return errorResult(error); }
     },
@@ -1037,7 +1472,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
       name,
       label,
       description,
-      parameters: Type.Object({ tabId: TAB_ID, bypassCache: Type.Optional(Type.Boolean()) }),
+      parameters: Type.Object({ tabId: TAB_ID,
+      handle: TAB_HANDLE, bypassCache: Type.Optional(Type.Boolean()) }),
       async execute(_toolCallId, params) {
         try { return textResult(await call(method, params)); } catch (error) { return errorResult(error); }
       },
@@ -1049,7 +1485,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_close_tab",
     label: "Close Browser Tab",
     description: "Close a specified browser tab. Agent-owned tabs must belong to the current session; unowned user tabs require userRequested: true.",
-    parameters: Type.Object({ tabId: Type.Number(), userRequested: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: Type.Number(), handle: TAB_HANDLE, userRequested: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("close_tab", params)); } catch (error) { return errorResult(error); }
     },
@@ -1073,7 +1509,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Mark an Agent-owned tab to survive the current turn cleanup for manual user handoff; repeat the mark in a later turn.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("mark_handoff", params)); } catch (error) { return errorResult(error); }
+      try { return textResult(await call("mark_handoff", { ...params, turnId: turnNumber })); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1084,7 +1520,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Mark an Agent-owned tab to survive the current turn cleanup as a user-facing deliverable; repeat the mark in a later turn.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("mark_deliverable", params)); } catch (error) { return errorResult(error); }
+      try { return textResult(await call("mark_deliverable", { ...params, turnId: turnNumber })); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1092,14 +1528,23 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_cleanup",
     label: "Finalize Browser Task",
-    description: "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs and release claims while keeping browser tools and the Bridge active.",
-    parameters: Type.Object({}),
-    async execute() {
+    description: "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims, and optionally forget stale-runtime ownership without closing unknown tabs while keeping browser tools and the Bridge active.",
+
+    parameters: Type.Object({ recoverStale: Type.Optional(Type.Boolean()) }),
+    async execute(_toolCallId, params) {
       const generation = lifecycleGeneration;
-      const value = await call("cleanup");
+      const value = await call("cleanup", params);
       if (generation !== lifecycleGeneration) throw new Error("Pi browser session changed while cleanup was completing");
-      bridgeUsed = false;
-      browserActivation.finalize();
+      const retainsTabs = cleanupRetainsTabs(value);
+      bridgeUsed = retainsTabs;
+      browserTargetUsed = retainsTabs;
+      if (retainsTabs) {
+        turnCleanupArmed = true;
+        browserActivation.markUsed();
+      } else {
+        turnCleanupArmed = false;
+        browserActivation.finalize();
+      }
       return textResult(value);
     },
   });
@@ -1115,6 +1560,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
       const value = await call("context_reset");
       if (generation !== lifecycleGeneration) throw new Error("Pi browser session changed while context reset was completing");
       bridgeUsed = false;
+        browserTargetUsed = false;
       turnCleanupArmed = false;
       browserActivation.reset();
       setBrowserTools(browserActivation.active);
@@ -1136,11 +1582,12 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     if (expectedSessionId !== undefined && expectedSessionId !== previousSessionId) return;
     const resetGeneration = ++lifecycleGeneration;
     sessionTransitionInFlight = true;
+    abortActiveBrowserWaits();
     const needsCleanup = bridgeUsed || turnCleanupArmed || browserActivation.cleanupRequired;
     let cleanupSucceeded = !needsCleanup;
     if (needsCleanup) {
       try {
-        await requestCleanup(previousSessionId);
+        await requestCleanup(previousSessionId, {}, { automatic: true });
         cleanupSucceeded = true;
       } catch {
         cleanupSucceeded = false;
@@ -1148,9 +1595,18 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     }
     await retryPendingCleanups();
     if (lifecycleGeneration !== resetGeneration || sessionId !== previousSessionId) return;
-    if (pendingCleanupSessionIds.has(previousSessionId)) cleanupSucceeded = false;
-    if (cleanupSucceeded) cleanupTargetRoutes.delete(previousSessionId);
+    cleanupSucceeded = !pendingCleanupSessionIds.has(previousSessionId);
+    if (!cleanupSucceeded) {
+      bridgeUsed = true;
+      browserTargetUsed = true;
+      turnCleanupArmed = true;
+      browserActivation.markUsed();
+      updateStatus(ctx, status + "; browser cleanup pending");
+      return;
+    }
+    cleanupTargetRoutes.delete(previousSessionId);
     bridgeUsed = false;
+    browserTargetUsed = false;
     turnCleanupArmed = false;
     browserActivation.reset();
     acknowledgedTarget = undefined;
@@ -1252,11 +1708,16 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         }
         if (action === "cleanup") {
           const generation = lifecycleGeneration;
-          const result = await humanCall("cleanup");
+          const recoverStale = rest.includes("--recover-stale") || rest.includes("recover-stale");
+          const result = await humanCall("cleanup", recoverStale ? { recoverStale: true } : {});
           if (generation !== lifecycleGeneration) return;
           ctx.ui.notify(JSON.stringify(result), "info");
-          bridgeUsed = false;
-          browserActivation.finalize();
+          const retainsTabs = cleanupRetainsTabs(result);
+          bridgeUsed = retainsTabs;
+          browserTargetUsed = retainsTabs;
+          turnCleanupArmed = retainsTabs;
+          if (retainsTabs) browserActivation.markUsed();
+          else browserActivation.finalize();
           return;
         }
         if (action === "release" && rest[0]) {
@@ -1290,7 +1751,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
           ctx.ui.notify("Load extension/ as an unpacked Chrome/Edge extension, then run /chrome connect and /chrome status.", "info");
           return;
         }
-        ctx.ui.notify("用法：/chrome status|connect|restart|disconnect|pause|resume|targets|tabs|profile [browserId]|group|setup|cleanup|release <tabId>", "warning");
+        ctx.ui.notify("用法：/chrome status|connect|restart|disconnect|pause|resume|targets|tabs|profile [browserId]|group|setup|cleanup [--recover-stale]|release <tabId>", "warning");
       } catch (error) {
         if (generation !== lifecycleGeneration) return;
         updateStatus(ctx, "chrome: offline");
@@ -1300,6 +1761,20 @@ export default function piControlChrome(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    abortActiveBrowserWaits();
+    if (pendingCleanupSessionIds.size > 0 || sessionTransitionInFlight) {
+      sessionTransitionInFlight = true;
+      await retryPendingCleanups();
+      if (pendingCleanupSessionIds.size > 0) {
+        bridgeUsed = true;
+        browserTargetUsed = true;
+        turnCleanupArmed = true;
+        browserActivation.reset();
+        setBrowserTools(browserActivation.active);
+        updateStatus(ctx, "chrome: ready; browser cleanup pending");
+        return;
+      }
+    }
     lifecycleGeneration += 1;
     sessionTransitionInFlight = false;
     sessionId = randomUUID();
@@ -1308,11 +1783,12 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     acknowledgedTarget = undefined;
     observedBrowserIds.clear();
     bridgeUsed = false;
+    browserTargetUsed = false;
     turnCleanupArmed = false;
     browserActivation.reset();
     paused = false;
     setBrowserTools(browserActivation.active);
-    updateStatus(ctx, pendingCleanupSessionIds.size > 0 ? "chrome: ready; browser cleanup pending" : "chrome: ready");
+    updateStatus(ctx, "chrome: ready");
   });
 
   pi.on("turn_start", event => {
@@ -1328,13 +1804,20 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     turnNumber = turn;
     if (turnCleanupArmed || bridgeUsed || browserActivation.cleanupRequired) {
       try {
-        const value = await requestCleanup(cleanupSessionId, { mode: "turn", turnId: turn, detachDevtools: true });
+        const value = await requestCleanup(cleanupSessionId, { mode: "turn", turnId: turn, detachDevtools: true }, { automatic: true });
         if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || turnNumber !== turn) return;
         bridgeUsed = false;
-        if (!cleanupRetainsTabs(value)) turnCleanupArmed = false;
-        browserActivation.finalize();
+        if (cleanupRetainsTabs(value)) {
+          browserTargetUsed = true;
+          turnCleanupArmed = true;
+        } else {
+          browserTargetUsed = false;
+          turnCleanupArmed = false;
+          browserActivation.finalize();
+        }
       } catch {
         if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || turnNumber !== turn) return;
+        browserTargetUsed = true;
         ctx.ui.setStatus("pi-control-chrome", "chrome: turn cleanup pending");
       }
     }

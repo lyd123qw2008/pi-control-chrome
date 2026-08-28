@@ -10,7 +10,7 @@ import { registerBrowserTools } from './tools.js'
 import { registerBrowserSkill } from './skill.js'
 import type { Config as ControlChromeConfig } from './types.js'
 
-export type { BrowserResult, BrowserTarget, BrowserTargetRoute, ResolvedConfig, ScreenshotResult } from './types.js'
+export type { BrowserElementTarget, BrowserResult, BrowserTarget, BrowserTargetRoute, BrowserWaitState, ResolvedConfig, ScreenshotResult } from './types.js'
 export interface Config extends ControlChromeConfig {}
 export { BrowserBridgeClient, resolveConfig } from './bridge.js'
 export { BROWSER_TOOL_NAMES, browserToolCatalog } from './tools.js'
@@ -31,7 +31,8 @@ export const Config: z<Config> = z.object({
   bridgePort: z.number().step(1).min(1).max(65_535).default(17_318),
   tokenFile: z.string(),
   autoStartBridge: z.boolean().default(true),
-  requestTimeoutMs: z.number().step(1).min(1).default(120_000),
+  requestTimeoutMs: z.number().step(1).min(1).max(120_000).default(120_000),
+  extensionReadyTimeoutMs: z.number().step(1).min(0).max(120_000).default(6_000),
   lazyTools: z.boolean().default(true),
   bridgeScript: z.string(),
 })

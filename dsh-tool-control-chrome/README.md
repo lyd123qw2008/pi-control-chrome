@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.16"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.3.17"
   }
 }
 ```
@@ -43,9 +43,11 @@ Browser target selection is explicit when one Bridge exposes multiple Profiles. 
 
 Put deployment settings in `<DSH_HOME>/settings.yaml`; copy the `control-chrome` section from [`config/settings.yaml.example`](./config/settings.yaml.example).
 
-`tokenFile` is a path, not a token. The plugin never logs or exposes its contents. The default host is loopback; non-loopback hosts are rejected. `autoStartBridge` starts the configured Bridge when the port is offline. `extensionReadyTimeoutMs` defaults to 6000 and bounds the model-side wait for the extension's background reconnect. `lazyTools` defaults to `true`: only the `pi-control-chrome` Skill metadata is available at load time, and the complete 39-tool catalog is registered in the current Agent after a successful named Skill load. The catalog remains active across turns in that Agent session. At turn end, the host closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease. A model must mark a handoff or deliverable tab for the current turn and repeat the mark in a later turn when needed. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it performs immediate current-Agent cleanup while retaining the catalog and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and then deactivates the lazy catalog. Set `lazyTools: false` for eager tool visibility during migration or debugging. A Bridge with `capabilities.localUserRestart: true` may be restarted by an explicitly invoked DSH or Pi Host command in the same local-user control domain. The Bridge validates its instance id and serializes restart requests; it rejects requests while a browser operation is pending. A legacy Bridge without that capability is left untouched.
+`tokenFile` is a path, not a token. The plugin never logs or exposes its contents. The checked-in MV3 extension connects only to `http://127.0.0.1:17318` and its manifest `connect-src` allowlist is fixed to that endpoint; custom `bridgeHost` or `bridgePort` settings are for a separately rebuilt extension (and matching CSP) or protocol tests, not the installed extension. The default host is loopback; non-loopback hosts are rejected. `autoStartBridge` starts the configured Bridge when the port is offline. `extensionReadyTimeoutMs` defaults to 6000 and bounds the model-side wait for the extension's background reconnect. `lazyTools` defaults to `true`: only the `pi-control-chrome` Skill metadata is available at load time, and the complete 39-tool catalog is registered in the current Agent after a successful named Skill load. The catalog remains active across turns in that Agent session. At turn end, the host closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease. A model must mark a handoff or deliverable tab for the current turn and repeat the mark in a later turn when needed. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it performs immediate current-Agent cleanup while retaining the catalog and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and then deactivates the lazy catalog. Set `lazyTools: false` for eager tool visibility during migration or debugging. A Bridge with `capabilities.localUserRestart: true` may be restarted by an explicitly invoked DSH or Pi Host command in the same local-user control domain. The Bridge validates its instance id and serializes restart requests; it rejects requests while a browser operation is pending. A legacy Bridge without that capability is left untouched.
 
-The plugin uses the active DSH Agent session id as the browser ownership session id. `browser_cleanup` therefore only handles tabs created or claimed by that Agent session.
+The plugin uses the active DSH Agent session id as the browser ownership session id. `browser_cleanup` therefore only handles tabs created or claimed by that Agent session. An explicit `recoverStale: true` cleanup request forgets ownership records from an unknown extension runtime without closing those tabs and returns their ids in `recovered`; use it only after a human-approved recovery decision.
+
+Tab handles carry a tab fence and, when document scripting is available, a document incarnation. Navigation invalidates snapshot refs, DOM-CUA nodes, dialog/file-chooser observations, and Network loader mappings. To retrieve a Network response body, pass both `requestId` and its matching `loaderId` from the same current `browser_network` listing. Debugger lease identity is persisted across an MV3 worker restart; ordinary cleanup does not detach an untracked target, and stale-runtime recovery detaches only a persisted lease whose tab fence and CDP target identity remain verified before and after detach.
 
 ## Tools
 
@@ -63,7 +65,26 @@ The package defines the complete browser-control surface, but default `lazyTools
 - `browser_evaluate`, `browser_cdp`;
 - `browser_close_tab`, `browser_release`, `browser_mark_handoff`, `browser_mark_deliverable`, `browser_cleanup`, `browser_context_reset`.
 
-Browser tools are model-facing DSH tools, not a `ctx.web` search provider. Web search configuration does not enable them.
+### Semantic targets and waits
+
+`browser_click`, `browser_double_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_locator`, and `browser_wait` accept a nested `target`. Prefer `role` with `name`, then `label`, `placeholder`, `text`, or `testId`; `ref` and CSS `selector` remain available for compatibility. A semantic action waits for one visible match and fails closed when no element or multiple elements match. Use `index` only when the ambiguity is intentional. `browser_wait` supports `load`, `url`, `text`, `text_gone`, `visible`, `hidden`, and `enabled`; text conditions use `text`, while element conditions use `target`. `hidden` succeeds when no visible match exists, including an absent target or multiple hidden matches; `visible` and `enabled` fail closed on multiple visible matches. `url` and `urlIncludes` remain available as URL filters. If an interaction loses its injected result during navigation, it reports an uncertain outcome and is not replayed automatically.
+
+Example:
+
+```json
+{
+  "state": "visible",
+  "target": { "role": "button", "name": "提交", "exact": true },
+  "timeoutMs": 30000
+}
+```
+
+```json
+{
+  "target": { "label": "邮箱", "exact": true },
+  "value": "user@example.com"
+}
+```
 
 ## Human commands
 
@@ -102,13 +123,13 @@ The package tests use a fake Bridge for protocol and tool behavior. Browser acce
 
 The package uses the standard DSH `tool/call` and `tool/result` lifecycle plus the host `session/event` turn boundary for internal cleanup. Browser operations and lifecycle cleanup share a per-session FIFO, and a cleanup response with non-empty `failed` remains recoverable instead of being treated as successful teardown. It does not append a provider-specific model-visible Session event. Skill activation is Agent-scoped and sticky across turns: turn end cleans unmarked temporary tabs, releases claimed user tabs, and detaches the debugger lease without removing tools; user-authorized `browser_cleanup` finalizes resources without removing tools, and user-authorized `browser_context_reset` finalizes resources before removing the lazy scope. Agent disposal and plugin disposal retry cleanup, remove remaining lazy tools, and retain unknown cleanup state for recovery; a replacement Agent reusing a failed session ID remains blocked until final cleanup succeeds. Plugin disposal closes new browser operations, drains active executions, and stops the Bridge in a finally path. Loading the Skill without calling a browser tool does not start or contact the Bridge.
 
-Cancellation stops waiting for the DSH tool call and clears the local pending request. The current Bridge protocol does not cancel an already-dispatched browser operation inside the extension; that operation may finish remotely while the DSH call has already settled.
+Cancellation sends a request-cancel message through the DSH client and Bridge. It is best-effort: abort-aware waits and ordering barriers stop promptly, while an operation already executing in the extension or browser may finish and may have side effects. The caller must inspect state after cancellation and must not replay an uncertain side-effecting operation automatically.
 
 ## Known Limitations and Deferred Work
 
 - Browser extension installation and local pairing remain user actions.
 - The Bridge is intentionally loopback-only and is not a remote browser-control transport.
-- A canceled request currently cannot interrupt an operation already executing inside the browser extension; a backward-compatible Bridge cancellation message is deferred.
+- Cancellation is best-effort and cannot undo an already-running side-effecting, CDP or page operation. Inspect the browser state before deciding whether a later action is safe.
 - Screenshot output requires the DSH attachment service for a durable image block. Without it, the tool returns the encoded image in its JSON result.
 - Simultaneous control of multiple browser targets within one Agent session is deferred; bind one session to one target and use separate sessions for parallel Profiles.
 

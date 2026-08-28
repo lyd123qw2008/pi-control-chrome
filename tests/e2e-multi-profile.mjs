@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, get as httpGet } from "node:http";
+import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -68,12 +69,37 @@ function spawnIgnored(command, args) {
   return spawn(command, args, { stdio: "ignore", windowsHide: true });
 }
 
+function waitForExit(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      child.off("exit", finish);
+      child.off("error", finish);
+      resolve();
+    };
+    child.once("exit", finish);
+    child.once("error", finish);
+    timer = setTimeout(finish, timeoutMs);
+  });
+}
+
 async function stopProcess(child) {
   if (!child?.pid) return;
   await new Promise((resolve) => {
     const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
     killer.once("error", resolve);
     killer.once("close", resolve);
+  });
+  await waitForExit(child);
+}
+
+async function closeSocket(socket) {
+  if (!socket || socket.readyState === WebSocket.CLOSED) return;
+  await new Promise((resolve) => {
+    socket.once("close", resolve);
+    socket.close();
   });
 }
 
@@ -141,6 +167,7 @@ function spawnBrowser(profile, extension, pageUrl) {
 const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-multi-profile-e2e-"));
 const bridgePort = await freePort();
 const pagePort = await freePort();
+const bridgeStartupMarker = `multi-profile-e2e-${process.pid}-${randomUUID()}`;
 const tokenFile = join(temp, "token");
 const extension = await prepareExtension(temp, bridgePort);
 const profileA = join(temp, "profile-a");
@@ -156,8 +183,14 @@ let browserA;
 let browserB;
 let pi;
 try {
-  bridgeProcess = spawnIgnored(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile]);
-  await waitFor(() => localGet(bridgePort, "/health"), (value) => value.body?.ok === true, "Bridge health");
+  bridgeProcess = spawnIgnored(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile, "--started-by", "pi", "--startup-marker", bridgeStartupMarker]);
+  const bridgeHealth = await waitFor(() => {
+     if (bridgeProcess.exitCode !== null) throw new Error(`Bridge process exited before binding to port ${bridgePort}; isolated launch failed (exit=${bridgeProcess.exitCode})`);
+     return localGet(bridgePort, "/health");
+   }, (value) => value.body?.ok === true && value.body?.startupMarker === bridgeStartupMarker, "Bridge health");
+   assert.equal(bridgeHealth.body.startupMarker, bridgeStartupMarker);
+   assert.equal(bridgeHealth.body.startedBy, "pi");
+   assert.equal(typeof bridgeHealth.body.instanceId, "string");
 
   const pageUrl = `http://127.0.0.1:${pagePort}/`;
   const pageUrlA = `${pageUrl}?profile=a`;
@@ -247,7 +280,7 @@ try {
     targetBUnaffected: unaffectedB.browserId === targetB.browserId,
   }));
 } finally {
-  pi?.socket.close();
+  await closeSocket(pi?.socket);
   await stopProcess(browserA);
   await stopProcess(browserB);
   await stopProcess(bridgeProcess);
