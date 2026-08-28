@@ -13,6 +13,7 @@ const DEFAULT_TOKEN_FILE = join(
   "agent",
   "pi-control-chrome.token",
 );
+const DRAINING_TIMEOUT_MS = 180_000;
 const DEBUG = process.env.PI_CONTROL_CHROME_DEBUG === "1";
 const BRIDGE_SERVICE = "pi-control-chrome";
 const BRIDGE_CAPABILITIES = Object.freeze({
@@ -24,7 +25,16 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   targetList: true,
   connectionGeneration: true,
   targetScopedEvents: true,
+  semanticTargetRequests: true,
+  pageWaitStates: true,
+  requestCancellation: true,
 });
+const TAB_INCARNATION_METHODS = new Set([
+  "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
+  "close_tab", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
+  "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard",
+  "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable", "download", "cleanup",
+]);
 const BRIDGE_VERSION = (() => {
   try {
     return JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version || "unknown";
@@ -42,6 +52,8 @@ const port = Number(argValue("--port", DEFAULT_PORT));
 const tokenFile = argValue("--token-file", DEFAULT_TOKEN_FILE);
 const startedByValue = argValue("--started-by", argValue("--managed-by", "unknown"));
 const startedBy = startedByValue === "dsh" || startedByValue === "pi" ? startedByValue : "unknown";
+const startupMarkerValue = argValue("--startup-marker", "");
+const startupMarker = typeof startupMarkerValue === "string" && startupMarkerValue.length > 0 ? startupMarkerValue : undefined;
 
 const instanceId = randomUUID();
 
@@ -59,6 +71,7 @@ function ensureToken() {
 const token = ensureToken();
 const clients = new Set();
 const pending = new Map();
+const draining = new Map();
 const extensionTargets = new Map();
 const targetGenerations = new Map();
 const diagnostics = [];
@@ -74,6 +87,7 @@ const metrics = {
   targetReplacements: 0,
 };
 let requestCounter = 0;
+let connectionSequence = 0;
 let restarting = false;
 
 function nonEmptyString(value) {
@@ -132,12 +146,21 @@ function broadcastTargetEvent(record, event, extra = {}) {
   }
 }
 
-function setExtensionIdentity(client, value) {
+function setExtensionIdentity(client, value, excludeBridgeRequestId) {
   const identity = extensionIdentity(value);
   if (!identity) return false;
   const previousIdentity = client.browserIdentity;
   const existing = extensionTargets.get(identity.browserId);
-  if (existing?.client === client) {
+  if (existing?.client && existing.client !== client && existing.client.acceptedSequence > client.acceptedSequence) {
+    recordDiagnostic("stale_target_handshake", {
+      browserId: identity.browserId,
+      staleSequence: client.acceptedSequence,
+      currentSequence: existing.client.acceptedSequence,
+    });
+    client.close(1012, "stale browser target connection");
+    return false;
+  }
+  if (existing?.client === client && (!previousIdentity || previousIdentity.browserId === identity.browserId)) {
     client.browserIdentity = identity;
     existing.extensionVersion = identity.extensionVersion;
     existing.profile = identity.profile;
@@ -150,6 +173,7 @@ function setExtensionIdentity(client, value) {
   }
 
   if (previousIdentity && previousIdentity.browserId !== identity.browserId) {
+    rejectPendingForExtension(client, "TARGET_CONNECTION_CHANGED", "The extension identified a different browser target; pending requests were canceled.", excludeBridgeRequestId);
     const previous = extensionTargets.get(previousIdentity.browserId);
     if (previous?.client === client) {
       previous.client = undefined;
@@ -244,6 +268,9 @@ function requestTargetSelector(message) {
   if (rawConnectionId !== undefined && expectedConnectionId === undefined) {
     return { error: "connectionId must be a non-empty string." };
   }
+  if (explicitTarget === undefined && (expectedConnectionId !== undefined || expectedConnectionGeneration !== undefined)) {
+    return { error: "browserId is required when a connection fence is supplied." };
+  }
   return {
     browserId: nonEmptyString(explicitTarget),
     expectedConnectionId,
@@ -296,26 +323,78 @@ function selectExtension(message) {
   return { errorCode: "EXTENSION_OFFLINE", errorMessage: "Chrome/Edge extension is not connected." };
 }
 
+function responseBrowserIdentity(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Object.prototype.hasOwnProperty.call(value, "browserId")) return { present: false };
+  return { present: true, browserId: nonEmptyString(value.browserId) };
+}
+
 function decorateTargetResult(value, target) {
   if (!target || !value || typeof value !== "object" || Array.isArray(value)) return value;
+  const responseIdentity = responseBrowserIdentity(value);
   return {
     ...value,
-    browserId: value.browserId ?? target.browserId,
-    profile: value.profile ?? target.profile,
+    browserId: responseIdentity.browserId ?? target.browserId,
+    profile: nonEmptyString(value.profile) ?? target.profile,
     connectionId: target.connectionId,
     connectionGeneration: target.connectionGeneration,
   };
 }
 
 function requestParams(message) {
-  return message.params && typeof message.params === "object" ? message.params : {};
+  return message.params && typeof message.params === "object" && !Array.isArray(message.params) ? message.params : {};
+}
+
+function isSideEffectingRequest(method, params = {}) {
+  if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable"].includes(method)) return true;
+  if (method === "interaction") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || params.operation || ""));
+  if (method === "locator") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || ""));
+  if (method === "dom_cua") return params.action !== "get_visible_dom";
+  if (method === "download") return !["list", "wait"].includes(String(params.action || ""));
+  if (method === "clipboard") return params.action === "write";
+  if (method === "dialog") return ["accept", "dismiss"].includes(String(params.action || ""));
+  if (method === "console_logs" || method === "network_requests") return params.clear === true;
+  return false;
+}
+
+
+function isTargetLocator(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (value.combine === "and" || value.combine === "or") return isTargetLocator(value.left) || isTargetLocator(value.right);
+  if (value.strategy !== undefined) return false;
+  return ["ref", "selector", "role", "label", "placeholder", "text", "testId"].some((key) => value[key] !== undefined);
+}
+
+function pendingFailure(entry, code, message) {
+  if (!isSideEffectingRequest(entry.method, entry.params)) return { code, message };
+  return {
+    code: "BROWSER_OPERATION_UNCERTAIN",
+    message: `${message} The ${entry.method} operation may have taken effect; inspect the current browser state before retrying`,
+    details: { actionState: "unknown", retryable: false, inspectFirst: true },
+  };
+}
+
+function sendPendingFailure(entry, code, message) {
+  if (!entry.client) return false;
+  const failure = pendingFailure(entry, code, message);
+  return sendError(entry.client, entry.clientRequestId, failure.code, failure.message, failure.details);
 }
 
 function missingExtensionCapabilities(message, extension) {
   const params = requestParams(message);
   const required = [];
-  if (message.method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery");
+  if (message.method === "dom_cua") required.push("domCuaSnapshots");
+  if (["interaction", "locator", "wait"].includes(message.method) && params.snapshotId !== undefined) required.push("snapshotRefs");
+  if (message.method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery", "tabIncarnationFence");
+  if (message.method === "cleanup" && params.recoverStale === true) required.push("tabIncarnationFence", "debuggerLeaseRecovery");
   if ((message.method === "mark_handoff" || message.method === "mark_deliverable") && params.turnId !== undefined) required.push("turnScopedMarks");
+  if (message.method === "interaction" && params.target !== undefined) required.push("semanticTargets");
+  if (message.method === "locator" && (params.target !== undefined || isTargetLocator(params.locator))) required.push("semanticTargets");
+  if (message.method === "wait") {
+    const state = String(params.state || "load");
+    if (params.target !== undefined) required.push("semanticTargets");
+    if (["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) required.push("pageWaitStates");
+  }
+  if (TAB_INCARNATION_METHODS.has(message.method)) required.push("tabIncarnationFence");
   const capabilities = extension.browserIdentity?.capabilities ?? extension.capabilities;
   return required.filter((name) => capabilities?.[name] !== true);
 }
@@ -330,8 +409,8 @@ function handleBridgeRestart(client, id, message) {
     sendError(client, id, "BRIDGE_INSTANCE_CHANGED", "The Bridge instance changed before the restart request was accepted.");
     return;
   }
-  if (pending.size !== 0) {
-    sendError(client, id, "BRIDGE_IN_USE", "The Bridge has a pending browser request.");
+  if (pending.size !== 0 || draining.size !== 0) {
+    sendError(client, id, "BRIDGE_IN_USE", "The Bridge has a pending or draining browser request.");
     return;
   }
   restarting = true;
@@ -354,18 +433,18 @@ function rejectWhileRestarting(client, id) {
   return true;
 }
 
-function rejectPendingForExtension(extension, code, message) {
+function rejectPendingForExtension(extension, code, message, excludeBridgeRequestId) {
   for (const [id, entry] of pending.entries()) {
-    if (entry.extension !== extension) continue;
-    clearTimeout(entry.timer);
-    pending.delete(id);
-    if (entry.client) sendError(entry.client, entry.clientRequestId, code, message);
+    if (id === excludeBridgeRequestId || entry.extension !== extension) continue;
+    cancelPendingEntry(id, entry, code);
+    sendPendingFailure(entry, code, message);
   }
 }
 
 function detachPendingForClient(client) {
-  for (const entry of pending.values()) {
-    if (entry.client === client) entry.client = undefined;
+  for (const [bridgeRequestId, entry] of pending) {
+    if (entry.client !== client) continue;
+    cancelPendingEntry(bridgeRequestId, entry, "pi_client_disconnected");
   }
 }
 
@@ -404,8 +483,49 @@ function send(client, message) {
   }
 }
 
-function sendError(client, id, code, message) {
-  send(client, { type: "response", id, error: { code, message } });
+function cancelExtensionRequest(bridgeRequestId, entry) {
+  if (!entry.extension) return false;
+  return send(entry.extension, { type: "cancel", id: bridgeRequestId });
+}
+function markDraining(bridgeRequestId, entry, reason) {
+  const existing = draining.get(bridgeRequestId);
+  if (existing !== undefined) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    if (draining.get(bridgeRequestId)?.timer !== timer) return;
+    draining.delete(bridgeRequestId);
+    recordDiagnostic("request_drain_expired", { method: entry.method, browserId: entry.target?.browserId, reason });
+  }, DRAINING_TIMEOUT_MS);
+  timer.unref?.();
+  draining.set(bridgeRequestId, { client: entry.client, clientRequestId: entry.clientRequestId, extension: entry.extension, method: entry.method, params: entry.params, target: entry.target, timer, reason });
+}
+
+function clearDraining(bridgeRequestId, extension) {
+  const entry = draining.get(bridgeRequestId);
+  if (entry === undefined || entry.extension !== extension) return;
+  clearTimeout(entry.timer);
+  draining.delete(bridgeRequestId);
+}
+function cancelPendingEntry(bridgeRequestId, entry, reason) {
+  cancelExtensionRequest(bridgeRequestId, entry);
+  clearTimeout(entry.timer);
+  pending.delete(bridgeRequestId);
+  markDraining(bridgeRequestId, entry, reason);
+}
+
+function rejectMalformedExtensionResponse(bridgeRequestId, entry, code, message, reason) {
+  clearTimeout(entry.timer);
+  pending.delete(bridgeRequestId);
+  const sideEffecting = isSideEffectingRequest(entry.method, entry.params);
+  if (sideEffecting) {
+    cancelExtensionRequest(bridgeRequestId, entry);
+    markDraining(bridgeRequestId, entry, reason);
+  }
+  metrics.requestErrors += 1;
+  sendPendingFailure(entry, code, message);
+}
+
+function sendError(client, id, code, message, details) {
+  return send(client, { type: "response", id, error: { code, message, ...(details === undefined ? {} : { details }) } });
 }
 
 function broadcast(message) {
@@ -415,6 +535,18 @@ function broadcast(message) {
 function handleMessage(client, message) {
   if (!message || typeof message !== "object") return;
 
+  if (message.type === "cancel" && client.role === "pi") {
+    const clientRequestId = nonEmptyString(message.id);
+    if (!clientRequestId) return;
+    for (const [bridgeRequestId, entry] of pending) {
+      if (entry.client !== client || entry.clientRequestId !== clientRequestId) continue;
+      cancelPendingEntry(bridgeRequestId, entry, "pi_request_canceled");
+      recordDiagnostic("request_canceled", { method: entry.method, browserId: entry.target?.browserId, connectionId: entry.connectionId, connectionGeneration: entry.connectionGeneration });
+      return;
+    }
+    return;
+  }
+
   if (message.type === "request" && client.role === "pi") {
     metrics.requests += 1;
     const id = nonEmptyString(message.id);
@@ -423,14 +555,33 @@ function handleMessage(client, message) {
       sendError(client, `req-${++requestCounter}`, "INVALID_REQUEST_ID", "request.id must be a non-empty string.");
       return;
     }
-    if ([...pending.values()].some((entry) => entry.client === client && entry.clientRequestId === id)) {
+    const drainingDuplicate = [...draining.values()].find((entry) => entry.clientRequestId === id);
+    if (drainingDuplicate) {
       metrics.requestErrors += 1;
-      sendError(client, id, "DUPLICATE_REQUEST_ID", `A request with id ${id} is already pending on this client.`);
+      const failure = pendingFailure(drainingDuplicate, "DUPLICATE_REQUEST_ID", "A request with this id is still draining after cancellation or a failed dispatch.");
+      recordDiagnostic("request_rejected", { method: drainingDuplicate.method, errorCode: failure.code });
+      sendError(client, id, failure.code, failure.message, failure.details);
+      return;
+    }
+    const duplicate = [...pending.entries()].find(([, entry]) => entry.client === client && entry.clientRequestId === id);
+    if (duplicate) {
+      metrics.requestErrors += 1;
+      const [bridgeRequestId, entry] = duplicate;
+      cancelPendingEntry(bridgeRequestId, entry, "duplicate_request_id");
+      const failure = pendingFailure(entry, "DUPLICATE_REQUEST_ID", "A request with this id is already pending on this client; the original request was canceled and may still be draining.");
+      recordDiagnostic("request_rejected", { method: entry.method, errorCode: failure.code });
+      sendError(client, id, failure.code, failure.message, failure.details);
+      client.close(1008, "duplicate request id");
       return;
     }
     if (typeof message.method !== "string" || message.method.length === 0) {
       metrics.requestErrors += 1;
       sendError(client, id, "INVALID_REQUEST", "request.method must be a non-empty string.");
+      return;
+    }
+    if (message.params !== undefined && (message.params === null || typeof message.params !== "object" || Array.isArray(message.params))) {
+      metrics.requestErrors += 1;
+      sendError(client, id, "INVALID_REQUEST", "request.params must be an object.");
       return;
     }
     if (message.method === "list_targets") {
@@ -491,6 +642,7 @@ function handleMessage(client, message) {
       clientRequestId: id,
       extension,
       method: message.method,
+      params: message.params && typeof message.params === "object" && !Array.isArray(message.params) ? message.params : {},
       target,
       connectionId: target?.connectionId,
       connectionGeneration: target?.connectionGeneration,
@@ -499,7 +651,7 @@ function handleMessage(client, message) {
     pending.set(bridgeRequestId, entry);
     entry.timer = setTimeout(() => {
       if (pending.get(bridgeRequestId) !== entry) return;
-      pending.delete(bridgeRequestId);
+      cancelPendingEntry(bridgeRequestId, entry, "request_timeout");
       metrics.requestTimeouts += 1;
       recordDiagnostic("request_timeout", {
         method: message.method,
@@ -507,8 +659,11 @@ function handleMessage(client, message) {
         connectionId: target?.connectionId,
         connectionGeneration: target?.connectionGeneration,
       });
-      if (entry.client) sendError(entry.client, entry.clientRequestId, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
-    }, 120_000);
+      if (entry.client) {
+         const failure = pendingFailure(entry, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
+         sendError(entry.client, entry.clientRequestId, failure.code, failure.message, failure.details);
+       }
+    }, DRAINING_TIMEOUT_MS);
     const forwarded = {
       type: "request",
       id: bridgeRequestId,
@@ -535,9 +690,11 @@ function handleMessage(client, message) {
       if (pending.get(bridgeRequestId) === entry) {
         clearTimeout(entry.timer);
         pending.delete(bridgeRequestId);
+        markDraining(bridgeRequestId, entry, "extension_send_failed");
       }
       metrics.requestErrors += 1;
-      sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected before the request was sent.");
+      const failure = pendingFailure(entry, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected while dispatching the request.");
+      sendError(client, id, failure.code, failure.message, failure.details);
     }
     return;
   }
@@ -548,33 +705,84 @@ function handleMessage(client, message) {
   }
 
   if (message.type === "response" && client.role === "extension") {
-    const entry = pending.get(String(message.id));
-    if (!entry || entry.extension !== client || (entry.connectionId !== undefined && client.connectionId !== entry.connectionId) || (entry.connectionGeneration !== undefined && client.connectionGeneration !== entry.connectionGeneration)) return;
-    const resultBrowserId = message.result && typeof message.result === "object" && !Array.isArray(message.result) ? nonEmptyString(message.result.browserId) : undefined;
-    if (entry.target && resultBrowserId !== undefined && resultBrowserId !== entry.target.browserId) {
-      clearTimeout(entry.timer);
-      pending.delete(String(message.id));
-      metrics.requestErrors += 1;
+    const bridgeRequestId = String(message.id);
+    const entry = pending.get(bridgeRequestId);
+    if (!entry) {
+      const drained = draining.get(bridgeRequestId);
+      if (drained?.extension === client && isSideEffectingRequest(drained.method, drained.params)) {
+        recordDiagnostic("late_response_ignored", { method: drained.method, browserId: drained.target?.browserId, reason: drained.reason });
+        return;
+      }
+      clearDraining(bridgeRequestId, client);
+      return;
+    }
+    if (entry.extension !== client || (entry.connectionId !== undefined && client.connectionId !== entry.connectionId) || (entry.connectionGeneration !== undefined && client.connectionGeneration !== entry.connectionGeneration)) return;
+    const hasResult = Object.prototype.hasOwnProperty.call(message, "result");
+    const hasError = message.error !== undefined;
+    if ((!hasResult && !hasError) || (hasResult && hasError)) {
+      rejectMalformedExtensionResponse(
+        bridgeRequestId,
+        entry,
+        "INVALID_BRIDGE_RESPONSE",
+        "The extension returned a response without exactly one result or error.",
+        "malformed_response_envelope",
+      );
+      return;
+    }
+    const responseIdentity = responseBrowserIdentity(message.result);
+    if (entry.method === "status" && !setExtensionIdentity(client, message.result, bridgeRequestId)) debug("extension status did not contain a browser identity");
+    if (entry.method === "status" && entry.target && responseIdentity.browserId !== undefined && responseIdentity.browserId !== entry.target.browserId) {
+      rejectMalformedExtensionResponse(
+        bridgeRequestId,
+        entry,
+        "TARGET_CONNECTION_CHANGED",
+        `Browser target ${entry.target.browserId} changed while status was in flight.`,
+        "target_rejection_delivery_failed",
+      );
+      recordDiagnostic("response_rejected", { method: entry.method, browserId: entry.target.browserId, responseBrowserId: responseIdentity.browserId, connectionId: entry.connectionId, connectionGeneration: entry.connectionGeneration });
+      return;
+    }
+    if (entry.target && ((responseIdentity.present && responseIdentity.browserId === undefined) || (responseIdentity.browserId !== undefined && responseIdentity.browserId !== entry.target.browserId))) {
       recordDiagnostic("response_rejected", {
         method: entry.method,
         browserId: entry.target.browserId,
-        responseBrowserId: resultBrowserId,
+        ...(responseIdentity.browserId === undefined ? {} : { responseBrowserId: responseIdentity.browserId }),
         connectionId: entry.connectionId,
         connectionGeneration: entry.connectionGeneration,
       });
-      if (entry.client) sendError(entry.client, entry.clientRequestId, "INVALID_BROWSER_TARGET", `The extension response identified ${resultBrowserId}, expected ${entry.target.browserId}.`);
+      rejectMalformedExtensionResponse(
+        bridgeRequestId,
+        entry,
+        "INVALID_BROWSER_TARGET",
+        responseIdentity.browserId === undefined
+          ? "The extension response contained an invalid browserId."
+          : `The extension response identified ${responseIdentity.browserId}, expected ${entry.target.browserId}.`,
+        "target_rejection_delivery_failed",
+      );
       return;
     }
-    if (entry.method === "status" && !setExtensionIdentity(client, message.result)) debug("extension status did not contain a browser identity");
+    const errorPayload = message.error;
+    const malformedError = errorPayload !== undefined && (errorPayload === null || typeof errorPayload !== "object" || Array.isArray(errorPayload) || typeof errorPayload.code !== "string" || typeof errorPayload.message !== "string");
+    if (malformedError) {
+      rejectMalformedExtensionResponse(
+        bridgeRequestId,
+        entry,
+        "INVALID_BRIDGE_RESPONSE",
+        "The extension returned a malformed error response.",
+        "malformed_response_delivery_failed",
+      );
+      return;
+    }
     clearTimeout(entry.timer);
-    pending.delete(String(message.id));
+    pending.delete(bridgeRequestId);
     if (entry.client) {
       if (message.error) metrics.requestErrors += 1;
-      send(entry.client, {
+      const delivered = send(entry.client, {
         ...message,
         id: entry.clientRequestId,
         ...(message.error ? {} : { result: decorateTargetResult(message.result, entry.target) }),
       });
+       if (!delivered && isSideEffectingRequest(entry.method, entry.params)) markDraining(bridgeRequestId, entry, "client_response_send_failed");
     }
     return;
   }
@@ -603,6 +811,7 @@ function healthDocument() {
     bridgeVersion: BRIDGE_VERSION,
     instanceId,
     startedBy,
+    ...(startupMarker === undefined ? {} : { startupMarker }),
     controlDomain: "local_user",
     capabilities: {
       ...BRIDGE_CAPABILITIES,
@@ -636,6 +845,7 @@ function healthDocument() {
     observability: {
       startedAt,
       pendingRequests: pending.size,
+      drainingRequests: draining.size,
       metrics: { ...metrics },
       recentEvents: diagnostics.slice(-20),
     },
@@ -667,7 +877,7 @@ function bridgeDoctor() {
 }
 
 const server = createServer((req, res) => {
-  const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1:${port}"}`);
+  const requestUrl = new URL(req.url || "/", `http://127.0.0.1:${port}`);
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       ...extensionCorsHeaders(req),
@@ -698,7 +908,7 @@ wss.on("connection", (client, request) => {
     client.close(1008, "invalid origin");
     return;
   }
-  const requestUrl = new URL(request.url || "/ws", `http://${request.headers.host || "127.0.0.1:${port}"}`);
+  const requestUrl = new URL(request.url || "/ws", `http://127.0.0.1:${port}`);
   const suppliedToken = requestUrl.searchParams.get("token");
   const role = requestUrl.searchParams.get("role");
   if (suppliedToken !== token || (role !== "pi" && role !== "extension")) {
@@ -707,6 +917,7 @@ wss.on("connection", (client, request) => {
   }
 
   client.role = role;
+  client.acceptedSequence = ++connectionSequence;
   client.browserIdentity = undefined;
   client.connectionId = undefined;
   client.connectionGeneration = undefined;
@@ -721,6 +932,7 @@ wss.on("connection", (client, request) => {
     bridgeVersion: BRIDGE_VERSION,
     instanceId,
     startedBy,
+    ...(startupMarker === undefined ? {} : { startupMarker }),
     controlDomain: "local_user",
     capabilities: {
       ...BRIDGE_CAPABILITIES,
@@ -775,6 +987,8 @@ server.listen(port, "127.0.0.1", () => {
 function shutdown() {
   for (const entry of pending.values()) clearTimeout(entry.timer);
   pending.clear();
+  for (const entry of draining.values()) clearTimeout(entry.timer);
+  draining.clear();
   for (const client of clients) client.close(1012, "restarting");
   wss.close();
   server.close(() => process.exit(0));

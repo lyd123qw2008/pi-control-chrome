@@ -4,9 +4,9 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 
 /** Plugin configuration accepted by Cordis and the settings section. */
 export interface Config {
-  /** Loopback host where the local Bridge listens. Defaults to `127.0.0.1`. */
+  /** Loopback host where the local Bridge listens. The checked-in extension uses `127.0.0.1`; custom hosts require a matching extension build. Defaults to `127.0.0.1`. */
   bridgeHost?: string
-  /** Local Bridge port. Defaults to `17318`. */
+  /** Local Bridge port. The checked-in extension uses `17318`; custom ports require matching extension code and manifest CSP. Defaults to `17318`. */
   bridgePort?: number
   /** Pairing-token file. Defaults to the current user's Pi agent token path. */
   tokenFile?: string
@@ -36,6 +36,31 @@ export interface ResolvedConfig {
 
 /** JSON-compatible result returned by the browser Bridge. */
 export type BrowserResult = Record<string, unknown>
+
+/**
+ * A semantic or structural browser element target.
+ *
+ * The target accepts one primary locator (`ref`, `selector`, `role`, `label`,
+ * `placeholder`, `text`, or `testId`) and optional narrowing fields.
+ */
+export interface BrowserElementTarget {
+  readonly ref?: string
+  readonly selector?: string
+  readonly role?: string
+  readonly name?: string
+  readonly label?: string
+  readonly placeholder?: string
+  readonly text?: string
+  readonly testId?: string
+  readonly exact?: boolean
+  readonly index?: number
+  readonly scopeSelector?: string
+  readonly hasText?: string
+  readonly hasSelector?: string
+}
+
+/** Conditions supported by the browser wait tool. */
+export type BrowserWaitState = 'load' | 'url' | 'text' | 'text_gone' | 'visible' | 'hidden' | 'enabled'
 
 /** Logical browser target selected for a session. */
 export interface BrowserTarget {

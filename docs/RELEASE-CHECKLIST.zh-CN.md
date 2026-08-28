@@ -139,7 +139,8 @@ corepack pnpm --dir <DSH_HOME>/profiles/web why pi-control-chrome
 - Bridge 版本为目标根包版本；
 - extension 已连接；
 - `targetStability.stable: true`；
-- `turnCleanup`、`turnScopedMarks`、`retainedCleanup` 和 `debuggerLeaseRecovery` 能力存在。
+- `turnCleanup`、`turnScopedMarks`、`retainedCleanup`、`debuggerLeaseRecovery` 和 `tabIncarnationFence` 能力存在；
+- 显式 `browser_cleanup({ recoverStale: true })` 只忘记未知 runtime 的 ownership 记录，不关闭 Tab，并在 `recovered` 返回记录的 id。
 
 如果出现 `bridge_only` 或 `extension_not_connected`：
 

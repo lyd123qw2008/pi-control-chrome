@@ -60,11 +60,15 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.equal(opened.group.title, "Pi");
     assert.equal(opened.group.color, "blue");
 
-    const snapshot = await runScript("snapshot", String(openedTabId), "--json");
+     const reused = await runScript("view", fixture.url, "--inactive", "--temporary", "--reuse-existing", "--session", sessionId, "--json");
+     assert.equal(reused.tab.id, openedTabId);
+     await assert.rejects(() => runScript("view", fixture.url, "--inactive", "--temporary", "--reuse-existing", "--json"), /requires --session/);
+
+    const snapshot = await runScript("snapshot", String(openedTabId), "--session", sessionId, "--json");
     assert.equal(snapshot.tabId, openedTabId);
 
     const screenshotPath = join(temp, "about-blank.png");
-    const screenshot = await runScript("screenshot", String(openedTabId), screenshotPath, "--json");
+    const screenshot = await runScript("screenshot", String(openedTabId), screenshotPath, "--session", sessionId, "--json");
     assert.equal(screenshot.tabId, openedTabId);
     assert.ok(statSync(screenshotPath).size > 100);
 
@@ -78,7 +82,7 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.match(viewed.content.text, /Pi Skill Script Test/);
     assert.match(viewed.content.markdown, /browser workflow fixture/);
 
-    const extracted = await runScript("extract", String(viewedTabId), "--max-chars", "200", "--json");
+    const extracted = await runScript("extract", String(viewedTabId), "--session", `${sessionId}-view`, "--max-chars", "200", "--json");
     assert.match(extracted.content.text, /Pi Skill Script Test/);
     assert.ok(extracted.content.text.length <= 240);
 
@@ -86,7 +90,7 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.ok(cleanup.removed.includes(openedTabId));
     assert.equal(cleanup.removed.includes(viewedTabId), false);
 
-    const closed = await runScript("close", String(viewedTabId), "--json");
+    const closed = await runScript("close", String(viewedTabId), "--session", `${sessionId}-view`, "--json");
     assert.equal(closed.closed, viewedTabId);
 
     const tabs = await runScript("tabs", "--json");
@@ -97,10 +101,10 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
       try { await runScript("cleanup", "--session", `${sessionId}-seed`, "--json"); } catch {}
     }
     if (openedTabId !== undefined) {
-      try { await runScript("close", String(openedTabId), "--json"); } catch {}
+      try { await runScript("close", String(openedTabId), "--session", sessionId, "--json"); } catch {}
     }
     if (viewedTabId !== undefined) {
-      try { await runScript("close", String(viewedTabId), "--json"); } catch {}
+      try { await runScript("close", String(viewedTabId), "--session", `${sessionId}-view`, "--json"); } catch {}
     }
     fixture.server.close();
     rmSync(temp, { recursive: true, force: true });

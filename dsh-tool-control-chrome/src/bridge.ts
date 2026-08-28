@@ -12,7 +12,8 @@ import { bridgeRecovery } from './diagnostics.js'
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 17318
-const DEFAULT_TIMEOUT_MS = 120_000
+const MAX_REQUEST_TIMEOUT_MS = 120_000
+const DEFAULT_TIMEOUT_MS = MAX_REQUEST_TIMEOUT_MS
 const DEFAULT_EXTENSION_READY_TIMEOUT_MS = 6_000
 const DEFAULT_TOKEN_FILE = join(homedir(), '.pi', 'agent', 'pi-control-chrome.token')
 const BRIDGE_WAIT_ATTEMPTS = 30
@@ -26,13 +27,15 @@ type PendingEntry = {
   readonly signal?: AbortSignal
   readonly onAbort?: () => void
   readonly socket: WebSocket
+  readonly method: string
+  readonly params: Record<string, unknown>
 }
 
 type BridgeResponse = {
   readonly type?: string
   readonly id?: string
   readonly result?: unknown
-  readonly error?: { readonly code?: string; readonly message?: string }
+  readonly error?: { readonly code?: string; readonly message?: string; readonly details?: unknown }
 }
 
 /** Resolve and validate deployment settings without reading credentials. */
@@ -45,8 +48,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
   if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65_535) {
     throw new Error(`control-chrome bridgePort must be an integer from 1 to 65535: ${bridgePort}`)
   }
-  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
-    throw new Error(`control-chrome requestTimeoutMs must be positive: ${requestTimeoutMs}`)
+  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0 || requestTimeoutMs > MAX_REQUEST_TIMEOUT_MS) {
+    throw new Error(`control-chrome requestTimeoutMs must be positive and at most ${MAX_REQUEST_TIMEOUT_MS}: ${requestTimeoutMs}`)
   }
   if (!Number.isFinite(extensionReadyTimeoutMs) || extensionReadyTimeoutMs < 0) {
     throw new Error(`control-chrome extensionReadyTimeoutMs must be a non-negative finite number: ${extensionReadyTimeoutMs}`)
@@ -85,6 +88,10 @@ async function localJsonRequest(config: ResolvedConfig, path: string, timeoutMs:
   return { status: response.status, value }
 }
 
+function errorMessage(error: unknown, fallback: string): Error {
+  return error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`)
+}
+
 function isHealthyResponse(response: { status: number; value: unknown }): boolean {
   return response.status === 200
     && typeof response.value === 'object'
@@ -92,9 +99,55 @@ function isHealthyResponse(response: { status: number; value: unknown }): boolea
     && (response.value as { ok?: unknown }).ok === true
 }
 
-function errorMessage(error: unknown, fallback: string): Error {
-  return error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`)
+function isSideEffectingBrowserRequest(method: string, params: Record<string, unknown>): boolean {
+  if (['navigate', 'back', 'forward', 'reload', 'select_tab', 'new_tab', 'close_tab', 'upload', 'cua', 'dom_cua', 'cleanup'].includes(method)) return method !== 'dom_cua' || params.action !== 'get_visible_dom'
+  if (method === 'interaction') return ['click', 'double_click', 'dblclick', 'fill', 'type', 'press', 'select', 'check', 'uncheck', 'set_checked', 'hover', 'focus', 'scroll'].includes(String(params.operation ?? params.action ?? ''))
+  if (method === 'locator') return ['click', 'dblclick', 'double_click', 'fill', 'type', 'press', 'select', 'check', 'uncheck', 'set_checked', 'hover', 'focus', 'scroll'].includes(String(params.action ?? ''))
+  if (method === 'download') return !['list', 'wait'].includes(String(params.action ?? ''))
+  if (method === 'clipboard') return params.action === 'write'
+  if (method === 'dialog') return ['accept', 'dismiss'].includes(String(params.action ?? ''))
+  if (method === 'console_logs' || method === 'network_requests') return params.clear === true
+  if (['devtools_enable', 'devtools_disable', 'evaluate', 'cdp', 'select_tab', 'release', 'claim_tab', 'mark_handoff', 'mark_deliverable'].includes(method)) return true
+  return false
 }
+
+function localBrowserRequestError(method: string, params: Record<string, unknown>, reason: unknown, outcomeUncertain: boolean): Error & { code?: string; details?: unknown } {
+  const sideEffecting = isSideEffectingBrowserRequest(method, params)
+  const source = reason instanceof Error ? reason : new Error(String(reason))
+  if (!outcomeUncertain) return source
+  const error = sideEffecting
+    ? new Error(`Browser ${method} operation outcome is uncertain after cancellation; inspect the current browser state before retrying`)
+    : source
+  const result = error as Error & { code?: string; details?: unknown }
+  if (sideEffecting) {
+    result.code = 'BROWSER_OPERATION_UNCERTAIN'
+    result.details = { actionState: 'unknown', retryable: false, inspectFirst: true }
+  } else if (result.code === undefined) {
+    result.code = 'BROWSER_REQUEST_CANCELED'
+  }
+  return result
+}
+
+function abortReason(signal: AbortSignal, fallback: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallback)
+}
+
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, fallback: string): Promise<T> {
+  if (signal === undefined) return promise
+  if (signal.aborted) {
+    promise.catch(() => {})
+    return Promise.reject(abortReason(signal, fallback))
+  }
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortReason(signal, fallback))
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  return Promise.race([promise, aborted]).finally(() => {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  })
+}
+
 
 function healthInstanceId(health: Record<string, unknown>): string | undefined {
   return typeof health.instanceId === 'string' && health.instanceId.length > 0 ? health.instanceId : undefined
@@ -134,11 +187,13 @@ export class BrowserBridgeClient {
   /** Stop this client connection without stopping the reusable Bridge process. */
   async stop(): Promise<void> {
     this.lifecycle += 1
-    this.rejectPending(new Error('DSH browser Bridge client stopped'))
+    this.rejectPending(new Error('DSH browser Bridge client stopped'), true)
     const socket = this.socket
     this.socket = undefined
     this.socketKey = undefined
     socket?.close()
+    const restarting = this.restarting
+    if (restarting !== undefined) await restarting.catch(() => {})
     const connecting = this.connecting
     const starting = [...this.starting.values()]
     if (connecting !== undefined) await connecting.catch(() => {})
@@ -167,10 +222,10 @@ export class BrowserBridgeClient {
   /** Send one browser method request and preserve caller cancellation locally. */
   async request(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal, target?: BrowserTargetRoute): Promise<unknown> {
     if (signal?.aborted) throw new Error(`Browser request aborted: ${method}`)
-    await this.connect()
+    await raceAbort(this.connect(), signal, `Browser request aborted: ${method}`)
     const config = this.resolveConfig()
     if (this.socketKey !== connectionKey(config)) {
-      await this.connect()
+      await raceAbort(this.connect(), signal, `Browser request aborted: ${method}`)
     }
     if (signal?.aborted) throw new Error(`Browser request aborted: ${method}`)
     const socket = this.socket
@@ -178,14 +233,10 @@ export class BrowserBridgeClient {
     const id = randomUUID()
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id)
-        signal?.removeEventListener('abort', onAbort)
-        reject(new Error(`Browser request timed out: ${method}`))
+        this.settlePending(id, new Error(`Browser request timed out: ${method}`), undefined, true)
       }, config.requestTimeoutMs)
       const onAbort = () => {
-        this.pending.delete(id)
-        clearTimeout(timer)
-        reject(new Error(`Browser request aborted: ${method}`))
+        this.settlePending(id, new Error(`Browser request aborted: ${method}`), undefined, true)
       }
       this.pending.set(id, {
         resolve,
@@ -194,12 +245,14 @@ export class BrowserBridgeClient {
         ...(signal === undefined ? {} : { signal }),
         onAbort,
         socket,
+        method,
+        params,
       })
       signal?.addEventListener('abort', onAbort, { once: true })
       try {
         socket.send(JSON.stringify({ type: 'request', id, method, params, ...(target === undefined ? {} : { target }) }))
       } catch (error) {
-        this.settlePending(id, errorMessage(error, 'Browser request failed'))
+        this.settlePending(id, errorMessage(error, 'Browser request failed'), undefined, true)
       }
     })
   }
@@ -209,7 +262,7 @@ export class BrowserBridgeClient {
     const targetKey = connectionKey(config)
     if (this.socket?.readyState === WebSocket.OPEN && this.socketKey === targetKey) return
     if (this.socket !== undefined && this.socketKey !== targetKey) {
-      this.rejectPending(new Error('Browser Bridge settings changed; reconnecting'))
+      this.rejectPending(new Error('Browser Bridge settings changed; reconnecting'), true)
       this.socket.close()
       this.socket = undefined
       this.socketKey = undefined
@@ -263,10 +316,11 @@ export class BrowserBridgeClient {
         resolve()
       })
       socket.once('close', () => {
+        const error = new Error('Browser Bridge disconnected')
+        this.rejectPendingForSocket(socket, error)
         if (this.socket === socket) {
           this.socket = undefined
           this.socketKey = undefined
-          this.rejectPendingForSocket(socket, new Error('Browser Bridge disconnected'))
         }
         if (!settled) {
           clearTimeout(timeout)
@@ -281,7 +335,7 @@ export class BrowserBridgeClient {
           reject(errorMessage(error, 'Browser Bridge websocket failed'))
           return
         }
-        if (this.socket === socket) this.rejectPendingForSocket(socket, errorMessage(error, 'Browser Bridge websocket failed'))
+        this.rejectPendingForSocket(socket, errorMessage(error, 'Browser Bridge websocket failed'))
       })
       socket.on('message', raw => this.handleMessage(raw.toString(), socket))
     })
@@ -424,35 +478,65 @@ export class BrowserBridgeClient {
       return
     }
     if (message.type !== 'response' || typeof message.id !== 'string') return
+    const hasResult = Object.prototype.hasOwnProperty.call(message, 'result')
+    const hasError = message.error !== undefined
+    if ((!hasResult && !hasError) || (hasResult && hasError)) {
+      this.settlePending(message.id, new Error('Browser Bridge returned a response without exactly one result or error'), undefined, true)
+      return
+    }
     const entry = this.pending.get(message.id)
     if (entry === undefined) return
     if (message.error !== undefined) {
-      const code = message.error.code
-      const error = new Error(message.error.message ?? code ?? 'Browser request failed') as Error & { code?: string }
-      if (code !== undefined) error.code = code
+      const rawError: unknown = message.error
+      if (rawError === null || typeof rawError !== 'object' || Array.isArray(rawError)) {
+        this.settlePending(message.id, new Error('Browser Bridge returned a malformed error response'), undefined, true)
+        return
+      }
+      const errorPayload = rawError as { readonly code?: unknown; readonly message?: unknown; readonly details?: unknown }
+      const code = typeof errorPayload.code === 'string' ? errorPayload.code : undefined
+      const errorMessage = typeof errorPayload.message === 'string' ? errorPayload.message : undefined
+      if (code === undefined || errorMessage === undefined) {
+        this.settlePending(message.id, new Error('Browser Bridge returned a malformed error response'), undefined, true)
+        return
+      }
+      const error = new Error(errorMessage) as Error & { code?: string; details?: unknown }
+      error.code = code
+      if (errorPayload.details !== undefined) error.details = errorPayload.details
       this.settlePending(message.id, error)
       return
     }
     this.settlePending(message.id, undefined, message.result)
   }
 
-  private settlePending(id: string, error?: Error, value?: unknown): void {
+  private settlePending(id: string, error?: Error, value?: unknown, cancelRemote = false): void {
     const entry = this.pending.get(id)
     if (entry === undefined) return
+    if (cancelRemote) this.cancelRemote(id, entry.socket)
     this.pending.delete(id)
     clearTimeout(entry.timer)
     if (entry.signal !== undefined && entry.onAbort !== undefined) entry.signal.removeEventListener('abort', entry.onAbort)
-    if (error !== undefined) entry.reject(error)
+    const settledError = error === undefined ? undefined : cancelRemote
+      ? localBrowserRequestError(entry.method, entry.params, error, true)
+      : error
+    if (settledError !== undefined) entry.reject(settledError)
     else entry.resolve(value)
   }
 
-  private rejectPending(error: Error): void {
-    for (const id of this.pending.keys()) this.settlePending(id, error)
+  private cancelRemote(id: string, socket: WebSocket): void {
+    try {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'cancel', id }))
+    } catch {
+      // The socket is closing; the Bridge disconnect path cancels its pending requests.
+    }
+  }
+
+  private rejectPending(error: Error, cancelRemote = false): void {
+    for (const id of this.pending.keys()) this.settlePending(id, error, undefined, cancelRemote)
   }
 
   private rejectPendingForSocket(socket: WebSocket, error: Error): void {
     for (const [id, entry] of this.pending.entries()) {
-      if (entry.socket === socket) this.settlePending(id, error)
+      if (entry.socket === socket) this.settlePending(id, error, undefined, true)
     }
   }
 }

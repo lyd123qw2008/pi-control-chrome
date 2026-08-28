@@ -66,6 +66,10 @@ it('BrowserBridgeClient pairs, routes requests, reads health, and observes abort
     socket.on('message', raw => {
       const message = JSON.parse(raw.toString()) as { id: string; method: string; params: Record<string, unknown> }
       if (message.method === 'wait_forever') return
+      if (message.method === 'malformed') {
+        socket.send(JSON.stringify({ type: 'response', id: message.id }))
+        return
+      }
       socket.send(JSON.stringify({ type: 'response', id: message.id, result: { method: message.method, params: message.params } }))
     })
     socket.on('close', () => sockets.delete(socket))
@@ -78,6 +82,7 @@ it('BrowserBridgeClient pairs, routes requests, reads health, and observes abort
       method: 'status',
       params: { sessionId: 'session-test' },
     })
+    await expect(client.request('malformed', {})).rejects.toThrow(/without exactly one result or error/)
     const controller = new AbortController()
     const pending = client.request('wait_forever', {}, controller.signal)
     controller.abort()

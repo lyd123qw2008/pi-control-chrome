@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added semantic element targets for common click, fill, type, keypress, locator, and wait operations. Targets support role/name, label, placeholder, text, test id, explicit indexing, and legacy ref/CSS compatibility with strict ambiguity handling.
+
+- Added durable tab fences, document incarnations, debugger lease persistence and explicit stale-runtime recovery. Navigation and lifecycle races now invalidate old page, loader, dialog, file-chooser and DOM state; Network response bodies require the matching `loaderId` from the current listing; uncertain side effects require inspection instead of automatic replay.
+
+- Hardened tab creation, removal and replacement reconciliation against numeric tab-id reuse, event-before-reservation ordering, duplicate lifecycle events and ownership transfer ambiguity. Unverified creation or removal outcomes fail closed.
+
+- Bridge and DSH clients now reject response envelopes that do not contain exactly one valid result or error, preserving uncertainty for side-effecting requests.
+
+- Extended browser waits with text appearance/disappearance and visible, hidden, and enabled element states. URL filters are applied to both tab and page conditions, and asynchronous target checks do not replay side-effecting actions.
+
+- Added DSH/Pi routing and real-browser coverage for semantic targets and asynchronous page waits.
+
 - Added a maintainer release Skill and a package/version matrix covering Pi, the browser extension, DSH, npm Trusted Publishing, lockfiles, Profile overrides, and post-release runtime verification.
 
 - Added a target registry that keeps multiple Chrome/Edge browser Profiles connected to one Bridge, with explicit `browserId` selection, connection IDs, monotonic connection generations, target-scoped events, and stale-route rejection.
@@ -48,7 +60,7 @@
 
 - Reused a short-lived, session-owned debugger lease across consecutive browser operations instead of attaching and detaching Chrome DevTools for every call; explicit Console/Network/CDP capture remains persistent and cleanup still releases it.
 - Captured ordinary active-tab viewport screenshots through the extension API, reserving DevTools attachment for full-page and background-tab captures.
-- Fixed explicit user-requested close to remove ownership metadata even when the target tab belongs to another Agent session.
+- Enforced explicit user-requested close for unowned user tabs without bypassing another Agent session's ownership.
 
 - Registered the DSH browser Skill from a bundled, DSH-specific Markdown provider with project/user override precedence; legacy Skill services retain a runtime fallback.
 

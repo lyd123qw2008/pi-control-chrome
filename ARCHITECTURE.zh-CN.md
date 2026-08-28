@@ -170,10 +170,13 @@ Pi 恢复浏览器连接
 owner: user
 ```
 
-Agent 需要先通过精确的标签页快照进行 claim：
+Agent 需要先通过标签页快照进行 claim。`tabId` 必须提供，`title`、URL 和 `windowId` 快照字段可以按需提供；每个已提供的字段都会在写入 ownership record 前立即重新读取校验：
 
 ```text
-tabId + title + URL + windowId
+tabId
++ 可选 title
++ 可选 URL
++ 可选 windowId
 ```
 
 如果 claim 前标签页已经改变，必须安全失败，不能静默接管另一个标签页。
@@ -232,7 +235,17 @@ closed
 - 当前 turn 标记的 `handoff` 标签页：跨越当前 turn 保留，后续仍需保留时重新标记；
 - 当前 turn 标记的 `deliverable` 标签页：跨越当前 turn 保留，后续仍需保留时重新标记；
 - 其他 Pi session 创建的标签页：不能清理；
-- 清理操作必须幂等，重复执行不能误关闭页面。
+- 清理操作必须幂等，重复执行不能误关闭页面；扩展运行时变更后，普通清理保留未知 incarnation 的 Agent ownership，只有显式传入 `recoverStale: true` 才会在不关闭 Tab 的情况下忘记这些记录，并返回 recovered id。
+
+## 五点五、标签页和文档身份
+
+数字 tab ID 只在一个标签页生命周期内有效，并由持久化的 `tabFence` 保护；生命周期事件不能授权对无关复用 ID 的操作。完整 Handle 还包含由 URL、`performance.timeOrigin` 和每个文档独有 Token 组成的 `incarnation`。导航会使 snapshot、DOM ref、dialog、file chooser 和 Network request-loader 映射失效；读取 Network response body 时，必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。每个页面操作都会在执行前后检查文档身份；身份变化时，有副作用的结果会标记为不确定且不可自动重试。
+
+## 五点六、Debugger lease 和创建竞态
+
+Debugger attachment record 包含 browser id、tab fence、attach epoch 和 CDP target id，并持久化到扩展 local storage，避免 MV3 worker 重启后把仍连接的 target 当成无主资源。普通清理不会 detach 未被当前运行时跟踪的全局 debugger target。只有显式 `recoverStale: true` 才可在 detach 前后重新校验 tab fence 和 target id；无法验证的 target 会保留为恢复失败并要求检查。
+
+扩展会串行化 ownership mutation，并跟踪 create flight、完成标记、removal intent 和生命周期 tombstone。`tabs.onCreated` 早于 reservation 到达时，只有 tab id、window、URL、事件序列和活动 create flight 一致才会被关联。替换标签页只有在旧/新 fence、稳定标签页元数据、文档身份和 replacement epoch 全部一致后才转移 ownership。Chrome 不提供权威创建 Token，也没有按 incarnation 原子限定的数字 ID 删除 API，因此无法消除的歧义会 fail closed 并要求检查。
 
 ## 六、页面控制层
 
@@ -444,7 +457,7 @@ Browser session 和 Pi session 绑定，但 Tab Handle 不能只依赖数字 tab
 
 ### 第 1/2 阶段：连接、读取和基础交互（已完成）
 
-已完成 Chrome/Edge 扩展、本地 Bridge、Pi Extension、一次性配对、状态/标签页、claim/release、Pi 分组、snapshot、Locator、DOM/坐标 CUA、导航和页面交互、截图、Clipboard、Upload/Download、Dialog、Console/Network、原生 CDP 以及 session/turn 清理。
+已完成 Chrome/Edge 扩展、本地 Bridge、Pi Extension、一次性配对、状态/标签页、claim/release、Pi 分组、snapshot、语义 role/name/label/placeholder/text/testId 定位、显式索引、load/url/text/text_gone/visible/hidden/enabled 页面等待、Locator、DOM/坐标 CUA、导航和页面交互、截图、Clipboard、Upload/Download、Dialog、Console/Network、原生 CDP 以及 session/turn 清理。扩展和 Bridge 会通过 `semanticTargets`、`pageWaitStates`、`semanticTargetRequests` 能力字段拒绝不兼容的新请求。
 
 ### 第 3 阶段：扩展能力（已完成当前基础实现）
 

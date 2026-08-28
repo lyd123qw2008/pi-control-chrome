@@ -8,7 +8,7 @@
 
 用户可以直接修改复选框、调整优先级或添加备注。
 
-> 实现状态（2026-08-17，按当前仓库持续更新）：阶段 1/2 核心代码已经完成。当前仓库已实现并验证 Chrome/Edge 扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。当前 Bridge 还支持多个已识别浏览器目标、target-qualified routing、connection-generation fencing、每 session 单目标绑定、目标断线状态、Bridge `list_targets`/`doctor` 诊断和有界 metrics。以下复选框保留原始产品规划，不作为当前实现状态的唯一来源；当前能力以 README、架构文档和测试为准。WebMCP、GSuite、历史记录、媒体下载、浏览器商店发布包和同一 session 同时控制多个目标仍未实现。
+> 实现状态（2026-08-17，按当前仓库持续更新）：阶段 1/2 核心代码已经完成。当前仓库已实现并验证 Chrome/Edge 扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、语义目标定位、文本和元素状态等待、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。当前 Bridge 还支持多个已识别浏览器目标、target-qualified routing、connection-generation fencing、每 session 单目标绑定、目标断线状态、Bridge `list_targets`/`doctor` 诊断和有界 metrics。以下复选框保留原始产品规划，不作为当前实现状态的唯一来源；当前能力以 README、架构文档和测试为准。WebMCP、GSuite、历史记录、媒体下载、浏览器商店发布包和同一 session 同时控制多个目标仍未实现。
 
 ---
 
@@ -70,7 +70,7 @@
 ### B2. Claim / Release
 
 - [ ] **P0** `openTabs()`：读取用户当前打开的标签页
-- [ ] **P0** 通过精确的 `tabId + title + URL` 快照 claim 用户标签页
+- [ ] **P0** 通过 `tabId` 和可选的 `title`、URL、`windowId` 快照 claim 用户标签页；每个已提供字段都在写入前重新校验
 - [ ] **P0** 如果标签页在 claim 前已变化，安全失败，不静默接管其他标签页
 - [ ] **P0** claim 后返回 Pi 可持续使用的 Tab Handle
 - [ ] **P0** `releaseTab()`：释放用户标签页控制权但不关闭标签页
