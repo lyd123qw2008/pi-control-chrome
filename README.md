@@ -17,7 +17,8 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text.
 - Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
 - Persists debugger lease identity across an MV3 worker restart. Ordinary cleanup reports an unverified old lease instead of detaching an untracked target; explicit stale recovery verifies the current tab fence and CDP target identity before detaching it.
-- Fences tab handles with a tab incarnation and document identity. Navigation invalidates page snapshots, locator refs, DOM-CUA node ids, dialog/file-chooser observations, and Network request-loader mappings; side-effecting operations that lose that identity return an uncertain result and are not replayed automatically.
+- Fences tab handles with a tab incarnation and document identity. Navigation invalidates page snapshots, locator refs, DOM-CUA node ids, dialog/file-chooser observations, and Network request-loader mappings; title-only updates within the same document do not invalidate a complete document handle; side-effecting operations that lose document identity return an uncertain result and are not replayed automatically.
+- Keeps a Manifest V3 Bridge socket active with application heartbeats, preventing idle worker suspension from creating avoidable connection-generation churn during long browser waits.
 - Includes a reusable `pi-control-chrome` Skill. Browser tool schemas are hidden until that Skill is explicitly loaded for the current session; the bundled CLI remains available for explicit human/developer workflows and tests.
 
 ## Semantic page interaction

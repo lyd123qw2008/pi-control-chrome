@@ -29,10 +29,13 @@ const EXTENSION_CAPABILITIES = Object.freeze({
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
 const DEBUGGER_LEASE_IDLE_MS = 15_000;
+const BRIDGE_HEARTBEAT_INTERVAL_MS = 20_000;
 
 let socket;
 let connecting;
 let reconnectTimer;
+let heartbeatTimer;
+let heartbeatSocket;
 let connectedAt;
 let cachedToken;
 let profileIdentity;
@@ -895,6 +898,25 @@ async function getPairingToken() {
   return cachedToken;
 }
 
+function stopBridgeHeartbeat(target) {
+  if (target !== undefined && heartbeatSocket !== target) return;
+  if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+  heartbeatTimer = undefined;
+  heartbeatSocket = undefined;
+}
+
+function startBridgeHeartbeat(target) {
+  stopBridgeHeartbeat();
+  heartbeatSocket = target;
+  heartbeatTimer = setInterval(() => {
+    if (socket !== target || target.readyState !== WebSocket.OPEN) {
+      stopBridgeHeartbeat(target);
+      return;
+    }
+    if (!send({ type: 'ping' }, target)) stopBridgeHeartbeat(target);
+  }, BRIDGE_HEARTBEAT_INTERVAL_MS);
+}
+
 function scheduleReconnect() {
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
@@ -1064,6 +1086,7 @@ async function connect() {
     next.addEventListener("open", () => {
       connectedAt = Date.now();
       send({ type: "hello", role: "extension", protocol: 1, capabilities: EXTENSION_CAPABILITIES, ...browserIdentity() }, next);
+      startBridgeHeartbeat(next);
       log("connected to Pi bridge");
     });
     next.addEventListener("message", async (event) => {
@@ -1296,6 +1319,7 @@ async function connect() {
       }
     });
     next.addEventListener("close", () => {
+      stopBridgeHeartbeat(next);
       abortActiveRequestsForSocket(next, "Browser request aborted because the Bridge connection closed");
       if (socket !== next) return;
       activeRequestControllers.clear();
@@ -2007,6 +2031,7 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
     && tabHandle.url !== undefined
     && tabHandle.tabFence !== undefined
     && tabHandle.incarnation !== undefined;
+  const hasHandleDocumentIdentity = typeof tabHandle.incarnation === "string" && tabHandle.incarnation.length > 0;
   const allowCrossSessionRead = allowOtherSession || crossSessionReadParams.has(handle);
   const requestSessionId = handle.sessionId ?? tabHandle.sessionId;
   if (tabHandle.tabId !== undefined && Number(tabHandle.tabId) !== Number(tab.id)) throw new Error("Tab handle is stale: tab id changed; take a new browser_tabs snapshot");
@@ -2019,7 +2044,7 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (tabHandle.expectedTitle !== undefined && String(tabHandle.expectedTitle) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   if (tabHandle.expectedUrl !== undefined && String(tabHandle.expectedUrl) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.windowId !== undefined && Number(tabHandle.windowId) !== Number(tab.windowId)) throw new Error("Tab handle is stale: window changed; take a new browser_tabs snapshot");
-  if (tabHandle.title !== undefined && String(tabHandle.title) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
+  if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && String(tabHandle.title) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   if (tabHandle.url !== undefined && String(tabHandle.url) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.tabFence !== undefined && fenceAfterVerification !== String(tabHandle.tabFence)) throw new Error("Tab handle is stale: tab incarnation changed; take a new browser_tabs snapshot");
   if (tabHandle.incarnation !== undefined && !allowBlockedPageDocumentCheck) {
@@ -2051,7 +2076,7 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (tabHandle.expectedTitle !== undefined && String(tabHandle.expectedTitle) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   if (tabHandle.expectedUrl !== undefined && String(tabHandle.expectedUrl) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.windowId !== undefined && Number(tabHandle.windowId) !== Number(finalTab.windowId)) throw new Error("Tab handle is stale: window changed; take a new browser_tabs snapshot");
-  if (tabHandle.title !== undefined && String(tabHandle.title) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
+  if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && String(tabHandle.title) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   if (tabHandle.url !== undefined && String(tabHandle.url) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.incarnation !== undefined && !allowBlockedPageDocumentCheck) {
     const incarnation = await readTabIncarnation(finalTab.id, finalFence);
@@ -3833,7 +3858,7 @@ function pageGeneration() {
 
 function isRestrictedPageError(error) {
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  return /cannot access (?:contents of )?the page|extensions (?:gallery|store)|refused to execute script/.test(message);
+  return /cannot access (?:contents of (?:the )?(?:page|url)|(?:the )?page)|extensions (?:gallery|store)|refused to execute script/.test(message);
 }
 
 async function readTabIncarnation(tabId, expectedFence) {

@@ -535,6 +535,11 @@ function broadcast(message) {
 function handleMessage(client, message) {
   if (!message || typeof message !== "object") return;
 
+  if (message.type === "ping" && client.role === "extension") {
+    send(client, { type: "pong" });
+    return;
+  }
+
   if (message.type === "cancel" && client.role === "pi") {
     const clientRequestId = nonEmptyString(message.id);
     if (!clientRequestId) return;

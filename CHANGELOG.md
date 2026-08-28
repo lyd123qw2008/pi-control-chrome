@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-08-28
+
+- Hardened DSH browser arguments against model-emitted blank optional fields, the `index: -1` sentinel, duplicate legacy locators and locator fields accidentally nested in a tab handle; canonical requests now preserve operation values while using one nested target.
+
+- Kept the MV3 extension Bridge socket alive with a 20-second application heartbeat and made restricted `about:blank` tab setup return a usable tab handle without a document incarnation.
+
+- Relaxed complete document handles so title-only metadata updates do not invalidate the handle; tab fences, URLs and document incarnations continue to fence tab replacement and navigation.
+
 ## 0.4.0 - 2026-08-28
 
 - Added semantic element targets for common click, fill, type, keypress, locator, and wait operations. Targets support role/name, label, placeholder, text, test id, explicit indexing, and legacy ref/CSS compatibility with strict ambiguity handling.
