@@ -57,12 +57,12 @@
 - Console、Network、Dialog、Upload、Download；
 - Chrome/Edge 页面能力检测；
 - 语义元素定位和页面状态等待。
-- 页面操作、上传和 Network response body 会校验 tab fence 与文档 `incarnation`；导航会使 snapshot、DOM ref、dialog、file chooser 和旧 loader 映射失效。读取 Network response body 必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。副作用结果不确定时必须先检查页面，系统不会自动重放。
+- 页面操作、上传和 Network response body 会校验 tab fence 与文档 `incarnation`；同一文档只有标题变化时不会使完整 Handle 失效，导航会使 snapshot、DOM ref、dialog、file chooser 和旧 loader 映射失效。新建 Tab 可能先处于受限的 `about:blank`，此时有 Tab 身份但没有文档 incarnation，应先导航到可注入脚本的 URL 再进行页面操作。读取 Network response body 必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。副作用结果不确定时必须先检查页面，系统不会自动重放。
 - Debugger lease 会记录 browserId、tab fence、attach epoch 和 CDP target id，并跨 MV3 worker 重启持久化。普通 cleanup 不会 detach 无法证明归属的全局 target；只有显式 `recoverStale: true` 才会在前后复核身份后恢复旧 lease。
 
 ## 语义页面交互
 
-常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。已有的快照 ref 和 CSS selector 仍然兼容。
+常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。已有的快照 ref 和 CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
 
 文字 target 用于操作或元素状态定位时，会把文字叶节点投影到最近的可操作祖先，因此 `isEnabled` 和 `browser_wait` 报告的是实际接收操作的控件状态。`browser_wait` 支持 `load`、`url`、`text`、`text_gone`、`visible`、`hidden` 和 `enabled`。文字条件使用 `text`，元素条件使用与交互相同的 `target`；`url` 和 `urlIncludes` 可以作为所有等待条件的 URL 过滤器。`hidden` 在没有可见匹配时成功，包括目标不存在或存在多个隐藏匹配；`visible` 和 `enabled` 遇到多个可见匹配时会安全失败。若交互因导航丢失注入结果，会报告结果不确定，系统不会自动重放该副作用操作。
 

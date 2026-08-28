@@ -110,6 +110,7 @@ function loadExtension(options = {}) {
     scripting: {
       async executeScript({ target, func }) {
         const tab = tabs.get(Number(target.tabId));
+        if (options.restrictedPageError && tab?.url === "about:blank") throw new Error(options.restrictedPageError);
         return [{ result: func.name === "pageGeneration" ? { url: tab?.url || "about:blank", timeOrigin: 1, token: "fixture-document-token" } : undefined }];
       },
     },
@@ -145,12 +146,29 @@ function loadExtension(options = {}) {
     },
     alarms: { create() {}, onAlarm: alarm },
   };
+  const heartbeatMessages = [];
+  const intervalCallbacks = new Map();
+  let nextIntervalId = 1;
+  const setIntervalFake = (callback, delay) => {
+    const id = nextIntervalId++;
+    intervalCallbacks.set(id, { callback, delay });
+    return id;
+  };
+  const clearIntervalFake = (id) => { intervalCallbacks.delete(id); };
+  let latestSocket;
   class FakeWebSocket {
     static OPEN = 1;
     static CONNECTING = 0;
     readyState = FakeWebSocket.OPEN;
-    addEventListener() {}
-    send() {}
+    listeners = new Map();
+    constructor() { latestSocket = this; }
+    addEventListener(name, listener) {
+      const listeners = this.listeners.get(name) || [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+    send(message) { heartbeatMessages.push(JSON.parse(message)); }
+    emit(name, event = {}) { for (const listener of this.listeners.get(name) || []) listener(event); }
   }
   let randomUUIDCalls = 0;
   const context = vm.createContext({
@@ -162,6 +180,8 @@ function loadExtension(options = {}) {
     console: { debug() {}, error() {} },
     setTimeout,
     clearTimeout,
+    setInterval: setIntervalFake,
+    clearInterval: clearIntervalFake,
   });
   const source = readFileSync(backgroundPath, "utf8");
   vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, devtoolsState };", context, { filename: backgroundPath });
@@ -177,6 +197,10 @@ function loadExtension(options = {}) {
     emitTabRemoved(tabId) { return tabRemoved.emit(tabId); },
     emitTabReplaced(addedTabId, removedTabId) { return tabReplaced.emit(addedTabId, removedTabId); },
     emitTabUpdated(tabId, changeInfo, tab) { return tabUpdated.emit(tabId, changeInfo, tab); },
+    emitSocketOpen() { latestSocket?.emit("open"); },
+    runHeartbeat() { for (const { callback } of intervalCallbacks.values()) callback(); },
+    heartbeatMessages,
+    heartbeatIntervals: intervalCallbacks,
     removeFailures,
     setDetachFailure(value) { detachFailure = value; },
     setDebuggerCommandFailure(value) { debuggerCommandFailure = value; },
@@ -196,6 +220,16 @@ function storedRecords(fixture) {
 function storedRecord(fixture, tabId) {
   return Object.values(storedRecords(fixture)).find((entry) => Number(entry?.tabId) === Number(tabId));
 }
+
+test("keeps the extension Bridge socket alive with application heartbeats", async () => {
+  const fixture = loadExtension();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  fixture.emitSocketOpen();
+  assert.equal(fixture.heartbeatIntervals.size, 1);
+  assert.equal([...fixture.heartbeatIntervals.values()][0].delay, 20_000);
+  fixture.runHeartbeat();
+  assert.deepEqual(fixture.heartbeatMessages.at(-1), { type: "ping" });
+});
 
 test("retains legacy ownership records for explicit stale recovery", async () => {
   const fixture = loadExtension();
@@ -290,11 +324,12 @@ test("new-tab setup fences an event-before-reservation numeric id reuse", async 
   assert.equal(fixture.api.orphanedDebuggerAttaches.get("test-extension::7")?.tabFence === result.tab.handle.tabFence, false);
   assert.equal(storedRecord(fixture, 7).sessionId, "session-test");
 });
-test("new-tab setup rotates a persisted fence even without debugger state", async () => {
-  const fixture = loadExtension({ createTabId: 7, sessionStorage: { [tabFencesKey]: { "test-extension::7": "tab:old" } } });
-  const result = await fixture.api.handleRequest("new_tab", { url: "https://example.test/new", sessionId: "session-test" });
-  assert.notEqual(result.tab.handle.tabFence, "tab:old");
-  assert.equal(storedRecord(fixture, 7)?.tabFence, result.tab.handle.tabFence);
+test("new-tab setup tolerates a restricted about:blank document", async () => {
+  const fixture = loadExtension({ restrictedPageError: 'Cannot access contents of url "about:blank". Extension manifest must request permission to access this host.' });
+  const result = await fixture.api.handleRequest("new_tab", { url: "about:blank", wait: false, sessionId: "session-test" });
+  assert.equal(result.tab.url, "about:blank");
+  assert.equal(result.tab.handle.incarnation, undefined);
+  assert.equal(storedRecord(fixture, result.tab.id)?.tabFence, result.tab.handle.tabFence);
 });
 
 
@@ -445,6 +480,18 @@ test("extension serializes concurrent claims without overwriting ownership", asy
   const stored = storedRecord(fixture, 303);
   assert.ok(stored);
   assert.ok(["session-a", "session-b"].includes(stored.sessionId));
+});
+
+test("complete document handles tolerate title-only updates", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(312, { id: 312, windowId: 1, title: "initial", url: "https://example.test/title", status: "complete", active: true });
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  const current = listed.tabs.find((entry) => entry.id === 312);
+  assert.ok(current);
+  const handle = { ...current.handle, incarnation: "https://example.test/title\u00001\u0000fixture-document-token" };
+  fixture.tabs.get(312).title = "updated";
+  const selected = await fixture.api.handleRequest("selected_tab", { tabId: 312, handle });
+  assert.equal(selected.tab.title, "updated");
 });
 
 test("claim revalidates the tab snapshot after ownership reads", async () => {

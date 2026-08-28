@@ -61,7 +61,7 @@ The extension returns tab metadata with `browserId`, `windowId`, `tabId`, title,
 
 ### Tab identity and document identity
 
-A numeric tab id is scoped to a tab lifetime and is fenced by a durable `tabFence`; lifecycle events never authorize an unrelated reuse of that id. Complete handles also carry a document `incarnation` derived from URL, `performance.timeOrigin`, and a per-document token. Navigation invalidates snapshots, DOM refs, dialogs, file choosers, and Network request-loader mappings; response-body reads require the matching `requestId` and `loaderId` from the current Network listing. Every page operation checks the document before and after execution; an identity change makes a side-effecting result uncertain and non-retryable.
+A numeric tab id is scoped to a tab lifetime and is fenced by a durable `tabFence`; lifecycle events never authorize an unrelated reuse of that id. Complete handles also carry a document `incarnation` derived from URL, `performance.timeOrigin`, and a per-document token. Navigation invalidates snapshots, DOM refs, dialogs, file choosers, and Network request-loader mappings; response-body reads require the matching `requestId` and `loaderId` from the current Network listing. Every page operation checks the document before and after execution; a title-only metadata update does not invalidate a complete document handle, while a document identity change makes a side-effecting result uncertain and non-retryable.
 
 ### Debugger leases
 

@@ -118,6 +118,19 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
       socket.once("error", reject);
     });
     extension = await connect("extension");
+    const pong = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("extension heartbeat was not acknowledged")), 1000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "pong") return;
+        clearTimeout(timer);
+        extension.off("message", onMessage);
+        resolve(message);
+      };
+      extension.on("message", onMessage);
+      extension.send(JSON.stringify({ type: "ping" }));
+    });
+    assert.deepEqual(pong, { type: "pong" });
     pi = await connect("pi");
 
     const response = await new Promise((resolve, reject) => {
