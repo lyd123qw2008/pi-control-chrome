@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 - 2026-08-29
 
 - Migrate the managed Skill CLI and DSH/Pi page-read consumers to a negotiated `responseMode=compact` Bridge response. Keep `responseMode=raw` as an explicit human/developer diagnostic path, retain old unspecified-mode compatibility, validate invalid modes, and make Pi/DSH projections idempotent for already compact results.
 
