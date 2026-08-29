@@ -47,6 +47,36 @@ describe('DSH /chrome command', () => {
     expect(selected.kind).toBe('success')
     expect(request).toHaveBeenLastCalledWith('status', { sessionId: 'session-test' }, expect.any(AbortSignal), { browserId: 'edge:profile-a' })
   })
+  it('lists tabs with compact wire responses when Bridge capability is advertised', async () => {
+    const request = vi.fn(async () => ({
+      browserId: 'edge:test',
+      tabs: [{ id: 7, title: 'Orders', url: 'https://example.test', favicon: 'data:image/png;base64,payload' }],
+      groups: [{ id: 1, title: 'Pi', color: 'blue' }],
+    }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, capabilities: { compactResponses: true } }))
+    const { handler } = setup({ request, health, start: vi.fn(), stop: vi.fn(), restart: vi.fn() })
+    const result = await handler(invocation('tabs'))
+    expect(result.kind).toBe('success')
+    expect(request).toHaveBeenCalledWith('list_tabs', { sessionId: 'session-test', responseMode: 'compact' }, expect.any(AbortSignal))
+    const rendered = JSON.parse(result.text ?? '{}')
+    expect(rendered.tabs[0].favicon).toBeUndefined()
+    expect(rendered.groups).toEqual([{ id: 1, title: 'Pi', color: 'blue' }])
+  })
+
+  it('projects tabs locally for an older Bridge without compact capability', async () => {
+    const request = vi.fn(async () => ({
+      browserId: 'edge:legacy',
+      tabs: [{ id: 8, title: 'Legacy', url: 'https://example.test', favicon: 'data:image/png;base64,payload' }],
+    }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true }))
+    const { handler } = setup({ request, health, start: vi.fn(), stop: vi.fn(), restart: vi.fn() })
+    const result = await handler(invocation('tabs'))
+    expect(result.kind).toBe('success')
+    expect(request).toHaveBeenCalledWith('list_tabs', { sessionId: 'session-test' }, expect.any(AbortSignal))
+    const rendered = JSON.parse(result.text ?? '{}')
+    expect(rendered.tabs[0].favicon).toBeUndefined()
+  })
+
   it('allows a human restart command without launcher-label checks', async () => {
     const restart = vi.fn(async () => ({ ok: true, restarted: true, bridgeHealth: { extensionConnected: true, startedBy: 'pi' } }))
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, startedBy: 'pi' }))

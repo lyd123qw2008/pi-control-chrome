@@ -935,6 +935,7 @@ function compactBridgeHealth(value: Record<string, unknown>): JsonValue {
   ] as const
   const result: Record<string, unknown> = {}
   for (const field of fields) if (value[field] !== undefined) result[field] = value[field]
+  if (isRecord(value.capabilities) && value.capabilities.compactResponses === true) result.capabilities = { compactResponses: true }
   if (Array.isArray(value.targets)) {
     result.targets = value.targets.filter(isRecord).map(target => {
       const compact: Record<string, unknown> = {}
@@ -1237,11 +1238,20 @@ function validateLocatorRequest(params: Record<string, JsonValue>): void {
   if (['strategy', 'selector', 'exact', 'name', 'index', 'hasText', 'hasSelector'].some(key => params[key] !== undefined)) throw new Error('locator target cannot be combined with legacy locator fields')
 }
 
+function compactResponseParams(toolName: string, params: Record<string, JsonValue>, health: Record<string, unknown>): Record<string, JsonValue> {
+  const supported = ['browser_snapshot', 'browser_accessibility_snapshot', 'browser_extract', 'browser_tabs', 'browser_selected'].includes(toolName)
+    || (toolName === 'browser_dom_cua' && params.action === 'get_visible_dom')
+  if (!supported || params.responseMode !== undefined) return params
+  if (!isRecord(health.capabilities) || health.capabilities.compactResponses !== true) return params
+  return { ...params, responseMode: 'compact' }
+}
+
 function assertBridgeRequestCapabilities(method: string, params: Record<string, JsonValue>, health: Record<string, unknown>, status?: unknown): void {
   const bridgeCapabilities = isRecord(health.capabilities) ? health.capabilities : {}
   const extensionCapabilities = isRecord(status) && isRecord(status.capabilities) ? status.capabilities : {}
   const requiredBridge: string[] = []
   const requiredExtension: string[] = []
+  if (params.responseMode === 'compact') requiredBridge.push('compactResponses')
   const requireTargetSupport = () => {
     requiredBridge.push('semanticTargetRequests')
     requiredExtension.push('semanticTargets')
@@ -2029,8 +2039,9 @@ export function registerBrowserTools(
         params = { ...params, expectedBrowserId: target.browserId }
         let method = spec.method
         if (spec.name === 'browser_accessibility_snapshot') {
-          assertBridgeRequestCapabilities('snapshot', params, connection.bridgeHealth, connection.status)
-          const result = await requestBrowserOperation(bridge, 'snapshot', { ...params, accessibilityOnly: true }, operationSignal, targetRoute)
+          const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
+          assertBridgeRequestCapabilities('snapshot', wireParams, connection.bridgeHealth, connection.status)
+          const result = await requestBrowserOperation(bridge, 'snapshot', { ...wireParams, accessibilityOnly: true }, operationSignal, targetRoute)
           if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
           return prepareAccessibility(result.value, params)
         }
@@ -2042,13 +2053,14 @@ export function registerBrowserTools(
           method = network.method
           params = network.params
         }
-        assertBridgeRequestCapabilities(method, params, connection.bridgeHealth, connection.status)
+        const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
+        assertBridgeRequestCapabilities(method, wireParams, connection.bridgeHealth, connection.status)
         if (spec.name === 'browser_screenshot') {
-          const result = await requestBrowserOperation(bridge, method, params, operationSignal, targetRoute)
+          const result = await requestBrowserOperation(bridge, method, wireParams, operationSignal, targetRoute)
           if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
           return prepareScreenshot(result.value, params, attachments)
         }
-        const result = await requestBrowserOperation(bridge, method, params, operationSignal, targetRoute)
+        const result = await requestBrowserOperation(bridge, method, wireParams, operationSignal, targetRoute)
         if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
         return compactBrowserResult(spec.name, params, result.value)
       } finally {

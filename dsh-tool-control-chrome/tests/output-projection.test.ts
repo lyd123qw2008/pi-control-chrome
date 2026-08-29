@@ -92,12 +92,35 @@ describe('browser output projections', () => {
     expect(dom.nodes).toBeUndefined()
   })
 
+  it('accepts an already compact Bridge snapshot response', () => {
+    const result = record(compactSnapshotResult({
+      browserId: 'edge:test',
+      connectionId: 'connection-1',
+      snapshot: { snapshotId: 'snapshot-wire', state: '- button "Save" [ref=e1]', nodeCount: 1, charCount: 25, truncated: false },
+    }))
+    expect(result.browserId).toBe('edge:test')
+    expect(result.connectionId).toBe('connection-1')
+    expect(record(result.snapshot).state).toBe('- button "Save" [ref=e1]')
+    expect(record(result.snapshot).elements).toBeUndefined()
+  })
+
   it('projects tab inventories without favicon data', () => {
     const result = record(compactTabsResult({ browserId: 'edge:test', profile: 'profile', tabs: [{ id: 1, title: 'A', url: 'https://example.test', favicon: `data:image/png;base64,${'A'.repeat(1000)}` }] }))
     const tabs = result.tabs as unknown[]
     expect(record(tabs[0]).favicon).toBeUndefined()
   })
 
+  it('fails closed for malformed page envelopes', () => {
+    const snapshot = record(compactBrowserResult('browser_snapshot', {}, { browserId: 'edge:test', frameTree: { secret: 'debug' }, raw: 'payload' }))
+    const extract = record(compactBrowserResult('browser_extract', {}, { browserId: 'edge:test', frameTree: { secret: 'debug' }, raw: 'payload' }))
+    const dom = record(compactBrowserResult('browser_dom_cua', { action: 'get_visible_dom' }, { browserId: 'edge:test', frameTree: { secret: 'debug' }, raw: 'payload' }))
+    expect(snapshot.frameTree).toBeUndefined()
+    expect(snapshot.raw).toBeUndefined()
+    expect(extract.frameTree).toBeUndefined()
+    expect(extract.raw).toBeUndefined()
+    expect(dom.frameTree).toBeUndefined()
+    expect(dom.raw).toBeUndefined()
+  })
   it('bounds a large snapshot state', () => {
     const result = record(compactBrowserResult('browser_snapshot', {}, {
       snapshot: { snapshotId: 'large', title: 'large', url: 'https://example.test', text: 'x'.repeat(30_000), elements: [] },

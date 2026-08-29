@@ -253,6 +253,9 @@ try {
 
   const initial = await request("list_tabs");
   assert.ok(initial.tabs.length >= 1);
+  const initialCompact = await request("list_tabs", { responseMode: "compact" });
+  assert.ok(initialCompact.tabs.length >= 1);
+  assert.equal(initialCompact.tabs[0].favicon, undefined);
   const selected = await request("selected_tab");
   assert.ok(selected.tab?.id !== undefined);
   const claimed = await request("claim_tab", {
@@ -334,6 +337,12 @@ try {
   }), /Timed out waiting for page condition enabled/);
   await sleep(100);
   const staleSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const compactWireSnapshot = await request("snapshot", { tabId: selected.tab.id, responseMode: "compact" });
+  assert.equal(compactWireSnapshot.snapshot.elements, undefined);
+  assert.equal(compactWireSnapshot.snapshot.accessibility, undefined);
+  assert.equal(compactWireSnapshot.snapshot.text, undefined);
+  assert.equal(compactWireSnapshot.frameTree, undefined);
+  assert.match(compactWireSnapshot.snapshot.state, /\[ref=/);
    const staleButton = staleSnapshot.snapshot.elements.find((element) => element.tag === "button");
    await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-stale-test', '1')" });
    await assert.rejects(() => request("interaction", { tabId: selected.tab.id, operation: "click", ref: staleButton.ref, snapshotId: staleSnapshot.snapshot.snapshotId }), /Snapshot is stale/);
@@ -366,11 +375,20 @@ try {
   const axDiff = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true });
   assert.equal(axDiff.snapshot.accessibility.mode, "diff");
   assert.match(axDiff.snapshot.accessibility.state, /Changed accessibility/);
+  const compactAx = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true, responseMode: "compact" });
+  assert.equal(compactAx.children, undefined);
+  assert.equal(compactAx.snapshot, undefined);
+  assert.equal(typeof compactAx.state, "string");
   await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#aria-label-button').setAttribute('aria-label', 'Labelled action')" });
   const actionSnapshot = await request("snapshot", { tabId: selected.tab.id });
   const actionInput = actionSnapshot.snapshot.elements.find((element) => element.tag === "input");
   assert.ok(actionInput?.ref);
   const extracted = await request("extract", { tabId: selected.tab.id });
+  const compactWireExtract = await request("extract", { tabId: selected.tab.id, responseMode: "compact" });
+  assert.equal(compactWireExtract.content.text.length <= 12000, true);
+  assert.equal(compactWireExtract.content.markdown.length <= 12000, true);
+  assert.equal(compactWireExtract.frameTree, undefined);
+
   assert.match(extracted.content.text, /Pi Control Chrome E2E/);
   assert.ok(extracted.content.text.length <= 12000);
   assert.ok(extracted.content.markdown.length <= 12000);
@@ -522,13 +540,17 @@ try {
    const staleDomButton = staleVisibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
            await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-dom-stale-test', '1')" });
            await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: staleDomButton.node_id, snapshotId: staleVisibleDom.dom.snapshotId }), /DOM snapshot is stale/);
-   const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
-  const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
+    const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+   const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
   assert.ok(domButton?.node_id);
   await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domButton.node_id, snapshotId: visibleDom.dom.snapshotId });
    const freshDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
    const freshButton = freshDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
    await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "type", nodeId: freshButton.node_id, snapshotId: freshDom.dom.snapshotId, value: "invalid" }), /not editable/);
+   const compactVisibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom", responseMode: "compact" });
+   assert.equal(compactVisibleDom.dom.nodes, undefined);
+   assert.equal(typeof compactVisibleDom.dom.state, "string");
+   assert.equal(typeof compactVisibleDom.dom.snapshotId, "string");
   const inputRect = input.rect;
   await request("cua", { tabId: selected.tab.id, action: "click", x: inputRect.x + 4, y: inputRect.y + 4 });
   await request("cua", { tabId: selected.tab.id, action: "type", text: " CUA" });

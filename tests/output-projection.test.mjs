@@ -72,6 +72,31 @@ test("Pi snapshot projection honors explicit budgets and preserves refs", () => 
   assert.equal(result.snapshot.truncated, true);
 });
 
+test("Pi snapshot projection accepts an already compact Bridge response", () => {
+  const result = compactSnapshotResult({
+    browserId: "edge:test",
+    connectionId: "connection-1",
+    snapshot: { snapshotId: "snapshot-wire", state: "- button \\\"Save\\\" [ref=e1]", nodeCount: 1, charCount: 29, truncated: false },
+  });
+  assert.equal(result.browserId, "edge:test");
+  assert.equal(result.connectionId, "connection-1");
+  assert.equal(result.snapshot.state, "- button \\\"Save\\\" [ref=e1]");
+  assert.equal(result.snapshot.elements, undefined);
+});
+
+test("Pi compact projections fail closed for malformed page envelopes", () => {
+  const snapshot = compactBrowserResult("browser_snapshot", {}, { browserId: "edge:test", frameTree: { secret: "debug" }, raw: "payload" });
+  const extract = compactBrowserResult("browser_extract", {}, { browserId: "edge:test", frameTree: { secret: "debug" }, raw: "payload" });
+  const dom = compactBrowserResult("browser_dom_cua", { action: "get_visible_dom" }, { browserId: "edge:test", frameTree: { secret: "debug" }, raw: "payload" });
+  assert.equal(snapshot.frameTree, undefined);
+  assert.equal(snapshot.raw, undefined);
+  assert.equal(extract.frameTree, undefined);
+  assert.equal(extract.raw, undefined);
+  assert.equal(dom.frameTree, undefined);
+  assert.equal(dom.raw, undefined);
+});
+
+
 test("Pi tab projection removes data URL favicon", () => {
   const result = compactTabsResult({ tabs: [{ id: 1, favicon: `data:image/png;base64,${"A".repeat(1000)}` }] });
   assert.equal(result.tabs[0].favicon, undefined);

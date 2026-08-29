@@ -5,6 +5,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { WebSocketServer } from "ws";
+import { compactBrowserResult } from "../pi-extension/output.js";
 
 const DEFAULT_PORT = 17318;
 const DEFAULT_TOKEN_FILE = join(
@@ -28,7 +29,9 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   semanticTargetRequests: true,
   pageWaitStates: true,
   requestCancellation: true,
+  compactResponses: true,
 });
+const RESPONSE_MODES = new Set(["compact", "raw"]);
 const TAB_INCARNATION_METHODS = new Set([
   "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
   "close_tab", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
@@ -344,6 +347,28 @@ function requestParams(message) {
   return message.params && typeof message.params === "object" && !Array.isArray(message.params) ? message.params : {};
 }
 
+function extensionRequestParams(params) {
+  if (!Object.prototype.hasOwnProperty.call(params, "responseMode")) return params;
+  const { responseMode: _responseMode, ...extensionParams } = params;
+  return extensionParams;
+}
+
+function compactResponseToolName(method, params = {}) {
+  if (method === "snapshot") return params.accessibilityOnly === true ? "browser_accessibility_snapshot" : "browser_snapshot";
+  if (method === "extract") return "browser_extract";
+  if (method === "list_tabs") return "browser_tabs";
+  if (method === "selected_tab") return "browser_selected";
+  if (method === "dom_cua" && params.action === "get_visible_dom") return "browser_dom_cua";
+  return undefined;
+}
+
+function responseForClient(entry, value) {
+  const decorated = decorateTargetResult(value, entry.target);
+  if (entry.params.responseMode !== "compact") return decorated;
+  const toolName = compactResponseToolName(entry.method, entry.params);
+  return toolName === undefined ? decorated : compactBrowserResult(toolName, entry.params, decorated);
+}
+
 function isSideEffectingRequest(method, params = {}) {
   if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable"].includes(method)) return true;
   if (method === "interaction") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || params.operation || ""));
@@ -589,7 +614,18 @@ function handleMessage(client, message) {
       sendError(client, id, "INVALID_REQUEST", "request.params must be an object.");
       return;
     }
-    if (message.method === "list_targets") {
+    const params = requestParams(message);
+    if (params.responseMode !== undefined && (typeof params.responseMode !== "string" || !RESPONSE_MODES.has(params.responseMode))) {
+      metrics.requestErrors += 1;
+      sendError(client, id, "INVALID_REQUEST", "request.params.responseMode must be compact or raw.");
+      return;
+    }
+    if (params.responseMode === "compact" && compactResponseToolName(message.method, params) === undefined) {
+      metrics.requestErrors += 1;
+      sendError(client, id, "INVALID_REQUEST", "request.params.responseMode=compact is only supported for bounded browser read responses.");
+      return;
+    }
+     if (message.method === "list_targets") {
       send(client, {
         type: "response",
         id,
@@ -647,7 +683,7 @@ function handleMessage(client, message) {
       clientRequestId: id,
       extension,
       method: message.method,
-      params: message.params && typeof message.params === "object" && !Array.isArray(message.params) ? message.params : {},
+      params,
       target,
       connectionId: target?.connectionId,
       connectionGeneration: target?.connectionGeneration,
@@ -673,7 +709,7 @@ function handleMessage(client, message) {
       type: "request",
       id: bridgeRequestId,
       method: message.method,
-      params: message.params ?? {},
+      params: extensionRequestParams(params),
       ...(target === undefined ? {} : {
         target: {
           browserId: target.browserId,
@@ -785,7 +821,7 @@ function handleMessage(client, message) {
       const delivered = send(entry.client, {
         ...message,
         id: entry.clientRequestId,
-        ...(message.error ? {} : { result: decorateTargetResult(message.result, entry.target) }),
+        ...(message.error ? {} : { result: responseForClient(entry, message.result) }),
       });
        if (!delivered && isSideEffectingRequest(entry.method, entry.params)) markDraining(bridgeRequestId, entry, "client_response_send_failed");
     }

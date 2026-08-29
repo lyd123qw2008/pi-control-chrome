@@ -10,7 +10,7 @@ import { WebSocketServer } from "ws";
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("..", import.meta.url));
 const script = join(root, "skills", "pi-control-chrome", "scripts", "browser.mjs");
-const capabilities = { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true };
+const capabilities = { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true, compactResponses: true };
 
 function runScript(port, ...args) {
   return execFileAsync(process.execPath, [script, ...args], {
@@ -30,7 +30,7 @@ test("browser CLI sends session and turn context with retention marks", async ()
   const server = createServer((request, response) => {
     response.setHeader("Content-Type", "application/json");
     if (request.url === "/health") {
-      response.end(JSON.stringify({ ok: true, extensionConnected: true, browserId: "edge:test" }));
+      response.end(JSON.stringify({ ok: true, extensionConnected: true, browserId: "edge:test", capabilities: { compactResponses: true } }));
       return;
     }
     if (request.url === "/pair") {
@@ -53,7 +53,14 @@ test("browser CLI sends session and turn context with retention marks", async ()
         const tab = { id: ++nextTabId, title: "CLI test", url: message.params.url, active: false, owner: "agent", lifecycle: "temporary", groupId: 1, windowId: 1, sessionId: message.params.sessionId };
         tabs.set(tab.id, tab);
         result = { tab, groupId: 1 };
-      } else if (message.method === "wait") {
+      } else if (message.method === "snapshot") {
+         result = {
+           tabId: Number(message.params.tabId),
+           tab: tabs.get(Number(message.params.tabId)),
+           snapshot: { snapshotId: "cli-snapshot", title: "CLI test", url: "https://example.test/", text: "raw page text", elements: [{ ref: "e1", role: "button", name: "Save" }] },
+           frameTree: { frameTree: { frame: { id: "main" } } },
+         };
+       } else if (message.method === "wait") {
         result = { tab: tabs.get(Number(message.params.tabId)) };
       } else if (message.method === "list_tabs") {
         result = { browser: "edge", browserId: "edge:test", profile: "profile", tabs: [...tabs.values()].map(tab => ({ ...tab, groupId: groupingReady ? 1 : -1 })), groups: [{ id: 1, title: "Pi", color: "blue" }] };
@@ -76,6 +83,15 @@ test("browser CLI sends session and turn context with retention marks", async ()
     assert.equal(output.tab.lifecycle, "handoff");
     assert.equal(output.sessionId, "cli-session");
     assert.equal(output.turnId, 4);
+    const compactSnapshot = JSON.parse((await runScript(port, "snapshot", "41", "--browser-id", "edge:test", "--session", "cli-session", "--json")).stdout);
+    assert.equal(compactSnapshot.snapshot.elements, undefined);
+    assert.equal(compactSnapshot.frameTree, undefined);
+    assert.match(compactSnapshot.snapshot.state, /\[ref=e1\]/);
+    assert.equal(routedRequests.find(message => message.method === "snapshot")?.params.responseMode, "compact");
+    const rawSnapshot = JSON.parse((await runScript(port, "snapshot", "41", "--browser-id", "edge:test", "--session", "cli-session", "--raw", "--json")).stdout);
+    assert.ok(rawSnapshot.snapshot.elements);
+    assert.ok(rawSnapshot.frameTree);
+    assert.equal(routedRequests.filter(message => message.method === "snapshot").at(-1)?.params.responseMode, "raw");
      assert.ok(routedRequests.length > 0);
      assert.ok(routedRequests.every(message => message.target?.browserId === "edge:test"));
      assert.ok(routedRequests.filter(message => message.method !== "status").every(message => message.target?.connectionId === "edge-connection" && message.target?.connectionGeneration === 5));

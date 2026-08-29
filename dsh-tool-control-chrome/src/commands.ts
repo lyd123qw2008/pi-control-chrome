@@ -3,6 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import { bridgeRecovery } from './diagnostics.js'
+import { compactBrowserResult } from './output.js'
 import type { BrowserBridgeClient } from './bridge.js'
 
 function render(value: unknown): string {
@@ -11,6 +12,16 @@ function render(value: unknown): string {
 
 function sessionId(invocation: CommandInvocation): string {
   return invocation.agent.session.id
+}
+
+function compactReadParams(bridgeHealth: Record<string, unknown>, params: Record<string, unknown>): Record<string, unknown> {
+  return isRecord(bridgeHealth.capabilities) && bridgeHealth.capabilities.compactResponses === true
+    ? { ...params, responseMode: 'compact' }
+    : params
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function usage(): CommandResult {
@@ -178,8 +189,9 @@ export function registerChromeCommand(ctx: Context, bridge: BrowserBridgeClient)
           }
         }
         if (action === 'tabs') {
-          const tabs = await bridge.request('list_tabs', { sessionId: sessionId(invocation) }, invocation.signal)
-          return { kind: 'success', text: render(tabs) }
+          const bridgeHealth = await bridge.health()
+          const tabs = await bridge.request('list_tabs', compactReadParams(bridgeHealth, { sessionId: sessionId(invocation) }), invocation.signal)
+          return { kind: 'success', text: render(compactBrowserResult('browser_tabs', {}, tabs)) }
         }
         if (action === 'restart') {
           if (invocation.signal.aborted) return { kind: 'error', text: 'Chrome Bridge restart was cancelled.' }
