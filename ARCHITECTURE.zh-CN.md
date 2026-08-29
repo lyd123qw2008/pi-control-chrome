@@ -239,7 +239,7 @@ closed
 
 ## 五点五、标签页和文档身份
 
-数字 tab ID 只在一个标签页生命周期内有效，并由持久化的 `tabFence` 保护；生命周期事件不能授权对无关复用 ID 的操作。完整 Handle 还包含由 URL、`performance.timeOrigin` 和每个文档独有 Token 组成的 `incarnation`。同一文档只有标题变化时不会使完整 Handle 失效；导航会使 snapshot、DOM ref、dialog、file chooser 和 Network request-loader 映射失效；读取 Network response body 时，必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。每个页面操作都会在执行前后检查文档身份；身份变化时，有副作用的结果会标记为不确定且不可自动重试。受限的 `about:blank` 可以保留 Tab 身份但没有文档 incarnation，页面操作前应先导航到可注入脚本的 URL。
+数字 tab ID 只在一个标签页生命周期内有效，并由持久化的 `tabFence` 保护；生命周期事件不能授权对无关复用 ID 的操作。完整 Handle 还包含由 URL、`performance.timeOrigin` 和每个文档独有 Token 组成的 `incarnation`。同一文档只有标题变化时不会使完整 Handle 失效；导航会使 snapshot、DOM ref、dialog、file chooser 和 Network request-loader 映射失效；读取 Network response body 时，必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。用户 Tab 的只读页面读取会重新观察当前文档并在变化时重试一次，持续变化时返回 `BROWSER_PAGE_CHANGING`。有副作用的页面操作继续在执行前后检查文档身份；身份变化时，结果会标记为不确定且不可自动重试。受限的 `about:blank` 可以保留 Tab 身份但没有文档 incarnation，页面操作前应先导航到可注入脚本的 URL。
 
 ## 五点六、Debugger lease 和创建竞态
 

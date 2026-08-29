@@ -390,6 +390,20 @@ describe('DSH browser tool catalog', () => {
     })
   })
 
+  it('drops blank selectors from page observation requests', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
+      : { method, params })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_snapshot')?.execute({ tabId: 7, selector: '' }, execution(harness.agent))
+    await harness.tools.get('browser_extract')?.execute({ tabId: 7, selector: '' }, execution(harness.agent))
+    await harness.tools.get('browser_accessibility_snapshot')?.execute({ tabId: 7, selector: '' }, execution(harness.agent))
+    const operationCalls = request.mock.calls.filter(([method]) => method !== 'status')
+    expect(operationCalls).toHaveLength(3)
+    for (const [, params] of operationCalls) expect(params).not.toHaveProperty('selector')
+  })
+
   it('prefers nested exact matching for a visible wait target', async () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { pageWaitStates: true, semanticTargets: true, tabIncarnationFence: true } }
@@ -415,6 +429,26 @@ describe('DSH browser tool catalog', () => {
       },
     })
   })
+
+
+  it('keeps browser_status compact without dropping target identity', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', connectionId: 'connection-1', connectionGeneration: 2, capabilities: { tabIncarnationFence: true } }
+      : { method })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browserId: 'edge:test',
+      connectionId: 'connection-1',
+      connectionGeneration: 2,
+      observability: { metrics: { requests: 4 }, recentEvents: Array.from({ length: 100 }, () => ({ event: 'internal' })) },
+    }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({ state: 'connected', browserId: 'edge:test', bridgeHealth: { browserId: 'edge:test', connectionGeneration: 2, observability: { metrics: { requests: 4 } } } })
+    expect(JSON.stringify(result)).not.toContain('internal')
+  })
+
 
   it('reports an actionable diagnosis when the Bridge has no extension', async () => {
     const request = vi.fn(async () => ({ connected: false }))
@@ -771,6 +805,123 @@ describe('DSH browser tool catalog', () => {
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })
 
+  it('returns compact recovery details for a stale browser target handle', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:current', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('Tab handle belongs to another browser target') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_TARGET_MISMATCH'
+      error.details = { expectedBrowserId: 'edge:old', currentBrowserId: 'edge:current' }
+      throw error
+    })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browserId: 'edge:current',
+      capabilities: { tabIncarnationFence: true, recentEvents: 'do not expose this' },
+      observability: { metrics: { requests: 3 }, recentEvents: Array.from({ length: 100 }, () => ({ event: 'internal' })) },
+      targets: [{ browser: 'edge', browserId: 'edge:current', profile: 'current', extensionVersion: '0.4.1', connectionId: 'connection-1', connectionGeneration: 2, private: 'do not expose this' }],
+    }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      nextAction: 'browser_status',
+      recommendation: 'refresh_browser_target_handle',
+      error: { code: 'BROWSER_TARGET_MISMATCH', details: { expectedBrowserId: 'edge:old' } },
+      bridgeHealth: { browserId: 'edge:current', observability: { metrics: { requests: 3 } } },
+    })
+    expect(JSON.stringify(result)).not.toContain('internal')
+    expect(JSON.stringify(result)).not.toContain('do not expose this')
+  })
+
+  it('returns a compact actionable result for a browser wait timeout', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { pageWaitStates: true, semanticTargets: true, tabIncarnationFence: true } }
+      const error = new Error('timed out') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_WAIT_TIMEOUT'
+      error.details = { tabId: 7, state: 'visible', count: 0, url: 'http://example.test' }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, pageWaitStates: true, tabIncarnationFence: true }, observability: { recentEvents: ['do not fetch'] } }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_wait')?.execute({ state: 'visible', target: { role: 'button', name: 'missing' }, tabId: 7 }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      retryable: true,
+      nextAction: 'browser_snapshot',
+      recommendation: 'inspect_wait_target',
+      error: { code: 'BROWSER_WAIT_TIMEOUT', details: { count: 0, url: 'http://example.test' } },
+    })
+    expect(health).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns a deterministic result for a selector that matches no page element', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('Snapshot selector did not match any element: main') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_SELECTOR_NOT_FOUND'
+      error.details = { tabId: 7, selector: 'main' }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_snapshot')?.execute({ tabId: 7, selector: 'main' }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      retryable: false,
+      nextAction: 'browser_snapshot',
+      recommendation: 'refresh_selector_target',
+      error: { code: 'BROWSER_SELECTOR_NOT_FOUND', details: { selector: 'main' } },
+    })
+    expect(health).toHaveBeenCalledTimes(2)
+  })
+  it('returns a non-retryable diagnosis for an unscriptable browser error page', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('page unavailable') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_PAGE_UNAVAILABLE'
+      error.details = { tabId: 7, pageIdentityVerified: false }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_snapshot')?.execute({ tabId: 7 }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      nextAction: 'browser_tabs',
+      recommendation: 'navigate_to_scriptable_page',
+      error: { code: 'BROWSER_PAGE_UNAVAILABLE', details: { tabId: 7 } },
+    })
+  })
+
+
+
+  it('returns a retryable diagnosis when a read crosses a document change', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('page changed during read') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_PAGE_CHANGING'
+      error.details = { tabId: 7, attempts: 2, pageChanged: true }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_extract')?.execute({ tabId: 7 }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'not_completed',
+      retryable: true,
+      inspectFirst: false,
+      nextAction: 'browser_tabs',
+      recommendation: 'retry_read_on_current_tab',
+      error: { code: 'BROWSER_PAGE_CHANGING', details: { tabId: 7, attempts: 2 } },
+    })
+  })
+
   it('reports and blocks an old Bridge without atomic target routing', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4' }
@@ -823,6 +974,26 @@ describe('DSH browser tool catalog', () => {
     })
   })
 
+  it('projects bounded snapshots and preserves refs when page text is large', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { snapshotRefs: true, tabIncarnationFence: true } }
+      : method === 'snapshot'
+        ? {
+          tabId: 7,
+          tab: { id: 7, title: 'Orders', url: 'https://example.test/orders', handle: { tabId: 7, browserId: 'edge:test', tabFence: 'fence-1' } },
+          snapshot: { snapshotId: 'snapshot-1', title: 'Orders', url: 'https://example.test/orders', text: 'x'.repeat(500), elements: [{ ref: 'e1', role: 'button', name: 'Submit' }] },
+          frameTree: { debug: true },
+        }
+        : { method })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { snapshotRefs: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    const snapshot = await harness.tools.get('browser_snapshot')?.execute({ maxChars: 100, maxNodes: 1 }, execution(harness.agent))
+    expect(snapshot).toMatchObject({ snapshot: { snapshotId: 'snapshot-1', nodeCount: 1, truncated: false } })
+    expect(JSON.stringify(snapshot)).toContain('[ref=e1]')
+    expect(JSON.stringify(snapshot)).not.toContain('frameTree')
+    expect(request).toHaveBeenCalledWith('snapshot', expect.objectContaining({ maxChars: 100, maxNodes: 1, sessionId: 'session-test', expectedBrowserId: 'edge:test' }), expect.any(AbortSignal), { browserId: 'edge:test' })
+  })
+
   it('projects accessibility and network specializations', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4', capabilities: { tabIncarnationFence: true } }
@@ -831,8 +1002,9 @@ describe('DSH browser tool catalog', () => {
         : { method })
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
     const harness = setup({ request, health })
-    const accessibility = await harness.tools.get('browser_accessibility_snapshot')?.execute({}, execution(harness.agent))
-    expect(accessibility).toEqual({ role: 'main', snapshotId: 'snapshot-1' })
+    const accessibility = await harness.tools.get('browser_accessibility_snapshot')?.execute({ maxChars: 100, maxNodes: 1, disableDiffing: true }, execution(harness.agent))
+    expect(accessibility).toEqual({ snapshotId: 'snapshot-1', mode: 'full', state: '', nodeCount: 0, charCount: 0, truncated: false })
+    expect(request).toHaveBeenCalledWith('snapshot', expect.objectContaining({ accessibilityOnly: true, maxChars: 100, maxNodes: 1, disableDiffing: true }), expect.any(AbortSignal), { browserId: 'edge:test' })
     await harness.tools.get('browser_network')?.execute({ action: 'enable' }, execution(harness.agent))
     expect(request).toHaveBeenLastCalledWith('devtools_enable', expect.objectContaining({ domains: ['Network', 'Page'] }), expect.any(AbortSignal), { browserId: 'edge:test' })
   })
@@ -1274,5 +1446,29 @@ describe('DSH browser tool catalog', () => {
     expect(saveImage).toHaveBeenCalledOnce()
     const content = tool?.output.render({}, value as never)
     expect(content?.[1]).toEqual({ type: 'image', attachment: ref })
+  })
+
+  it('ignores an empty screenshot path instead of treating it as the workspace directory', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
+      : { tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    const tool = harness.tools.get('browser_screenshot')
+    const value = await tool?.execute({ tabId: 7, path: '' }, execution(harness.agent))
+    expect(value).toEqual({ tabId: 7, mimeType: 'image/png', attachmentUnavailable: true })
+  })
+
+
+  it('does not expose screenshot data without an attachment store', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4', capabilities: { tabIncarnationFence: true } }
+      : { tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const tool = harness.tools.get('browser_screenshot')
+    const value = await tool?.execute({ tabId: 7 }, execution(harness.agent))
+    expect(value).toEqual({ tabId: 7, mimeType: 'image/png', attachmentUnavailable: true })
+    expect(JSON.stringify(value)).not.toContain('AQID')
   })
 })
