@@ -31,6 +31,7 @@ function loadExtension(options = {}) {
   const downloads = new Map();
   let nextDownloadId = 1;
   let nextTabId = Number(options.nextTabId ?? 1000);
+  let pageGenerationCalls = 0;
   const removeFailures = new Set();
   let detachFailure = false;
   let debuggerCommandFailure = false;
@@ -111,7 +112,15 @@ function loadExtension(options = {}) {
       async executeScript({ target, func }) {
         const tab = tabs.get(Number(target.tabId));
         if (options.restrictedPageError && tab?.url === "about:blank") throw new Error(options.restrictedPageError);
-        return [{ result: func.name === "pageGeneration" ? { url: tab?.url || "about:blank", timeOrigin: 1, token: "fixture-document-token" } : undefined }];
+        if (options.executeScriptException && func.name === (options.executeScriptException.functionName || "collectSnapshot")) return [{ exceptionDetails: options.executeScriptException.details }];
+        if (func.name === "pageGeneration") {
+          const sequence = Array.isArray(options.pageGenerationSequence) ? options.pageGenerationSequence : [];
+          const fallback = { url: tab?.url || "about:blank", timeOrigin: 1, token: "fixture-document-token" };
+          const generation = sequence.length > 0 ? sequence[Math.min(pageGenerationCalls++, sequence.length - 1)] : fallback;
+          return [{ result: clone(generation ?? fallback) }];
+        }
+        const scriptedResults = options.executeScriptResults && typeof options.executeScriptResults === "object" ? options.executeScriptResults : {};
+        return [{ result: Object.hasOwn(scriptedResults, func.name) ? clone(scriptedResults[func.name]) : undefined }];
       },
     },
     debugger: {
@@ -120,7 +129,11 @@ function loadExtension(options = {}) {
       async attach(debuggee) { attachedDebuggerTabs.add(Number(debuggee.tabId)); },
       async getTargets() { return [...attachedDebuggerTabs].map((tabId) => ({ tabId, attached: true, id: `target-${tabId}` })); },
       async detach(debuggee) { if (detachFailure) throw new Error("simulated debugger detach failure"); attachedDebuggerTabs.delete(Number(debuggee.tabId)); },
-      async sendCommand(_debuggee, method) { if (debuggerCommandFailure && method !== "Page.captureScreenshot") throw new Error("simulated debugger command failure"); return method === "Page.captureScreenshot" ? { data: "debugger-data" } : {}; },
+      async sendCommand(_debuggee, method) {
+        if (debuggerCommandFailure && method !== "Page.captureScreenshot") throw new Error("simulated debugger command failure");
+        if (method === "Runtime.evaluate" && options.debuggerEvaluateResult !== undefined) return { result: { type: "object", value: clone(options.debuggerEvaluateResult) } };
+        return method === "Page.captureScreenshot" ? { data: "debugger-data" } : {};
+      },
     },
     downloads: {
       onCreated: downloadsCreated,
@@ -293,9 +306,19 @@ test("captures a screenshot with debugger fallback", async () => {
   assert.equal(result.data, "debugger-data");
 });
 
-test("debugger document epochs reject delayed loader and unqualified events", async () => {
-  const fixture = loadExtension();
-  fixture.tabs.set(309, { id: 309, windowId: 1, title: "debug", url: "about:blank" });
+test("read-only screenshot retries once when a user tab document changes", async () => {
+  const generation = (token) => ({ url: "https://example.test/changing-shot", timeOrigin: 1, token });
+  const fixture = loadExtension({
+    pageGenerationSequence: [generation("one"), generation("one"), generation("one"), generation("two"), generation("two"), generation("two"), generation("two"), generation("two")],
+  });
+  fixture.tabs.set(319, { id: 319, windowId: 1, title: "changing", url: "https://example.test/changing-shot" });
+  const result = await fixture.api.handleRequest("screenshot", { tabId: 319, sessionId: "session-test" });
+  assert.equal(result.data, "debugger-data");
+});
+
+  test("debugger document epochs reject delayed loader and unqualified events", async () => {
+    const fixture = loadExtension();
+    fixture.tabs.set(309, { id: 309, windowId: 1, title: "debug", url: "about:blank" });
   await fixture.api.attachDebugger(309, "session-test", { lease: true });
   const source = { tabId: 309, targetId: "target-309" };
   await fixture.emitDebuggerEvent(source, "Page.lifecycleEvent", { frameId: "main", loaderId: "loader-a", name: "load" });
@@ -482,6 +505,96 @@ test("extension serializes concurrent claims without overwriting ownership", asy
   assert.ok(["session-a", "session-b"].includes(stored.sessionId));
 });
 
+test("target mismatch errors include a stable diagnostic code", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(306, { id: 306, windowId: 1, title: "target", url: "https://example.test/target" });
+  await assert.rejects(
+    () => fixture.api.handleRequest("snapshot", {
+      tabId: 306,
+      handle: { tabId: 306, browserId: "chrome:other", windowId: 1, title: "target", url: "https://example.test/target", tabFence: "tab:306", incarnation: "https://example.test/target\\u00001\\u0000fixture-document-token" },
+      sessionId: "session-test",
+    }),
+    (error) => error?.code === "BROWSER_TARGET_MISMATCH"
+      && error?.details?.expectedBrowserId === "chrome:other"
+      && error?.details?.currentBrowserId === "edge:test-extension:profile-id",
+  );
+});
+
+test("browser error pages return a structured unavailable-page diagnostic", async () => {
+  const fixture = loadExtension({ restrictedPageError: "Frame with ID 0 is showing error page" });
+  fixture.tabs.set(307, { id: 307, windowId: 1, title: "error", url: "about:blank" });
+  await assert.rejects(
+    () => fixture.api.handleRequest("snapshot", { tabId: 307, sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_PAGE_UNAVAILABLE"
+      && error?.details?.tabId === 307
+      && /browser error page or restricted page/.test(error?.message || ""),
+  );
+});
+
+
+test("page selector failures retain a deterministic diagnostic", async () => {
+  const fixture = loadExtension({
+    executeScriptException: {
+      functionName: "collectSnapshot",
+      details: { text: "Uncaught", exception: { description: "Error: Snapshot selector did not match any element: main" } },
+    },
+  });
+  fixture.tabs.set(308, { id: 308, windowId: 1, title: "selector", url: "https://example.test/selector" });
+  await assert.rejects(
+    () => fixture.api.handleRequest("snapshot", { tabId: 308, selector: "main", sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_SELECTOR_NOT_FOUND"
+      && error?.details?.tabId === 308
+      && error?.details?.selector === "main",
+  );
+});
+test("extract accepts an unowned user tab without a returned document handle", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(316, { id: 316, windowId: 1, title: "user tab", url: "https://example.test/user" });
+  const result = await fixture.api.handleRequest("extract", { tabId: 316, sessionId: "session-test" });
+  assert.equal(result.tabId, 316);
+  assert.equal(typeof result.incarnation, "string");
+});
+
+test("read-only extract retries once when a user tab document changes", async () => {
+  const generation = (token) => ({ url: "https://example.test/changing", timeOrigin: 1, token });
+  const fixture = loadExtension({
+    pageGenerationSequence: [generation("one"), generation("one"), generation("one"), generation("two"), generation("two"), generation("two"), generation("two"), generation("two")],
+    executeScriptResults: { extractPage: { title: "changing", url: "https://example.test/changing", text: "stable", markdown: "stable", truncated: false } },
+  });
+  fixture.tabs.set(317, { id: 317, windowId: 1, title: "changing", url: "https://example.test/changing" });
+  const result = await fixture.api.handleRequest("extract", { tabId: 317, sessionId: "session-test" });
+  assert.equal(result.tabId, 317);
+  assert.equal(result.content.text, "stable");
+  assert.equal(result.incarnation, "https://example.test/changing\u00001\u0000two");
+});
+
+test("read-only extract reports a changing page after the bounded retry", async () => {
+  const generation = (token) => ({ url: "https://example.test/changing", timeOrigin: 1, token });
+  const fixture = loadExtension({ pageGenerationSequence: [generation("one"), generation("two"), generation("three"), generation("four")] });
+  fixture.tabs.set(318, { id: 318, windowId: 1, title: "changing", url: "https://example.test/changing" });
+  await assert.rejects(
+    () => fixture.api.handleRequest("extract", { tabId: 318, sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_PAGE_CHANGING"
+      && error?.details?.tabId === 318
+      && error?.details?.attempts === 2
+      && error?.details?.retryable === true
+      && error?.details?.inspectFirst === false,
+  );
+});
+
+test("side-effecting requests keep strict document fencing after read-only re-observation", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(320, { id: 320, windowId: 1, title: "fenced", url: "https://example.test/fenced" });
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  const current = listed.tabs.find((entry) => entry.id === 320);
+  assert.ok(current);
+  const handle = { ...current.handle, incarnation: "https://example.test/fenced\u00001\u0000old-document-token" };
+  await assert.rejects(
+    () => fixture.api.handleRequest("evaluate", { tabId: 320, handle, sessionId: "session-test", expression: "window.location.href" }),
+    /Tab handle is stale: document incarnation changed/,
+  );
+});
+
 test("complete document handles tolerate title-only updates", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(312, { id: 312, windowId: 1, title: "initial", url: "https://example.test/title", status: "complete", active: true });
@@ -494,6 +607,62 @@ test("complete document handles tolerate title-only updates", async () => {
   assert.equal(selected.tab.title, "updated");
 });
 
+test("read-only user handles tolerate title-only updates", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(313, { id: 313, windowId: 1, title: "initial", url: "https://example.test/user-title", status: "complete", active: true });
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  const current = listed.tabs.find((entry) => entry.id === 313);
+  assert.ok(current);
+  fixture.tabs.get(313).title = "updated";
+  const selected = await fixture.api.handleRequest("selected_tab", { tabId: 313, handle: current.handle });
+  assert.equal(selected.tab.title, "updated");
+});
+
+test("evaluate bounds deep, wide and long return values", async () => {
+  const wide = {
+    items: Array.from({ length: 2_005 }, (_, index) => index),
+    long: "x".repeat(200_005),
+  };
+  let deep = "leaf";
+  for (let index = 0; index < 9; index += 1) deep = { value: deep };
+  wide.deep = deep;
+  for (let index = 0; index < 205; index += 1) wide[`field${index}`] = index;
+  const fixture = loadExtension({ debuggerEvaluateResult: wide });
+  fixture.tabs.set(7, { id: 7, windowId: 1, title: "evaluate", url: "https://example.test/evaluate" });
+  const result = await fixture.api.handleRequest("evaluate", { tabId: 7, sessionId: "session-test", expression: "window.result" });
+  assert.equal(result.result.outputTruncated, true);
+  assert.equal(result.result.outputLimits.depth, 8);
+  assert.equal(Object.keys(result.result.result.value).length, 201);
+  assert.equal(result.result.result.value.items.length, 2_001);
+  assert.equal(result.result.result.value.long.length, 200_000);
+  let boundedDeep = result.result.result.value.deep;
+  for (let index = 0; index < 10 && boundedDeep && typeof boundedDeep === "object"; index += 1) boundedDeep = boundedDeep.value;
+  assert.equal(boundedDeep, "[Max depth reached]");
+});
+
+test("console and network reads apply aggregate output limits", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(314, { id: 314, windowId: 1, title: "events", url: "https://example.test/events" });
+  await fixture.api.handleRequest("devtools_enable", { tabId: 314, sessionId: "session-test", domains: ["Runtime", "Network"] });
+  const state = fixture.api.devtoolsState.get("test-extension::314");
+  state.console.push(...Array.from({ length: 205 }, (_, index) => ({ type: "log", text: `${index}-${"x".repeat(100)}` })));
+  state.network.push(...Array.from({ length: 205 }, (_, index) => ({ event: "request", url: `https://example.test/${index}`, body: "x".repeat(100) })));
+  const logs = await fixture.api.handleRequest("console_logs", { tabId: 314, sessionId: "session-test" });
+  const requests = await fixture.api.handleRequest("network_requests", { tabId: 314, sessionId: "session-test" });
+  assert.ok(logs.logs.length <= 200);
+  assert.ok(logs.logCharCount <= 20_000);
+  assert.equal(logs.logTruncated, true);
+  assert.ok(requests.requests.length <= 200);
+  assert.ok(requests.requestCharCount <= 20_000);
+  assert.equal(requests.requestTruncated, true);
+});
+
+test("list_tabs suppresses data-url favicon payloads", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(313, { id: 313, windowId: 1, title: "favicon", url: "https://example.test", favIconUrl: `data:image/png;base64,${"A".repeat(10000)}` });
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  assert.equal(listed.tabs.find((entry) => entry.id === 313)?.favicon, "");
+});
 test("claim revalidates the tab snapshot after ownership reads", async () => {
   const fixture = loadExtension({ storageGetDelay: 30 });
   fixture.tabs.set(304, { id: 304, windowId: 1, title: "claimable", url: "https://example.test/start", active: true });
@@ -550,7 +719,20 @@ test("extension reports bounded wait timeouts", async () => {
   await assert.rejects(() => fixture.api.waitForTabState(7, { state: "load", timeoutMs: 1 }), /Timed out waiting for tab 7/);
 });
 
-test("cleanup aborts a registered tab wait", async () => {
+test("page condition timeouts carry tab and state diagnostics", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(315, { id: 315, windowId: 1, title: "wait page", url: "https://example.test/wait", status: "complete" });
+  await assert.rejects(
+    () => fixture.api.handleRequest("wait", { tabId: 315, state: "visible", target: { role: "button", name: "missing" }, timeoutMs: 1, sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_WAIT_TIMEOUT"
+      && error?.details?.tabId === 315
+      && error?.details?.state === "visible"
+      && error?.details?.url === "https://example.test/wait",
+  );
+});
+
+
+  test("cleanup aborts a registered tab wait", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(7, { id: 7, windowId: 1, title: "loading", url: "https://example.test/start", status: "loading" });
   const controller = new AbortController();

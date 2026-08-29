@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { compactBrowserResult } from "../pi-extension/output.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const bridge = join(root, "bridge", "server.mjs");
@@ -46,9 +47,10 @@ const backgroundFile = join(extension, "background.js");
 writeFileSync(backgroundFile, readFileSync(backgroundFile, "utf8").replaceAll("127.0.0.1:17318", `127.0.0.1:${bridgePort}`));
 const manifestFile = join(extension, "manifest.json");
 writeFileSync(manifestFile, readFileSync(manifestFile, "utf8").replaceAll("127.0.0.1:17318", `127.0.0.1:${bridgePort}`));
+const largeGenericPage = Array.from({ length: 600 }, (_, index) => `<div><div><span>Repeated generic content ${index} ${"copy ".repeat(24)}</span></div></div>`).join("");
 const site = `<!doctype html>
 <title>Pi Control Chrome E2E</title>
-<style>#delayed-action,#ambiguous-a,#ambiguous-b,#hidden-action{display:none}</style>
+<style>#delayed-action,#ambiguous-a,#ambiguous-b,#hidden-action,#indexed-hidden{display:none}</style>
 <h1>Pi Control Chrome E2E</h1>
 <div id="async-status">Loading...</div>
 <label>Name <input id="name" placeholder="Name"></label>
@@ -69,13 +71,16 @@ const site = `<!doctype html>
 <button id="disabled-nested" disabled data-probe="disabled-button"><span>Disabled nested</span></button>
 <div id="nested-editor" contenteditable><span>Nested editor</span></div>
 <button id="ambiguous-a">Ambiguous</button><button id="ambiguous-b">Ambiguous</button>
+<button id="indexed-hidden">Indexed action</button><button id="indexed-visible">Indexed action</button>
 <div id="out"></div>
+<div id="large-generic-page">${largeGenericPage}</div>
 <script>
 const marker = new URLSearchParams(location.search).get('marker');
 if (marker) document.querySelector('h1').textContent = marker;
 const out = document.querySelector('#out');
 document.querySelector('#go').addEventListener('click', () => { out.textContent = 'Hello ' + document.querySelector('#name').value; });
 document.querySelector('#dialog').addEventListener('click', () => setTimeout(() => alert('e2e-dialog'), 0));
+document.querySelector('#indexed-visible').addEventListener('click', () => { out.textContent = 'Indexed visible'; });
 console.log('page-ready');
 setTimeout(() => {
   document.querySelector('#async-status').textContent = 'Async ready';
@@ -333,14 +338,43 @@ try {
    await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-stale-test', '1')" });
    await assert.rejects(() => request("interaction", { tabId: selected.tab.id, operation: "click", ref: staleButton.ref, snapshotId: staleSnapshot.snapshot.snapshotId }), /Snapshot is stale/);
    const snapshot = await request("snapshot", { tabId: selected.tab.id });
+   const snapshotBytes = Buffer.byteLength(JSON.stringify(snapshot));
+   const projectedSnapshot = compactBrowserResult("browser_snapshot", {}, snapshot);
+   const projectedSnapshotBytes = Buffer.byteLength(JSON.stringify(projectedSnapshot));
+   assert.ok(projectedSnapshotBytes <= 120_000);
   const input = snapshot.snapshot.elements.find((element) => element.tag === "input");
   const button = snapshot.snapshot.elements.find((element) => element.tag === "button");
   assert.ok(input?.ref);
   assert.ok(button?.ref);
-  assert.ok(snapshot.snapshot.accessibility?.children?.some((node) => node.role === "button"));
+  const accessibilityChildren = snapshot.snapshot.accessibility?.children || [];
+  assert.ok(accessibilityChildren.some((node) => node.role === "button"));
+  assert.ok(accessibilityChildren.every((node) => !["generic", "group", "listitem"].includes(node.role)));
+  assert.ok(accessibilityChildren.length <= 200);
+  assert.ok((snapshot.snapshot.accessibility?.charCount || 0) <= 20000);
+  assert.ok(snapshot.snapshot.text.length <= 8000);
+  assert.equal(JSON.stringify(accessibilityChildren).includes("Repeated generic content"), false);
+  const limitedSnapshot = await request("snapshot", { tabId: selected.tab.id, maxChars: 100, maxNodes: 1 });
+  assert.ok(limitedSnapshot.snapshot.elements.length <= 1);
+  assert.equal(limitedSnapshot.snapshot.truncated, true);
+  const scopedSnapshot = await request("snapshot", { tabId: selected.tab.id, selector: "main" });
+  assert.ok(scopedSnapshot.snapshot.elements.every((element) => element.name.includes("Text") || element.name.includes("target") || element.name.includes("now")));
+  const axFull = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true });
+  assert.equal(axFull.snapshot.accessibility.mode, "full");
+  const axUnchanged = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true });
+  assert.equal(axUnchanged.snapshot.accessibility.mode, "unchanged");
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#aria-label-button').setAttribute('aria-label', 'Changed accessibility')" });
+  const axDiff = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true });
+  assert.equal(axDiff.snapshot.accessibility.mode, "diff");
+  assert.match(axDiff.snapshot.accessibility.state, /Changed accessibility/);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#aria-label-button').setAttribute('aria-label', 'Labelled action')" });
+  const actionSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const actionInput = actionSnapshot.snapshot.elements.find((element) => element.tag === "input");
+  assert.ok(actionInput?.ref);
   const extracted = await request("extract", { tabId: selected.tab.id });
-  assert.match(extracted.content.markdown, /Pi Control Chrome E2E/);
-  await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: input.ref, snapshotId: snapshot.snapshot.snapshotId, value: "Pi" });
+  assert.match(extracted.content.text, /Pi Control Chrome E2E/);
+  assert.ok(extracted.content.text.length <= 12000);
+  assert.ok(extracted.content.markdown.length <= 12000);
+  await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: actionInput.ref, snapshotId: actionSnapshot.snapshot.snapshotId, value: "Pi" });
   const afterFillSnapshot = await request("snapshot", { tabId: selected.tab.id });
   const afterFillButton = afterFillSnapshot.snapshot.elements.find((element) => element.tag === "button");
   await request("interaction", { tabId: selected.tab.id, operation: "click", ref: afterFillButton.ref, snapshotId: afterFillSnapshot.snapshot.snapshotId });
@@ -374,6 +408,15 @@ try {
     assert.equal(error.details?.count, 2);
     return true;
   });
+  const indexedTarget = { text: "Indexed action", exact: true, index: 0 };
+  const indexedVisible = await request("wait", { tabId: selected.tab.id, state: "visible", target: indexedTarget, timeoutMs: 1000 });
+  assert.equal(indexedVisible.matched, true);
+  await request("interaction", { tabId: selected.tab.id, operation: "click", target: indexedTarget, timeoutMs: 1000 });
+  const indexedInteraction = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#out').textContent" });
+  assert.equal(indexedInteraction.result?.result?.value, "Indexed visible");
+  await request("locator", { tabId: selected.tab.id, target: indexedTarget, locator: indexedTarget, action: "click", timeoutMs: 1000 });
+  const indexedLocator = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#out').textContent" });
+  assert.equal(indexedLocator.result?.result?.value, "Indexed visible");
   const evaluated = await request("evaluate", { tabId: selected.tab.id, expression: "document.title" });
   assert.equal(evaluated.result?.result?.value, "Pi Control Chrome E2E");
 
@@ -577,6 +620,9 @@ try {
     refs: { input: input.ref, button: button.ref },
     claimedTab: claimed.claimed.id,
     screenshotBytes: Buffer.from(screenshot.data, "base64").length,
+    snapshotBytes,
+    projectedSnapshotBytes,
+    pageBytes: Buffer.byteLength(site),
     group,
     cleanup,
     staleMarkCleanup,

@@ -399,6 +399,29 @@ test("Pi forwards semantic wait and locator targets with session and connection 
   }
 });
 
+test("Pi omits blank browser fields before dispatch", async () => {
+  const mock = await createMockBridge();
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    await harness.tools.get("browser_status").execute("bind", {});
+    await harness.tools.get("browser_snapshot").execute("snapshot", { tabId: 7, selector: "", snapshotId: "  ", incarnation: "", maxChars: 1_000 });
+    const snapshot = mock.requests.filter(message => message.method === "snapshot").at(-1);
+    assert.deepEqual(snapshot.params, { tabId: 7, maxChars: 1_000, sessionId: snapshot.params.sessionId, expectedBrowserId: "edge:test" });
+    assert.equal(Object.hasOwn(snapshot.params, "selector"), false);
+    assert.equal(Object.hasOwn(snapshot.params, "snapshotId"), false);
+    assert.equal(Object.hasOwn(snapshot.params, "incarnation"), false);
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
 test("Pi refuses stale-runtime recovery when the extension capability is missing", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();
@@ -423,6 +446,7 @@ test("Pi refuses stale-runtime recovery when the extension capability is missing
     await mock.close();
   }
 });
+
 
 test("Pi does not automatically retry an inspect-first cleanup intent", async () => {
   const mock = await createMockBridge();

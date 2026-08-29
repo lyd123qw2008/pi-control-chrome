@@ -50,6 +50,7 @@ const debuggerAttachEpochs = new Map();
 const orphanedDebuggerAttaches = new Map();
 const pageSnapshotStates = new Map();
 const domSnapshotStates = new Map();
+const accessibilitySnapshotStates = new Map();
 const tabFenceTokens = new Map();
 const createdTabReservations = new Map();
 const createdTabFlights = new Set();
@@ -177,6 +178,23 @@ function boundedPush(list, value) {
   if (list.length > MAX_EVENTS) list.splice(0, list.length - MAX_EVENTS);
 }
 
+function boundedEventCollection(entries, maxChars = 20_000, maxItems = 200) {
+  const items = [];
+  let charCount = 2;
+  let truncated = false;
+  for (const entry of entries) {
+    const serialized = JSON.stringify(entry);
+    const cost = (typeof serialized === "string" ? serialized : String(entry)).length + (items.length > 0 ? 1 : 0);
+    if (items.length >= maxItems || charCount + cost > maxChars) {
+      truncated = true;
+      break;
+    }
+    items.push(entry);
+    charCount += cost;
+  }
+  return { items, charCount, truncated, maxChars, maxItems };
+}
+
 function runtimeStateKey(tabId) {
   return `${chrome.runtime.id}::${Number(tabId)}`;
 }
@@ -228,6 +246,50 @@ function boundedEventText(value, limit = 4096) {
 }
 
 const SENSITIVE_EVENT_FIELD = /(?:authorization|proxy-authorization|cookie|set-cookie|password|passwd|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|credential)/i;
+const EVALUATE_OUTPUT_LIMITS = Object.freeze({ depth: 8, arrayItems: 2_000, objectFields: 200, stringChars: 200_000 });
+
+function boundEvaluateValue(value, state, depth = 0, ancestors = new WeakSet()) {
+  if (typeof value === "string") {
+    if (value.length <= EVALUATE_OUTPUT_LIMITS.stringChars) return value;
+    state.truncated = true;
+    return `${value.slice(0, EVALUATE_OUTPUT_LIMITS.stringChars - 3)}...`;
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= EVALUATE_OUTPUT_LIMITS.depth) {
+    state.truncated = true;
+    return "[Max depth reached]";
+  }
+  if (ancestors.has(value)) {
+    state.truncated = true;
+    return "[Circular]";
+  }
+  ancestors.add(value);
+  let result;
+  if (Array.isArray(value)) {
+    result = value.slice(0, EVALUATE_OUTPUT_LIMITS.arrayItems).map((entry) => boundEvaluateValue(entry, state, depth + 1, ancestors));
+    if (value.length > EVALUATE_OUTPUT_LIMITS.arrayItems) {
+      state.truncated = true;
+      result.push(`[${value.length - EVALUATE_OUTPUT_LIMITS.arrayItems} more items omitted]`);
+    }
+  } else {
+    result = {};
+    const entries = Object.entries(value);
+    for (const [key, entry] of entries.slice(0, EVALUATE_OUTPUT_LIMITS.objectFields)) result[key] = boundEvaluateValue(entry, state, depth + 1, ancestors);
+    if (entries.length > EVALUATE_OUTPUT_LIMITS.objectFields) {
+      state.truncated = true;
+      result.__piControlChromeTruncatedFields = `${entries.length - EVALUATE_OUTPUT_LIMITS.objectFields} fields omitted`;
+    }
+  }
+  ancestors.delete(value);
+  return result;
+}
+
+function boundEvaluateResult(value) {
+  const state = { truncated: false };
+  const bounded = boundEvaluateValue(value, state);
+  if (!state.truncated || !bounded || typeof bounded !== "object" || Array.isArray(bounded)) return bounded;
+  return { ...bounded, outputTruncated: true, outputLimits: { ...EVALUATE_OUTPUT_LIMITS } };
+}
 
 function redactEventText(value, limit = 2048) {
   const text = boundedEventText(value, limit);
@@ -522,6 +584,7 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo = {}) => {
   // Any tab update can invalidate refs; URL/loading changes also reset debugger data tied to the old document.
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
+  accessibilitySnapshotStates.delete(key);
   if (changeInfo.url !== undefined || changeInfo.status === "loading") {
     const state = devtoolsState.get(key) || (persistentDebuggers.has(key) ? stateForTab(id) : undefined);
     if (state) resetDebuggerDocumentState(state, state.mainFrameId);
@@ -627,6 +690,7 @@ chrome.tabs?.onRemoved?.addListener((tabId) => {
   createdTabEvents.delete(key);
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
+  accessibilitySnapshotStates.delete(key);
   void (async () => {
     await ensureTabFenceState();
     if (tabRemovalTombstones.get(key) !== tombstone) return;
@@ -1681,7 +1745,7 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
     const tabFence = await tabFenceFor(tab.id, true);
     if (tabFence !== fenceBeforeLookup) throw new Error(`Tab ${tab.id} changed during setup; inspect the current browser state before retrying`);
     const incarnation = await readTabIncarnation(tab.id, tabFence);
-    if (owner === "claimed" && typeof incarnation !== "string") throw new Error(`Cannot claim tab ${tab.id}; its document identity could not be verified`);
+    if (owner === "claimed" && typeof incarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
     if (tab.incarnation !== undefined && incarnation !== undefined && tab.incarnation !== incarnation) throw new Error(`Tab ${tab.id} incarnation changed during the claim`);
     const existing = owned[key];
     if (existing) {
@@ -1693,13 +1757,19 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
     await assertTabFence(tab.id, tabFence, "record");
     if (owner === "claimed" && !tabSnapshotMatches(tab, finalTab)) throw new Error(`Tab ${tab.id} changed during the claim; take a new browser_tabs snapshot`);
     const finalIncarnation = await readTabIncarnation(tab.id, tabFence);
-    if (owner === "claimed" && (typeof incarnation !== "string" || typeof finalIncarnation !== "string" || incarnation !== finalIncarnation)) throw new Error(`Tab ${tab.id} document incarnation changed during ownership recording`);
+    if (owner === "claimed" && (typeof incarnation !== "string" || typeof finalIncarnation !== "string" || incarnation !== finalIncarnation)) {
+      if (typeof incarnation !== "string" || typeof finalIncarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
+      throw new Error(`Tab ${tab.id} document incarnation changed during ownership recording`);
+    }
     const latestTab = await chrome.tabs.get(Number(tab.id)).catch(() => undefined);
     if (!latestTab) throw new Error(`Tab ${tab.id} was closed before ownership could be recorded`);
     await assertTabFence(tab.id, tabFence, "record");
     if (owner === "claimed" && !tabSnapshotMatches(tab, latestTab)) throw new Error(`Tab ${tab.id} changed during the claim; take a new browser_tabs snapshot`);
     const latestIncarnation = await readTabIncarnation(tab.id, tabFence);
-    if (owner === "claimed" && (typeof incarnation !== "string" || typeof latestIncarnation !== "string" || incarnation !== latestIncarnation)) throw new Error(`Tab ${tab.id} document incarnation changed during ownership recording`);
+    if (owner === "claimed" && (typeof incarnation !== "string" || typeof latestIncarnation !== "string" || incarnation !== latestIncarnation)) {
+      if (typeof incarnation !== "string" || typeof latestIncarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
+      throw new Error(`Tab ${tab.id} document incarnation changed during ownership recording`);
+    }
     owned[key] = {
       tabId: latestTab.id,
       browserId,
@@ -1878,6 +1948,7 @@ function prepareCreatedTabRuntimeState(tabId, fence) {
   }
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
+  accessibilitySnapshotStates.delete(key);
   devtoolsState.delete(key);
   return true;
 }
@@ -1934,6 +2005,7 @@ async function reconcileUnreservedCreatedTabNow(tab, eventObservedAt) {
   const nextFence = rotateTabFence(id);
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
+  accessibilitySnapshotStates.delete(key);
   devtoolsState.delete(key);
   const debuggerRecord = persistentDebuggers.get(key);
   if (debuggerRecord?.releaseTimer !== undefined) clearTimeout(debuggerRecord.releaseTimer);
@@ -2035,21 +2107,18 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   const allowCrossSessionRead = allowOtherSession || crossSessionReadParams.has(handle);
   const requestSessionId = handle.sessionId ?? tabHandle.sessionId;
   if (tabHandle.tabId !== undefined && Number(tabHandle.tabId) !== Number(tab.id)) throw new Error("Tab handle is stale: tab id changed; take a new browser_tabs snapshot");
-  if (tabHandle.expectedBrowserId !== undefined && String(tabHandle.expectedBrowserId) !== browserIdentity().browserId) {
-    throw new Error(`Tab handle belongs to browser target ${tabHandle.expectedBrowserId}; current target is ${browserIdentity().browserId}`);
-  }
-  if (tabHandle.browserId !== undefined && String(tabHandle.browserId) !== browserIdentity().browserId) {
-    throw new Error(`Tab handle belongs to browser target ${tabHandle.browserId}; current target is ${browserIdentity().browserId}`);
-  }
+  if (tabHandle.expectedBrowserId !== undefined && String(tabHandle.expectedBrowserId) !== browserIdentity().browserId) throw browserTargetMismatchError(tabHandle.expectedBrowserId);
+  if (tabHandle.browserId !== undefined && String(tabHandle.browserId) !== browserIdentity().browserId) throw browserTargetMismatchError(tabHandle.browserId);
   if (tabHandle.expectedTitle !== undefined && String(tabHandle.expectedTitle) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   if (tabHandle.expectedUrl !== undefined && String(tabHandle.expectedUrl) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.windowId !== undefined && Number(tabHandle.windowId) !== Number(tab.windowId)) throw new Error("Tab handle is stale: window changed; take a new browser_tabs snapshot");
-  if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && String(tabHandle.title) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
-  if (tabHandle.url !== undefined && String(tabHandle.url) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
+  if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && !allowBlockedPageDocumentCheck && String(tabHandle.title) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
+  if (tabHandle.url !== undefined && !allowBlockedPageDocumentCheck && String(tabHandle.url) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.tabFence !== undefined && fenceAfterVerification !== String(tabHandle.tabFence)) throw new Error("Tab handle is stale: tab incarnation changed; take a new browser_tabs snapshot");
   if (tabHandle.incarnation !== undefined && !allowBlockedPageDocumentCheck) {
     const incarnation = await readTabIncarnation(tab.id, fenceAfterVerification);
-    if (typeof incarnation !== "string" || incarnation !== String(tabHandle.incarnation)) throw new Error("Tab handle is stale: document incarnation changed; take a new browser_tabs snapshot");
+    if (typeof incarnation !== "string") throw documentIdentityUnavailableError(tab.id, "use");
+    if (incarnation !== String(tabHandle.incarnation)) throw new Error("Tab handle is stale: document incarnation changed; take a new browser_tabs snapshot");
   }
   const owned = await ownedTabs();
   const lifecycleTombstone = tabRemovalTombstones.get(runtimeStateKey(tab.id));
@@ -2057,7 +2126,7 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   const record = owned[targetStateKey(tab.id)];
   if (record) {
     if (record.runtimeId !== runtimeInstanceIdentity) throw new Error(`Cannot use tab ${tab.id}; its tab incarnation is unknown after the extension runtime changed`);
-    if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw new Error(`Cannot use tab ${tab.id}; it belongs to another browser target`);
+    if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw browserTargetMismatchError(record.browserId);
     if (record.sessionId !== sessionKey(requestSessionId) && !allowCrossSessionRead) throw new Error(`Cannot use tab ${tab.id}; it belongs to another Agent session`);
     await assertOwnedTabFence(record, "use");
     if (explicitTabId !== undefined && !allowRecordedSnapshotChange && !hasCompleteNestedHandle && record.owner === "claimed") {
@@ -2076,11 +2145,12 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (tabHandle.expectedTitle !== undefined && String(tabHandle.expectedTitle) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
   if (tabHandle.expectedUrl !== undefined && String(tabHandle.expectedUrl) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.windowId !== undefined && Number(tabHandle.windowId) !== Number(finalTab.windowId)) throw new Error("Tab handle is stale: window changed; take a new browser_tabs snapshot");
-  if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && String(tabHandle.title) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
-  if (tabHandle.url !== undefined && String(tabHandle.url) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
+  if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && !allowBlockedPageDocumentCheck && String(tabHandle.title) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
+  if (tabHandle.url !== undefined && !allowBlockedPageDocumentCheck && String(tabHandle.url) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.incarnation !== undefined && !allowBlockedPageDocumentCheck) {
     const incarnation = await readTabIncarnation(finalTab.id, finalFence);
-    if (typeof incarnation !== "string" || incarnation !== String(tabHandle.incarnation)) throw new Error("Tab handle is stale: document incarnation changed; take a new browser_tabs snapshot");
+    if (typeof incarnation !== "string") throw documentIdentityUnavailableError(tab.id, "use");
+    if (incarnation !== String(tabHandle.incarnation)) throw new Error("Tab handle is stale: document incarnation changed; take a new browser_tabs snapshot");
   }
   return attachTabFence(finalTab, finalFence);
 }
@@ -2125,7 +2195,7 @@ async function listTabs() {
     return {
       id: tab.id,
       browserId: identity.browserId,
-      favicon: tab.favIconUrl || "",
+      favicon: typeof tab.favIconUrl === "string" && /^https?:\/\//i.test(tab.favIconUrl) ? tab.favIconUrl.slice(0, 2048) : "",
       windowId: tab.windowId,
       index: tab.index,
       active: Boolean(tab.active),
@@ -2575,7 +2645,26 @@ async function putInPiGroup(tab, expectedFence) {
   return groupId;
 }
 
-function collectAccessibilitySnapshot() {
+function collectAccessibilitySnapshot(options = {}) {
+  const MAX_CHARS = 100_000;
+  const MAX_NODES = 1_000;
+  const DEFAULT_CHARS = 20_000;
+  const DEFAULT_NODES = 200;
+  const valueLimit = (value, fallback, maximum) => {
+    if (value === undefined) return fallback;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < 1) throw new Error("Snapshot output limits must be positive integers");
+    return Math.min(number, maximum);
+  };
+  const maxChars = valueLimit(options.maxChars, DEFAULT_CHARS, MAX_CHARS);
+  const maxNodes = valueLimit(options.maxNodes, DEFAULT_NODES, MAX_NODES);
+  const bound = (value, limit = 240) => {
+    const text = String(value ?? "");
+    if (limit <= 0) return "";
+    if (text.length <= limit) return text;
+    if (limit <= 3) return text.slice(0, limit);
+    return `${text.slice(0, limit - 3)}...`;
+  };
   const isContentEditableHost = (element) => {
     const attr = element.getAttribute("contenteditable");
     return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
@@ -2584,7 +2673,7 @@ function collectAccessibilitySnapshot() {
   const isContentEditable = (element) => element.isContentEditable === true || isContentEditableHost(element);
   const implicitRole = (element) => {
     const tag = element.tagName.toLowerCase();
-    if (element.getAttribute("role")) return element.getAttribute("role").trim().split(/\s+/)[0].toLowerCase();
+    if (element.getAttribute("role")) return element.getAttribute("role").trim().split(/\s+/)[0].toLowerCase().slice(0, 64);
     if (tag === "a" && element.hasAttribute("href")) return "link";
     if (tag === "button" || tag === "summary") return "button";
     if (/^h[1-6]$/.test(tag)) return "heading";
@@ -2636,7 +2725,7 @@ function collectAccessibilitySnapshot() {
     const type = (element.getAttribute("type") || "").toLowerCase();
     const valueName = tag === "input" && ["button", "submit", "reset", "image"].includes(type) ? String(element.value || "") : "";
     const textName = isValueBearing(element) ? "" : textOf(element);
-    return referencedText(element) || normalize(element.getAttribute("aria-label") || labelTextOf(element) || element.getAttribute("alt") || textName || valueName || element.getAttribute("placeholder") || element.getAttribute("title") || "");
+    return normalize(referencedText(element) || normalize(element.getAttribute("aria-label") || labelTextOf(element) || element.getAttribute("alt") || textName || valueName || element.getAttribute("placeholder") || element.getAttribute("title") || "")).slice(0, 240);
   };
   const visible = (element) => {
     const rect = element.getBoundingClientRect();
@@ -2650,27 +2739,103 @@ function collectAccessibilitySnapshot() {
     return true;
   };
   const disabled = (element) => Boolean(element.matches?.(":disabled") || element.disabled || String(element.getAttribute("aria-disabled") || "").toLowerCase() === "true");
+  const root = (() => {
+    if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
+    try {
+      const selected = document.querySelector(String(options.selector));
+      if (!selected) throw new Error(`Snapshot selector did not match any element: ${String(options.selector)}`);
+      return selected;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Snapshot selector did not match")) throw error;
+      throw new Error(`Invalid snapshot selector: ${String(options.selector)}`);
+    }
+  })();
+  const candidates = [];
+  const candidateSelector = "a,button,input,textarea,select,summary,[role],[contenteditable]";
+  if (root.matches?.(candidateSelector) || implicitRole(root)) candidates.push(root);
+  candidates.push(...Array.from(root.querySelectorAll(candidateSelector)));
   const nodes = [];
-  for (const element of Array.from(document.querySelectorAll("body *"))) {
+  let charCount = 0;
+  let truncated = false;
+  const pathOf = (element) => {
+    const parts = [];
+    let current = element;
+    while (current && current !== root && current.nodeType === Node.ELEMENT_NODE) {
+      let ordinal = 0;
+      let sibling = current;
+      while ((sibling = sibling.previousElementSibling)) ordinal += 1;
+      parts.push(`${current.tagName.toLowerCase()}:${ordinal}`);
+      current = current.parentElement;
+    }
+    return parts.reverse().join("/");
+  };
+  for (const element of candidates) {
     if (!visible(element)) continue;
     const role = implicitRole(element);
-    const name = accessibleName(element);
-    if (!role && !name) continue;
-    nodes.push({
-      role: role || "generic",
-      name,
+    if (!role || ["generic", "group", "listitem"].includes(role)) continue;
+    const node = {
+      key: pathOf(element),
+      role,
+      name: bound(accessibleName(element)),
       value: exposedValue(element),
       disabled: disabled(element),
       checked: "checked" in element ? Boolean(element.checked) : element.getAttribute("aria-checked") === "true" ? true : undefined,
       level: /^h[1-6]$/i.test(element.tagName) ? Number(element.tagName[1]) : undefined,
-    });
-    if (nodes.length >= 300) break;
+    };
+    const cost = JSON.stringify(node).length;
+    if (nodes.length >= maxNodes || charCount + cost > maxChars) {
+      truncated = true;
+      break;
+    }
+    nodes.push(node);
+    charCount += cost;
   }
-  return { role: "document", name: document.title, children: nodes };
+  const publicNodes = nodes.map(({ key: _key, ...node }) => node);
+  const state = publicNodes.map((node) => {
+    const name = node.name ? ` ${JSON.stringify(String(node.name))}` : "";
+    const value = node.value === undefined ? "" : ` value=${JSON.stringify(String(node.value))}`;
+    const disabled = node.disabled ? " disabled" : "";
+    const checked = node.checked === undefined ? "" : ` checked=${node.checked === true}`;
+    const level = node.level === undefined ? "" : ` level=${node.level}`;
+    return `- ${node.role}${name}${value}${disabled}${checked}${level}`;
+  }).join("\n");
+  return {
+    role: "document",
+    name: bound(document.title),
+    children: publicNodes,
+    state,
+    nodeCount: publicNodes.length,
+    charCount: state.length,
+    truncated,
+    maxChars,
+    maxNodes,
+    __piControlChromeAccessibilityNodes: nodes,
+  };
 }
 
-function collectSnapshot() {
+function collectSnapshot(options = {}) {
   const includeLiveState = false;
+  const MAX_CHARS = 100_000;
+  const MAX_NODES = 1_000;
+  const DEFAULT_CHARS = 20_000;
+  const DEFAULT_NODES = 200;
+  const PAGE_TEXT_CHARS = 8_000;
+  const valueLimit = (value, fallback, maximum) => {
+    if (value === undefined) return fallback;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < 1) throw new Error("Snapshot output limits must be positive integers");
+    return Math.min(number, maximum);
+  };
+  const maxChars = valueLimit(options.maxChars, DEFAULT_CHARS, MAX_CHARS);
+  const maxNodes = valueLimit(options.maxNodes, DEFAULT_NODES, MAX_NODES);
+  const pageTextLimit = Math.min(PAGE_TEXT_CHARS, maxChars);
+  const bound = (value, limit) => {
+    const text = String(value ?? "");
+    if (limit <= 0) return "";
+    if (text.length <= limit) return text;
+    if (limit <= 3) return text.slice(0, limit);
+    return `${text.slice(0, limit - 3)}...`;
+  };
   const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   const domFingerprint = () => {
     let hash = 2166136261;
@@ -2692,7 +2857,10 @@ function collectSnapshot() {
     visit(document.documentElement);
     return String(hash >>> 0);
   };
-  const isContentEditable = (element) => element.isContentEditable === true || (element.hasAttribute("contenteditable") && ["", "true", "plaintext-only"].includes(element.getAttribute("contenteditable").trim().toLowerCase()));
+  const isContentEditableHost = (element) => {
+    const attr = element.getAttribute("contenteditable");
+    return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
+  };
   const textOf = (element) => normalize(element.innerText || element.textContent || "");
   const referencedText = (element) => normalize(String(element.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean).map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || "").join(" "));
   const labelTextOf = (element) => {
@@ -2720,11 +2888,7 @@ function collectSnapshot() {
     const type = (element.getAttribute("type") || "").toLowerCase();
     const valueName = tag === "input" && ["button", "submit", "reset", "image"].includes(type) ? String(element.value || "") : "";
     const textName = isValueBearing(element) ? "" : textOf(element);
-    return referencedText(element) || normalize(element.getAttribute("aria-label") || labelTextOf(element) || element.getAttribute("alt") || textName || valueName || element.getAttribute("placeholder") || element.getAttribute("title") || "");
-  };
-  const isContentEditableHost = (element) => {
-    const attr = element.getAttribute("contenteditable");
-    return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
+    return normalize(referencedText(element) || normalize(element.getAttribute("aria-label") || labelTextOf(element) || element.getAttribute("alt") || textName || valueName || element.getAttribute("placeholder") || element.getAttribute("title") || "")).slice(0, 240);
   };
   const roleOf = (element) => {
     const explicit = element.getAttribute("role");
@@ -2785,51 +2949,113 @@ function collectSnapshot() {
   });
   observer.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
   globalThis[observerKey] = observer;
-  const candidates = Array.from(document.querySelectorAll("a,button,input,textarea,select,summary,[role],[contenteditable]"))
-    .filter((element) => !element.hasAttribute("contenteditable") || isContentEditableHost(element));
+  const root = (() => {
+    if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
+    try {
+      const selected = document.querySelector(String(options.selector));
+      if (!selected) throw new Error(`Snapshot selector did not match any element: ${String(options.selector)}`);
+      return selected;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Snapshot selector did not match")) throw error;
+      throw new Error(`Invalid snapshot selector: ${String(options.selector)}`);
+    }
+  })();
+  const candidateSelector = "a,button,input,textarea,select,summary,[role],[contenteditable]";
+  const candidates = [];
+  if (root.matches?.(candidateSelector)) candidates.push(root);
+  candidates.push(...Array.from(root.querySelectorAll(candidateSelector)));
   const elements = [];
+  let elementCharCount = 0;
+  let elementsTruncated = false;
   let counter = 0;
   for (const element of candidates) {
+    if (element.hasAttribute("contenteditable") && !isContentEditableHost(element) && !element.getAttribute("role")) continue;
     if (!visible(element)) continue;
+    const role = roleOf(element);
+    if (!role || ["generic", "group", "listitem"].includes(role)) continue;
     const rect = element.getBoundingClientRect();
     const ref = `e${++counter}`;
-    element.setAttribute("data-pi-control-chrome-ref", ref);
-    elements.push({
+    const entry = {
       ref,
       tag: element.tagName.toLowerCase(),
-      role: roleOf(element) || element.tagName.toLowerCase(),
+      role,
       name: accessibleName(element).slice(0, 240),
       value: exposedValue(element),
       disabled: disabled(element),
       checked: "checked" in element ? Boolean(element.checked) : undefined,
-      href: element instanceof HTMLAnchorElement ? element.href : undefined,
+      href: element instanceof HTMLAnchorElement ? bound(element.href, 4_096) : undefined,
       rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
-    });
-    if (elements.length >= 300) break;
+    };
+    const cost = JSON.stringify(entry).length;
+    if (elements.length >= maxNodes || elementCharCount + cost > maxChars) {
+      elementsTruncated = true;
+      break;
+    }
+    element.setAttribute("data-pi-control-chrome-ref", ref);
+    elements.push(entry);
+    elementCharCount += cost;
   }
   const snapshotFingerprint = domFingerprint();
   document.documentElement.setAttribute("data-pi-control-chrome-snapshot-fingerprint", snapshotFingerprint);
   observer.takeRecords();
+  const rawPageText = root.innerText || root.textContent || "";
+  const pageText = bound(rawPageText.replace(/\n{3,}/g, "\n\n"), pageTextLimit);
   return {
     snapshotId,
     __piControlChromeSnapshotFingerprint: snapshotFingerprint,
     __piControlChromeSnapshotUrl: location.href,
     __piControlChromeSnapshotTimeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
     __piControlChromeSnapshotToken: documentToken,
-    title: document.title,
+    title: bound(document.title, 240),
     url: location.href,
-    text: (document.body?.innerText || "").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
-    selectedText: window.getSelection?.()?.toString() || "",
+    text: pageText,
+    textTruncated: rawPageText.length > pageTextLimit,
+    selectedText: bound(window.getSelection?.()?.toString() || "", 240),
     viewport: { width: window.innerWidth, height: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY },
     elements,
+    elementCount: elements.length,
+    elementCharCount,
+    maxChars,
+    maxNodes,
+    truncated: elementsTruncated || rawPageText.length > pageTextLimit,
     accessibility: undefined,
   };
 }
 
-function extractPage() {
+function extractPage(options = {}) {
+  const MAX_CHARS = 100_000;
+  const DEFAULT_CHARS = 12_000;
+  const maxChars = (() => {
+    if (options.maxChars === undefined) return DEFAULT_CHARS;
+    const requested = Number(options.maxChars);
+    if (!Number.isInteger(requested) || requested < 1) throw new Error("Extract maxChars must be a positive integer");
+    return Math.min(requested, MAX_CHARS);
+  })();
   const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const bound = (value) => {
+    const text = String(value ?? "");
+    if (maxChars <= 0) return "";
+    if (text.length <= maxChars) return text;
+    if (maxChars <= 3) return text.slice(0, maxChars);
+    return `${text.slice(0, maxChars - 3)}...`;
+  };
+  const root = (() => {
+    if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
+    try {
+      const selected = document.querySelector(String(options.selector));
+      if (!selected) throw new Error(`Extract selector did not match any element: ${String(options.selector)}`);
+      return selected;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Extract selector did not match")) throw error;
+      throw new Error(`Invalid extract selector: ${String(options.selector)}`);
+    }
+  })();
   const markdown = [];
-  for (const element of Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,a"))) {
+  const markdownSelector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,a";
+  const markdownElements = [];
+  if (root.matches?.(markdownSelector)) markdownElements.push(root);
+  markdownElements.push(...Array.from(root.querySelectorAll(markdownSelector)));
+  for (const element of markdownElements) {
     const text = clean(element.innerText || element.textContent);
     if (!text) continue;
     const tag = element.tagName.toLowerCase();
@@ -2840,7 +3066,12 @@ function extractPage() {
     else if (tag === "a" && element.getAttribute("href")) markdown.push(`[${text}](<${element.href}>)`);
     else markdown.push(text);
   }
-  return { title: document.title, url: location.href, text: (document.body?.innerText || "").replace(/\n{3,}/g, "\n\n").slice(0, 50000), markdown: [...new Set(markdown)].join("\n\n") };
+  const sourceText = (root.innerText || root.textContent || "").replace(/\n{3,}/g, "\n\n");
+  const text = bound(sourceText);
+  const remainingChars = Math.max(0, maxChars - text.length);
+  const rawMarkdown = [...new Set(markdown)].join("\n\n");
+  const markdownText = remainingChars > 0 ? bound(rawMarkdown.slice(0, remainingChars)) : "";
+  return { title: clean(document.title).slice(0, 240), url: location.href, text, markdown: markdownText, maxChars, truncated: sourceText.length > maxChars || rawMarkdown.length > remainingChars };
 }
 
 async function pageOperation(params = {}) {
@@ -3028,6 +3259,12 @@ async function pageOperation(params = {}) {
     if (strategy !== "role") delete spec.name;
     return validate();
   };
+  const selectIndexedElement = (elements, indexValue, indexAfterVisibility) => {
+    const index = Number(indexValue);
+    if (!Number.isInteger(index) || index < 0) throw new Error("Locator index must be a non-negative integer");
+    const candidates = indexAfterVisibility ? elements.filter(isInteractable) : elements;
+    return candidates[index] ? [candidates[index]] : [];
+  };
   const elementsFor = (input, options = {}) => {
     if (input?.combine === "and" || input?.combine === "or") {
       const left = elementsFor(input.left, options);
@@ -3036,11 +3273,7 @@ async function pageOperation(params = {}) {
       if (input.hasText !== undefined) combined = combined.filter((element) => matches(element.innerText || element.textContent, input.hasText, input.exact));
       if (input.hasSelector !== undefined) combined = combined.filter((element) => selectorElements(element, input.hasSelector).length > 0);
       const unique = [...new Set(combined)];
-      if (input.index !== undefined) {
-        const index = Number(input.index);
-        if (!Number.isInteger(index) || index < 0) throw new Error("Locator index must be a non-negative integer");
-        return unique[index] ? [unique[index]] : [];
-      }
+      if (input.index !== undefined) return selectIndexedElement(unique, input.index, options.indexAfterVisibility === true);
       return unique;
     }
     const spec = normalizedSpec(input);
@@ -3099,11 +3332,7 @@ async function pageOperation(params = {}) {
     if (spec.hasText !== undefined) elements = elements.filter((element) => matches(element.innerText || element.textContent, spec.hasText, spec.exact));
     if (spec.hasSelector !== undefined) elements = elements.filter((element) => selectorElements(element, spec.hasSelector).length > 0);
     const unique = [...new Set(elements)];
-    if (spec.index !== undefined) {
-      const index = Number(spec.index);
-      if (!Number.isInteger(index) || index < 0) throw new Error("Locator index must be a non-negative integer");
-      return unique[index] ? [unique[index]] : [];
-    }
+    if (spec.index !== undefined) return selectIndexedElement(unique, spec.index, options.indexAfterVisibility === true);
     return unique;
   };
   const describe = (element, includeContent = true) => {
@@ -3135,7 +3364,7 @@ async function pageOperation(params = {}) {
     let lastCount = 0;
     while (Date.now() < deadline) {
       if (containsRefTarget(spec)) requireCurrentSnapshot();
-      const found = elementsFor(spec, { projectTextToActionable: true }).filter(isInteractable);
+      const found = elementsFor(spec, { projectTextToActionable: true, indexAfterVisibility: true }).filter(isInteractable);
       lastCount = found.length;
       if (found.length === 1) {
         if (isDisabled(found[0])) {
@@ -3207,7 +3436,7 @@ async function pageOperation(params = {}) {
     }
     if (!["visible", "hidden", "enabled"].includes(state)) throw new Error(`Unsupported page wait state: ${state}`);
     if (containsRefTarget(params.target)) requireCurrentSnapshot();
-    const found = elementsFor(params.target, { projectTextToActionable: true });
+    const found = elementsFor(params.target, { projectTextToActionable: true, indexAfterVisibility: state !== "hidden" });
     const visible = found.filter(isVisible);
     if (state === "hidden") return { matched: visible.length === 0, count: visible.length };
     if (visible.length > 1) {
@@ -3311,18 +3540,18 @@ async function pageOperation(params = {}) {
     requireCurrentSnapshot();
   }
   const actionProjection = action === "focus" || ["click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "isVisible", "isEnabled", "first", "last", "nth"].includes(action);
-  const resolve = () => elementsFor(locator, { projectTextToActionable: actionProjection });
+  const resolve = () => elementsFor(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection });
   if (action === "filter") return { ...locator, hasText: params.value !== undefined ? String(params.value) : locator.hasText, hasSelector: params.hasSelector ?? locator.hasSelector };
   if (action === "and" || action === "or") return { combine: action, left: locator, right: params.other };
   if (action === "count") return resolve().length;
   if (action === "all") return resolve().map(describe);
   if (action === "allTextContents") return resolve().map((element) => element.textContent);
   if (action === "first" || action === "last" || action === "nth") return { ...locator, index: action === "first" ? 0 : action === "last" ? Math.max(0, resolve().length - 1) : Number(params.index) };
-  if (action === "textContent") return strict(locator, { projectTextToActionable: actionProjection }).textContent;
-  if (action === "innerText") return strict(locator, { projectTextToActionable: actionProjection }).innerText;
-  if (action === "getAttribute") return strict(locator, { projectTextToActionable: actionProjection }).getAttribute(String(params.attribute));
-  if (action === "isVisible") return isVisible(strict(locator, { projectTextToActionable: actionProjection }));
-  if (action === "isEnabled") return !isDisabled(strict(locator, { projectTextToActionable: actionProjection }));
+  if (action === "textContent") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).textContent;
+  if (action === "innerText") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).innerText;
+  if (action === "getAttribute") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).getAttribute(String(params.attribute));
+  if (action === "isVisible") return isVisible(strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }));
+  if (action === "isEnabled") return !isDisabled(strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }));
   if (action === "focus") { const element = actionProjection ? await waitForElement(locator, params.timeoutMs) : strict(locator); element.focus(); return { ok: true }; }
   if (["click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover"].includes(action)) {
     const element = actionProjection ? await waitForElement(locator, params.timeoutMs) : strict(locator);
@@ -3399,8 +3628,27 @@ async function pageOperation(params = {}) {
   }
 }
 
-function collectVisibleDom() {
+function collectVisibleDom(options = {}) {
   const includeLiveState = true;
+  const MAX_CHARS = 100_000;
+  const MAX_NODES = 1_000;
+  const DEFAULT_CHARS = 20_000;
+  const DEFAULT_NODES = 200;
+  const valueLimit = (value, fallback, maximum) => {
+    if (value === undefined) return fallback;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < 1) throw new Error("DOM output limits must be positive integers");
+    return Math.min(number, maximum);
+  };
+  const maxChars = valueLimit(options.maxChars, DEFAULT_CHARS, MAX_CHARS);
+  const maxNodes = valueLimit(options.maxNodes, DEFAULT_NODES, MAX_NODES);
+  const bound = (value, limit = 160) => {
+    const text = String(value ?? "");
+    if (limit <= 0) return "";
+    if (text.length <= limit) return text;
+    if (limit <= 3) return text.slice(0, limit);
+    return `${text.slice(0, limit - 3)}...`;
+  };
   const domFingerprint = () => {
     let hash = 2166136261;
     const add = (value) => { for (const character of String(value ?? "")) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619); };
@@ -3442,6 +3690,19 @@ function collectVisibleDom() {
   globalThis[observerKey] = observer;
   let counter = 0;
   const nodes = [];
+  let charCount = 0;
+  let truncated = false;
+  const root = (() => {
+    if (options.selector === undefined) return document.body;
+    try {
+      const selected = document.querySelector(String(options.selector));
+      if (!selected) throw new Error(`DOM selector did not match any element: ${String(options.selector)}`);
+      return selected;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("DOM selector did not match")) throw error;
+      throw new Error(`Invalid DOM selector: ${String(options.selector)}`);
+    }
+  })();
   const visible = (element) => {
     const rect = element.getBoundingClientRect();
     let current = element;
@@ -3452,21 +3713,62 @@ function collectVisibleDom() {
     }
     return rect.width > 0 && rect.height > 0;
   };
-  const walk = (element, parentId = undefined) => {
-    if (!visible(element)) return undefined;
-    const id = `d${++counter}`;
-    element.setAttribute("data-pi-control-chrome-dom-id", id);
-    const rect = element.getBoundingClientRect();
-    const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 300);
-    const node = { node_id: id, parent_id: parentId, tag: element.tagName.toLowerCase(), role: element.getAttribute("role"), text, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, children: [] };
-    nodes.push(node);
-    for (const child of Array.from(element.children)) {
-      const childId = walk(child, id);
-      if (childId) node.children.push(childId);
-    }
-    return id;
+  const isActionable = (element) => {
+    const tag = element.tagName.toLowerCase();
+    const role = String(element.getAttribute("role") || "").trim().toLowerCase();
+    const overflow = getComputedStyle(element).overflow;
+    return ["a", "button", "input", "textarea", "select", "option", "summary", "iframe"].includes(tag)
+      || role.length > 0
+      || element.hasAttribute("contenteditable")
+      || element.hasAttribute("tabindex")
+      || ["auto", "scroll"].includes(overflow);
   };
-  if (document.body) walk(document.body);
+  const walk = (element, parentId = undefined) => {
+    if (truncated || !visible(element)) return undefined;
+    const include = element === root || isActionable(element);
+    let currentParent = parentId;
+    let node;
+    if (include) {
+      const id = `d${++counter}`;
+      element.setAttribute("data-pi-control-chrome-dom-id", id);
+      const rect = element.getBoundingClientRect();
+      const text = bound(element.innerText || element.textContent || "");
+      node = { node_id: id, parent_id: parentId, tag: element.tagName.toLowerCase(), role: bound(element.getAttribute("role") || "", 64) || undefined, text, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, children: [] };
+      const cost = JSON.stringify(node).length + (nodes.length > 0 ? 1 : 0);
+      if (nodes.length >= maxNodes || charCount + cost > maxChars) {
+        truncated = true;
+        element.removeAttribute("data-pi-control-chrome-dom-id");
+        return undefined;
+      }
+      nodes.push(node);
+      charCount += cost;
+      currentParent = id;
+    }
+    let firstDescendantId;
+    for (const child of Array.from(element.children)) {
+      const childStart = nodes.length;
+      const childCharCount = charCount;
+      const childId = walk(child, currentParent);
+      if (childId) {
+        if (node) {
+          const linkCost = JSON.stringify(childId).length + (node.children.length > 0 ? 1 : 0);
+          if (charCount + linkCost > maxChars) {
+            nodes.length = childStart;
+            charCount = childCharCount;
+            truncated = true;
+            break;
+          }
+          node.children.push(childId);
+          charCount += linkCost;
+        } else {
+          firstDescendantId = firstDescendantId || childId;
+        }
+      }
+      if (truncated) break;
+    }
+    return node?.node_id || firstDescendantId;
+  };
+  if (root) walk(root);
   const domFingerprintValue = domFingerprint();
   document.documentElement?.setAttribute("data-pi-control-chrome-dom-fingerprint", domFingerprintValue);
   observer.takeRecords();
@@ -3477,7 +3779,12 @@ function collectVisibleDom() {
     __piControlChromeDomTimeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
     __piControlChromeDomToken: documentToken,
     viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY },
-    nodes: nodes.slice(0, 1000),
+    nodes,
+    nodeCount: nodes.length,
+    charCount,
+    maxChars,
+    maxNodes,
+    truncated,
   };
 }
 
@@ -3572,7 +3879,13 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __e
 async function executeInTab(tabId, func, args = [], expectedFence) {
   const fence = expectedFence ?? await tabFenceFor(tabId, true);
   await assertTabFence(tabId, fence, "access");
-  const result = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+  let result;
+  try {
+    result = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+  } catch (error) {
+    if (isRestrictedPageError(error)) throw pageUnavailableError(tabId);
+    throw error;
+  }
   if (expectedFence !== undefined) {
     try {
       await assertTabFence(tabId, expectedFence, "access");
@@ -3585,6 +3898,19 @@ async function executeInTab(tabId, func, args = [], expectedFence) {
     }
   }
   const value = result?.[0]?.result;
+  const exceptionDetails = result?.[0]?.exceptionDetails;
+  if (value === undefined && exceptionDetails && typeof exceptionDetails === "object") {
+    const exception = exceptionDetails.exception && typeof exceptionDetails.exception === "object" ? exceptionDetails.exception : undefined;
+    const rawMessage = typeof exception?.description === "string" ? exception.description : typeof exceptionDetails.text === "string" ? exceptionDetails.text : "Injected page script failed";
+    const message = rawMessage.replace(/^Error:\s*/, "").slice(0, 1_000);
+    const selector = args[0] && typeof args[0] === "object" && typeof args[0].selector === "string" ? args[0].selector : undefined;
+    const isMissingSelector = /(?:Snapshot|Extract) selector did not match any element:/.test(message);
+    const isInvalidSelector = /Invalid (?:snapshot|extract) selector:/.test(message);
+    const error = new Error(message);
+    error.code = isMissingSelector ? "BROWSER_SELECTOR_NOT_FOUND" : isInvalidSelector ? "BROWSER_SELECTOR_INVALID" : "BROWSER_SCRIPT_ERROR";
+    error.details = { tabId, ...(selector === undefined ? {} : { selector }) };
+    throw error;
+  }
   if (value && typeof value === "object" && value.__piControlError === true && value.error && typeof value.error.message === "string") {
     const error = new Error(value.error.message);
     error.code = typeof value.error.code === "string" ? value.error.code : "BROWSER_ERROR";
@@ -3592,6 +3918,96 @@ async function executeInTab(tabId, func, args = [], expectedFence) {
     throw error;
   }
   return value;
+}
+
+function publicAccessibilityNode(node) {
+  if (!isRecordObject(node)) return node;
+  const { key: _key, ...publicNode } = node;
+  return publicNode;
+}
+
+function accessibilityNodeLine(node, prefix = "- ") {
+  const role = String(node?.role || "generic").slice(0, 64);
+  const name = typeof node?.name === "string" && node.name.length > 0 ? ` ${JSON.stringify(node.name.slice(0, 240))}` : "";
+  const value = node?.value === undefined ? "" : ` value=${JSON.stringify(String(node.value).slice(0, 240))}`;
+  const disabled = node?.disabled === true ? " disabled" : "";
+  const checked = node?.checked === undefined ? "" : ` checked=${node.checked === true}`;
+  const level = node?.level === undefined ? "" : ` level=${node.level}`;
+  return `${prefix}${role}${name}${value}${disabled}${checked}${level}`;
+}
+
+function accessibilityStateText(nodes, prefix = "- ") {
+  return nodes.map((node) => accessibilityNodeLine(node, prefix)).join("\n");
+}
+
+function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, remember = true) {
+  const rawNodes = Array.isArray(accessibility?.__piControlChromeAccessibilityNodes)
+    ? accessibility.__piControlChromeAccessibilityNodes.filter((node) => isRecordObject(node))
+    : Array.isArray(accessibility?.children)
+      ? accessibility.children.filter((node) => isRecordObject(node))
+      : [];
+  const key = runtimeStateKey(tabId);
+  const generation = {
+    url: typeof snapshot?.__piControlChromeSnapshotUrl === "string" ? snapshot.__piControlChromeSnapshotUrl : "",
+    timeOrigin: snapshot?.__piControlChromeSnapshotTimeOrigin,
+    token: typeof snapshot?.__piControlChromeSnapshotToken === "string" ? snapshot.__piControlChromeSnapshotToken : undefined,
+  };
+  const previous = accessibilitySnapshotStates.get(key);
+  const sameDocument = previous !== undefined
+    && previous.url === generation.url
+    && previous.timeOrigin === generation.timeOrigin
+    && previous.token === generation.token;
+  const currentByKey = new Map(rawNodes.map((node, index) => [String(node.key || `${node.role || "generic"}:${index}`), node]));
+  const fullState = accessibilityStateText(rawNodes);
+  let mode = "full";
+  let state = fullState;
+  let changedNodeCount = rawNodes.length;
+  if (diffRequested && sameDocument && previous) {
+    const previousByKey = new Map(previous.nodes.map((node) => [String(node.key || ""), node]));
+    const added = rawNodes.filter((node) => !previousByKey.has(String(node.key || "")));
+    const changed = rawNodes.filter((node) => {
+      const old = previousByKey.get(String(node.key || ""));
+      return old !== undefined && JSON.stringify(publicAccessibilityNode(old)) !== JSON.stringify(publicAccessibilityNode(node));
+    });
+    const removed = previous.nodes.filter((node) => !currentByKey.has(String(node.key || "")));
+    changedNodeCount = added.length + changed.length + removed.length;
+    const diffLines = [
+      ...added.map((node) => accessibilityNodeLine(node, "+ ")),
+      ...changed.map((node) => accessibilityNodeLine(node, "~ ")),
+      ...removed.map((node) => accessibilityNodeLine(node, "- ")),
+    ];
+    const diffState = diffLines.join("\n");
+    const tooBroad = changedNodeCount > Math.max(1, Math.floor(Math.max(previous.nodes.length, rawNodes.length) / 2));
+    if (changedNodeCount === 0) {
+      mode = "unchanged";
+      state = "";
+    } else if (!tooBroad && diffState.length < fullState.length) {
+      mode = "diff";
+      state = diffState;
+    }
+  }
+  const publicNodes = rawNodes.map(publicAccessibilityNode);
+  if (remember) accessibilitySnapshotStates.set(key, {
+    snapshotId: String(snapshot?.snapshotId || ""),
+    url: generation.url,
+    timeOrigin: generation.timeOrigin,
+    token: generation.token,
+    nodes: rawNodes.map((node) => ({ ...node })),
+  });
+  return {
+    role: "document",
+    name: typeof accessibility?.name === "string" ? accessibility.name : "",
+    ...(mode === "full" ? { children: publicNodes } : {}),
+    state,
+    mode,
+    baseSnapshotId: previous?.snapshotId,
+    nodeCount: publicNodes.length,
+    changedNodeCount,
+    charCount: state.length,
+    truncated: accessibility?.truncated === true,
+    maxChars: accessibility?.maxChars,
+    maxNodes: accessibility?.maxNodes,
+  };
 }
 
 function rememberPageSnapshot(tabId, snapshot) {
@@ -3655,6 +4071,37 @@ function isLostExecutionContext(error) {
   return /execution context was destroyed|context.*destroyed|frame.*(?:detached|removed|no longer exists)|cannot access (?:contents of )?the page|no frame with given id|receiving end does not exist/.test(message);
 }
 
+function pageChangingDuringReadError(method, details = {}) {
+  const error = new Error(`Browser ${method} read was not stable because the tab document changed during observation; retry the read on the current tab`);
+  error.code = "BROWSER_PAGE_CHANGING";
+  error.details = { actionState: "not_completed", retryable: true, inspectFirst: false, pageChanged: true, ...details };
+  return error;
+}
+function isPageChangingDuringRead(error) {
+  if (error && typeof error === "object") {
+    if (error.code === "BROWSER_PAGE_CHANGING") return true;
+    if (error.code === "BROWSER_OPERATION_UNCERTAIN" && error.details?.pageChanged === true) return true;
+  }
+  return isLostExecutionContext(error);
+}
+async function readOnlyWithRetry(method, tabId, signal, operation) {
+  let lastError;
+  const attempts = 2;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    assertRequestActive(signal);
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      if (!isPageChangingDuringRead(error)) throw error;
+      lastError = error;
+      if (attempt === attempts) break;
+      await waitWithSignal(25, signal);
+    }
+  }
+  const details = lastError && typeof lastError === "object" && lastError.details && typeof lastError.details === "object" ? lastError.details : {};
+  throw pageChangingDuringReadError(method, { tabId: Number(tabId), attempts, ...details });
+}
+
 function uncertainPageOperationError() {
   const error = new Error("Browser page operation outcome is uncertain because the page execution context was lost; inspect the page before retrying");
   error.code = "BROWSER_OPERATION_UNCERTAIN";
@@ -3709,7 +4156,7 @@ function isSideEffectingPageOperation(params) {
   return SIDE_EFFECTING_PAGE_ACTIONS.has(String(params.operation || params.action || ""));
 }
 
-const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN"]);
+const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
 
 function isStructuredPageError(error) {
   return Boolean(error && typeof error === "object" && STRUCTURED_PAGE_ERROR_CODES.has(error.code));
@@ -3857,11 +4304,31 @@ function pageGeneration() {
 }
 
 function isRestrictedPageError(error) {
+  if (error && typeof error === "object" && error.code === "BROWSER_PAGE_UNAVAILABLE") return true;
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  return /cannot access (?:contents of (?:the )?(?:page|url)|(?:the )?page)|extensions (?:gallery|store)|refused to execute script/.test(message);
+  return /cannot access (?:contents of (?:the )?(?:page|url)|(?:the )?page)|extensions (?:gallery|store)|refused to execute script|frame with id .* showing error page|showing error page/.test(message);
+}
+function pageUnavailableError(tabId) {
+  const error = new Error(`Tab ${Number(tabId)} is a browser error page or restricted page and cannot be scripted; navigate it to a scriptable page, then take a new browser_tabs snapshot`);
+  error.code = "BROWSER_PAGE_UNAVAILABLE";
+  error.details = { tabId: Number(tabId), pageIdentityVerified: false };
+  return error;
+}
+function browserTargetMismatchError(expectedBrowserId) {
+  const currentBrowserId = browserIdentity().browserId;
+  const error = new Error(`Tab handle belongs to browser target ${String(expectedBrowserId)}; current target is ${currentBrowserId}. Refresh browser_status and browser_tabs before retrying`);
+  error.code = "BROWSER_TARGET_MISMATCH";
+  error.details = { expectedBrowserId: String(expectedBrowserId), currentBrowserId };
+  return error;
+}
+function documentIdentityUnavailableError(tabId, action) {
+  const error = pageUnavailableError(tabId);
+  error.message = `Cannot ${String(action)} tab ${Number(tabId)}; its document identity could not be verified because the page is restricted or a browser error page. Navigate it to a scriptable page, then take a new browser_tabs snapshot`;
+  error.details = { tabId: Number(tabId), action: String(action), pageIdentityVerified: false };
+  return error;
 }
 
-async function readTabIncarnation(tabId, expectedFence) {
+async function readTabIncarnation(tabId, expectedFence, readOnly = false) {
   if (!chrome.scripting?.executeScript) return undefined;
   try {
     const first = await executeInTab(tabId, pageGeneration, [], expectedFence);
@@ -3870,7 +4337,7 @@ async function readTabIncarnation(tabId, expectedFence) {
     const second = await executeInTab(tabId, pageGeneration, [], expectedFence);
     const secondIdentity = pageGenerationIdentity(second);
     if (secondIdentity === undefined) return undefined;
-    if (firstIdentity !== secondIdentity) throw uncertainBrowserOperationError("document", { tabId: Number(tabId), pageChanged: true });
+    if (firstIdentity !== secondIdentity) throw readOnly ? pageChangingDuringReadError("document", { tabId: Number(tabId), pageChanged: true }) : uncertainBrowserOperationError("document", { tabId: Number(tabId), pageChanged: true });
     return firstIdentity;
   } catch (error) {
     if (error && typeof error === "object" && ["BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN"].includes(error.code)) throw error;
@@ -3879,11 +4346,15 @@ async function readTabIncarnation(tabId, expectedFence) {
   }
   return undefined;
 }
-async function assertPageGenerationStable(tabId, expectedFence, generation, action) {
-  if (!generation || typeof generation.url !== "string" || typeof generation.timeOrigin !== "number") throw uncertainBrowserOperationError(action, { tabId: Number(tabId), pageGenerationUnavailable: true });
+async function assertPageGenerationStable(tabId, expectedFence, generation, action, readOnly = false) {
+  if (!generation || typeof generation.url !== "string" || typeof generation.timeOrigin !== "number") {
+    throw readOnly ? pageChangingDuringReadError(action, { tabId: Number(tabId), pageGenerationUnavailable: true }) : uncertainBrowserOperationError(action, { tabId: Number(tabId), pageGenerationUnavailable: true });
+  }
   const current = await executeInTab(tabId, pageGeneration, [], expectedFence);
   await assertTabFence(tabId, expectedFence, action);
-  if (!current || current.url !== generation.url || current.timeOrigin !== generation.timeOrigin || typeof generation.token !== "string" || typeof current.token !== "string" || current.token !== generation.token) throw uncertainBrowserOperationError(action, { tabId: Number(tabId), pageChanged: true });
+  if (!current || current.url !== generation.url || current.timeOrigin !== generation.timeOrigin || typeof generation.token !== "string" || typeof current.token !== "string" || current.token !== generation.token) {
+    throw readOnly ? pageChangingDuringReadError(action, { tabId: Number(tabId), pageChanged: true }) : uncertainBrowserOperationError(action, { tabId: Number(tabId), pageChanged: true });
+  }
 }
 function tabUrlMatches(tab, params = {}) {
   const url = String(tab.url || "");
@@ -3897,9 +4368,11 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
   let lastResult;
+  let lastTab;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw abortError(signal, "Browser request aborted");
     const tab = await chrome.tabs.get(Number(tabId));
+    lastTab = tab;
     await assertTabFence(tabId, expectedFence, "wait");
     assertRequestActive(signal);
     if (Date.now() >= deadline) break;
@@ -3945,8 +4418,19 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
     }
     await waitWithSignal(100, signal);
   }
-  const count = lastResult?.count === undefined ? "" : ` (${lastResult.count} matches)`;
-  throw new Error(`Timed out waiting for page condition ${String(params.state || "load")}${count}`);
+  const state = String(params.state || "load");
+  const matchCount = typeof lastResult?.count === "number" ? lastResult.count : undefined;
+  const count = matchCount === undefined ? "" : ` (${matchCount} matches)`;
+  const error = new Error(`Timed out waiting for page condition ${state}${count}`);
+  error.code = "BROWSER_WAIT_TIMEOUT";
+  error.details = {
+    tabId: Number(tabId),
+    state,
+    ...(matchCount === undefined ? {} : { count: matchCount }),
+    ...(lastTab?.title === undefined ? {} : { title: String(lastTab.title || "") }),
+    ...(lastTab?.url === undefined ? {} : { url: String(lastTab.url || "") }),
+  };
+  throw error;
 }
 
 function clearDebuggerLease(record) {
@@ -5224,13 +5708,15 @@ async function documentFencedDebuggerOperation(tabId, callback, sessionId, expec
   return result;
 }
 
-async function captureScreenshot(tab, params, expectedFence) {
+async function captureScreenshot(tab, params, expectedFence, signal) {
   const format = params.format || "png";
-  const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence);
-  const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.captureScreenshot", { format, captureBeyondViewport: params.fullPage === true }), params.sessionId, expectedFence);
-  const afterIncarnation = await readTabIncarnation(tab.id, expectedFence);
-  if (typeof beforeIncarnation !== "string" || typeof afterIncarnation !== "string" || beforeIncarnation !== afterIncarnation) throw uncertainBrowserOperationError("screenshot", { tabId: tab.id, pageChanged: true });
-  return { tabId: tab.id, data: result.data, mimeType: `image/${format}` };
+  return readOnlyWithRetry("screenshot", tab.id, signal, async () => {
+    const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+    const result = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.captureScreenshot", { format, captureBeyondViewport: params.fullPage === true }), params.sessionId, expectedFence);
+    const afterIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+    if (beforeIncarnation !== undefined && afterIncarnation !== undefined && beforeIncarnation !== afterIncarnation) throw pageChangingDuringReadError("screenshot", { tabId: tab.id, pageChanged: true });
+    return { tabId: tab.id, data: result.data, mimeType: `image/${format}` };
+  });
 }
 
 function abortError(signal, fallback) {
@@ -5280,6 +5766,11 @@ async function assertSelectedTab(tabId, action = "selected_tab", windowId, requi
   if (Number(active?.id) !== Number(tabId) || active?.active !== true) throw uncertainBrowserOperationError(action, { tabId: Number(tabId), selectionChanged: true });
 }
 
+function allowsReadOnlyDocumentChange(method, params = {}) {
+  return ["selected_tab", "extract", "snapshot", "screenshot"].includes(method)
+    || (method === "dom_cua" && params.action === "get_visible_dom");
+}
+
 function isReadOnlyTabRequest(method, params = {}) {
   if (["selected_tab", "extract", "snapshot", "screenshot", "network_response_body"].includes(method)) return true;
   if (method === "wait") return true;
@@ -5312,15 +5803,16 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     assertRequestActive(signal);
   } else if (TAB_REQUEST_METHODS.has(method)) {
     const allowRecordedSnapshotChange = dispatchOptions.expectedTabFence !== undefined || method === "dialog";
+    const allowReadOnlyDocumentChange = allowsReadOnlyDocumentChange(method, params);
     if (method === "devtools_disable") {
       try {
-        requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog");
+        requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || allowReadOnlyDocumentChange);
         requestTabFence = authorizedTabFence(requestTab);
       } catch (error) {
         if (!isMissingTabError(error)) throw error;
       }
     } else {
-      requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog");
+      requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || allowReadOnlyDocumentChange);
       requestTabFence = authorizedTabFence(requestTab);
       const suppliedHandle = isRecordObject(params.handle) ? params.handle : undefined;
       requestTabIncarnation = typeof suppliedHandle?.incarnation === "string" ? suppliedHandle.incarnation : undefined;
@@ -5477,28 +5969,44 @@ async function handleRequest(method, params, dispatchOptions = {}) {
   if (method === "extract") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
-    const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence);
-    const content = await executeInTab(tab.id, extractPage, [], expectedFence);
-    const afterIncarnation = await readTabIncarnation(tab.id, expectedFence);
-    if (typeof beforeIncarnation !== "string" || typeof afterIncarnation !== "string" || afterIncarnation !== beforeIncarnation) throw uncertainBrowserOperationError("extract", { tabId: tab.id, pageChanged: true });
-    const listed = await tabEntryFor(tab.id, expectedFence, "extract");
-    if (listed.handle?.incarnation !== afterIncarnation) throw uncertainBrowserOperationError("extract", { tabId: tab.id, pageChanged: true });
-    return { tabId: tab.id, tab: listed, content, incarnation: afterIncarnation };
+    return readOnlyWithRetry("extract", tab.id, signal, async () => {
+      const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+      const content = await executeInTab(tab.id, extractPage, [{
+        ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
+        ...(params.selector === undefined ? {} : { selector: params.selector }),
+      }], expectedFence);
+      const afterIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+      if (typeof beforeIncarnation !== "string" || typeof afterIncarnation !== "string" || afterIncarnation !== beforeIncarnation) throw pageChangingDuringReadError("extract", { tabId: tab.id, pageChanged: true });
+      const listed = await tabEntryFor(tab.id, expectedFence, "extract");
+      if (listed.handle?.incarnation !== undefined && listed.handle.incarnation !== afterIncarnation) throw pageChangingDuringReadError("extract", { tabId: tab.id, pageChanged: true });
+      return { tabId: tab.id, tab: listed, content, incarnation: afterIncarnation };
+    });
   }
   if (method === "snapshot") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
-    const snapshot = await executeInTab(tab.id, collectSnapshot, [], expectedFence);
-    const snapshotGeneration = snapshot && { url: snapshot.__piControlChromeSnapshotUrl, timeOrigin: snapshot.__piControlChromeSnapshotTimeOrigin, token: snapshot.__piControlChromeSnapshotToken };
-    if (snapshot) snapshot.accessibility = await executeInTab(tab.id, collectAccessibilitySnapshot, [], expectedFence);
-    let frameTree;
-    try { frameTree = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.getFrameTree"), params.sessionId, expectedFence); } catch (error) {
-      if (error && typeof error === "object" && ["BROWSER_OPERATION_UNCERTAIN", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED"].includes(error.code)) throw error;
-    }
-    await assertPageGenerationStable(tab.id, expectedFence, snapshotGeneration, "snapshot");
-    rememberPageSnapshot(tab.id, snapshot);
-    const listed = await tabEntryFor(tab.id, expectedFence, "snapshot");
-    return { tabId: tab.id, tab: listed, snapshot, frameTree };
+    const snapshotOptions = {
+      ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
+      ...(params.maxNodes === undefined ? {} : { maxNodes: params.maxNodes }),
+      ...(params.selector === undefined ? {} : { selector: params.selector }),
+    };
+    return readOnlyWithRetry("snapshot", tab.id, signal, async () => {
+      const snapshot = await executeInTab(tab.id, collectSnapshot, [snapshotOptions], expectedFence);
+      const snapshotGeneration = snapshot && { url: snapshot.__piControlChromeSnapshotUrl, timeOrigin: snapshot.__piControlChromeSnapshotTimeOrigin, token: snapshot.__piControlChromeSnapshotToken };
+      const accessibility = snapshot ? await executeInTab(tab.id, collectAccessibilitySnapshot, [snapshotOptions], expectedFence) : undefined;
+      let frameTree;
+      try { frameTree = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.getFrameTree"), params.sessionId, expectedFence); } catch (error) {
+        if (error && typeof error === "object" && ["BROWSER_OPERATION_UNCERTAIN", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED"].includes(error.code)) throw error;
+      }
+      await assertPageGenerationStable(tab.id, expectedFence, snapshotGeneration, "snapshot", true);
+      if (snapshot) {
+        const accessibilityOnly = params.accessibilityOnly === true;
+        snapshot.accessibility = accessibilityRevision(tab.id, snapshot, accessibility, accessibilityOnly && params.disableDiffing !== true, accessibilityOnly);
+      }
+      rememberPageSnapshot(tab.id, snapshot);
+      const listed = await tabEntryFor(tab.id, expectedFence, "snapshot");
+      return { tabId: tab.id, tab: listed, snapshot, frameTree };
+    });
   }
   if (method === "locator") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
@@ -5519,12 +6027,18 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
     if (params.action === "get_visible_dom") {
-      const dom = await executeInTab(tab.id, collectVisibleDom, [], expectedFence);
-      const domGeneration = dom && { url: dom.__piControlChromeDomUrl, timeOrigin: dom.__piControlChromeDomTimeOrigin, token: dom.__piControlChromeDomToken };
-      await assertPageGenerationStable(tab.id, expectedFence, domGeneration, "snapshot");
-      rememberDomSnapshot(tab.id, dom);
-      const listed = await tabEntryFor(tab.id, expectedFence, "snapshot");
-      return { tabId: tab.id, tab: listed, dom };
+      return readOnlyWithRetry("dom_cua", tab.id, signal, async () => {
+        const dom = await executeInTab(tab.id, collectVisibleDom, [{
+          ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
+          ...(params.maxNodes === undefined ? {} : { maxNodes: params.maxNodes }),
+          ...(params.selector === undefined ? {} : { selector: params.selector }),
+        }], expectedFence);
+        const domGeneration = dom && { url: dom.__piControlChromeDomUrl, timeOrigin: dom.__piControlChromeDomTimeOrigin, token: dom.__piControlChromeDomToken };
+        await assertPageGenerationStable(tab.id, expectedFence, domGeneration, "dom_cua", true);
+        rememberDomSnapshot(tab.id, dom);
+        const listed = await tabEntryFor(tab.id, expectedFence, "snapshot");
+        return { tabId: tab.id, tab: listed, dom };
+      });
     }
     const result = await executeDomCuaOperation(tab.id, params, signal, expectedFence);
     await refreshOwnedTabDocument(tab.id, expectedFence, params.sessionId);
@@ -5538,14 +6052,14 @@ async function handleRequest(method, params, dispatchOptions = {}) {
   if (method === "screenshot") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
-    return captureScreenshot(tab, params, expectedFence);
+    return captureScreenshot(tab, params, expectedFence, signal);
   }
   if (method === "evaluate") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
     try {
       const result = await documentFencedDebuggerOperation(tab.id, (sendCommand) => sendCommand("Runtime.evaluate", { expression: String(params.expression || "undefined"), awaitPromise: params.awaitPromise !== false, returnByValue: true }), params.sessionId, expectedFence, method);
-      return { tabId: tab.id, result };
+      return { tabId: tab.id, result: boundEvaluateResult(result) };
     } catch (error) {
       if (error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
       const uncertain = uncertainBrowserOperationError(method, { tabId: tab.id });
@@ -5584,9 +6098,9 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     await enableDevtools(tab.id, ["Runtime", "Log"], params.sessionId, expectedFence);
     await assertTabFence(tab.id, expectedFence, "read console logs");
     const state = stateForTab(tab.id);
-    const logs = [...state.console];
+    const logs = boundedEventCollection(state.console);
     if (params.clear === true) state.console.length = 0;
-    return { tabId: tab.id, logs };
+    return { tabId: tab.id, logs: logs.items, logCount: logs.items.length, logCharCount: logs.charCount, logTruncated: logs.truncated, maxLogChars: logs.maxChars, maxLogs: logs.maxItems };
   }
   if (method === "network_requests") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
@@ -5594,9 +6108,9 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     await enableDevtools(tab.id, ["Network", "Page"], params.sessionId, expectedFence);
     await assertTabFence(tab.id, expectedFence, "read network requests");
     const state = stateForTab(tab.id);
-    const requests = [...state.network];
+    const requests = boundedEventCollection(state.network);
     if (params.clear === true) state.network.length = 0;
-    return { tabId: tab.id, requests };
+    return { tabId: tab.id, requests: requests.items, requestCount: requests.items.length, requestCharCount: requests.charCount, requestTruncated: requests.truncated, maxRequestChars: requests.maxChars, maxRequests: requests.maxItems };
   }
   if (method === "network_response_body") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));

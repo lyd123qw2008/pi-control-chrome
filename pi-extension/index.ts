@@ -8,6 +8,7 @@ import WebSocket from "ws";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applyBrowserToolMask, createBrowserActivation } from "./activation.js";
+import { compactBrowserResult } from "./output.js";
 
 const BRIDGE_HOST = "127.0.0.1";
 const configuredBridgePort = Number.parseInt(process.env.PI_CONTROL_CHROME_BRIDGE_PORT ?? "", 10);
@@ -166,6 +167,8 @@ const TAB_HANDLE = Type.Optional(Type.Object({
   sessionId: Type.Optional(Type.String()),
 }, { additionalProperties: false }));
 const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot." }));
+const OUTPUT_MAX_CHARS = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output character budget; the extension caps this at 100000." }));
+const OUTPUT_MAX_NODES = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output node budget; the extension caps this at 1000." }));
 const WAIT_STATE = Type.Optional(Type.Union([
   Type.Literal("load"),
   Type.Literal("url"),
@@ -781,7 +784,7 @@ async function retryPendingCleanups(): Promise<void> {
 
 function textResult(value: unknown, details?: unknown) {
   return {
-    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
+    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) ?? String(value) }],
     details,
   };
 }
@@ -839,7 +842,16 @@ async function call(method: string, params: Record<string, unknown> = {}, option
   }
 }
 
+function normalizeBrowserParams(params: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...params };
+  for (const key of ["snapshotId", "incarnation", "selector", "path"]) {
+    if (typeof normalized[key] === "string" && normalized[key].trim().length === 0) delete normalized[key];
+  }
+  return normalized;
+}
+
 async function callBrowserRequest(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}, requestSignal?: AbortSignal) {
+  params = normalizeBrowserParams(params);
   const requestSessionId = sessionId;
   const requestTurn = turnNumber;
   const requestGeneration = lifecycleGeneration;
@@ -1039,7 +1051,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state.",
     parameters: Type.Object({}),
     async execute() {
-      try { return textResult(await call("list_tabs")); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_tabs", {}, await call("list_tabs"))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1050,7 +1062,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Return the currently selected Chrome/Edge tab.",
     parameters: Type.Object({}),
     async execute() {
-      try { return textResult(await call("selected_tab")); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_selected", {}, await call("selected_tab"))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1103,10 +1115,10 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_snapshot",
     label: "Browser Snapshot",
-    description: "Read the active page title, URL, visible text and interactive elements with snapshot-scoped eN refs; ref actions require the returned snapshotId.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE }),
+    description: "Read the active page title and one bounded semantic page state with snapshot-scoped eN refs; ref actions require the returned snapshotId.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("snapshot", params)); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_snapshot", params, await call("snapshot", params))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1115,9 +1127,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_extract",
     label: "Extract Browser Page",
     description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE }),
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("extract", params)); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_extract", params, await call("extract", params))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1125,15 +1137,12 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_accessibility_snapshot",
     label: "Browser Accessibility Snapshot",
-    description: "Return the accessibility-oriented semantic tree included in the current page snapshot, including its snapshotId for subsequent ref actions.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE }),
+    description: "Return the bounded accessibility-oriented semantic tree as full, incremental diff or unchanged text; the first read is full and later reads may be diff or unchanged.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
-        const result = await call("snapshot", params) as { snapshot?: { accessibility?: unknown; snapshotId?: string } };
-        const accessibility = result.snapshot?.accessibility;
-        return textResult(accessibility && typeof accessibility === "object" && result.snapshot?.snapshotId
-          ? { ...accessibility, snapshotId: result.snapshot.snapshotId }
-          : accessibility ?? result);
+        const result = await call("snapshot", { ...params, accessibilityOnly: true });
+        return textResult(compactBrowserResult("browser_accessibility_snapshot", params, result));
       } catch (error) { return errorResult(error); }
     },
   });
@@ -1295,13 +1304,19 @@ function registerBrowserTools(pi: ExtensionAPI) {
       action: Type.Union([Type.Literal("get_visible_dom"), Type.Literal("click"), Type.Literal("double_click"), Type.Literal("type"), Type.Literal("keypress"), Type.Literal("scroll")]),
       snapshotId: Type.Optional(Type.String()),
       nodeId: Type.Optional(Type.String()),
+      selector: SELECTOR,
+      maxChars: OUTPUT_MAX_CHARS,
+      maxNodes: OUTPUT_MAX_NODES,
       value: Type.Optional(Type.String()),
       key: Type.Optional(Type.String()),
       deltaX: Type.Optional(Type.Number()),
       deltaY: Type.Optional(Type.Number()),
     }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("dom_cua", params)); } catch (error) { return errorResult(error); }
+      try {
+        const result = await call("dom_cua", params);
+        return textResult(compactBrowserResult("browser_dom_cua", params, result));
+      } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1346,12 +1361,13 @@ function registerBrowserTools(pi: ExtensionAPI) {
           await mkdir(dirname(savedPath), { recursive: true });
           await writeFile(savedPath, Buffer.from(result.data, "base64"));
         }
+        const { data: _discarded, ...metadata } = result;
         return {
           content: [
             { type: "text", text: `Screenshot captured for tab ${result.tabId ?? "selected"}${savedPath ? ` and saved to ${savedPath}` : ""}.` },
             { type: "image", data: result.data, mimeType: result.mimeType || "image/png" },
           ],
-          details: { ...result, path: savedPath },
+          details: { ...metadata, path: savedPath },
         };
       } catch (error) { return errorResult(error); }
     },

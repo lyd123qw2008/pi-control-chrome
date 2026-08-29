@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 - 2026-08-29
+
+- Add bounded re-observation for read-only page reads on user tabs: a document change is retried once, persistent movement returns `BROWSER_PAGE_CHANGING`, and side-effecting operations retain strict document fencing. Automated browser verification uses isolated Agent-owned tabs or browser profiles rather than the active DSH GUI tab.
+
+- Add Codex-aligned browser output compaction: the extension bounds semantic accessibility, snapshot, extract, visible DOM, evaluate, Console and Network collection; Pi and DSH expose one compact model-facing state; Accessibility reads support full/diff/unchanged revisions; evaluate values use depth, array, object-field and string limits; data URL favicons and screenshot Base64 are excluded from model results; and selector/budget parameters are available for scoped reads.
 
 ## 0.4.1 - 2026-08-28
 

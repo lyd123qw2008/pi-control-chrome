@@ -93,6 +93,8 @@ This is normal for an idle Service Worker. Send a harmless `browser_status` requ
 
 Never retry a stale click or fill with the old ref.
 
+`BROWSER_PAGE_CHANGING` applies to a read-only page observation whose document changed during the bounded read retry. Refresh `browser_tabs` and retry the read on the current tab; no page side effect was sent. For automated verification, use an Agent-owned test tab or an isolated browser profile rather than the active DSH GUI tab. Keep explicit user-tab inspection available when the user requests a logged-in or currently visible page.
+
 ### Element cannot be found or an interaction fails
 
 Use this recovery ladder, stopping when the target is unambiguous:
@@ -177,17 +179,17 @@ Use these tools when available:
 - `browser_selected`: inspect the selected tab without changing it.
 - `browser_new_tab`: create an Agent-owned tab. Prefer `active: false` unless the user needs to see it.
 - `browser_select_tab`: select an existing tab explicitly.
-- `browser_snapshot`: inspect the page and obtain snapshot-scoped element refs before interacting; pass its `snapshotId` with any ref action.
-- `browser_accessibility_snapshot`: inspect semantic roles and accessible names; it returns the current snapshot's `snapshotId` for subsequent ref actions.
-- `browser_extract`: read bounded visible page text and simple Markdown.
-- `browser_locator`: use role + name, label, placeholder, text, test id, or CSS locators; require a single match or an explicit `index`.
+- `browser_snapshot`: inspect one bounded semantic page state and obtain snapshot-scoped element refs before interacting; pass its `snapshotId` with any ref action. The default collector keeps visible semantic/actionable nodes, caps text and nodes, and the model-facing result does not include the duplicate raw accessibility tree or frameTree. Optional `selector`, `maxChars`, and `maxNodes` narrow the read.
+- `browser_accessibility_snapshot`: inspect semantic roles and accessible names as bounded full, incremental diff, or unchanged text; it includes the current snapshot id and document metadata. The first read is full, later reads may be diff or unchanged; pass `disableDiffing: true` when a full tree is required.
+- `browser_extract`: read bounded visible page text and simple Markdown. Optional `selector` and `maxChars` share one output budget.
+- `browser_locator`: use role + name, label, placeholder, text, test id, or CSS locators; require a single match or an explicit `index`. Actions and visible/enabled state queries apply an explicit index after visibility filtering, so hidden duplicate controls do not consume it.
 - `browser_click`, `browser_double_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_scroll`: perform page actions with a semantic `target`, a ref plus its matching `snapshotId`, or a CSS selector.
-- `browser_dom_cua` and `browser_cua`: use visible DOM or coordinate actions when a locator is not sufficient.
-- `browser_wait`: wait for page load, URL, text, text disappearance, or an element to become visible, hidden, or enabled. Use `text` for page text and `target` for element conditions. `hidden` succeeds when no visible match exists; `visible` and `enabled` require one visible match and reject multiple visible matches.
+- `browser_dom_cua` and `browser_cua`: use visible DOM or coordinate actions when a locator is not sufficient. `browser_dom_cua` returns bounded line-oriented node ids for `get_visible_dom`; optional `selector`, `maxChars`, and `maxNodes` limit the read.
+- `browser_wait`: wait for page load, URL, text, text disappearance, or an element to become visible, hidden, or enabled. Use `text` for page text and `target` for element conditions. `hidden` succeeds when no visible match exists; `visible` and `enabled` require one visible match and reject multiple visible matches. Visible/enabled waits apply an explicit index after visibility filtering.
 - `browser_screenshot`: capture the current tab, saving it only when a path is needed.
-- `browser_evaluate`: run narrowly scoped page JavaScript when the supported browser tools are insufficient.
+- `browser_evaluate`: run narrowly scoped page JavaScript when the supported browser tools are insufficient; returned values are bounded to depth 8, 2,000 array items, 200 object fields, and 200,000 characters.
 - `browser_cdp`: use a specific CDP method only when the higher-level tool does not expose the required capability.
-- `browser_console`, `browser_network`, and `browser_dialog`: inspect development events and handle JavaScript dialogs.
+- `browser_console`, `browser_network`, and `browser_dialog`: inspect development events and handle JavaScript dialogs; Console and Network listings are limited to 200 entries and 20,000 serialized characters per read.
 - `browser_upload`, `browser_download`, and `browser_clipboard`: use only when required by the user's task.
 - `browser_claim_tab` and `browser_release`: take and release ownership of an existing user tab.
 - `browser_mark_handoff` and `browser_mark_deliverable`: preserve an Agent tab through the current turn cleanup; repeat the mark in a later turn when it is still needed.

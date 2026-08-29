@@ -24,8 +24,9 @@
 - [Pi Skill](./skills/pi-control-chrome/SKILL.md)
 - [浏览器能力显式激活方案](./BROWSER-ACTIVATION-DESIGN.zh-CN.md)
 - [Codex 对齐的浏览器生命周期实施方案](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md)
+- [浏览器模型输出压缩实施方案](./docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md)
 
-本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。用于管理标签页的 CLI `open` 和 `cleanup` 必须显式提供 `--session <id>`；非临时 `view` 还必须提供 `--turn <n>`，不再使用进程 PID 作为会话标识。只有在用户明确决定恢复扩展运行时之后，CLI `cleanup` 才应使用 `--recover-stale`；它不会关闭未知 runtime 的 Tab。
+本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。用于管理标签页的 CLI `open` 和 `cleanup` 必须显式提供 `--session <id>`；非临时 `view` 还必须提供 `--turn <n>`，不再使用进程 PID 作为会话标识。只有在用户明确决定恢复扩展运行时之后，CLI `cleanup` 才应使用 `--recover-stale`；它不会关闭未知 runtime 的 Tab。用户 Tab 可以作为浏览器目标，但页面文档可能在用户或 DSH 界面活动时被替换；只读读取会有限重新观察一次，副作用操作继续严格校验文档身份。自动化浏览器验证应使用 Agent-owned 测试 Tab 或隔离浏览器 Profile，不要使用正在聊天的 DSH GUI Tab。
 
 ## 重点目标
 
@@ -48,23 +49,26 @@
 ### 页面和 CDP
 
 - Accessibility Snapshot；
+- 默认返回可见语义页面状态，snapshot 和 DOM CUA 使用 20,000 字符/200 节点预算，extract 使用共享 12,000 字符预算；Pi/DSH 模型结果不暴露重复 raw accessibility 和 frameTree；当 Tab 已携带标题和 URL 时，snapshot、Accessibility 和 extract 不在内部重复这些字段；有交互元素或 Accessibility 节点时不再追加重复的页面全文，完整正文请使用 `browser_extract`；空的可选 `selector`、`snapshotId`、`incarnation` 和截图 `path` 会在发送前按省略处理；
+- Accessibility 支持 full、增量 diff 和 unchanged；需要完整树时显式传 `disableDiffing: true`；snapshot、Accessibility、extract 和 DOM CUA 支持可选 selector 与预算参数；
+- `browser_evaluate` 返回值限制为深度 8、数组 2,000 项、对象 200 个字段和字符串 200,000 字符；
 - DOM 和 Locator 操作；
 - click、fill、type、press、scroll；
 - 截图和图片回传；
 - 普通当前标签页视口截图不打开 DevTools 调试会话；完整页面和后台标签页截图使用短时、会话归属的调试租约；
 - 原生 CDP；
 - Runtime.evaluate；
-- Console、Network、Dialog、Upload、Download；
+- Console、Network、Dialog、Upload、Download；Console 和 Network 每次读取最多返回 200 条、20,000 个序列化字符；
 - Chrome/Edge 页面能力检测；
 - 语义元素定位和页面状态等待。
-- 页面操作、上传和 Network response body 会校验 tab fence 与文档 `incarnation`；同一文档只有标题变化时不会使完整 Handle 失效，导航会使 snapshot、DOM ref、dialog、file chooser 和旧 loader 映射失效。新建 Tab 可能先处于受限的 `about:blank`，此时有 Tab 身份但没有文档 incarnation，应先导航到可注入脚本的 URL 再进行页面操作。读取 Network response body 必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。副作用结果不确定时必须先检查页面，系统不会自动重放。
+- 有副作用的页面操作、上传和 Network response body 会校验 tab fence 与文档 `incarnation`；同一文档只有标题变化时不会使完整 Handle 失效，导航会使 snapshot、DOM ref、dialog、file chooser 和旧 loader 映射失效。新建 Tab 可能先处于受限的 `about:blank`，此时有 Tab 身份但没有文档 incarnation，应先导航到可注入脚本的 URL 再进行页面操作。读取 Network response body 必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。目标不匹配、受限/错误页面、选择器不匹配和等待超时都返回结构化诊断；纯页面读取遇到文档在读取期间替换时会有限重试，仍不稳定则返回可重试的 `BROWSER_PAGE_CHANGING`；收到 `BROWSER_OPERATION_UNCERTAIN` 时必须先检查页面，系统不会自动重放副作用。
 - Debugger lease 会记录 browserId、tab fence、attach epoch 和 CDP target id，并跨 MV3 worker 重启持久化。普通 cleanup 不会 detach 无法证明归属的全局 target；只有显式 `recoverStale: true` 才会在前后复核身份后恢复旧 lease。
 
 ## 语义页面交互
 
-常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。已有的快照 ref 和 CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
+常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。交互操作会在过滤可见元素后应用该索引，隐藏的重复控件不会占用索引。已有的快照 ref 和 CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
 
-文字 target 用于操作或元素状态定位时，会把文字叶节点投影到最近的可操作祖先，因此 `isEnabled` 和 `browser_wait` 报告的是实际接收操作的控件状态。`browser_wait` 支持 `load`、`url`、`text`、`text_gone`、`visible`、`hidden` 和 `enabled`。文字条件使用 `text`，元素条件使用与交互相同的 `target`；`url` 和 `urlIncludes` 可以作为所有等待条件的 URL 过滤器。`hidden` 在没有可见匹配时成功，包括目标不存在或存在多个隐藏匹配；`visible` 和 `enabled` 遇到多个可见匹配时会安全失败。若交互因导航丢失注入结果，会报告结果不确定，系统不会自动重放该副作用操作。
+文字 target 用于操作或元素状态定位时，会把文字叶节点投影到最近的可操作祖先，因此 `isEnabled` 和 `browser_wait` 报告的是实际接收操作的控件状态。`browser_wait` 支持 `load`、`url`、`text`、`text_gone`、`visible`、`hidden` 和 `enabled`。文字条件使用 `text`，元素条件使用与交互相同的 `target`；`url` 和 `urlIncludes` 可以作为所有等待条件的 URL 过滤器。`hidden` 在没有可见匹配时成功，包括目标不存在或存在多个隐藏匹配；`visible` 和 `enabled` 遇到多个可见匹配时会安全失败。对于 `visible` 和 `enabled`，会在过滤可见元素后应用明确提供的索引。若交互因导航丢失注入结果，会报告结果不确定，系统不会自动重放该副作用操作。
 
 ## 当前状态
 

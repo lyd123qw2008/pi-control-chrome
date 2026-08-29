@@ -17,6 +17,7 @@ import {
 import type { BrowserBridgeClient } from './bridge.js'
 import { bridgeRecovery, unavailableBridgeRecovery } from './diagnostics.js'
 import { BROWSER_SKILL_NAME } from './skill.js'
+import { compactBrowserResult } from './output.js'
 import type { BrowserTarget, BrowserTargetRoute, ResolvedConfig, ScreenshotResult } from './types.js'
 
 const TAB_ID: ParameterPropertySpec = { type: 'number', description: 'Browser tab id. Omit to use the selected tab.' }
@@ -30,6 +31,8 @@ const INDEX: ParameterPropertySpec = { type: 'integer', description: 'Optional z
 const OPTIONAL_BOOLEAN: ParameterPropertySpec = { type: 'boolean' }
 const WAIT_EXACT: ParameterPropertySpec = { type: 'boolean', description: 'For text/text_gone waits only. For visible/hidden/enabled waits, put exact inside target.' }
 const SELECTOR: ParameterPropertySpec = { type: 'string', description: 'Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot.' }
+const OUTPUT_MAX_CHARS: ParameterPropertySpec = { type: 'integer', description: 'Optional output character budget. The extension caps this at 100000; the default is 20000 for snapshots and DOM CUA.' }
+const OUTPUT_MAX_NODES: ParameterPropertySpec = { type: 'integer', description: 'Optional output node budget. The extension caps this at 1000; the default is 200.' }
 const TAB_HANDLE_PROPERTIES: ParameterSchemaSpec = {
   tabId: { type: 'number', required: true },
   browserId: OPTIONAL_STRING,
@@ -336,20 +339,20 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_snapshot',
-    description: 'Read the active page title, URL, visible text and interactive elements with snapshot-scoped eN refs; ref actions require the returned snapshotId.',
-    parameters: { tabId: TAB_ID },
+    description: 'Read the active page title and one bounded semantic page state with snapshot-scoped eN refs; ref actions require the returned snapshotId. Read-only observation may retry once if the tab document changes.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES },
     method: 'snapshot',
   },
   {
     name: 'browser_extract',
-    description: 'Extract the current page as bounded plain text and simple Markdown without using a separate web scraper.',
-    parameters: { tabId: TAB_ID },
+    description: 'Extract the current page as bounded plain text and simple Markdown without using a separate web scraper. Read-only observation may retry once if the tab document changes.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS },
     method: 'extract',
   },
   {
     name: 'browser_accessibility_snapshot',
-    description: 'Return the accessibility-oriented semantic tree included in the current page snapshot, including its snapshotId for subsequent ref actions.',
-    parameters: { tabId: TAB_ID },
+    description: 'Return the accessibility-oriented semantic tree as bounded full or incremental text; the first read is full and later reads may be diff or unchanged.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: OPTIONAL_BOOLEAN },
     method: 'snapshot',
   },
   {
@@ -550,6 +553,9 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
       action: DOM_CUA_ACTION,
       snapshotId: OPTIONAL_STRING,
       nodeId: OPTIONAL_STRING,
+      selector: SELECTOR,
+      maxChars: OUTPUT_MAX_CHARS,
+      maxNodes: OUTPUT_MAX_NODES,
       value: OPTIONAL_STRING,
       key: OPTIONAL_STRING,
       deltaX: OPTIONAL_NUMBER,
@@ -786,7 +792,8 @@ function normalizeWaitParams(params: Record<string, JsonValue>): void {
 
 function normalizeBrowserToolArgs(name: string, raw: Record<string, JsonValue>): Record<string, JsonValue> {
   const params = { ...raw }
-  deleteBlankFields(params, ['snapshotId', 'incarnation'])
+  deleteBlankFields(params, ['snapshotId', 'incarnation', 'selector'])
+  if (name === 'browser_screenshot') deleteBlankFields(params, ['path'])
   if (SEMANTIC_INTERACTION_TOOLS.has(name)) {
     deleteBlankFields(params, ['ref', 'selector'])
     if (params.target !== undefined) {
@@ -810,11 +817,17 @@ function validateElementTargetNumbers(value: unknown): void {
   validateElementIndex(value.index)
 }
 
+function validateOutputLimit(value: unknown, name: string): void {
+  if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) throw new Error(`${name} must be a positive integer`)
+}
+
 function validateRequestNumbers(params: Record<string, JsonValue>): void {
   const timeoutMs = params.timeoutMs
   if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 1)) throw new Error('timeoutMs must be a positive finite number')
   validateElementIndex(params.index)
   validateElementTargetNumbers(params.target)
+  validateOutputLimit(params.maxChars, 'maxChars')
+  validateOutputLimit(params.maxNodes, 'maxNodes')
 }
 
 function asJsonValue(value: unknown): JsonValue {
@@ -823,7 +836,7 @@ function asJsonValue(value: unknown): JsonValue {
 
 function resultText(value: JsonValue): string {
   if (typeof value === 'string') return value
-  return JSON.stringify(value, null, 2) ?? String(value)
+  return JSON.stringify(value) ?? String(value)
 }
 
 function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
@@ -866,7 +879,8 @@ async function prepareScreenshot(
     await writeFile(savedPath, Buffer.from(data, 'base64'))
   }
   if (attachments === undefined) {
-    return asJsonValue({ ...result, ...(savedPath === undefined ? {} : { path: savedPath }) })
+    const { data: _discarded, ...metadata } = result
+    return asJsonValue({ ...metadata, ...(savedPath === undefined ? {} : { path: savedPath }), attachmentUnavailable: true })
   }
   const mediaType = screenshotMediaType(result.mimeType ?? 'image/png')
   const ref = await attachments.saveImage({
@@ -878,13 +892,8 @@ async function prepareScreenshot(
   return asJsonValue({ ...metadata, ...(savedPath === undefined ? {} : { path: savedPath }), attachment: ref })
 }
 
-function prepareAccessibility(value: unknown): JsonValue {
-  if (!isRecord(value)) return asJsonValue(value)
-  const snapshot = value.snapshot
-  if (!isRecord(snapshot)) return asJsonValue(value)
-  const accessibility = snapshot.accessibility ?? value
-  if (!isRecord(accessibility) || typeof snapshot.snapshotId !== 'string') return asJsonValue(accessibility)
-  return asJsonValue({ ...accessibility, snapshotId: snapshot.snapshotId })
+function prepareAccessibility(value: unknown, params: Record<string, JsonValue> = {}): JsonValue {
+  return compactBrowserResult('browser_accessibility_snapshot', params, value)
 }
 
 function prepareNetwork(args: Record<string, JsonValue>): { method: string; params: Record<string, JsonValue> } {
@@ -916,6 +925,34 @@ function targetRecords(value: unknown): BrowserTarget[] {
 
 function readyTargetRecords(value: unknown): BrowserTarget[] {
   return targetRecords(value).filter(target => target.state === undefined || target.state === 'ready')
+}
+
+function compactBridgeHealth(value: Record<string, unknown>): JsonValue {
+  const fields = [
+    'ok', 'protocol', 'service', 'bridgeVersion', 'instanceId', 'startedBy', 'controlDomain', 'port',
+    'extensionConnected', 'targetCount', 'readyTargetCount', 'targetAmbiguous', 'browser', 'browserId',
+    'profile', 'extensionVersion', 'connectionId', 'connectionGeneration', 'state',
+  ] as const
+  const result: Record<string, unknown> = {}
+  for (const field of fields) if (value[field] !== undefined) result[field] = value[field]
+  if (Array.isArray(value.targets)) {
+    result.targets = value.targets.filter(isRecord).map(target => {
+      const compact: Record<string, unknown> = {}
+      for (const field of ['browser', 'browserId', 'profile', 'extensionVersion', 'connectionId', 'connectionGeneration', 'state'] as const) {
+        if (target[field] !== undefined) compact[field] = target[field]
+      }
+      return compact
+    })
+  }
+  if (isRecord(value.observability)) {
+    const observability: Record<string, unknown> = {}
+    for (const field of ['pendingRequests', 'drainingRequests'] as const) {
+      if (value.observability[field] !== undefined) observability[field] = value.observability[field]
+    }
+    if (isRecord(value.observability.metrics)) observability.metrics = value.observability.metrics
+    if (Object.keys(observability).length > 0) result.observability = observability
+  }
+  return asJsonValue(result)
 }
 
 function requestWithTarget(
@@ -1023,7 +1060,7 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
       },
       ...(connection.target === undefined ? {} : { target: connection.target }),
       targets: connection.targets,
-      bridgeHealth: connection.bridgeHealth,
+      bridgeHealth: compactBridgeHealth(connection.bridgeHealth),
       recovery: bridgeRecovery(connection.bridgeHealth),
     })
   }
@@ -1042,7 +1079,7 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
         message: 'Multiple browser targets are connected; call browser_status with browserId to select one.',
       },
       targets: connection.targets,
-      bridgeHealth: connection.bridgeHealth,
+      bridgeHealth: compactBridgeHealth(connection.bridgeHealth),
       recovery: bridgeRecovery(connection.bridgeHealth),
     })
   }
@@ -1060,7 +1097,7 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
         code: 'extension_not_connected',
         message: 'The browser extension is still reconnecting after the automatic wait. No browser action was sent; retry browser_status before asking the user to connect it.',
       },
-      bridgeHealth: connection.bridgeHealth,
+      bridgeHealth: compactBridgeHealth(connection.bridgeHealth),
       recovery: bridgeRecovery(connection.bridgeHealth),
     })
   }
@@ -1081,9 +1118,55 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
 
 async function operationDisconnectedResult(
   bridge: BrowserBridgeClient,
-  code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' | 'BROWSER_OPERATION_UNCERTAIN' = 'EXTENSION_OFFLINE',
+  code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' | 'BROWSER_OPERATION_UNCERTAIN' | 'BROWSER_TARGET_MISMATCH' | 'BROWSER_PAGE_UNAVAILABLE' | 'BROWSER_PAGE_CHANGING' | 'BROWSER_WAIT_TIMEOUT' | 'BROWSER_SELECTOR_NOT_FOUND' | 'BROWSER_SELECTOR_INVALID' | 'BROWSER_SCRIPT_ERROR' = 'EXTENSION_OFFLINE',
   details?: JsonValue,
 ): Promise<JsonValue> {
+  if (code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR') return asJsonValue({
+    ok: false,
+    completed: false,
+    actionState: 'not_completed',
+    retryable: false,
+    inspectFirst: false,
+    nextAction: 'browser_snapshot',
+    recommendation: code === 'BROWSER_SELECTOR_NOT_FOUND' ? 'refresh_selector_target' : code === 'BROWSER_SELECTOR_INVALID' ? 'fix_selector' : 'inspect_page_script_error',
+    error: {
+      code,
+      message: code === 'BROWSER_SELECTOR_NOT_FOUND'
+        ? 'The requested page selector did not match an element. Run browser_snapshot without selector or choose a selector present on the current page.'
+        : code === 'BROWSER_SELECTOR_INVALID'
+          ? 'The requested page selector is invalid. Use a valid CSS selector, then run browser_snapshot again.'
+          : 'The page script failed before producing a result. Inspect the current page before retrying.',
+      ...(details === undefined ? {} : { details }),
+    },
+  })
+  if (code === 'BROWSER_PAGE_CHANGING') return asJsonValue({
+    ok: false,
+    completed: false,
+    actionState: 'not_completed',
+    retryable: true,
+    inspectFirst: false,
+    nextAction: 'browser_tabs',
+    recommendation: 'retry_read_on_current_tab',
+    error: {
+      code,
+      message: 'The tab document changed during a read. Refresh browser_tabs and retry the read; no page side effect was sent.',
+      ...(details === undefined ? {} : { details }),
+    },
+  })
+  if (code === 'BROWSER_WAIT_TIMEOUT') return asJsonValue({
+    ok: false,
+    completed: false,
+    actionState: 'not_completed',
+    retryable: true,
+    inspectFirst: true,
+    nextAction: 'browser_snapshot',
+    recommendation: 'inspect_wait_target',
+    error: {
+      code,
+      message: 'The wait condition did not become true before the timeout. Inspect the current page or narrow the target before retrying.',
+      ...(details === undefined ? {} : { details }),
+    },
+  })
   let bridgeHealth: Record<string, unknown> | undefined
   try {
     bridgeHealth = await bridge.health()
@@ -1091,6 +1174,8 @@ async function operationDisconnectedResult(
     // Preserve the operation uncertainty even if the Bridge also went offline.
   }
   const targetLoss = code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED'
+  const targetMismatch = code === 'BROWSER_TARGET_MISMATCH'
+  const pageUnavailable = code === 'BROWSER_PAGE_UNAVAILABLE'
   const uncertain = code === 'BROWSER_OPERATION_UNCERTAIN'
   return asJsonValue({
     ok: false,
@@ -1098,23 +1183,27 @@ async function operationDisconnectedResult(
     actionState: 'unknown',
     retryable: false,
     inspectFirst: true,
-    ...(targetLoss ? { nextAction: 'browser_status', recommendation: 'refresh_browser_targets' } : {}),
+    ...(targetLoss || targetMismatch ? { nextAction: 'browser_status', recommendation: targetMismatch ? 'refresh_browser_target_handle' : 'refresh_browser_targets' } : pageUnavailable ? { nextAction: 'browser_tabs', recommendation: 'navigate_to_scriptable_page' } : uncertain ? { nextAction: 'browser_snapshot', recommendation: 'inspect_before_retry' } : {}),
     error: {
-      code: uncertain ? code : targetLoss ? code : 'extension_disconnected_during_operation',
+      code: uncertain || targetLoss || targetMismatch || pageUnavailable ? code : 'extension_disconnected_during_operation',
       message: uncertain
-        ? 'The browser operation may have taken effect before the Bridge request ended. Inspect the current browser state before retrying.'
+        ? 'The browser operation may have taken effect before the Bridge request ended. Inspect the current browser state before retrying; do not replay side effects automatically.'
         : targetLoss
-          ? 'The selected browser target is unavailable or its connection changed during the browser operation. Inspect the current page before retrying.'
-          : 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.',
+          ? 'The selected browser target is unavailable or its connection changed during the browser operation. Run browser_status, then refresh the tab state before retrying.'
+          : targetMismatch
+            ? 'The tab handle belongs to a different browser target. Run browser_status, then browser_tabs and use a handle from the selected target; the request was not sent to that tab.'
+            : pageUnavailable
+              ? 'The selected tab is a browser error page or restricted page and cannot be scripted. Navigate it to a scriptable page, then run browser_tabs before retrying.'
+              : 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.',
       ...(details === undefined ? {} : { details }),
     },
-    ...(bridgeHealth === undefined ? {} : { bridgeHealth, recovery: bridgeRecovery(bridgeHealth) }),
+    ...(bridgeHealth === undefined ? {} : { bridgeHealth: compactBridgeHealth(bridgeHealth), recovery: bridgeRecovery(bridgeHealth) }),
   })
 }
 
 type BrowserOperationResponse =
   | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false; readonly code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' | 'BROWSER_OPERATION_UNCERTAIN'; readonly details?: JsonValue }
+  | { readonly ok: false; readonly code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' | 'BROWSER_OPERATION_UNCERTAIN' | 'BROWSER_TARGET_MISMATCH' | 'BROWSER_PAGE_UNAVAILABLE' | 'BROWSER_PAGE_CHANGING' | 'BROWSER_WAIT_TIMEOUT' | 'BROWSER_SELECTOR_NOT_FOUND' | 'BROWSER_SELECTOR_INVALID' | 'BROWSER_SCRIPT_ERROR'; readonly details?: JsonValue }
 
 function isTargetLocator(value: unknown): boolean {
   if (!isRecord(value)) return false
@@ -1187,7 +1276,7 @@ async function requestBrowserOperation(
     return { ok: true, value: await requestWithTarget(bridge, method, params, signal, target) }
   } catch (error) {
     const code = bridgeErrorCode(error)
-    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN') {
+    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR') {
       const details = error && typeof error === 'object' && 'details' in error ? (error as { readonly details?: unknown }).details : undefined
       return { ok: false, code, ...(details === undefined ? {} : { details: asJsonValue(details) }) }
     }
@@ -1236,15 +1325,15 @@ async function browserStatus(
       targetStability: preview,
       recommendation: 'cleanup_browser_target',
       error: { code: 'TARGET_OWNERSHIP_REQUIRES_CLEANUP', message: 'Clean up the currently bound browser target before acknowledging a different browser target; ownership is not transferred.' },
-      bridgeHealth: connection.bridgeHealth,
+      bridgeHealth: compactBridgeHealth(connection.bridgeHealth),
     })
   }
   const targetStability = selectionBrowserId === undefined ? preview : tracker.observe(connection.status, selectionBrowserId)
   const base = isRecord(connection.status) ? connection.status : { result: connection.status }
   try {
-    return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: await bridge.health() })
+    return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: compactBridgeHealth(await bridge.health()) })
   } catch {
-    return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: connection.bridgeHealth })
+    return asJsonValue({ ...base, state: connection.state, targetStability, bridgeHealth: compactBridgeHealth(connection.bridgeHealth) })
   }
 }
 
@@ -1921,7 +2010,7 @@ export function registerBrowserTools(
           const result = await cleanupSession(session, mode, exec.signal, undefined, false, { recoverStale: spec.name === 'browser_cleanup' && args.recoverStale === true })
           if (!result.ok) throw result.error
           pendingCleanups.set(exec, { session, mode, activation, generation: generationFor(session), clearTurnCleanup: mode === 'context' || !cleanupRetainsTabs(result.value) })
-          return asJsonValue(result.value)
+          return compactBrowserResult(spec.name, params, result.value)
         }
         const tracker = trackerFor(session)
         if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, operationSignal)
@@ -1941,9 +2030,9 @@ export function registerBrowserTools(
         let method = spec.method
         if (spec.name === 'browser_accessibility_snapshot') {
           assertBridgeRequestCapabilities('snapshot', params, connection.bridgeHealth, connection.status)
-          const result = await requestBrowserOperation(bridge, 'snapshot', params, operationSignal, targetRoute)
+          const result = await requestBrowserOperation(bridge, 'snapshot', { ...params, accessibilityOnly: true }, operationSignal, targetRoute)
           if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
-          return prepareAccessibility(result.value)
+          return prepareAccessibility(result.value, params)
         }
         if (spec.name === 'browser_console') {
           method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
@@ -1961,7 +2050,7 @@ export function registerBrowserTools(
         }
         const result = await requestBrowserOperation(bridge, method, params, operationSignal, targetRoute)
         if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
-        return asJsonValue(result.value)
+        return compactBrowserResult(spec.name, params, result.value)
       } finally {
         releaseOperation?.()
         if (waitController !== undefined) {
