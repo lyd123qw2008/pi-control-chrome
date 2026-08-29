@@ -165,7 +165,7 @@ Never include the pairing token, cookies, passwords, access tokens, or unrelated
 
 ## Fast Common Workflows
 
-The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Managed `open`, `view`, and `cleanup` calls require an explicit `--session <id>`; `view` retention marks also require `--turn <n>`. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
+The bundled `scripts/browser.mjs` commands are for explicit human or developer workflows and automated tests only. They connect to the Bridge directly and are not a model-facing alternative to the Skill-gated `browser_*` tools. Managed `open`, `view`, and `cleanup` calls require an explicit `--session <id>`; `view` retention marks also require `--turn <n>`. Read-only `tabs`, `view`, `snapshot`, and `extract` use the negotiated Bridge `responseMode=compact` by default; pass `--raw` only for human/developer diagnostics that need the compatibility fields such as `frameTree`. Do not invoke them through a model shell. For model browser work, use the visible native tools below so the current Agent session, target identity, and ownership protections remain active.
 
 `/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` remain explicit human diagnostics or lifecycle commands and do not activate model browser tools.
 

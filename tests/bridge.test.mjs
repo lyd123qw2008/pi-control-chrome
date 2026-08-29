@@ -163,6 +163,106 @@ test("bridge exposes health/pair endpoints and routes Pi requests to extension",
   }
 });
 
+test("bridge negotiates compact page responses while retaining explicit raw compatibility", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-output-mode-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let pi;
+  let extension;
+  let forwardedSnapshot;
+  const rawSnapshot = {
+    browserId: "edge:compact",
+    profile: "profile-compact",
+    tabId: 7,
+    tab: { id: 7, title: "Orders", url: "https://example.test/orders", favicon: `data:image/png;base64,${"A".repeat(1000)}` },
+    snapshot: {
+      snapshotId: "snapshot-wire",
+      title: "Orders",
+      url: "https://example.test/orders",
+      text: "duplicate page text",
+      elements: [{ ref: "e1", role: "button", name: "Save" }],
+      accessibility: { children: [{ role: "button", name: "Save" }] },
+    },
+    frameTree: { frameTree: { frame: { id: "main" }, childFrames: [{ frame: { id: "child" } }] } },
+  };
+  const connect = (role, token) => new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(token)}`);
+    socket.once("open", () => resolve(socket));
+    socket.once("error", reject);
+  });
+  const responseFor = (socket, id) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`response timeout: ${id}`)), 3000);
+    const onMessage = (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type !== "response" || message.id !== id) return;
+      clearTimeout(timer);
+      socket.off("message", onMessage);
+      resolve(message);
+    };
+    socket.on("message", onMessage);
+  });
+  try {
+    const health = await waitHealth(port);
+    assert.equal(health.capabilities.compactResponses, true);
+    const pair = await getJson(port, "/pair");
+    extension = await connect("extension", pair.body.token);
+    extension.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "request" && message.method === "snapshot") {
+        forwardedSnapshot = message;
+        extension.send(JSON.stringify({ type: "response", id: message.id, result: rawSnapshot }));
+      }
+    });
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:compact", profile: "profile-compact", capabilities: { tabIncarnationFence: true } }));
+    await waitHealthTarget(port, "edge:compact");
+    pi = await connect("pi", pair.body.token);
+
+    const compactId = "compact-snapshot";
+    const compactPending = responseFor(pi, compactId);
+    pi.send(JSON.stringify({ type: "request", id: compactId, method: "snapshot", params: { tabId: 7, responseMode: "compact" } }));
+    const compact = await compactPending;
+    assert.equal(compact.error, undefined);
+    assert.equal(compact.result.browserId, "edge:compact");
+    assert.equal(compact.result.connectionGeneration > 0, true);
+    assert.equal(compact.result.snapshot.text, undefined);
+    assert.equal(compact.result.snapshot.elements, undefined);
+    assert.equal(compact.result.frameTree, undefined);
+    assert.match(compact.result.snapshot.state, /\[ref=e1\]/);
+    assert.equal(compact.result.tab.favicon, undefined);
+    assert.equal(forwardedSnapshot?.params.responseMode, undefined);
+
+    const rawId = "raw-snapshot";
+    const rawPending = responseFor(pi, rawId);
+    pi.send(JSON.stringify({ type: "request", id: rawId, method: "snapshot", params: { tabId: 7, responseMode: "raw" } }));
+    const raw = await rawPending;
+    assert.equal(raw.error, undefined);
+    assert.equal(raw.result.snapshot.text, "duplicate page text");
+    assert.ok(raw.result.snapshot.elements);
+    assert.ok(raw.result.frameTree);
+    assert.equal(forwardedSnapshot?.params.responseMode, undefined);
+
+    const invalidId = "invalid-response-mode";
+    const invalidPending = responseFor(pi, invalidId);
+    pi.send(JSON.stringify({ type: "request", id: invalidId, method: "snapshot", params: { tabId: 7, responseMode: "verbose" } }));
+    const invalid = await invalidPending;
+    assert.equal(invalid.error.code, "INVALID_REQUEST");
+    assert.match(invalid.error.message, /compact or raw/);
+
+    const unsupportedId = "unsupported-compact-mode";
+    const unsupportedPending = responseFor(pi, unsupportedId);
+    pi.send(JSON.stringify({ type: "request", id: unsupportedId, method: "screenshot", params: { tabId: 7, responseMode: "compact" } }));
+    const unsupported = await unsupportedPending;
+    assert.equal(unsupported.error.code, "INVALID_REQUEST");
+    assert.match(unsupported.error.message, /only supported for bounded browser read responses/);
+  } finally {
+    pi?.close();
+    extension?.close();
+    await stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
 test("bridge forwards client cancellation to the selected extension", async () => {
   const port = 17800 + Math.floor(Math.random() * 500);
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-cancel-test-"));

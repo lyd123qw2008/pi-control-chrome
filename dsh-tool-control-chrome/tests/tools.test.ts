@@ -985,13 +985,13 @@ describe('DSH browser tool catalog', () => {
           frameTree: { debug: true },
         }
         : { method })
-    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { snapshotRefs: true, tabIncarnationFence: true } }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { snapshotRefs: true, tabIncarnationFence: true, compactResponses: true } }))
     const harness = setup({ request, health })
     const snapshot = await harness.tools.get('browser_snapshot')?.execute({ maxChars: 100, maxNodes: 1 }, execution(harness.agent))
     expect(snapshot).toMatchObject({ snapshot: { snapshotId: 'snapshot-1', nodeCount: 1, truncated: false } })
     expect(JSON.stringify(snapshot)).toContain('[ref=e1]')
     expect(JSON.stringify(snapshot)).not.toContain('frameTree')
-    expect(request).toHaveBeenCalledWith('snapshot', expect.objectContaining({ maxChars: 100, maxNodes: 1, sessionId: 'session-test', expectedBrowserId: 'edge:test' }), expect.any(AbortSignal), { browserId: 'edge:test' })
+    expect(request).toHaveBeenCalledWith('snapshot', expect.objectContaining({ maxChars: 100, maxNodes: 1, responseMode: 'compact', sessionId: 'session-test', expectedBrowserId: 'edge:test' }), expect.any(AbortSignal), { browserId: 'edge:test' })
   })
 
   it('projects accessibility and network specializations', async () => {

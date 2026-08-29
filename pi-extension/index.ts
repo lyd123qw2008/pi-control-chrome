@@ -589,6 +589,16 @@ function localBrowserRequestError(method: string, params: Record<string, unknown
   return result;
 }
 
+function compactResponseParams(method: string, params: Record<string, unknown>, health: unknown): Record<string, unknown> {
+  const supported = method === "snapshot" || method === "extract" || method === "list_tabs" || method === "selected_tab" || (method === "dom_cua" && params.action === "get_visible_dom");
+  if (!supported || params.responseMode !== undefined) return params;
+  const capabilities = health && typeof health === "object" && !Array.isArray(health)
+    ? (health as { capabilities?: unknown }).capabilities
+    : undefined;
+  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities) || (capabilities as Record<string, unknown>).compactResponses !== true) return params;
+  return { ...params, responseMode: "compact" };
+}
+
 function assertBridgeRequestCapabilities(method: string, params: Record<string, unknown>, health: unknown, status?: unknown): void {
   const bridgeCapabilities = health && typeof health === "object" ? (health as { capabilities?: unknown }).capabilities : undefined;
   const bridgeRecord = bridgeCapabilities && typeof bridgeCapabilities === "object" && !Array.isArray(bridgeCapabilities) ? bridgeCapabilities as Record<string, unknown> : {};
@@ -596,6 +606,7 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
   const extensionRecord = extensionCapabilities && typeof extensionCapabilities === "object" && !Array.isArray(extensionCapabilities) ? extensionCapabilities as Record<string, unknown> : {};
   const requiredBridge: string[] = [];
   const requiredExtension: string[] = [];
+  if (params.responseMode === "compact") requiredBridge.push("compactResponses");
   const requireTargetSupport = () => {
     requiredBridge.push("semanticTargetRequests");
     requiredExtension.push("semanticTargets");
@@ -996,10 +1007,12 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
     throw new Error(`Browser target changed from ${targetStability.previousBrowser} (${targetStability.previousBrowserId}) to ${targetStability.browser} (${targetStability.browserId}); run browser_status with acknowledgeBrowserId after disabling the other browser extension`);
   }
   cleanupTargetRoutes.set(requestSessionId, targetRoute(target));
+  let wireParams = params;
   try {
     const bridgeHealth = await bridge.health();
     assertCurrent();
-    assertBridgeRequestCapabilities(method, params, bridgeHealth, status);
+    wireParams = compactResponseParams(method, params, bridgeHealth);
+    assertBridgeRequestCapabilities(method, wireParams, bridgeHealth, status);
   } catch (error) {
     assertCurrent();
     if (bridgeErrorCode(error) === "BRIDGE_CAPABILITY_MISSING") throw error;
@@ -1013,7 +1026,7 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
   browserActivation.markUsed();
   const turnParams = method === "mark_handoff" || method === "mark_deliverable" ? { turnId: requestTurn } : {};
   assertCurrent();
-  const value = await bridgeRequest(method, { ...params, ...turnParams, sessionId: requestSessionId, expectedBrowserId: target.browserId }, targetRoute(target), requestSignal);
+  const value = await bridgeRequest(method, { ...wireParams, ...turnParams, sessionId: requestSessionId, expectedBrowserId: target.browserId }, targetRoute(target), requestSignal);
   assertCurrent();
   return value;
 }

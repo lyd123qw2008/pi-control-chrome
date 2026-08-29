@@ -10,6 +10,7 @@ const OUTPUT_HARD_MAX_CHARS = 100_000
 const OUTPUT_HARD_MAX_NODES = 1_000
 const DEFAULT_OUTPUT_NODES = 200
 const FIELD_MAX_CHARS = 240
+const RESULT_IDENTITY_KEYS = ['browserId', 'profile', 'connectionId', 'connectionGeneration'] as const
 
 function outputChars(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1
@@ -64,6 +65,56 @@ function compactTab(value: unknown): unknown {
   return result
 }
 
+function compactResultEnvelope(value: RecordValue): RecordValue {
+  const result: RecordValue = {}
+  for (const key of RESULT_IDENTITY_KEYS) {
+    if (value[key] === undefined) continue
+    result[key] = key === 'profile' ? bounded(value[key], FIELD_MAX_CHARS) : value[key]
+  }
+  if (value.tabId !== undefined) result.tabId = value.tabId
+  if (value.tab !== undefined) result.tab = compactTab(value.tab)
+  return result
+}
+
+function compactStateSnapshot(snapshot: RecordValue, maxChars: number, maxNodes: number): { state: string; nodeCount: number; charCount: number; truncated: boolean } | undefined {
+  if (typeof snapshot.state !== 'string' || Array.isArray(snapshot.elements) || isRecord(snapshot.accessibility)) return undefined
+  const sourceState = text(snapshot.state)
+  const state = bounded(sourceState, maxChars)
+  const sourceNodeCount = typeof snapshot.nodeCount === 'number' && Number.isFinite(snapshot.nodeCount) ? Math.max(0, snapshot.nodeCount) : 0
+  return {
+    state,
+    nodeCount: Math.min(sourceNodeCount, maxNodes),
+    charCount: state.length,
+    truncated: snapshot.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+  }
+}
+
+function compactAccessibilityState(value: RecordValue, maxChars: number, maxNodes: number): { state: string; nodeCount: number; charCount: number; truncated: boolean } | undefined {
+  if (typeof value.state !== 'string' || Array.isArray(value.children)) return undefined
+  const sourceState = text(value.state)
+  const state = bounded(sourceState, maxChars)
+  const sourceNodeCount = typeof value.nodeCount === 'number' && Number.isFinite(value.nodeCount) ? Math.max(0, value.nodeCount) : 0
+  return {
+    state,
+    nodeCount: Math.min(sourceNodeCount, maxNodes),
+    charCount: state.length,
+    truncated: value.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+  }
+}
+
+function compactDomState(dom: RecordValue, maxChars: number, maxNodes: number): { state: string; nodeCount: number; charCount: number; truncated: boolean } | undefined {
+  if (typeof dom.state !== 'string' || Array.isArray(dom.nodes)) return undefined
+  const sourceState = text(dom.state)
+  const state = bounded(sourceState, maxChars)
+  const sourceNodeCount = typeof dom.nodeCount === 'number' && Number.isFinite(dom.nodeCount) ? Math.max(0, dom.nodeCount) : 0
+  return {
+    state,
+    nodeCount: Math.min(sourceNodeCount, maxNodes),
+    charCount: state.length,
+    truncated: dom.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+  }
+}
+
 function quote(value: unknown): string {
   return JSON.stringify(bounded(value, FIELD_MAX_CHARS))
 }
@@ -88,7 +139,7 @@ function accessibilityLine(node: RecordValue, prefix = '- '): string {
   return `${prefix}${role}${name ? ` ${quote(name)}` : ''}${value}${disabled}${checked}`
 }
 
-function snapshotState(snapshot: RecordValue, maxChars: number, maxNodes: number): { state: string; nodeCount: number; truncated: boolean } {
+function snapshotState(snapshot: RecordValue, maxChars: number, maxNodes: number): { state: string; nodeCount: number; charCount: number; truncated: boolean } {
   const lines: string[] = []
   const allElements = Array.isArray(snapshot.elements) ? snapshot.elements.filter(isRecord) : []
   const allChildren = isRecord(snapshot.accessibility) && Array.isArray(snapshot.accessibility.children) ? snapshot.accessibility.children.filter(isRecord) : []
@@ -115,6 +166,7 @@ function snapshotState(snapshot: RecordValue, maxChars: number, maxNodes: number
   return {
     state,
     nodeCount: elements.length > 0 ? elements.length : Math.min(allChildren.length, maxNodes),
+    charCount: state.length,
     truncated: semanticTruncated || pageTextTruncated,
   }
 }
@@ -127,19 +179,19 @@ function snapshotState(snapshot: RecordValue, maxChars: number, maxNodes: number
  * @returns Model-facing JSON result.
  */
 export function compactSnapshotResult(value: unknown, maxChars = SNAPSHOT_MAX_CHARS, maxNodes = DEFAULT_OUTPUT_NODES): JsonValue {
-  if (!isRecord(value) || !isRecord(value.snapshot)) return value as JsonValue
+  if (!isRecord(value)) return value as JsonValue
+  if (!isRecord(value.snapshot)) return compactResultEnvelope(value) as JsonValue
   const snapshot = value.snapshot
-  const projected = snapshotState(snapshot, maxChars, maxNodes)
+  const projected = compactStateSnapshot(snapshot, maxChars, maxNodes) ?? snapshotState(snapshot, maxChars, maxNodes)
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     snapshot: {
       snapshotId: snapshot.snapshotId,
-       ...(value.tab === undefined && snapshot.title !== undefined ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
-       ...(value.tab === undefined && snapshot.url !== undefined ? { url: bounded(snapshot.url, 4_096) } : {}),
+      ...(value.tab === undefined && snapshot.title !== undefined ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
+      ...(value.tab === undefined && snapshot.url !== undefined ? { url: bounded(snapshot.url, 4_096) } : {}),
       state: projected.state,
       nodeCount: projected.nodeCount,
-      charCount: projected.state.length,
+      charCount: projected.charCount ?? projected.state.length,
       truncated: projected.truncated,
       ...(snapshot.viewport === undefined ? {} : { viewport: snapshot.viewport }),
     },
@@ -155,6 +207,20 @@ export function compactSnapshotResult(value: unknown, maxChars = SNAPSHOT_MAX_CH
  */
 export function compactAccessibilityResult(value: unknown, maxChars = SNAPSHOT_MAX_CHARS, maxNodes = DEFAULT_OUTPUT_NODES): JsonValue {
   if (!isRecord(value)) return value as JsonValue
+  const precompact = compactAccessibilityState(value, maxChars, maxNodes)
+  if (precompact) {
+    return {
+      ...compactResultEnvelope(value),
+      snapshotId: value.snapshotId,
+      ...(typeof value.baseSnapshotId === 'string' ? { baseSnapshotId: value.baseSnapshotId } : {}),
+      mode: typeof value.mode === 'string' ? value.mode : 'full',
+      state: precompact.state,
+      nodeCount: precompact.nodeCount,
+      ...(typeof value.changedNodeCount === 'number' ? { changedNodeCount: value.changedNodeCount } : {}),
+      charCount: precompact.charCount,
+      truncated: precompact.truncated,
+    } as JsonValue
+  }
   const snapshot = isRecord(value.snapshot) ? value.snapshot : undefined
   const accessibility = isRecord(snapshot?.accessibility) ? snapshot.accessibility : value
   const allChildren = Array.isArray(accessibility.children) ? accessibility.children.filter(isRecord) : []
@@ -167,11 +233,10 @@ export function compactAccessibilityResult(value: unknown, maxChars = SNAPSHOT_M
       : children.map(node => accessibilityLine(node)).join('\n')
   const state = bounded(sourceState, maxChars)
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     snapshotId: typeof snapshot?.snapshotId === 'string' ? snapshot.snapshotId : accessibility.snapshotId,
-     ...(value.tab === undefined && typeof snapshot?.title === 'string' ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
-     ...(value.tab === undefined && typeof snapshot?.url === 'string' ? { url: bounded(snapshot.url, 4_096) } : {}),
+    ...(value.tab === undefined && typeof snapshot?.title === 'string' ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
+    ...(value.tab === undefined && typeof snapshot?.url === 'string' ? { url: bounded(snapshot.url, 4_096) } : {}),
     ...(typeof accessibility.baseSnapshotId === 'string' ? { baseSnapshotId: accessibility.baseSnapshotId } : {}),
     mode,
     state,
@@ -190,8 +255,23 @@ export function compactAccessibilityResult(value: unknown, maxChars = SNAPSHOT_M
  * @returns Model-facing JSON result.
  */
 export function compactDomCuaResult(value: unknown, maxChars = DOM_MAX_CHARS, maxNodes = DEFAULT_OUTPUT_NODES): JsonValue {
-  if (!isRecord(value) || !isRecord(value.dom)) return value as JsonValue
+  if (!isRecord(value)) return value as JsonValue
+  if (!isRecord(value.dom)) return compactResultEnvelope(value) as JsonValue
   const dom = value.dom
+  const precompact = compactDomState(dom, maxChars, maxNodes)
+  if (precompact) {
+    return {
+      ...compactResultEnvelope(value),
+      dom: {
+        snapshotId: dom.snapshotId,
+        ...(dom.viewport === undefined ? {} : { viewport: dom.viewport }),
+        state: precompact.state,
+        nodeCount: precompact.nodeCount,
+        charCount: precompact.charCount,
+        truncated: precompact.truncated,
+      },
+    } as JsonValue
+  }
   const allNodes = Array.isArray(dom.nodes) ? dom.nodes.filter(isRecord) : []
   const nodes = allNodes.slice(0, maxNodes)
   const stateSource = nodes.map(node => {
@@ -204,8 +284,7 @@ export function compactDomCuaResult(value: unknown, maxChars = DOM_MAX_CHARS, ma
   }).join('\n')
   const state = bounded(stateSource, maxChars)
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     dom: {
       snapshotId: dom.snapshotId,
       viewport: dom.viewport,
@@ -226,13 +305,12 @@ export function compactDomCuaResult(value: unknown, maxChars = DOM_MAX_CHARS, ma
 export function compactExtractResult(value: unknown, maxChars = EXTRACT_MAX_CHARS): JsonValue {
   if (!isRecord(value)) return value as JsonValue
   const content = isRecord(value.content) ? value.content : undefined
-  if (content === undefined) return value as JsonValue
+  if (content === undefined) return compactResultEnvelope(value) as JsonValue
   const contentText = bounded(content.text, maxChars)
   const remainingChars = Math.max(0, maxChars - contentText.length)
   const contentMarkdown = remainingChars > 0 ? bounded(content.markdown, remainingChars) : ''
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     content: {
        ...(value.tab === undefined && content.title !== undefined ? { title: bounded(content.title, FIELD_MAX_CHARS) } : {}),
        ...(value.tab === undefined && content.url !== undefined ? { url: bounded(content.url, 4_096) } : {}),
@@ -252,8 +330,7 @@ export function compactTabsResult(value: unknown): JsonValue {
   if (!isRecord(value)) return value as JsonValue
   const tabs = Array.isArray(value.tabs) ? value.tabs.map(compactTab) : []
   return {
-    ...(value.browserId === undefined ? {} : { browserId: value.browserId }),
-    ...(value.profile === undefined ? {} : { profile: bounded(value.profile, FIELD_MAX_CHARS) }),
+    ...compactResultEnvelope(value),
     tabs,
     ...(Array.isArray(value.groups) ? { groups: value.groups } : {}),
   } as JsonValue
@@ -273,7 +350,7 @@ export function compactBrowserResult(toolName: string, params: Record<string, un
   if (toolName === 'browser_accessibility_snapshot') return compactAccessibilityResult(value, maxChars, maxNodes)
   if (toolName === 'browser_extract') return compactExtractResult(value, maxChars)
   if (toolName === 'browser_tabs') return compactTabsResult(value)
-  if (toolName === 'browser_selected') return isRecord(value) ? { ...value, ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }) } as JsonValue : value as JsonValue
+  if (toolName === 'browser_selected') return isRecord(value) ? compactResultEnvelope(value) as JsonValue : value as JsonValue
   if (toolName === 'browser_dom_cua' && params.action === 'get_visible_dom') return compactDomCuaResult(value, maxChars, maxNodes)
   return value as JsonValue
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Migrate the managed Skill CLI and DSH/Pi page-read consumers to a negotiated `responseMode=compact` Bridge response. Keep `responseMode=raw` as an explicit human/developer diagnostic path, retain old unspecified-mode compatibility, validate invalid modes, and make Pi/DSH projections idempotent for already compact results.
+
 ## 0.4.2 - 2026-08-29
 
 - Add bounded re-observation for read-only page reads on user tabs: a document change is retried once, persistent movement returns `BROWSER_PAGE_CHANGING`, and side-effecting operations retain strict document fencing. Automated browser verification uses isolated Agent-owned tabs or browser profiles rather than the active DSH GUI tab.

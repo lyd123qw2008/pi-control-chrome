@@ -8,6 +8,7 @@ const OUTPUT_HARD_MAX_CHARS = 100_000;
 const OUTPUT_HARD_MAX_NODES = 1_000;
 const DEFAULT_OUTPUT_NODES = 200;
 const FIELD_MAX_CHARS = 240;
+const RESULT_IDENTITY_KEYS = ["browserId", "profile", "connectionId", "connectionGeneration"];
 
 function outputChars(value, fallback) {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? Math.min(value, OUTPUT_HARD_MAX_CHARS) : fallback;
@@ -50,6 +51,56 @@ function compactTab(value) {
   if (isRecord(result.handle) && typeof result.handle.url === "string") result.handle.url = bounded(result.handle.url, 4_096);
   if (typeof result.favicon === "string" && !/^https?:\/\//i.test(result.favicon)) delete result.favicon;
   return result;
+}
+
+function compactResultEnvelope(value) {
+  const result = {};
+  for (const key of RESULT_IDENTITY_KEYS) {
+    if (value[key] === undefined) continue;
+    result[key] = key === "profile" ? bounded(value[key], FIELD_MAX_CHARS) : value[key];
+  }
+  if (value.tabId !== undefined) result.tabId = value.tabId;
+  if (value.tab !== undefined) result.tab = compactTab(value.tab);
+  return result;
+}
+
+function compactStateSnapshot(snapshot, maxChars, maxNodes) {
+  if (typeof snapshot.state !== "string" || Array.isArray(snapshot.elements) || isRecord(snapshot.accessibility)) return undefined;
+  const sourceState = text(snapshot.state);
+  const state = bounded(sourceState, maxChars);
+  const sourceNodeCount = typeof snapshot.nodeCount === "number" && Number.isFinite(snapshot.nodeCount) ? Math.max(0, snapshot.nodeCount) : 0;
+  return {
+    state,
+    nodeCount: Math.min(sourceNodeCount, maxNodes),
+    charCount: state.length,
+    truncated: snapshot.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+  };
+}
+
+function compactAccessibilityState(value, maxChars, maxNodes) {
+  if (!isRecord(value) || typeof value.state !== "string" || Array.isArray(value.children)) return undefined;
+  const sourceState = text(value.state);
+  const state = bounded(sourceState, maxChars);
+  const sourceNodeCount = typeof value.nodeCount === "number" && Number.isFinite(value.nodeCount) ? Math.max(0, value.nodeCount) : 0;
+  return {
+    state,
+    nodeCount: Math.min(sourceNodeCount, maxNodes),
+    charCount: state.length,
+    truncated: value.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+  };
+}
+
+function compactDomState(dom, maxChars, maxNodes) {
+  if (!isRecord(dom) || typeof dom.state !== "string" || Array.isArray(dom.nodes)) return undefined;
+  const sourceState = text(dom.state);
+  const state = bounded(sourceState, maxChars);
+  const sourceNodeCount = typeof dom.nodeCount === "number" && Number.isFinite(dom.nodeCount) ? Math.max(0, dom.nodeCount) : 0;
+  return {
+    state,
+    nodeCount: Math.min(sourceNodeCount, maxNodes),
+    charCount: state.length,
+    truncated: dom.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+  };
 }
 
 function quote(value) {
@@ -109,19 +160,19 @@ function snapshotState(snapshot, maxChars, maxNodes) {
 
 /** Project a raw snapshot to one bounded semantic state while retaining refs. */
 export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxNodes = DEFAULT_OUTPUT_NODES) {
-  if (!isRecord(value) || !isRecord(value.snapshot)) return value;
+  if (!isRecord(value)) return value;
+  if (!isRecord(value.snapshot)) return compactResultEnvelope(value);
   const snapshot = value.snapshot;
-  const projected = snapshotState(snapshot, maxChars, maxNodes);
+  const projected = compactStateSnapshot(snapshot, maxChars, maxNodes) ?? snapshotState(snapshot, maxChars, maxNodes);
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     snapshot: {
       snapshotId: snapshot.snapshotId,
-       ...(value.tab === undefined && snapshot.title !== undefined ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
-       ...(value.tab === undefined && snapshot.url !== undefined ? { url: bounded(snapshot.url, 4_096) } : {}),
+      ...(value.tab === undefined && snapshot.title !== undefined ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
+      ...(value.tab === undefined && snapshot.url !== undefined ? { url: bounded(snapshot.url, 4_096) } : {}),
       state: projected.state,
       nodeCount: projected.nodeCount,
-      charCount: projected.state.length,
+      charCount: projected.charCount ?? projected.state.length,
       truncated: projected.truncated,
       ...(snapshot.viewport === undefined ? {} : { viewport: snapshot.viewport }),
     },
@@ -131,6 +182,20 @@ export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxN
 /** Project a raw accessibility response to bounded full/diff text. */
 export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxNodes = DEFAULT_OUTPUT_NODES) {
   if (!isRecord(value)) return value;
+  const precompact = compactAccessibilityState(value, maxChars, maxNodes);
+  if (precompact) {
+    return {
+      ...compactResultEnvelope(value),
+      snapshotId: value.snapshotId,
+      ...(typeof value.baseSnapshotId === "string" ? { baseSnapshotId: value.baseSnapshotId } : {}),
+      mode: typeof value.mode === "string" ? value.mode : "full",
+      state: precompact.state,
+      nodeCount: precompact.nodeCount,
+      ...(typeof value.changedNodeCount === "number" ? { changedNodeCount: value.changedNodeCount } : {}),
+      charCount: precompact.charCount,
+      truncated: precompact.truncated,
+    };
+  }
   const snapshot = isRecord(value.snapshot) ? value.snapshot : undefined;
   const accessibility = isRecord(snapshot?.accessibility) ? snapshot.accessibility : value;
   const allChildren = Array.isArray(accessibility.children) ? accessibility.children.filter(isRecord) : [];
@@ -141,11 +206,10 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
     : typeof accessibility.state === "string" ? accessibility.state : children.map(node => accessibilityLine(node)).join("\n");
   const state = bounded(sourceState, maxChars);
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     snapshotId: typeof snapshot?.snapshotId === "string" ? snapshot.snapshotId : accessibility.snapshotId,
-     ...(value.tab === undefined && typeof snapshot?.title === "string" ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
-     ...(value.tab === undefined && typeof snapshot?.url === "string" ? { url: bounded(snapshot.url, 4_096) } : {}),
+    ...(value.tab === undefined && typeof snapshot?.title === "string" ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
+    ...(value.tab === undefined && typeof snapshot?.url === "string" ? { url: bounded(snapshot.url, 4_096) } : {}),
     ...(typeof accessibility.baseSnapshotId === "string" ? { baseSnapshotId: accessibility.baseSnapshotId } : {}),
     mode,
     state,
@@ -158,8 +222,23 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
 
 /** Project visible DOM nodes to bounded line-oriented state. */
 export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = DEFAULT_OUTPUT_NODES) {
-  if (!isRecord(value) || !isRecord(value.dom)) return value;
+  if (!isRecord(value)) return value;
+  if (!isRecord(value.dom)) return compactResultEnvelope(value);
   const dom = value.dom;
+  const precompact = compactDomState(dom, maxChars, maxNodes);
+  if (precompact) {
+    return {
+      ...compactResultEnvelope(value),
+      dom: {
+        snapshotId: dom.snapshotId,
+        ...(dom.viewport === undefined ? {} : { viewport: dom.viewport }),
+        state: precompact.state,
+        nodeCount: precompact.nodeCount,
+        charCount: precompact.charCount,
+        truncated: precompact.truncated,
+      },
+    };
+  }
   const allNodes = Array.isArray(dom.nodes) ? dom.nodes.filter(isRecord) : [];
   const nodes = allNodes.slice(0, maxNodes);
   const stateSource = nodes.map(node => {
@@ -171,8 +250,7 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
   }).join("\n");
   const state = bounded(stateSource, maxChars);
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     dom: {
       snapshotId: dom.snapshotId,
       viewport: dom.viewport,
@@ -186,14 +264,14 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
 
 /** Project extracted page content with one shared text budget. */
 export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
-  if (!isRecord(value) || !isRecord(value.content)) return value;
+  if (!isRecord(value)) return value;
+  if (!isRecord(value.content)) return compactResultEnvelope(value);
   const content = value.content;
   const contentText = bounded(content.text, maxChars);
   const remainingChars = Math.max(0, maxChars - contentText.length);
   const contentMarkdown = remainingChars > 0 ? bounded(content.markdown, remainingChars) : "";
   return {
-    ...(value.tabId === undefined ? {} : { tabId: value.tabId }),
-    ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }),
+    ...compactResultEnvelope(value),
     content: {
        ...(value.tab === undefined && content.title !== undefined ? { title: bounded(content.title, FIELD_MAX_CHARS) } : {}),
        ...(value.tab === undefined && content.url !== undefined ? { url: bounded(content.url, 4_096) } : {}),
@@ -208,8 +286,7 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
 export function compactTabsResult(value) {
   if (!isRecord(value)) return value;
   return {
-    ...(value.browserId === undefined ? {} : { browserId: value.browserId }),
-    ...(value.profile === undefined ? {} : { profile: bounded(value.profile, FIELD_MAX_CHARS) }),
+    ...compactResultEnvelope(value),
     tabs: Array.isArray(value.tabs) ? value.tabs.map(compactTab) : [],
     ...(Array.isArray(value.groups) ? { groups: value.groups } : {}),
   };
@@ -223,7 +300,7 @@ export function compactBrowserResult(toolName, params, value) {
   if (toolName === "browser_accessibility_snapshot") return compactAccessibilityResult(value, maxChars, maxNodes);
   if (toolName === "browser_extract") return compactExtractResult(value, maxChars);
   if (toolName === "browser_tabs") return compactTabsResult(value);
-  if (toolName === "browser_selected" && isRecord(value)) return { ...value, ...(value.tab === undefined ? {} : { tab: compactTab(value.tab) }) };
+  if (toolName === "browser_selected" && isRecord(value)) return compactResultEnvelope(value);
   if (toolName === "browser_dom_cua" && params.action === "get_visible_dom") return compactDomCuaResult(value, maxChars, maxNodes);
   return value;
 }

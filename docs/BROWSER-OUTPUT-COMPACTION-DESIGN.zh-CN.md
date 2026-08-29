@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-本文是 `pi-control-chrome` 浏览器工具输出压缩方案和实现记录，用于说明模型可见结果、扩展侧边界、兼容性选择和发布结果。当前阶段 A～E 已实现；浏览器操作的安全 fencing、快照引用和副作用不确定性语义保持不变。
+本文是 `pi-control-chrome` 浏览器工具输出压缩方案和实现记录，用于说明模型可见结果、扩展侧边界、兼容性选择和发布结果。阶段 A～E 已实现；当前又完成了 Bridge compact response 协议迁移，浏览器操作的安全 fencing、快照引用和副作用不确定性语义保持不变。
 
 目标发布面包括：Pi Extension、DSH browser tools、Manifest V3 扩展和本地 Bridge。实现优先保持浏览器操作的安全 fencing、快照引用和副作用不确定性语义不变。
 
@@ -47,7 +47,14 @@ snapshot.accessibility
 frameTree
 ```
 
-这些字段不再直接进入 Pi 或 DSH 的模型结果。两侧新增的纯 projection 会生成单一的有界语义 `state`，删除 raw accessibility、`frameTree` 和内部调试字段，同时保留 `snapshotId`、tab identity、可操作 ref、计数和 `truncated`。
+Bridge 线协议的页面读取响应现在支持显式 `responseMode`：
+
+- `compact`：Bridge 直接返回 bounded model-facing contract；普通 snapshot 只保留 `snapshotId`、`state`、计数、截断标记、viewport 和紧凑 tab identity，不返回 `snapshot.text`、`snapshot.elements`、`snapshot.accessibility` 或 `frameTree`。
+- `raw`：仅用于人工/开发者诊断，保留当前兼容字段；不会由 Pi/DSH 默认请求。
+- 未指定时保持旧 Bridge 的 raw 兼容行为。新 Pi、DSH 和 Skill CLI 消费者会先通过 health capability 发现 compact 支持；旧 Bridge 上由宿主侧本地 projection 降级。
+
+`responseMode` 仅改变响应表示，不改变请求的 tab fence、document incarnation、snapshot refs、ownership 或副作用不确定性语义。Bridge health 宣告 `capabilities.compactResponses=true`；非法 mode 或对不支持 compact projection 的方法使用 compact 时，以 `INVALID_REQUEST` 拒绝。
+
 
 扩展 collector 已实现以下边界：
 
@@ -70,7 +77,7 @@ frameTree
 | elements | 约 54 KB |
 | 页面文本 | 约 23 KB |
 
-主要问题不是 JSON 缩进，而是同时返回了多份页面表示，并且 accessibility 包含大量重复 generic 容器文本。当前实现通过源头筛选和模型投影消除这两类重复；Bridge raw 兼容字段仍待后续协议迁移完成后删除。
+主要问题不是 JSON 缩进，而是同时返回了多份页面表示，并且 accessibility 包含大量重复 generic 容器文本。当前实现通过源头筛选、Bridge compact wire response 和模型 projection 消除这两类重复；未指定 `responseMode` 的 raw 字段仍保留给兼容消费者和显式诊断。
 
 ## 4. 目标
 
@@ -132,7 +139,7 @@ Bridge 线协议第一阶段可以继续返回兼容字段，Pi/DSH 模型适配
 
 普通结果不再默认同时包含 `text`、`elements`、`accessibility` 和 `frameTree`。内部仍保留 ref 映射，`ref` 操作继续携带 `snapshotId` 并经过当前页面 fingerprint 校验。
 
-为降低迁移风险，可以先保留 Bridge raw response，再在 Pi/DSH 的 `browser_snapshot` render 层投影为上述结果。确认所有消费者迁移后，再删除 raw response 中不需要的字段。
+Bridge 现在可以直接返回上述 compact response；未指定 `responseMode` 的旧请求继续获得 raw 兼容字段。确认所有消费者后，raw 字段是否最终删除仍需另行提高协议版本，不由本次兼容变更隐式执行。
 
 ### 5.2 `browser_accessibility_snapshot`
 
@@ -415,7 +422,7 @@ Screenshot captured for tab 123.
 state lines + ref map + counts + truncation
 ```
 
-普通 `browser_snapshot` 默认输出 `state`，不再输出 `text`、`elements`、`accessibility` 的重复组合。Bridge raw response 可以在过渡期继续保留旧字段，但模型 projection 不再暴露这些字段。
+普通 `browser_snapshot` 默认输出 `state`，不再输出 `text`、`elements`、`accessibility` 的重复组合。Bridge 通过 `responseMode=compact` 在 wire 层直接提供同一 contract；未指定 mode 的旧请求仍可获得 raw 兼容字段。
 
 ### 阶段 C：AX revision diff（已实现）
 
@@ -449,6 +456,14 @@ Pi 与 DSH 已完成双通道验证，compact projection 作为默认发布行�
 - Profile 解析结果；
 - README、Codex 对齐文档和 CHANGELOG。
 
+### 阶段 F：Bridge raw consumer 迁移（已在工作树实现，待下一次显式发布）
+
+- Bridge health 宣告 `compactResponses`，并校验 `responseMode=compact|raw`。
+- Bridge 在响应发送前对 snapshot、Accessibility、extract、tabs、selected tab 和 visible DOM 执行 canonical compact projection。
+- 新 Pi、DSH 和 Skill CLI 消费者按能力协商 compact wire response；旧 Bridge 由宿主侧本地 projection 降级。
+- Skill CLI 默认不读取 `frameTree`；`--raw` 仅保留给人工/开发者诊断。
+- Pi/DSH projection 对已 compact 的结果幂等，保证独立调用方和过渡期 Bridge 的兼容。
+
 ## 11. 文件改动清单
 
 当前实现涉及：
@@ -470,7 +485,7 @@ README-zh-CN.md
 CHANGELOG.md
 ```
 
-`bridge/server.mjs` 暂未修改，现有多目标路由和 Bridge envelope 语义保持不变。`skills/pi-control-chrome/scripts/browser.mjs` 仍读取 Bridge raw `frameTree`，所以 raw 字段在迁移完成前继续保留。
+`bridge/server.mjs` 现在负责协商并执行 `compact`/`raw` response mode；`skills/pi-control-chrome/scripts/browser.mjs` 默认使用 compact response，不再读取 raw `frameTree`。显式 `--raw` 仅用于人工/开发者诊断。Pi 与 DSH projection 对已 compact 的 Bridge 响应保持幂等，以兼容旧 Bridge 和独立调用方。
 
 ## 12. 测试和验收标准
 
@@ -516,9 +531,16 @@ CHANGELOG.md
 - unchanged AX 结果只包含状态标识和计数；
 - Pi 和 DSH 对同一 Bridge 结果生成等价的模型可见字段。
 
-## 13. 当前决策
+### 12.5 Bridge 响应协议
 
-阶段 A～D 已在工作树实现，默认的模型可见结果使用 compact projection；Bridge raw 字段暂时保留给现有 CLI 和调试消费者。当前实现采用以下决策：
+- `/health` 宣告 `capabilities.compactResponses=true`。
+- `responseMode=compact` 的 snapshot、accessibility、extract、tabs、selected_tab 和 visible DOM 响应不包含对应 raw 数组、页面全文重复字段或 `frameTree`。
+- `responseMode=raw` 只通过显式 CLI `--raw` 或开发者请求启用；默认消费者不发送 raw mode。
+- 未指定 mode 的旧请求仍获得兼容 raw 响应；非法 mode 或对不支持 compact projection 的方法使用 compact 时返回 `INVALID_REQUEST`。
+- compact 响应保留 `browserId`、`connectionId`、`connectionGeneration`、tab handle、snapshot/DOM refs 和计数，且 Pi/DSH 二次 projection 不改变语义。
+
+
+阶段 A～E 与 Bridge raw consumer 迁移已在工作树实现，默认的模型和 Skill CLI 页面读取使用 compact response；Bridge raw 字段仍由未指定 mode 的旧请求和显式 raw 调试路径保留。当前实现采用以下决策：
 
 - generic 容器过滤、字段上限和扩展侧预算先于模型 projection 执行，避免大报文在 Bridge 中生成和传输。
 - 普通 snapshot 只向 Pi/DSH 暴露单一有界 `state`，ref map、snapshot id 和 fencing 仍由扩展内部维护；交互元素或 AX 节点已经描述页面时，省略的页面全文不会把语义 state 标记为截断。
@@ -526,15 +548,16 @@ CHANGELOG.md
 - `maxChars`、`maxNodes` 和 `selector` 由扩展执行，projection 作为第二道边界；selector 不绕过可见性、敏感字段和 snapshot fencing。
 - 同一个用户 Tab 可能在读取期间被用户或 DSH UI 导航/重载。只读读取最多重新观察一次，连续变化返回 `BROWSER_PAGE_CHANGING`；副作用结果不使用这一重试路径。
 - 自动化验证使用 Agent-owned 测试 Tab 或隔离浏览器 Profile；用户明确要求时仍可读取或操作现有用户 Tab。
-- Bridge raw 字段的删除、版本号变更和发布需要先完成现有 CLI、Skill script 与双通道 Pi/DSH 的兼容性审查。
+- `responseMode=compact` 是新 Pi、DSH 和 Skill CLI 的默认页面读取模式；旧 Bridge 未宣告该能力时，宿主侧本地 projection 提供兼容降级。
+- raw 字段只为未指定 mode 的旧消费者和显式人工/开发者诊断保留；后续独立删除 raw wire 字段仍需另行提高协议版本，不在本次兼容变更中隐式执行。
 
 发布前仍需完成真实长页面体积测量、所有消费者迁移确认、文档和 CHANGELOG 复核；在此之前不 bump 版本、不 commit、不 publish。
 
-## 14. 待评审问题
+## 14. 已确认的评审决策
 
-1. 是否接受普通 `browser_snapshot` 的模型结果移除 `accessibility` 和 `frameTree` 字段，只保留单一 semantic state？
-2. 是否让 `browser_accessibility_snapshot` 默认返回 diff，而普通 `browser_snapshot` 保持当前页的完整 compact refs？
-3. 普通 snapshot 的页面文本默认上限是否采用 8,000 字符？
-4. data URL favicon 是暂时返回空字符串，还是直接删除 `favicon` 字段？
-5. `selector`、`maxChars`、`maxNodes` 是第一阶段加入，还是在 compact projection 稳定后加入？
-6. 是否需要保留一个仅供人工调试的 raw snapshot 命令，避免 raw 调试字段进入模型工具结果？
+1. 普通 `browser_snapshot` 的模型结果移除 `accessibility` 和 `frameTree` 字段，只保留单一 bounded semantic state；Bridge compact wire response 同样遵守该边界。
+2. `browser_accessibility_snapshot` 默认返回 full/diff/unchanged revision；普通 `browser_snapshot` 保持当前页的完整 compact refs。
+3. 普通 snapshot 的页面文本默认上限为 8,000 字符；显式 `maxChars` 仍受扩展硬上限约束。
+4. data URL favicon 直接删除，不返回空字符串。
+5. `selector`、`maxChars`、`maxNodes` 已加入并由扩展先执行，projection 再执行第二道边界。
+6. 保留仅供人工/开发者调试的 raw response：旧请求可省略 mode，CLI 使用显式 `--raw`；新模型消费者不得依赖该路径。

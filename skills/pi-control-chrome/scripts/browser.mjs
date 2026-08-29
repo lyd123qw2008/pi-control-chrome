@@ -8,6 +8,7 @@
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { compactBrowserResult } from "../../../pi-extension/output.js";
 
 const BRIDGE_HOST = process.env.PI_CONTROL_CHROME_BRIDGE_HOST || "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
@@ -15,17 +16,29 @@ const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_WS = `ws://${BRIDGE_HOST}:${BRIDGE_PORT}/ws`;
 const DEFAULT_TIMEOUT = 30_000;
 const DEFAULT_MAX_CHARS = 8_000;
+const COMPACT_RESPONSE_METHODS = new Map([
+  ["snapshot", "browser_snapshot"],
+  ["extract", "browser_extract"],
+  ["list_tabs", "browser_tabs"],
+  ["selected_tab", "browser_selected"],
+]);
+
+function compactToolName(method, params = {}) {
+  if (method === "snapshot") return params.accessibilityOnly === true ? "browser_accessibility_snapshot" : "browser_snapshot";
+  if (method === "dom_cua" && params.action === "get_visible_dom") return "browser_dom_cua";
+  return COMPACT_RESPONSE_METHODS.get(method);
+}
 
 function usage() {
   console.log(`Usage:
   node browser.mjs status [--browser-id <id>] [--acknowledge-browser-id <id>] [--json]
   node browser.mjs targets [--json]
-  node browser.mjs tabs --browser-id <id> [--json]
+  node browser.mjs tabs --browser-id <id> [--raw] [--json]
   node browser.mjs group --browser-id <id> [--json]
   node browser.mjs open <url> --session <id> --browser-id <id> [--active|--inactive] [--turn <n>] [--json]
-  node browser.mjs view <url> --session <id> --browser-id <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--json]
-  node browser.mjs snapshot <tabId> --browser-id <id> [--session <id>] [--json]
-  node browser.mjs extract <tabId> --browser-id <id> [--session <id>] [--max-chars <n>] [--json]
+  node browser.mjs view <url> --session <id> --browser-id <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--raw] [--json]
+  node browser.mjs snapshot <tabId> --browser-id <id> [--session <id>] [--raw] [--json]
+  node browser.mjs extract <tabId> --browser-id <id> [--session <id>] [--max-chars <n>] [--raw] [--json]
   node browser.mjs screenshot <tabId> <path> --browser-id <id> [--session <id>] [--full-page]
   node browser.mjs close <tabId> --browser-id <id> [--session <id>] [--json]
   node browser.mjs cleanup --session <id> --browser-id <id> [--recover-stale] [--json]
@@ -331,7 +344,13 @@ class BridgeClient {
       throw new Error(`${reason} changed; run status with --acknowledge-browser-id ${target.browserId} before retrying`);
     }
     if (previous === undefined) this.acknowledgedTarget = target;
-    return this.rawRequest(method, { ...params, expectedBrowserId: target.browserId }, timeoutMs, this.targetRoute(target));
+    const responseTool = compactToolName(method, params);
+    const requestedMode = params.responseMode === "raw" || params.responseMode === "compact" ? params.responseMode : undefined;
+    const { responseMode: _requestedMode, ...baseParams } = params;
+    const negotiatedMode = this.bridgeCapabilities.compactResponses === true && requestedMode !== undefined ? requestedMode : undefined;
+    const wireParams = negotiatedMode === undefined ? baseParams : { ...baseParams, responseMode: negotiatedMode };
+    const result = await this.rawRequest(method, { ...wireParams, expectedBrowserId: target.browserId }, timeoutMs, this.targetRoute(target));
+    return requestedMode === "compact" && responseTool !== undefined ? compactBrowserResult(responseTool, params, result) : result;
   }
 
   close() {
@@ -371,8 +390,12 @@ function tabSummary(tab) {
   };
 }
 
+async function readTabs(client, raw = false) {
+  return client.request("list_tabs", { responseMode: raw ? "raw" : "compact" });
+}
+
 async function findTab(client, tabId) {
-  const tabs = await client.request("list_tabs");
+  const tabs = await readTabs(client);
   const tab = tabs.tabs.find((entry) => Number(entry.id) === Number(tabId));
   if (!tab) throw new Error(`Tab not found: ${tabId}`);
   return { tabs, tab };
@@ -381,7 +404,7 @@ async function findTab(client, tabId) {
 async function waitForGroupedTab(client, tabId, attempts = 12) {
   let latest;
   for (let i = 0; i < attempts; i += 1) {
-    latest = await client.request("list_tabs");
+    latest = await readTabs(client);
     const tab = latest.tabs.find((entry) => Number(entry.id) === Number(tabId));
     if (tab?.groupId !== undefined && tab.groupId !== -1) return { tabs: latest, tab };
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
@@ -423,9 +446,10 @@ async function inspectTab(client, tabOrId, options, sessionId) {
   const sourceTab = tabOrId && typeof tabOrId === "object" ? tabOrId : undefined;
   const tabId = sourceTab?.id ?? tabOrId;
   const target = { tabId, ...(sourceTab?.handle ? { handle: sourceTab.handle } : {}), ...(sessionId ? { sessionId } : {}) };
-  const snapshot = await client.request("snapshot", target);
+  const responseMode = boolOption(options, "raw", false) ? "raw" : "compact";
+  const snapshot = await client.request("snapshot", { ...target, responseMode });
   const snapshotTarget = snapshot?.tab?.handle ? { ...target, handle: snapshot.tab.handle } : target;
-  const extracted = await client.request("extract", snapshotTarget);
+  const extracted = await client.request("extract", { ...snapshotTarget, responseMode });
   const extractedTarget = extracted?.tab?.handle ? { ...snapshotTarget, handle: extracted.tab.handle } : snapshotTarget;
   let timing;
   try {
@@ -448,15 +472,24 @@ async function inspectTab(client, tabOrId, options, sessionId) {
     screenshot = { path: target, bytes: Buffer.byteLength(Buffer.from(captured.data, "base64")), mimeType: captured.mimeType };
   }
 
-  const finalTab = extracted?.tab || snapshot?.tab || sourceTab;
-  return {
-    tab: tabSummary(finalTab),
-    snapshot: {
+  const snapshotDetails = responseMode === "raw"
+    ? {
       available: Boolean(snapshot?.snapshot),
       elementCount: snapshot?.snapshot?.elements?.length ?? null,
       accessibilityAvailable: Boolean(snapshot?.snapshot?.accessibility),
       frameCount: snapshot?.frameTree?.frameTree ? 1 + (snapshot.frameTree.frameTree.childFrames?.length || 0) : null,
-    },
+    }
+    : {
+      available: Boolean(snapshot?.snapshot),
+      snapshotId: snapshot?.snapshot?.snapshotId ?? null,
+      nodeCount: snapshot?.snapshot?.nodeCount ?? null,
+      charCount: snapshot?.snapshot?.charCount ?? null,
+      truncated: snapshot?.snapshot?.truncated ?? null,
+    };
+  const finalTab = extracted?.tab || snapshot?.tab || sourceTab;
+  return {
+    tab: tabSummary(finalTab),
+    snapshot: snapshotDetails,
     timing,
     content: {
       title: extracted?.content?.title || extracted?.content?.text?.split("\n")[0] || "",
@@ -518,12 +551,12 @@ async function main() {
       return;
     }
     if (command === "tabs") {
-      const result = await client.request("list_tabs");
+      const result = await readTabs(client, boolOption(options, "raw", false));
       printResult(result, options);
       return;
     }
     if (command === "group") {
-      const result = await client.request("list_tabs");
+      const result = await readTabs(client);
       printResult(result.groups || [], options);
       return;
     }
@@ -549,7 +582,7 @@ async function main() {
       if (!positionals[0]) throw new Error("view requires a URL");
       let opened;
       if (boolOption(options, "reuse_existing", false)) {
-        const tabs = await client.request("list_tabs");
+        const tabs = await readTabs(client);
         const existing = tabs.tabs.find((tab) => tab.url === positionals[0]);
         if (existing) {
           const requestedSession = options.session === undefined ? undefined : String(options.session);
@@ -574,7 +607,8 @@ async function main() {
     }
     if (command === "snapshot" || command === "extract") {
       if (!positionals[0]) throw new Error(`${command} requires a tab id`);
-      const result = await client.request(command, { tabId: Number(positionals[0]), ...(options.session === undefined ? {} : { sessionId: String(options.session) }) });
+      const responseMode = boolOption(options, "raw", false) ? "raw" : "compact";
+      const result = await client.request(command, { tabId: Number(positionals[0]), responseMode, ...(options.session === undefined ? {} : { sessionId: String(options.session) }) });
       if (command === "extract") {
         result.content.text = truncate(result.content.text, numberOption(options, "max_chars", DEFAULT_MAX_CHARS));
         result.content.markdown = truncate(result.content.markdown, numberOption(options, "max_chars", DEFAULT_MAX_CHARS));

@@ -105,7 +105,7 @@ The plugin registers the DSH `/chrome` command independently from its model-faci
 /chrome tabs
 ```
 
-`/chrome connect` starts or reuses the local Bridge, establishes the current DSH client connection, waits for the browser extension, and reports the final status without restarting a healthy Bridge. `/chrome disconnect` closes only the current DSH client connection; it leaves the shared Bridge and browser extension available for a later `/chrome connect`. `/chrome restart` explicitly restarts a compatible Bridge and waits for the browser extension to reconnect before returning. These commands preserve browser tabs and return an error for a legacy Bridge without `capabilities.localUserRestart: true` when a restart is requested.
+`/chrome connect` starts or reuses the local Bridge, establishes the current DSH client connection, waits for the browser extension, and reports the final status without restarting a healthy Bridge. `/chrome disconnect` closes only the current DSH client connection; it leaves the shared Bridge and browser extension available for a later `/chrome connect`. `/chrome restart` explicitly restarts a compatible Bridge and waits for the browser extension to reconnect before returning. These commands preserve browser tabs and return an error for a legacy Bridge without `capabilities.localUserRestart: true` when a restart is requested. Page-read requests negotiate `responseMode=compact` when the Bridge advertises `capabilities.compactResponses`; an older Bridge is handled by the DSH projection, while `responseMode=raw` remains an explicit developer diagnostic path rather than a model default.
 
 ## Model-facing cost
 
