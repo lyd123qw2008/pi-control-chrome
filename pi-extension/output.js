@@ -32,7 +32,7 @@ function bounded(value, limit) {
   return `${source.slice(0, limit - 3)}...`;
 }
 
-function compactTab(value) {
+function compactTab(value, currentSessionId) {
   if (!isRecord(value)) return value;
   const keys = [
     "id", "browserId", "windowId", "index", "active", "pinned", "title", "url", "status", "groupId",
@@ -40,6 +40,10 @@ function compactTab(value) {
   ];
   const result = {};
   for (const key of keys) if (value[key] !== undefined) result[key] = value[key];
+  if (typeof currentSessionId === "string" && currentSessionId.length > 0) {
+    const tabSessionId = typeof result.sessionId === "string" && result.sessionId.length > 0 ? result.sessionId : undefined;
+    result.sessionScope = tabSessionId === undefined ? "user" : tabSessionId === currentSessionId ? "current-agent" : "other-agent";
+  }
   if (isRecord(result.handle)) {
     const handle = result.handle;
     const handleKeys = ["tabId", "browserId", "windowId", "title", "url", "groupId", "sessionId", "tabFence", "incarnation"];
@@ -53,14 +57,14 @@ function compactTab(value) {
   return result;
 }
 
-function compactResultEnvelope(value) {
+function compactResultEnvelope(value, currentSessionId) {
   const result = {};
   for (const key of RESULT_IDENTITY_KEYS) {
     if (value[key] === undefined) continue;
     result[key] = key === "profile" ? bounded(value[key], FIELD_MAX_CHARS) : value[key];
   }
   if (value.tabId !== undefined) result.tabId = value.tabId;
-  if (value.tab !== undefined) result.tab = compactTab(value.tab);
+  if (value.tab !== undefined) result.tab = compactTab(value.tab, currentSessionId);
   return result;
 }
 
@@ -283,12 +287,26 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
 }
 
 /** Project tab descriptors and remove favicon data payloads. */
-export function compactTabsResult(value) {
+export function compactTabsResult(value, currentSessionId) {
   if (!isRecord(value)) return value;
+  const hasSession = typeof currentSessionId === "string" && currentSessionId.length > 0;
   return {
     ...compactResultEnvelope(value),
-    tabs: Array.isArray(value.tabs) ? value.tabs.map(compactTab) : [],
+    ...(hasSession ? { currentAgentSessionId: currentSessionId } : {}),
+    tabs: Array.isArray(value.tabs) ? value.tabs.map(tab => compactTab(tab, currentSessionId)) : [],
     ...(Array.isArray(value.groups) ? { groups: value.groups } : {}),
+  };
+}
+
+/** Project a created tab result while retaining the handle needed for the next call. */
+export function compactNewTabResult(value, currentSessionId) {
+  if (!isRecord(value)) return value;
+  const hasSession = typeof currentSessionId === "string" && currentSessionId.length > 0;
+  return {
+    ...compactResultEnvelope(value, currentSessionId),
+    ...(hasSession ? { currentAgentSessionId: currentSessionId } : {}),
+    ...(value.groupId === undefined ? {} : { groupId: value.groupId }),
+    ...(value.tabFence === undefined ? {} : { tabFence: value.tabFence }),
   };
 }
 
@@ -299,8 +317,10 @@ export function compactBrowserResult(toolName, params, value) {
   if (toolName === "browser_snapshot") return compactSnapshotResult(value, maxChars, maxNodes);
   if (toolName === "browser_accessibility_snapshot") return compactAccessibilityResult(value, maxChars, maxNodes);
   if (toolName === "browser_extract") return compactExtractResult(value, maxChars);
-  if (toolName === "browser_tabs") return compactTabsResult(value);
-  if (toolName === "browser_selected" && isRecord(value)) return compactResultEnvelope(value);
+  const currentSessionId = typeof params.sessionId === "string" && params.sessionId.length > 0 ? params.sessionId : undefined;
+  if (toolName === "browser_new_tab") return compactNewTabResult(value, currentSessionId);
+  if (toolName === "browser_tabs") return compactTabsResult(value, currentSessionId);
+  if (toolName === "browser_selected" && isRecord(value)) return compactResultEnvelope(value, currentSessionId);
   if (toolName === "browser_dom_cua" && params.action === "get_visible_dom") return compactDomCuaResult(value, maxChars, maxNodes);
   return value;
 }

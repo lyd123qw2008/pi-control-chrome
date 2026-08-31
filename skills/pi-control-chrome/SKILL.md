@@ -177,7 +177,7 @@ Use these tools when available:
 - `browser_status`: verify browser, profile, Bridge, extension, and target stability.
 - `browser_tabs`: inspect windows, tabs, groups, ownership, lifecycle, and handles.
 - `browser_selected`: inspect the selected tab without changing it.
-- `browser_new_tab`: create an Agent-owned tab. Prefer `active: false` unless the user needs to see it.
+- `browser_new_tab`: create an Agent-owned tab. With `windowId`, it can target a specific browser window returned by `browser_tabs`; otherwise it uses the current browser window. Prefer `active: false` unless the user needs to see it; this avoids activation at creation time but cannot prevent later browser or user focus changes. With `wait: true`, the returned handle is refreshed after loading; `allowRedirects: false` still accepts normal URL canonicalization such as a trailing `/`, while `true` permits an actual destination change.
 - `browser_select_tab`: select an existing tab explicitly.
 - `browser_snapshot`: inspect one bounded semantic page state and obtain snapshot-scoped element refs before interacting; pass its `snapshotId` with any ref action. The default collector keeps visible semantic/actionable nodes, caps text and nodes, and the model-facing result does not include the duplicate raw accessibility tree or frameTree. Optional `selector`, `maxChars`, and `maxNodes` narrow the read.
 - `browser_accessibility_snapshot`: inspect semantic roles and accessible names as bounded full, incremental diff, or unchanged text; it includes the current snapshot id and document metadata. The first read is full, later reads may be diff or unchanged; pass `disableDiffing: true` when a full tree is required.
@@ -218,6 +218,7 @@ Do not reuse a ref after navigation or a DOM-changing action. If a tab handle re
 - Before claiming a user tab, use its current tab id, title, and URL snapshot. A changed title or URL means the handle is stale; refresh the tab list.
 - Prefer `browser_new_tab` for exploratory work so the user's current page is not disturbed.
 - Agent-created tabs are temporary by default and the host closes unmarked ones at turn end.
+- The `Pi` group can be shared by multiple sessions; `groupId` is visual grouping only. Use `owner`, `sessionId`, and `sessionScope` to choose a tab, and never treat `groupId` alone as ownership.
 - Mark a tab as `handoff` when the user needs to continue using it manually; the mark applies to the current turn and must be repeated later.
 - Mark a tab as `deliverable` when it is a user-facing result that must remain open through the current turn cleanup.
 - Claimed user tabs are released at turn end and are never closed by turn cleanup.

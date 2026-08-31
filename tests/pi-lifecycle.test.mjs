@@ -448,6 +448,43 @@ test("Pi refuses stale-runtime recovery when the extension capability is missing
 });
 
 
+test("Pi defers browser cleanup until agent_settled so tabs survive tool rounds", async () => {
+  const mock = await createMockBridge();
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    await harness.emit("agent_start", {}, context);
+    await harness.tools.get("browser_new_tab").execute("new-tab", { url: "https://example.test/new", active: false });
+    const cleanupCountAfterCreate = mock.requests.filter(message => message.method === "cleanup").length;
+    const sessionId = mock.requests.filter(message => message.method === "status").at(-1)?.params.sessionId;
+
+    await harness.emit("turn_end", { turnIndex: 0, toolResults: [{ role: "toolResult" }] }, context);
+    assert.equal(mock.requests.filter(message => message.method === "cleanup").length, cleanupCountAfterCreate);
+
+    await harness.emit("turn_start", { turnIndex: 1 }, context);
+    await harness.tools.get("browser_snapshot").execute("snapshot", { tabId: 7, handle: { tabId: 7 } });
+    await harness.emit("turn_end", { turnIndex: 1, toolResults: [{ role: "toolResult" }] }, context);
+    assert.equal(mock.requests.filter(message => message.method === "cleanup").length, cleanupCountAfterCreate);
+
+    await harness.emit("agent_settled", {}, context);
+    const cleanup = mock.requests.filter(message => message.method === "cleanup").at(-1);
+    assert.equal(cleanup.params.mode, "turn");
+    assert.equal(cleanup.params.detachDevtools, true);
+    assert.equal(cleanup.params.sessionId, sessionId);
+    assert.match(String(cleanup.params.turnId), /:run-1$/);
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
+
+
 test("Pi does not automatically retry an inspect-first cleanup intent", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();
