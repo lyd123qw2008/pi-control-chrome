@@ -298,7 +298,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_tabs',
-    description: 'List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state.',
+    description: 'List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.',
     parameters: EMPTY_PARAMETERS,
     method: 'list_tabs',
   },
@@ -327,13 +327,14 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_new_tab',
-    description: 'Create an Agent-owned tab and place it in the Pi tab group.',
+    description: 'Create an Agent-owned tab and place it in the Pi tab group. Use windowId to target a specific window; otherwise use the current browser window. With wait=true, return a refreshed post-load handle; `active: false` avoids selecting it at creation time but cannot prevent later browser or user focus changes.',
     parameters: {
       url: { type: 'string', description: 'Initial URL. Defaults to about:blank.' },
-      active: { type: 'boolean', description: 'Whether to activate the new tab.' },
-      wait: OPTIONAL_BOOLEAN,
-      timeoutMs: TIMEOUT_MS,
-      allowRedirects: OPTIONAL_BOOLEAN,
+      active: { type: 'boolean', description: 'Whether to activate the new tab at creation time; false is best effort if the browser or user later changes focus.' },
+      windowId: { type: 'number', description: 'Optional target browser window id. If omitted, use the current browser window.' },
+      wait: { type: 'boolean', description: 'Wait for the created tab to finish loading before returning.' },
+      timeoutMs: { ...TIMEOUT_MS, description: 'Optional positive timeout for the load wait.' },
+      allowRedirects: { type: 'boolean', description: 'Allow the final URL to differ from the requested URL while waiting; browser URL canonicalization is accepted even when false.' },
     },
     method: 'new_tab',
   },

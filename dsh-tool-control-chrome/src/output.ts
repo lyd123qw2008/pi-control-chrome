@@ -42,7 +42,7 @@ function bounded(value: unknown, limit: number): string {
   return `${source.slice(0, limit - 3)}...`
 }
 
-function compactTab(value: unknown): unknown {
+function compactTab(value: unknown, currentSessionId?: string): unknown {
   if (!isRecord(value)) return value
   const keys = [
     'id', 'browserId', 'windowId', 'index', 'active', 'pinned', 'title', 'url', 'status', 'groupId',
@@ -51,6 +51,10 @@ function compactTab(value: unknown): unknown {
   const result: RecordValue = {}
   for (const key of keys) {
     if (value[key] !== undefined) result[key] = value[key]
+  }
+  if (currentSessionId !== undefined && currentSessionId.length > 0) {
+    const tabSessionId = typeof result.sessionId === 'string' && result.sessionId.length > 0 ? result.sessionId : undefined
+    result.sessionScope = tabSessionId === undefined ? 'user' : tabSessionId === currentSessionId ? 'current-agent' : 'other-agent'
   }
   if (typeof result.handle === 'object' && result.handle !== null && !Array.isArray(result.handle)) {
     const handle = result.handle as RecordValue
@@ -65,14 +69,14 @@ function compactTab(value: unknown): unknown {
   return result
 }
 
-function compactResultEnvelope(value: RecordValue): RecordValue {
+function compactResultEnvelope(value: RecordValue, currentSessionId?: string): RecordValue {
   const result: RecordValue = {}
   for (const key of RESULT_IDENTITY_KEYS) {
     if (value[key] === undefined) continue
     result[key] = key === 'profile' ? bounded(value[key], FIELD_MAX_CHARS) : value[key]
   }
   if (value.tabId !== undefined) result.tabId = value.tabId
-  if (value.tab !== undefined) result.tab = compactTab(value.tab)
+  if (value.tab !== undefined) result.tab = compactTab(value.tab, currentSessionId)
   return result
 }
 
@@ -326,13 +330,30 @@ export function compactExtractResult(value: unknown, maxChars = EXTRACT_MAX_CHAR
  * @param value Raw Bridge result.
  * @returns Model-facing JSON result.
  */
-export function compactTabsResult(value: unknown): JsonValue {
+export function compactTabsResult(value: unknown, currentSessionId?: string): JsonValue {
   if (!isRecord(value)) return value as JsonValue
-  const tabs = Array.isArray(value.tabs) ? value.tabs.map(compactTab) : []
+  const tabs = Array.isArray(value.tabs) ? value.tabs.map(tab => compactTab(tab, currentSessionId)) : []
   return {
     ...compactResultEnvelope(value),
+    ...(currentSessionId === undefined || currentSessionId.length === 0 ? {} : { currentAgentSessionId: currentSessionId }),
     tabs,
     ...(Array.isArray(value.groups) ? { groups: value.groups } : {}),
+  } as JsonValue
+}
+
+/**
+ * Project a created tab result while retaining the handle needed for the next call.
+ * @param value Raw Bridge result.
+ * @param currentSessionId Current Agent session id.
+ * @returns Model-facing JSON result.
+ */
+export function compactNewTabResult(value: unknown, currentSessionId?: string): JsonValue {
+  if (!isRecord(value)) return value as JsonValue
+  return {
+    ...compactResultEnvelope(value, currentSessionId),
+    ...(currentSessionId === undefined || currentSessionId.length === 0 ? {} : { currentAgentSessionId: currentSessionId }),
+    ...(value.groupId === undefined ? {} : { groupId: value.groupId }),
+    ...(value.tabFence === undefined ? {} : { tabFence: value.tabFence }),
   } as JsonValue
 }
 
@@ -349,8 +370,9 @@ export function compactBrowserResult(toolName: string, params: Record<string, un
   if (toolName === 'browser_snapshot') return compactSnapshotResult(value, maxChars, maxNodes)
   if (toolName === 'browser_accessibility_snapshot') return compactAccessibilityResult(value, maxChars, maxNodes)
   if (toolName === 'browser_extract') return compactExtractResult(value, maxChars)
-  if (toolName === 'browser_tabs') return compactTabsResult(value)
-  if (toolName === 'browser_selected') return isRecord(value) ? compactResultEnvelope(value) as JsonValue : value as JsonValue
+  if (toolName === 'browser_new_tab') return compactNewTabResult(value, typeof params.sessionId === 'string' ? params.sessionId : undefined)
+  if (toolName === 'browser_tabs') return compactTabsResult(value, typeof params.sessionId === 'string' ? params.sessionId : undefined)
+  if (toolName === 'browser_selected') return isRecord(value) ? compactResultEnvelope(value, typeof params.sessionId === 'string' ? params.sessionId : undefined) as JsonValue : value as JsonValue
   if (toolName === 'browser_dom_cua' && params.action === 'get_visible_dom') return compactDomCuaResult(value, maxChars, maxNodes)
   return value as JsonValue
 }

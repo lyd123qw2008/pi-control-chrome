@@ -3,7 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { registerChromeCommand } from './commands.js'
 import { BrowserBridgeClient, resolveConfig } from './bridge.js'
 import { registerBrowserTools } from './tools.js'
@@ -23,7 +23,7 @@ export const name = 'tool-control-chrome'
 export const inject = ['tools', 'commands']
 
 /** Settings namespace carrying the local Bridge connection configuration. */
-export const CONTROL_CHROME_SETTINGS_NAMESPACE = settingsNamespace('control-chrome')
+export const CONTROL_CHROME_SETTINGS_NAMESPACE = 'control-chrome' as SettingsNamespace
 
 /** Cordis configuration schema for the local browser Bridge. */
 export const Config: z<Config> = z.object({
@@ -50,9 +50,9 @@ export const Config: z<Config> = z.object({
 export function apply(ctx: Context, config: Config): void {
   let currentSource: () => Config = () => config
   const current = () => resolveConfig(currentSource())
-  installSettingsSection(ctx, CONTROL_CHROME_SETTINGS_NAMESPACE, Config, config, {
-    setSource: source => { currentSource = source },
-    onChange: () => {},
+  ctx.inject(['settings'], (settingsCtx) => {
+    const scope = settingsCtx.settings.register(CONTROL_CHROME_SETTINGS_NAMESPACE, Config, { base: config })
+    currentSource = () => scope.get()
   })
   const bridge = new BrowserBridgeClient(current)
   const attachments = ctx.get('attachments') as AttachmentStore | undefined
