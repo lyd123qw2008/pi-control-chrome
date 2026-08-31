@@ -26,6 +26,9 @@ let turnCleanupArmed = false;
 let lifecycleGeneration = 0;
 let sessionTransitionInFlight = false;
 let sessionStartBlocked = false;
+let browserRunId: string | undefined;
+let browserRunSequence = 0;
+let agentRunCleanupDone = false;
 const activeWaitControllers = new Set<AbortController>();
 const BRIDGE_WAIT_DELAY_MS = 100;
 const BRIDGE_WAIT_ATTEMPTS = 30;
@@ -698,6 +701,10 @@ function cleanupIntentPriority(params: Record<string, unknown>): number {
   return 1;
 }
 
+function currentBrowserTurnId(): string | number {
+  return browserRunId ?? turnNumber;
+}
+
 const TURN_CLEANUP_CAPABILITIES = ["turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery", "tabIncarnationFence"] as const;
 
 async function refreshCleanupRoute(session: string, browserId?: string, requireIncarnationFence = false): Promise<BrowserTargetRoute> {
@@ -864,7 +871,7 @@ function normalizeBrowserParams(params: Record<string, unknown>): Record<string,
 async function callBrowserRequest(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}, requestSignal?: AbortSignal) {
   params = normalizeBrowserParams(params);
   const requestSessionId = sessionId;
-  const requestTurn = turnNumber;
+  const requestTurn = currentBrowserTurnId();
   const requestGeneration = lifecycleGeneration;
   const assertCurrent = () => {
     if (requestGeneration !== lifecycleGeneration || requestSessionId !== sessionId) throw new Error("Pi browser session changed while the request was in flight");
@@ -1061,10 +1068,10 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_tabs",
     label: "Browser Tabs",
-    description: "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state.",
+    description: "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.",
     parameters: Type.Object({}),
     async execute() {
-      try { return textResult(compactBrowserResult("browser_tabs", {}, await call("list_tabs"))); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_tabs", { sessionId }, await call("list_tabs"))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1075,7 +1082,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Return the currently selected Chrome/Edge tab.",
     parameters: Type.Object({}),
     async execute() {
-      try { return textResult(compactBrowserResult("browser_selected", {}, await call("selected_tab"))); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_selected", { sessionId }, await call("selected_tab"))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1111,16 +1118,17 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_new_tab",
     label: "New Browser Tab",
-    description: "Create an Agent-owned tab and place it in the Pi tab group.",
+    description: "Create an Agent-owned tab and place it in the Pi tab group. Use windowId to target a specific window; otherwise use the current browser window. With wait=true, return a refreshed post-load handle; active=false avoids activation at creation time but cannot prevent later browser or user focus changes.",
     parameters: Type.Object({
       url: Type.Optional(Type.String({ description: "Initial URL. Defaults to about:blank." })),
-      active: Type.Optional(Type.Boolean({ description: "Whether to activate the new tab." })),
-      wait: Type.Optional(Type.Boolean()),
-      timeoutMs: Type.Optional(Type.Number()),
-      allowRedirects: Type.Optional(Type.Boolean()),
+      active: Type.Optional(Type.Boolean({ description: "Whether to activate the new tab at creation time; false is best effort if the browser or user later changes focus." })),
+      windowId: Type.Optional(Type.Number({ description: "Optional target browser window id. If omitted, use the current browser window." })),
+      wait: Type.Optional(Type.Boolean({ description: "Wait for the created tab to finish loading before returning." })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Optional positive timeout for the load wait." })),
+      allowRedirects: Type.Optional(Type.Boolean({ description: "Allow the final URL to differ from the requested URL while waiting; browser URL canonicalization is accepted even when false." })),
     }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("new_tab", params)); } catch (error) { return errorResult(error); }
+      try { return textResult(compactBrowserResult("browser_new_tab", { ...params, sessionId }, await call("new_tab", params))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1538,7 +1546,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Mark an Agent-owned tab to survive the current turn cleanup for manual user handoff; repeat the mark in a later turn.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("mark_handoff", { ...params, turnId: turnNumber })); } catch (error) { return errorResult(error); }
+      try { return textResult(await call("mark_handoff", { ...params, turnId: currentBrowserTurnId() })); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1549,7 +1557,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     description: "Mark an Agent-owned tab to survive the current turn cleanup as a user-facing deliverable; repeat the mark in a later turn.",
     parameters: Type.Object({ tabId: Type.Number() }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("mark_deliverable", { ...params, turnId: turnNumber })); } catch (error) { return errorResult(error); }
+      try { return textResult(await call("mark_deliverable", { ...params, turnId: currentBrowserTurnId() })); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1637,6 +1645,9 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     bridgeUsed = false;
     browserTargetUsed = false;
     turnCleanupArmed = false;
+    browserRunId = undefined;
+    browserRunSequence = 0;
+    agentRunCleanupDone = false;
     browserActivation.reset();
     acknowledgedTarget = undefined;
     observedBrowserIds.clear();
@@ -1814,10 +1825,60 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     bridgeUsed = false;
     browserTargetUsed = false;
     turnCleanupArmed = false;
+    browserRunId = undefined;
+    browserRunSequence = 0;
+    agentRunCleanupDone = false;
     browserActivation.reset();
     paused = false;
     setBrowserTools(browserActivation.active);
     updateStatus(ctx, "chrome: ready");
+  });
+
+  const runAutomaticTurnCleanup = async (
+    ctx: ExtensionContext,
+    cleanupSessionId: string,
+    generation: number,
+    cleanupTurnId: string | number,
+  ): Promise<void> => {
+    if (sessionTransitionInFlight || generation !== lifecycleGeneration || sessionId !== cleanupSessionId || agentRunCleanupDone) return;
+    const needsCleanup = turnCleanupArmed || bridgeUsed || browserActivation.cleanupRequired;
+    if (!needsCleanup) {
+      agentRunCleanupDone = true;
+      browserRunId = undefined;
+      return;
+    }
+    try {
+      const value = await requestCleanup(cleanupSessionId, { mode: "turn", turnId: cleanupTurnId, detachDevtools: true }, { automatic: true });
+      if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || sessionTransitionInFlight) return;
+      bridgeUsed = false;
+      if (cleanupRetainsTabs(value)) {
+        browserTargetUsed = true;
+        turnCleanupArmed = true;
+      } else {
+        browserTargetUsed = false;
+        turnCleanupArmed = false;
+        browserActivation.finalize();
+      }
+      agentRunCleanupDone = true;
+      browserRunId = undefined;
+    } catch {
+      if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || sessionTransitionInFlight) return;
+      browserTargetUsed = true;
+      // The failed intent remains queued for an explicit, safe retry. Start a
+      // fresh logical Pi run next time; requestCleanup still retains the exact
+      // failed intent in pendingCleanupSessionIds.
+      browserRunId = undefined;
+      ctx.ui.setStatus("pi-control-chrome", "chrome: turn cleanup pending");
+    }
+  };
+
+  pi.on("agent_start", () => {
+    if (sessionTransitionInFlight) return;
+    if (browserRunId === undefined) {
+      browserRunSequence += 1;
+      browserRunId = `${sessionId}:run-${browserRunSequence}`;
+    }
+    agentRunCleanupDone = false;
   });
 
   pi.on("turn_start", event => {
@@ -1831,26 +1892,22 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     const turn = event.turnIndex;
     if (sessionTransitionInFlight) return;
     turnNumber = turn;
-    if (turnCleanupArmed || bridgeUsed || browserActivation.cleanupRequired) {
-      try {
-        const value = await requestCleanup(cleanupSessionId, { mode: "turn", turnId: turn, detachDevtools: true }, { automatic: true });
-        if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || turnNumber !== turn) return;
-        bridgeUsed = false;
-        if (cleanupRetainsTabs(value)) {
-          browserTargetUsed = true;
-          turnCleanupArmed = true;
-        } else {
-          browserTargetUsed = false;
-          turnCleanupArmed = false;
-          browserActivation.finalize();
-        }
-      } catch {
-        if (generation !== lifecycleGeneration || sessionId !== cleanupSessionId || turnNumber !== turn) return;
-        browserTargetUsed = true;
-        ctx.ui.setStatus("pi-control-chrome", "chrome: turn cleanup pending");
-      }
+    // Pi emits turn_end after every model/tool round. Browser tabs must stay
+    // alive for the following round (e.g. new_tab -> snapshot), so defer the
+    // actual turn cleanup until agent_settled. Keep the fallback for older Pi
+    // hosts that did not include toolResults in the event payload.
+    if (Array.isArray(event.toolResults)) {
+      if (generation === lifecycleGeneration && sessionId === cleanupSessionId && turnNumber === turn) turnNumber = turn + 1;
+      return;
     }
+    await runAutomaticTurnCleanup(ctx, cleanupSessionId, generation, currentBrowserTurnId());
     if (generation === lifecycleGeneration && sessionId === cleanupSessionId && turnNumber === turn) turnNumber = turn + 1;
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    const generation = lifecycleGeneration;
+    const cleanupSessionId = sessionId;
+    await runAutomaticTurnCleanup(ctx, cleanupSessionId, generation, currentBrowserTurnId());
   });
 
   pi.on("session_before_switch", async (_event, ctx) => {

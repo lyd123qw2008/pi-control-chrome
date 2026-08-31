@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.4 - 2026-08-31
+
+- Hardened `browser_new_tab` waiting and tab identity: normal URL canonicalization such as a trailing `/` is accepted with `allowRedirects: false`, an optional `windowId` is forwarded to tab creation, and `wait: true` returns a refreshed post-load handle with the current tab fence and document incarnation.
+
+- Preserved session-aware browser result projection and delayed Pi Agent temporary-tab cleanup until the Agent settles, preventing a temporary tab from being closed between consecutive browser tool calls; added lifecycle and output-projection regression coverage.
+
 ## 0.4.3 - 2026-08-29
 
 - Migrate the managed Skill CLI and DSH/Pi page-read consumers to a negotiated `responseMode=compact` Bridge response. Keep `responseMode=raw` as an explicit human/developer diagnostic path, retain old unspecified-mode compatibility, validate invalid modes, and make Pi/DSH projections idempotent for already compact results.

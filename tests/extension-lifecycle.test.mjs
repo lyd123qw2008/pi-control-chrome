@@ -94,7 +94,8 @@ function loadExtension(options = {}) {
       },
       async create(details = {}) {
         const id = options.createTabId === undefined ? nextTabId++ : Number(options.createTabId);
-        const tab = { id, windowId: Number(details.windowId ?? 1), title: "", url: String(details.url || "about:blank"), status: "loading", active: details.active === true };
+        const createdUrl = options.createdTabUrl === undefined ? String(details.url || "about:blank") : String(options.createdTabUrl);
+        const tab = { id, windowId: Number(details.windowId ?? 1), title: "", url: createdUrl, status: "loading", active: details.active === true };
         tabs.set(id, tab);
         await tabCreated.emit(tab);
         tab.status = "complete";
@@ -195,6 +196,8 @@ function loadExtension(options = {}) {
     clearTimeout,
     setInterval: setIntervalFake,
     clearInterval: clearIntervalFake,
+    URL,
+    AbortController,
   });
   const source = readFileSync(backgroundPath, "utf8");
   vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, devtoolsState };", context, { filename: backgroundPath });
@@ -211,6 +214,10 @@ function loadExtension(options = {}) {
     emitTabReplaced(addedTabId, removedTabId) { return tabReplaced.emit(addedTabId, removedTabId); },
     emitTabUpdated(tabId, changeInfo, tab) { return tabUpdated.emit(tabId, changeInfo, tab); },
     emitSocketOpen() { latestSocket?.emit("open"); },
+    async emitSocketMessage(message) {
+      const listeners = latestSocket?.listeners.get("message") || [];
+      await Promise.all(listeners.map((listener) => listener({ data: JSON.stringify(message) })));
+    },
     runHeartbeat() { for (const { callback } of intervalCallbacks.values()) callback(); },
     heartbeatMessages,
     heartbeatIntervals: intervalCallbacks,
@@ -347,6 +354,39 @@ test("new-tab setup fences an event-before-reservation numeric id reuse", async 
   assert.equal(fixture.api.orphanedDebuggerAttaches.get("test-extension::7")?.tabFence === result.tab.handle.tabFence, false);
   assert.equal(storedRecord(fixture, 7).sessionId, "session-test");
 });
+test("new-tab can target an explicit browser window", async () => {
+  const fixture = loadExtension();
+  const result = await fixture.api.handleRequest("new_tab", { url: "about:blank", windowId: 7, wait: false, sessionId: "session-test" });
+  assert.equal(result.tab.windowId, 7);
+  assert.equal(fixture.tabs.get(result.tab.id).windowId, 7);
+});
+
+
+test("new-tab load wait accepts browser URL canonicalization without requiring redirects", async () => {
+  const fixture = loadExtension({ createdTabUrl: "https://example.test/" });
+  const result = await fixture.api.handleRequest("new_tab", { url: "https://example.test", wait: true, sessionId: "session-test" });
+  assert.equal(result.tab.url, "https://example.test/");
+  assert.equal(result.tab.handle.url, "https://example.test/");
+});
+
+
+test("Bridge new-tab wait accepts canonical URL normalization", async () => {
+  const fixture = loadExtension({ createdTabUrl: "https://example.test/" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  fixture.emitSocketOpen();
+  const requestId = "new-tab-canonical";
+  await fixture.emitSocketMessage({
+    type: "request",
+    id: requestId,
+    method: "new_tab",
+    params: { url: "https://example.test", wait: true, sessionId: "session-test" },
+  });
+  const response = fixture.heartbeatMessages.find((message) => message.type === "response" && message.id === requestId);
+  assert.equal(response?.error, undefined, JSON.stringify(fixture.heartbeatMessages));
+  assert.equal(response?.result?.tab?.url, "https://example.test/");
+});
+
+
 test("new-tab setup tolerates a restricted about:blank document", async () => {
   const fixture = loadExtension({ restrictedPageError: 'Cannot access contents of url "about:blank". Extension manifest must request permission to access this host.' });
   const result = await fixture.api.handleRequest("new_tab", { url: "about:blank", wait: false, sessionId: "session-test" });

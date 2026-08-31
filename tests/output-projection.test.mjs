@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compactAccessibilityResult, compactBrowserResult, compactDomCuaResult, compactSnapshotResult, compactTabsResult } from "../pi-extension/output.js";
+import { compactAccessibilityResult, compactBrowserResult, compactDomCuaResult, compactNewTabResult, compactSnapshotResult, compactTabsResult } from "../pi-extension/output.js";
 
 test("Pi snapshot projection keeps refs and drops duplicate raw fields", () => {
   const result = compactSnapshotResult({
@@ -94,6 +94,46 @@ test("Pi compact projections fail closed for malformed page envelopes", () => {
   assert.equal(extract.raw, undefined);
   assert.equal(dom.frameTree, undefined);
   assert.equal(dom.raw, undefined);
+});
+
+
+test("Pi new-tab projection keeps the complete fresh handle and session context", () => {
+  const result = compactNewTabResult({
+    browserId: "edge:test",
+    groupId: 9,
+    tabFence: "tab:1",
+    tab: {
+      id: 1,
+      owner: "agent",
+      lifecycle: "temporary",
+      sessionId: "session-current",
+      groupId: 9,
+      handle: { tabId: 1, browserId: "edge:test", url: "https://example.test/", tabFence: "tab:1", incarnation: "doc-1" },
+    },
+  }, "session-current");
+  assert.equal(result.currentAgentSessionId, "session-current");
+  assert.equal(result.groupId, 9);
+  assert.equal(result.tabFence, "tab:1");
+  assert.equal(result.tab.handle.incarnation, "doc-1");
+  assert.equal(result.tab.sessionId, "session-current");
+});
+
+
+test("Pi tab projection annotates the current Agent session when a shared group is used", () => {
+  const result = compactTabsResult({
+    tabs: [
+      { id: 1, owner: "user" },
+      { id: 2, owner: "agent", ownership: "agent", sessionId: "session-current" },
+      { id: 3, owner: "agent", ownership: "agent", sessionId: "session-other" },
+      { id: 4, owner: "user", ownership: "claimed", sessionId: "session-current" },
+    ],
+    groups: [{ id: 9, title: "Pi", color: "blue" }],
+  }, "session-current");
+  assert.equal(result.currentAgentSessionId, "session-current");
+  assert.equal(result.tabs[0].sessionScope, "user");
+  assert.equal(result.tabs[1].sessionScope, "current-agent");
+  assert.equal(result.tabs[2].sessionScope, "other-agent");
+  assert.equal(result.tabs[3].sessionScope, "current-agent");
 });
 
 

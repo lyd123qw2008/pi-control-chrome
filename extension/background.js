@@ -1242,10 +1242,10 @@ async function connect() {
               await awaitWithSignal(reservation.before, requestController.signal);
 
               const readyTab = await waitAfterEffect("new_tab", async () => {
-                await waitForTabState(newTabId, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: params.url }) }, requestController.signal, newTabFence);
+                await waitForTabState(newTabId, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: params.url, normalizeUrl: true }) }, requestController.signal, newTabFence);
                 await assertTabFence(newTabId, newTabFence, "read");
                 return tabEntryFor(newTabId, newTabFence, "read");
-              }, { tabId: newTabId });
+              }, { tabId: newTabId, phase: "load", requestedUrl: params.url === undefined ? "about:blank" : String(params.url), allowRedirects: params.allowRedirects === true });
               response = { ok: true, result: { ...response.result, tab: readyTab } };
               if (socket !== next || next.readyState !== WebSocket.OPEN) response = { ok: false, error: { code: "BROWSER_OPERATION_UNCERTAIN", message: "Browser tab creation completed after its Bridge connection became stale; inspect the current browser state before retrying" } };
             }
@@ -4356,9 +4356,23 @@ async function assertPageGenerationStable(tabId, expectedFence, generation, acti
     throw readOnly ? pageChangingDuringReadError(action, { tabId: Number(tabId), pageChanged: true }) : uncertainBrowserOperationError(action, { tabId: Number(tabId), pageChanged: true });
   }
 }
+function canonicalTabUrl(value) {
+  const source = String(value ?? "");
+  try {
+    const parsed = new URL(source);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.toString();
+  } catch {
+    // Preserve non-URL values for the exact fallback comparison below.
+  }
+  return source;
+}
 function tabUrlMatches(tab, params = {}) {
   const url = String(tab.url || "");
-  if (params.url !== undefined && url !== String(params.url)) return false;
+  const comparableUrl = params.normalizeUrl === true ? canonicalTabUrl(url) : url;
+  if (params.url !== undefined) {
+    const expectedUrl = String(params.url);
+    if (comparableUrl !== (params.normalizeUrl === true ? canonicalTabUrl(expectedUrl) : expectedUrl)) return false;
+  }
   if (params.urlIncludes !== undefined && !url.includes(String(params.urlIncludes))) return false;
   return true;
 }
@@ -5094,7 +5108,11 @@ async function createTab(params) {
   createdTabFlights.add(creationFlight);
   let tab;
   try {
-    tab = await chrome.tabs.create({ url: params.url || "about:blank", active: params.active === true });
+    tab = await chrome.tabs.create({
+      url: params.url || "about:blank",
+      active: params.active === true,
+      ...(params.windowId === undefined ? {} : { windowId: Number(params.windowId) }),
+    });
     creationFlight.tabId = Number(tab.id);
     creationFlight.windowId = Number(tab.windowId);
   } catch (error) {
@@ -5867,7 +5885,10 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     if (signal?.aborted) throw uncertainBrowserOperationError(method);
     if (params.wait === true && created.tab?.id !== undefined) {
       try {
-        await waitAfterEffect("new_tab", () => waitForTabState(created.tab.id, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: params.url }) }, signal, created.tabFence), { tabId: created.tab.id });
+        await waitAfterEffect("new_tab", () => waitForTabState(created.tab.id, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: params.url, normalizeUrl: true }) }, signal, created.tabFence), { tabId: created.tab.id, phase: "load", requestedUrl: params.url === undefined ? "about:blank" : String(params.url), allowRedirects: params.allowRedirects === true });
+        const readyTab = await waitAfterEffect("new_tab", () => tabEntryFor(created.tab.id, created.tabFence, "new_tab"), { tabId: created.tab.id, phase: "response", refreshedHandle: true });
+        created.tab = readyTab;
+        if (readyTab.groupId !== undefined) created.groupId = readyTab.groupId;
       } catch (error) {
         if (signal?.aborted) throw uncertainBrowserOperationError(method);
         throw error;
