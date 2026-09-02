@@ -25,6 +25,7 @@
 - [浏览器能力显式激活方案](./BROWSER-ACTIVATION-DESIGN.zh-CN.md)
 - [Codex 对齐的浏览器生命周期实施方案](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md)
 - [浏览器模型输出压缩实施方案](./docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md)
+- [Agent-first 浏览器运行时重构方案](./docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md)
 
 本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。用于管理标签页的 CLI `open` 和 `cleanup` 必须显式提供 `--session <id>`；非临时 `view` 还必须提供 `--turn <n>`，不再使用进程 PID 作为会话标识。只有在用户明确决定恢复扩展运行时之后，CLI `cleanup` 才应使用 `--recover-stale`；它不会关闭未知 runtime 的 Tab。用户 Tab 可以作为浏览器目标，但页面文档可能在用户或 DSH 界面活动时被替换；只读读取会有限重新观察一次，副作用操作继续严格校验文档身份。自动化浏览器验证应使用 Agent-owned 测试 Tab 或隔离浏览器 Profile，不要使用正在聊天的 DSH GUI Tab。
 
@@ -61,12 +62,12 @@
 - Console、Network、Dialog、Upload、Download；Console 和 Network 每次读取最多返回 200 条、20,000 个序列化字符；
 - Chrome/Edge 页面能力检测；
 - 语义元素定位和页面状态等待。
-- 有副作用的页面操作、上传和 Network response body 会校验 tab fence 与文档 `incarnation`；同一文档只有标题变化时不会使完整 Handle 失效，导航会使 snapshot、DOM ref、dialog、file chooser 和旧 loader 映射失效。新建 Tab 可能先处于受限的 `about:blank`，此时有 Tab 身份但没有文档 incarnation，应先导航到可注入脚本的 URL 再进行页面操作。读取 Network response body 必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。目标不匹配、受限/错误页面、选择器不匹配和等待超时都返回结构化诊断；纯页面读取遇到文档在读取期间替换时会有限重试，仍不稳定则返回可重试的 `BROWSER_PAGE_CHANGING`；收到 `BROWSER_OPERATION_UNCERTAIN` 时必须先检查页面，系统不会自动重放副作用。
+- 有副作用的页面操作、上传和 Network response body 会校验 tab fence 与文档 `incarnation`；snapshot ref 和 DOM-CUA node id 在其来源 document 内是 live observation：标题/焦点变化、用户切 Tab、后续 snapshot 与无关 DOM 刷新不会使其失效；原 node 被框架替换时，只会在同 document 内存在唯一且强等价的候选时 rebind 一次。导航、reload、document replacement、Tab 关闭和 tab fence 变化仍是硬边界，旧 observation 返回 `BROWSER_DOCUMENT_CHANGED`，不会跨 document 复用。`navigate(wait: false)`、`back`、`forward` 和 `reload` 返回标记为 `transitionPending` 的 Tab，其 handle 会省略不稳定的 URL/title 和 document incarnation，必须先等待或重新观察才能进行 document-bound 操作。新建 Tab 可能先处于受限的 `about:blank`，此时有 Tab 身份但没有文档 incarnation，应先导航到可注入脚本的 URL 再进行页面操作。读取 Network response body 必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。目标不匹配、受限/错误页面、选择器不匹配和等待超时都返回结构化诊断；纯页面读取遇到文档在读取期间替换时会有限重试，仍不稳定则返回可重试的 `BROWSER_PAGE_CHANGING`；收到 `BROWSER_OPERATION_UNCERTAIN` 时必须先检查页面，系统不会自动重放副作用。
 - Debugger lease 会记录 browserId、tab fence、attach epoch 和 CDP target id，并跨 MV3 worker 重启持久化。普通 cleanup 不会 detach 无法证明归属的全局 target；只有显式 `recoverStale: true` 才会在前后复核身份后恢复旧 lease。
 
 ## 语义页面交互
 
-常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。交互操作会在过滤可见元素后应用该索引，隐藏的重复控件不会占用索引。已有的快照 ref 和 CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
+常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。交互操作会在过滤可见元素后应用该索引，隐藏的重复控件不会占用索引。已有的快照 ref 需携带匹配的 `snapshotId`；运行时优先使用原 connected node，且只允许一次同 document 内唯一、强等价的 rebind。CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
 
 文字 target 用于操作或元素状态定位时，会把文字叶节点投影到最近的可操作祖先，因此 `isEnabled` 和 `browser_wait` 报告的是实际接收操作的控件状态。`browser_wait` 支持 `load`、`url`、`text`、`text_gone`、`visible`、`hidden` 和 `enabled`。文字条件使用 `text`，元素条件使用与交互相同的 `target`；`url` 和 `urlIncludes` 可以作为所有等待条件的 URL 过滤器。`hidden` 在没有可见匹配时成功，包括目标不存在或存在多个隐藏匹配；`visible` 和 `enabled` 遇到多个可见匹配时会安全失败。对于 `visible` 和 `enabled`，会在过滤可见元素后应用明确提供的索引。若交互因导航丢失注入结果，会报告结果不确定，系统不会自动重放该副作用操作。
 
@@ -87,7 +88,7 @@
 - `tests/bridge.test.mjs`：Bridge 单元/协议测试；
 - `tests/pi-lifecycle.test.mjs`：Pi session-generation、cleanup retry intent 和 BridgeClient 重连竞态测试；
 - `tests/skill-script.test.mjs`：Skill 快速脚本的实时 Bridge 集成测试；
-- `tests/e2e-browser.mjs`：真实 Edge/Chrome for Testing + 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。
+- `tests/e2e-browser.mjs`：真实浏览器（默认 Edge，可指定 Chrome for Testing）+ 扩展 + Bridge 的高覆盖 E2E 测试；覆盖 Locator、DOM/坐标 CUA、Console、Network、Dialog、Upload、Download、Clipboard 和 cleanup。当前 worktree 的隔离真实浏览器回归已在 Edge 和 Chrome for Testing 149.0.7827.55 通过；Chrome for Testing 双 profile 路由/重连 smoke 与人工加载 Chrome 扩展的受控 Skill 集成流程也已通过。
 
 功能范围已经按 Codex 默认行为确定，具体见 [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md)。后续开发继续按阶段实现，不再缩减核心浏览器控制能力。
 
@@ -161,6 +162,8 @@ npm run smoke:e2e
 npm run smoke:e2e:multi-profile
 ```
 
+`npm run test:skill` 需要已连接的 Chrome/Edge Profile 和本地 Bridge，并会创建临时 Agent Tab；当 Bridge 有多个 ready target 时，它会跳过而不擅自选择目标。只有在获得明确授权后才通过 `PI_CONTROL_CHROME_TEST_BROWSER_ID` 指定测试目标。
+
 `smoke:e2e` 请求使用唯一的临时 `--user-data-dir`，而不是日常 Profile。测试程序会在扩展握手前发现浏览器进程退出并直接失败，用于识别 Windows 常见的 singleton 转发；Chrome for Testing 是最可靠的隔离执行文件。部分已安装的 Google Chrome 版本会拒绝命令行加载 unpacked extension 的参数；验证正常 Chrome Profile 时，应在 `chrome://extensions` 中手动加载 `extension/`。
 
 ```powershell
@@ -168,7 +171,7 @@ $env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
 npm run smoke:e2e
 ```
 
-`smoke:e2e:multi-profile` 会启动两个隔离的临时 Edge/Chrome Profile，验证显式目标路由、一个目标断线时另一个目标继续可用，以及同一 Profile 重连后的 connection generation fence。两个测试都不会修改用户日常 Profile。部分已安装的 Google Chrome 版本会拒绝命令行加载 unpacked extension 的参数；验证正常 Chrome Profile 时，应在 `chrome://extensions` 中手动加载 `extension/`。
+`smoke:e2e:multi-profile` 会启动当前配置浏览器的两个隔离临时 Profile（默认 Edge，也可指定 Chrome for Testing），验证显式目标路由、一个目标断线时另一个目标继续可用，以及同一 Profile 重连后的 connection generation fence。两个测试都不会修改用户日常 Profile。部分已安装的 Google Chrome 版本会拒绝命令行加载 unpacked extension 的参数；验证正常 Chrome Profile 时，应在 `chrome://extensions` 中手动加载 `extension/`。
 
 ## 对齐基线
 

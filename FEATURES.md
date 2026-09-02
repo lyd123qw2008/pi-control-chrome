@@ -8,7 +8,7 @@
 
 用户可以直接修改复选框、调整优先级或添加备注。
 
-> 实现状态（2026-08-17，按当前仓库持续更新）：阶段 1/2 核心代码已经完成。当前仓库已实现并验证 Chrome/Edge 扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、语义目标定位、文本和元素状态等待、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。当前 Bridge 还支持多个已识别浏览器目标、target-qualified routing、connection-generation fencing、每 session 单目标绑定、目标断线状态、Bridge `list_targets`/`doctor` 诊断和有界 metrics。以下复选框保留原始产品规划，不作为当前实现状态的唯一来源；当前能力以 README、架构文档和测试为准。WebMCP、GSuite、历史记录、媒体下载、浏览器商店发布包和同一 session 同时控制多个目标仍未实现。
+> 实现状态（2026-08-17，按当前仓库持续更新）：阶段 1/2 核心代码已经完成。当前仓库已实现 Chrome/Edge 共用的扩展、Bridge、Pi 工具、标签页生命周期、完整基础 Locator、语义目标定位、文本和元素状态等待、DOM/坐标 CUA、原生 CDP、Console、Network、Dialog、Upload、Download、Clipboard 和页面提取。当前 Agent-first runtime 的隔离真实浏览器回归已在 Edge 通过；人工加载 Chrome 扩展已通过受控 Skill 集成流程，Chrome for Testing 或等效隔离环境仍需完成 Chrome smoke。当前 Bridge 还支持多个已识别浏览器目标、target-qualified routing、connection-generation fencing、每 session 单目标绑定、目标断线状态、Bridge `list_targets`/`doctor` 诊断和有界 metrics。以下复选框保留原始产品规划，不作为当前实现状态的唯一来源；当前能力以 README、架构文档和测试为准。WebMCP、GSuite、历史记录、媒体下载、浏览器商店发布包和同一 session 同时控制多个目标仍未实现。
 
 ---
 

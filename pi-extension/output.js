@@ -36,7 +36,7 @@ function compactTab(value, currentSessionId) {
   if (!isRecord(value)) return value;
   const keys = [
     "id", "browserId", "windowId", "index", "active", "pinned", "title", "url", "status", "groupId",
-    "tabFence", "incarnation", "owner", "ownership", "sessionId", "lifecycle", "stale", "handle",
+    "tabFence", "incarnation", "owner", "ownership", "sessionId", "lifecycle", "stale", "transitionPending", "handle",
   ];
   const result = {};
   for (const key of keys) if (value[key] !== undefined) result[key] = value[key];

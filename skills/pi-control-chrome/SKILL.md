@@ -29,8 +29,8 @@ Treat a browser obstacle as a diagnosis problem, not a reason to repeat the last
 - Run `browser_status` before acting when the target browser is not already confirmed.
 - If `browser` or `browserId` is not the browser the user requested, stop. Do not use its tab ids or handles.
 - A Bridge may expose multiple connected browser targets. When more than one target is ready, select one with `browser_status` and its `browserId`, `/chrome profile <browserId>`, or the managed CLI `--browser-id`; never choose the newest connection, active window, or first list entry by assumption.
-- Every complete tab handle includes `tabFence` and, when the page is script-accessible, a document `incarnation` made from URL, `performance.timeOrigin`, and a per-document token. Keep locator fields in `target`, never in `handle`, and omit optional fields instead of sending empty strings or `index: -1`. Navigation invalidates snapshot refs, DOM-CUA node ids, dialog/file-chooser observations, and Network request-loader ids; reacquire the relevant snapshot or observation before acting.
-- A page operation checks the document identity before and after execution. If a side-effecting operation cannot prove that it ran against one document, treat `BROWSER_OPERATION_UNCERTAIN` as unknown and inspect before retrying; do not replay it automatically.
+- Every complete tab handle includes `tabFence` and, when the page is script-accessible, a document `incarnation` made from URL, `performance.timeOrigin`, and a per-document token. Keep locator fields in `target`, never in `handle`, and omit optional fields instead of sending empty strings or `index: -1`. Snapshot refs and DOM-CUA node ids are document-scoped live observations: title/focus changes and unrelated same-document UI churn do not invalidate them. Navigation, reload, document replacement, tab closure, and a changed tab fence remain hard boundaries; reacquire the relevant observation before acting on the new document. `browser_navigate` with `wait: false`, `browser_back`, `browser_forward`, and `browser_reload` return a tab marked `transitionPending` whose handle omits unstable URL/title and document-incarnation fields, so use `browser_wait` and then a fresh snapshot before document-bound work.
+- A page operation checks document identity before and after execution. If an action confirms dispatch and the post-action document identity is readable, it remains successful even when that identity changed; if it loses its injected result or cannot verify the post-action identity, treat `BROWSER_OPERATION_UNCERTAIN` as unknown and inspect before retrying. Do not replay it automatically.
 - Debugger leases include the browser target, tab fence, attach epoch, and CDP target id. Ordinary cleanup will not detach a debugger target that is not tracked by the current extension runtime. Use stale-runtime recovery only after the user explicitly authorizes recovery; it verifies the persisted lease identity before and after detach.
 - Do not expose pairing tokens, cookies, passwords, access tokens, private keys, or unrelated page data in a diagnostic report.
 
@@ -85,15 +85,12 @@ This is normal for an idle Service Worker. Send a harmless `browser_status` requ
 
 **Symptoms:** a tab id no longer exists, a snapshot ref is rejected, an action reports stale state, or the target moved.
 
-1. Run `browser_tabs` again.
-2. Match the target by current title and URL; do not trust an old tab id or ref.
-3. Run `browser_snapshot` or `browser_accessibility_snapshot` again.
-4. Use refs from that latest snapshot only.
-5. If the user tab changed unexpectedly, stop and ask before claiming or navigating it.
+1. Check the error code first. `BROWSER_DOCUMENT_CHANGED`, a stale handle, or tab-fence failure means the page identity changed; run `browser_tabs`, inspect the current page, and obtain a fresh observation.
+2. A title/focus change or unrelated UI update within one document is not itself stale. A ref can still resolve its original connected node, or one unique semantically equivalent replacement.
+3. If the resolver reports `ELEMENT_TARGET_DETACHED`, `ELEMENT_TARGET_NOT_FOUND`, or `ELEMENT_TARGET_AMBIGUOUS`, take a fresh snapshot and narrow the semantic target; never choose among ambiguous replacements.
+4. If the user tab changed unexpectedly, stop and ask before claiming or navigating it.
 
-Never retry a stale click or fill with the old ref.
-
-`BROWSER_PAGE_CHANGING` applies to a read-only page observation whose document changed during the bounded read retry. Refresh `browser_tabs` and retry the read on the current tab; no page side effect was sent. For automated verification, use an Agent-owned test tab or an isolated browser profile rather than the active DSH GUI tab. Keep explicit user-tab inspection available when the user requests a logged-in or currently visible page.
+Never retry an uncertain click or fill automatically. `BROWSER_PAGE_CHANGING` applies to a read-only page observation whose document changed during the bounded read retry. Refresh `browser_tabs` and retry the read on the current tab; no page side effect was sent. For automated verification, use an Agent-owned test tab or an isolated browser profile rather than the active DSH GUI tab. Keep explicit user-tab inspection available when the user requests a logged-in or currently visible page.
 
 ### Element cannot be found or an interaction fails
 
@@ -108,7 +105,7 @@ latest browser_snapshot
 → narrowly scoped browser_evaluate
 ```
 
-After a navigation or DOM-changing action, obtain a fresh snapshot. Do not switch to coordinate clicks merely because the first locator was not tried with the latest page state.
+After navigation, obtain a fresh snapshot. When navigation used `wait: false`, `browser_back`, `browser_forward`, or `browser_reload`, first use `browser_wait` for `load` or the expected URL; its tab is marked `transitionPending` and its handle intentionally omits unstable URL/title and document-incarnation fields. After a meaningful same-document UI action, prefer a fresh snapshot to update the model's understanding, but do not treat unrelated DOM churn as a reason to switch to coordinate clicks or retry a failed side effect.
 
 ### Navigation or page request times out
 
@@ -179,7 +176,7 @@ Use these tools when available:
 - `browser_selected`: inspect the selected tab without changing it.
 - `browser_new_tab`: create an Agent-owned tab. With `windowId`, it can target a specific browser window returned by `browser_tabs`; otherwise it uses the current browser window. Prefer `active: false` unless the user needs to see it; this avoids activation at creation time but cannot prevent later browser or user focus changes. With `wait: true`, the returned handle is refreshed after loading; `allowRedirects: false` still accepts normal URL canonicalization such as a trailing `/`, while `true` permits an actual destination change.
 - `browser_select_tab`: select an existing tab explicitly.
-- `browser_snapshot`: inspect one bounded semantic page state and obtain snapshot-scoped element refs before interacting; pass its `snapshotId` with any ref action. The default collector keeps visible semantic/actionable nodes, caps text and nodes, and the model-facing result does not include the duplicate raw accessibility tree or frameTree. Optional `selector`, `maxChars`, and `maxNodes` narrow the read.
+- `browser_snapshot`: inspect one bounded semantic page state and obtain document-scoped live element refs before interacting; pass its matching `snapshotId` with any ref action. The resolver uses the original connected node first and may make one unique semantic rebind in the same document; it never crosses navigation. The default collector keeps visible semantic/actionable nodes, caps text and nodes, and the model-facing result does not include the duplicate raw accessibility tree or frameTree. Optional `selector`, `maxChars`, and `maxNodes` narrow the read.
 - `browser_accessibility_snapshot`: inspect semantic roles and accessible names as bounded full, incremental diff, or unchanged text; it includes the current snapshot id and document metadata. The first read is full, later reads may be diff or unchanged; pass `disableDiffing: true` when a full tree is required.
 - `browser_extract`: read bounded visible page text and simple Markdown. Optional `selector` and `maxChars` share one output budget.
 - `browser_locator`: use role + name, label, placeholder, text, test id, or CSS locators; require a single match or an explicit `index`. Actions and visible/enabled state queries apply an explicit index after visibility filtering, so hidden duplicate controls do not consume it.
@@ -203,19 +200,19 @@ Use these tools when available:
 2. Run `browser_tabs` or `browser_selected` to identify the target tab.
 3. For an existing user tab, confirm its title and URL before acting.
 4. Run `browser_snapshot` or `browser_accessibility_snapshot` before clicking or filling.
-5. Prefer semantic targets (`role` + `name`, `label`, `placeholder`, `text`, or `testId`) for common interactions; use a ref from the latest snapshot only with that snapshot's `snapshotId`, or use a CSS selector when appropriate.
+5. Prefer semantic targets (`role` + `name`, `label`, `placeholder`, `text`, or `testId`) for common interactions; use a ref with the matching `snapshotId`, or use a CSS selector when appropriate.
 6. Use `browser_wait` for asynchronous text or element states before proceeding; include `url` or `urlIncludes` when the page identity matters.
-7. After navigation or a meaningful action, take a fresh snapshot because refs can become stale.
+7. After navigation, take a fresh snapshot. After a meaningful same-document action, normally re-observe before reasoning about the next step; an existing ref may still be safely usable across unrelated churn or one unique framework replacement.
 8. Verify the visible result with a snapshot, extract, URL wait, or evaluation.
 9. Do not call `browser_cleanup` merely because the turn or browser task appears complete. The host performs turn cleanup automatically; call it only when the user explicitly asks for immediate cleanup.
 
-Do not reuse a ref after navigation or a DOM-changing action. If a tab handle reports stale state, call `browser_tabs` again and obtain a fresh handle.
+Do not reuse a ref after navigation, reload, document replacement, or `BROWSER_DOCUMENT_CHANGED`. If a tab handle reports stale state, call `browser_tabs` again and obtain a fresh handle.
 
 ## Tab Ownership and Cleanup
 
 - Treat existing user tabs as user-owned by default.
 - Do not close, navigate, move, or claim an existing user tab unless the task requires it or the user explicitly asks.
-- Before claiming a user tab, use its current tab id, title, and URL snapshot. A changed title or URL means the handle is stale; refresh the tab list.
+- Before claiming a user tab, use its current tab id, title, and URL snapshot. A changed URL or document incarnation means the handle is stale; title-only metadata changes do not.
 - Prefer `browser_new_tab` for exploratory work so the user's current page is not disturbed.
 - Agent-created tabs are temporary by default and the host closes unmarked ones at turn end.
 - The `Pi` group can be shared by multiple sessions; `groupId` is visual grouping only. Use `owner`, `sessionId`, and `sessionScope` to choose a tab, and never treat `groupId` alone as ownership.
@@ -254,4 +251,5 @@ The browser tools are registered by `pi-extension/index.ts`; the extension and B
 - [Feature matrix](../../FEATURES.md)
 - [Codex alignment](../../CODEX-ALIGNMENT.zh-CN.md)
 - [Architecture](../../ARCHITECTURE.zh-CN.md)
+- [Agent-first browser runtime design](../../docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md)
 - [Decisions](../../DECISIONS.zh-CN.md)

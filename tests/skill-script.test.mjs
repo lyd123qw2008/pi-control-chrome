@@ -12,8 +12,13 @@ const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("..", import.meta.url));
 const script = join(root, "skills", "pi-control-chrome", "scripts", "browser.mjs");
 
+let activeTestBrowserId;
+
 async function runScript(...args) {
-  const result = await execFileAsync(process.execPath, [script, ...args], {
+  const commandArgs = activeTestBrowserId !== undefined && args[0] !== "targets"
+    ? [...args, "--browser-id", activeTestBrowserId]
+    : args;
+  const result = await execFileAsync(process.execPath, [script, ...commandArgs], {
     encoding: "utf8",
     timeout: 60_000,
     windowsHide: true,
@@ -36,7 +41,23 @@ function startFixture() {
   });
 }
 
-test("bundled browser CLI completes common Bridge workflows", async () => {
+test("bundled browser CLI completes common Bridge workflows", async (t) => {
+  const inventory = await runScript("targets", "--json");
+  const readyTargets = Array.isArray(inventory.targets)
+    ? inventory.targets.filter((target) => target?.state === "ready" && typeof target.browserId === "string" && target.browserId.length > 0)
+    : [];
+  const requestedBrowserId = process.env.PI_CONTROL_CHROME_TEST_BROWSER_ID;
+  if (requestedBrowserId !== undefined) {
+    assert.ok(readyTargets.some((target) => target.browserId === requestedBrowserId), `PI_CONTROL_CHROME_TEST_BROWSER_ID is not a ready target: ${requestedBrowserId}`);
+    activeTestBrowserId = requestedBrowserId;
+  } else if (readyTargets.length === 1) {
+    activeTestBrowserId = readyTargets[0].browserId;
+  } else {
+    t.skip("requires exactly one ready browser target; set PI_CONTROL_CHROME_TEST_BROWSER_ID to an explicitly authorized target");
+    return;
+  }
+  t.after(() => { activeTestBrowserId = undefined; });
+
   const fixture = await startFixture();
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-skill-test-"));
   const sessionId = `skill-script-test-${process.pid}`;
@@ -48,7 +69,7 @@ test("bundled browser CLI completes common Bridge workflows", async () => {
     assert.equal(status.status.connected, true);
     assert.equal(status.health.extensionConnected, true);
 
-    const seeded = await runScript("open", "about:blank", "--inactive", "--session", `${sessionId}-seed`, "--json");
+    const seeded = await runScript("open", `${fixture.url}?seed=${encodeURIComponent(sessionId)}`, "--inactive", "--session", `${sessionId}-seed`, "--json");
     seedTabId = seeded.tab.id;
     const groups = await runScript("group", "--json");
     assert.ok(groups.some((group) => group.title === "Pi" && group.color === "blue"));

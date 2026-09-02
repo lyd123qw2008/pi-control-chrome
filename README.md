@@ -20,13 +20,13 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text. Console and Network listings retain at most 200 entries and 20,000 serialized characters per read.
 - Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
 - Persists debugger lease identity across an MV3 worker restart. Ordinary cleanup reports an unverified old lease instead of detaching an untracked target; explicit stale recovery verifies the current tab fence and CDP target identity before detaching it.
-- Fences tab handles with a tab fence and document identity. Navigation invalidates page snapshots, locator refs, DOM-CUA node ids, dialog/file-chooser observations, and Network request-loader mappings; title-only updates within the same document do not invalidate a complete document handle; read-only page reads re-observe a user tab and retry once when its document changes, while side-effecting operations that lose document identity return an uncertain result and are not replayed automatically.
+- Fences tab handles with a tab fence and document identity. Snapshot refs and DOM-CUA node ids are live observations within their originating document: title/focus changes, user tab switching, later observations, and unrelated DOM churn do not invalidate them; an original detached node can be rebound once only when a strongly equivalent replacement is unique. Navigation, reload, document replacement, tab closure, and tab-fence changes remain hard boundaries and reject old observations with `BROWSER_DOCUMENT_CHANGED`; `navigate(wait: false)`, `back`, `forward`, and `reload` return a tab marked `transitionPending` whose handle omits unstable URL/title and document-incarnation fields, so wait or re-observe before document-bound work. Read-only page reads re-observe a user tab and retry once when its document changes, while side-effecting operations that lose document identity return an uncertain result and are not replayed automatically.
 - Keeps a Manifest V3 Bridge socket active with application heartbeats, preventing idle worker suspension from creating avoidable connection-generation churn during long browser waits.
 - Includes a reusable `pi-control-chrome` Skill. Browser tool schemas are hidden until that Skill is explicitly loaded for the current session; the bundled CLI remains available for explicit human/developer workflows and tests.
 
 ## Semantic page interaction
 
-The common click and form tools accept a semantic `target` such as `{ "role": "button", "name": "Submit" }`, `{ "label": "Email" }`, `{ "placeholder": "Search" }`, `{ "text": "Next" }`, or `{ "testId": "submit-button" }`. Semantic interactions wait for one visible match and fail closed when a target is missing, hidden, disabled, or ambiguous; use an explicit zero-based `index` only when multiple matches are intentional. Actions apply that index after visibility filtering, so hidden duplicate controls do not consume it. `browser_snapshot` returns snapshot-scoped `eN` refs and a `snapshotId`; pass that `snapshotId` with every ref-based interaction or element-state wait. CSS selectors remain supported.
+The common click and form tools accept a semantic `target` such as `{ "role": "button", "name": "Submit" }`, `{ "label": "Email" }`, `{ "placeholder": "Search" }`, `{ "text": "Next" }`, or `{ "testId": "submit-button" }`. Semantic interactions wait for one visible match and fail closed when a target is missing, hidden, disabled, or ambiguous; use an explicit zero-based `index` only when multiple matches are intentional. Actions apply that index after visibility filtering, so hidden duplicate controls do not consume it. `browser_snapshot` returns document-scoped live `eN` refs and a `snapshotId`; pass that matching `snapshotId` with every ref-based interaction or element-state wait. The resolver uses the original connected element first and allows one unique, strongly equivalent same-document rebind; CSS selectors remain supported.
 
 Text targets used by action and element-state locators project a matching text leaf to its nearest actionable ancestor, so `isEnabled` and `browser_wait` report the state of the control that receives the action. `browser_wait` supports `load`, `url`, `text`, `text_gone`, `visible`, `hidden`, and `enabled`. Text conditions use `text`; element conditions use the same semantic `target` accepted by interactions. `url` and `urlIncludes` can constrain every wait condition. `hidden` succeeds when the target has no visible matches, including an absent target or multiple hidden matches; `visible` and `enabled` require one visible match, and multiple visible matches fail closed. For `visible` and `enabled`, an explicit index is applied after visibility filtering. Browser page matching runs inside the selected tab, while the Bridge continues to enforce the existing browser target and connection-generation fence. If a side-effecting interaction loses its injected result after navigation, it reports an uncertain outcome and is never replayed automatically.
 
@@ -130,19 +130,19 @@ npm run test:skill
 npm run pack:check
 ```
 
-`npm run test:skill` requires a connected Chrome or Edge profile and the local Bridge. The high-coverage browser smoke test is:
+`npm run test:skill` requires a connected Chrome or Edge profile and the local Bridge. It creates temporary Agent tabs, so when multiple ready targets exist it skips rather than choosing one; set `PI_CONTROL_CHROME_TEST_BROWSER_ID` only for an explicitly authorized target. The high-coverage browser smoke test is:
 
 ```powershell
 npm run smoke:e2e
 ```
 
-The multi-target acceptance test launches two isolated temporary Edge/Chrome profiles and verifies explicit routing, target disconnect isolation, and same-Profile reconnection fencing:
+The multi-target acceptance test launches two isolated temporary profiles of the configured browser (Edge by default, or Chrome for Testing when selected) and verifies explicit routing, target disconnect isolation, and same-Profile reconnection fencing:
 
 ```powershell
 npm run smoke:e2e:multi-profile
 ```
 
-The smoke test defaults to Edge. Run the same coverage against Chrome for Testing with:
+The smoke test defaults to Edge. The current worktree has passed the same isolated coverage on Edge and Chrome for Testing 149.0.7827.55. Run it against Chrome for Testing with:
 
 ```powershell
 $env:PI_CONTROL_CHROME_BROWSER = "<path-to>\chrome-for-testing\chrome.exe"
@@ -174,6 +174,7 @@ This requests a unique temporary `--user-data-dir` rather than the normal user p
 - [`BROWSER-ACTIVATION-DESIGN.zh-CN.md`](./BROWSER-ACTIVATION-DESIGN.zh-CN.md) — browser capability activation and on-demand Skill design.
 - [`docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md`](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md) — implemented Codex-aligned browser lifecycle.
 - [`docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md`](./docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md) — implemented bounded model-facing browser output and AX revision design.
+- [`docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md`](./docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md) — Agent-first live-ref runtime design, implementation status, and AX roadmap.
 
 ## Current future scope
 

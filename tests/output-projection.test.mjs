@@ -119,6 +119,21 @@ test("Pi new-tab projection keeps the complete fresh handle and session context"
 });
 
 
+test("Pi tab projection preserves a transition-pending handle without an invented document identity", () => {
+  const result = compactTabsResult({
+    tabs: [{
+      id: 7,
+      url: "https://example.test/destination",
+      transitionPending: true,
+      handle: { tabId: 7, browserId: "edge:test", tabFence: "tab:7" },
+    }],
+  });
+  assert.equal(result.tabs[0].transitionPending, true);
+  assert.equal(result.tabs[0].handle.incarnation, undefined);
+  assert.equal(result.tabs[0].handle.url, undefined);
+  assert.equal(result.tabs[0].handle.tabFence, "tab:7");
+});
+
 test("Pi tab projection annotates the current Agent session when a shared group is used", () => {
   const result = compactTabsResult({
     tabs: [

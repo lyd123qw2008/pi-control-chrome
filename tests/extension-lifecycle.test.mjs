@@ -7,6 +7,7 @@ import { join } from "node:path";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const backgroundPath = join(root, "extension", "background.js");
+const pageAgentPath = join(root, "extension", "page-agent.js");
 const ownedTabsKey = "piControlChromeOwnedTabs";
 const tabFencesKey = "piControlChromeTabFences";
 const debuggerLeasesKey = "piControlChromeDebuggerLeases";
@@ -32,6 +33,7 @@ function loadExtension(options = {}) {
   let nextDownloadId = 1;
   let nextTabId = Number(options.nextTabId ?? 1000);
   let pageGenerationCalls = 0;
+  const executeScriptCalls = [];
   const removeFailures = new Set();
   let detachFailure = false;
   let debuggerCommandFailure = false;
@@ -101,6 +103,41 @@ function loadExtension(options = {}) {
         tab.status = "complete";
         return tab;
       },
+      async update(tabId, details = {}) {
+        const tab = tabs.get(Number(tabId));
+        if (!tab) throw new Error("tab not found");
+        const changeInfo = {};
+        if (details.url !== undefined) {
+          tab.url = String(details.url);
+          tab.status = "loading";
+          changeInfo.url = tab.url;
+          changeInfo.status = tab.status;
+        }
+        if (details.active !== undefined) {
+          tab.active = details.active === true;
+          changeInfo.active = tab.active;
+        }
+        await tabUpdated.emit(Number(tabId), changeInfo, tab);
+        return tab;
+      },
+      async goBack(tabId) {
+        const tab = tabs.get(Number(tabId));
+        if (!tab) throw new Error("tab not found");
+        tab.status = "loading";
+        await tabUpdated.emit(Number(tabId), { status: "loading" }, tab);
+      },
+      async goForward(tabId) {
+        const tab = tabs.get(Number(tabId));
+        if (!tab) throw new Error("tab not found");
+        tab.status = "loading";
+        await tabUpdated.emit(Number(tabId), { status: "loading" }, tab);
+      },
+      async reload(tabId) {
+        const tab = tabs.get(Number(tabId));
+        if (!tab) throw new Error("tab not found");
+        tab.status = "loading";
+        await tabUpdated.emit(Number(tabId), { status: "loading" }, tab);
+      },
       async remove(tabId) {
         const id = Number(tabId);
         if (removeFailures.has(id)) throw new Error("simulated tab close failure");
@@ -110,9 +147,11 @@ function loadExtension(options = {}) {
       },
     },
     scripting: {
-      async executeScript({ target, func }) {
+      async executeScript({ target, func, files, args }) {
+        executeScriptCalls.push({ tabId: Number(target?.tabId), functionName: func?.name, files: Array.isArray(files) ? [...files] : undefined, args: clone(args) });
         const tab = tabs.get(Number(target.tabId));
         if (options.restrictedPageError && tab?.url === "about:blank") throw new Error(options.restrictedPageError);
+        if (Array.isArray(files) && files.length > 0) return [{ result: undefined }];
         if (options.executeScriptException && func.name === (options.executeScriptException.functionName || "collectSnapshot")) return [{ exceptionDetails: options.executeScriptException.details }];
         if (func.name === "pageGeneration") {
           const sequence = Array.isArray(options.pageGenerationSequence) ? options.pageGenerationSequence : [];
@@ -200,9 +239,24 @@ function loadExtension(options = {}) {
     AbortController,
   });
   const source = readFileSync(backgroundPath, "utf8");
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, devtoolsState };", context, { filename: backgroundPath });
+  const pageAgentSource = readFileSync(pageAgentPath, "utf8");
+  const injectedPageAgents = new Set();
+  const originalExecuteScript = chrome.scripting.executeScript;
+  chrome.scripting.executeScript = async (details) => {
+    if (Array.isArray(details.files) && details.files.includes("page-agent.js")) {
+      const tabId = Number(details.target.tabId);
+      if (!injectedPageAgents.has(tabId)) {
+        vm.runInContext(pageAgentSource, context, { filename: join(root, "extension", "page-agent.js") });
+        injectedPageAgents.add(tabId);
+      }
+      return [{ result: undefined }];
+    }
+    return originalExecuteScript(details);
+  };
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
+    chrome,
     storage,
     sessionStorage,
     tabs,
@@ -221,12 +275,34 @@ function loadExtension(options = {}) {
     runHeartbeat() { for (const { callback } of intervalCallbacks.values()) callback(); },
     heartbeatMessages,
     heartbeatIntervals: intervalCallbacks,
+    executeScriptCalls,
     removeFailures,
     setDetachFailure(value) { detachFailure = value; },
     setDebuggerCommandFailure(value) { debuggerCommandFailure = value; },
     setVisibleCaptureFailure(value) { visibleCaptureFailure = value; },
   };
 }
+
+test("Page Agent injection is idempotent and bounds observation history", () => {
+  const context = vm.createContext({});
+  const source = readFileSync(pageAgentPath, "utf8");
+
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  const agent = vm.runInContext("globalThis.__piControlChromePageAgent", context);
+  assert.equal(agent.version, 2);
+  for (let index = 0; index < 20; index += 1) agent.remember("snapshot", `snapshot-${index}`, { value: index });
+  assert.equal(agent.observations.size, 16);
+  assert.equal(agent.lookup("snapshot", "snapshot-0"), undefined);
+  assert.equal(agent.lookup("snapshot", "snapshot-4")?.value, 4);
+  // The extension's isolated world and executeScript function world are distinct
+  // realms, so the registry must accept map-like records across that boundary.
+  assert.equal(agent.remember("snapshot", "cross-realm", { refs: new Map([["e1", { value: 1 }]]) })?.refs instanceof Map, true);
+  agent.remember("snapshot", "expired", { createdAt: Date.now() - agent.ttlMs - 1 });
+  assert.equal(agent.lookup("snapshot", "expired"), undefined);
+
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  assert.equal(vm.runInContext("globalThis.__piControlChromePageAgent", context), agent);
+});
 
 function record(tabId, lifecycle = "temporary", title = "", url = "") {
   return { tabId, browserId: "edge:test-extension:profile-id", windowId: 1, sessionId: "session-test", createdAt: 1, groupId: 1, owner: "agent", lifecycle, runtimeId: "profile-id", tabFence: `tab:${tabId}`, title, url };
@@ -240,6 +316,15 @@ function storedRecords(fixture) {
 function storedRecord(fixture, tabId) {
   return Object.values(storedRecords(fixture)).find((entry) => Number(entry?.tabId) === Number(tabId));
 }
+
+test("advertises live-ref and semantic-rebind capabilities", async () => {
+  const fixture = loadExtension();
+  const status = await fixture.api.handleRequest("status", {});
+
+  assert.equal(status.capabilities.liveRefs, true);
+  assert.equal(status.capabilities.semanticRebind, true);
+  assert.equal(status.capabilities.axRefs, false);
+});
 
 test("keeps the extension Bridge socket alive with application heartbeats", async () => {
   const fixture = loadExtension();
@@ -404,6 +489,8 @@ test("replacement transfer requires the old fence and preserves ownership on the
   const oldRecord = record(20, "temporary", "replace", "https://example.test/replace");
   fixture.storage[ownedTabsKey] = { version: 3, records: { ["edge:test-extension:profile-id::20"]: oldRecord } };
   fixture.storage[tabFencesKey] = { "test-extension::20": oldRecord.tabFence };
+  fixture.api.accessibilitySnapshotStates.set("test-extension::20", { snapshotId: "old-ax", nodes: [] });
+  fixture.api.accessibilitySnapshotStates.set("test-extension::21", { snapshotId: "added-ax", nodes: [] });
   await fixture.emitTabReplaced(21, 20);
   const replacementTombstone = fixture.api.tabRemovalTombstones.get("test-extension::20");
   await fixture.emitTabReplaced(21, 20);
@@ -412,6 +499,8 @@ test("replacement transfer requires the old fence and preserves ownership on the
   assert.equal(storedRecord(fixture, 20), undefined);
   assert.equal(storedRecord(fixture, 21)?.tabId, 21);
   assert.equal(storedRecord(fixture, 21)?.tabFence === oldRecord.tabFence, false);
+  assert.equal(fixture.api.accessibilitySnapshotStates.get("test-extension::20"), undefined);
+  assert.equal(fixture.api.accessibilitySnapshotStates.get("test-extension::21"), undefined);
 });
 test("duplicate tab removal events converge without restoring ownership", async () => {
   const fixture = loadExtension();
@@ -633,6 +722,356 @@ test("side-effecting requests keep strict document fencing after read-only re-ob
     () => fixture.api.handleRequest("evaluate", { tabId: 320, handle, sessionId: "session-test", expression: "window.location.href" }),
     /Tab handle is stale: document incarnation changed/,
   );
+});
+
+test("a known-dispatched page action succeeds when its post-action document identity is verified", async () => {
+  const oldDocument = { url: "https://example.test/action", timeOrigin: 1, token: "old-document" };
+  const newDocument = { url: "https://example.test/action", timeOrigin: 2, token: "new-document" };
+  const fixture = loadExtension({
+    pageGenerationSequence: [oldDocument, newDocument],
+    executeScriptResults: { pageOperation: { ok: true, operation: "click", ref: "e1" } },
+  });
+  fixture.tabs.set(319, { id: 319, windowId: 1, title: "action", url: oldDocument.url, status: "complete" });
+
+  const result = await fixture.api.handleRequest("interaction", { tabId: 319, operation: "click", ref: "e1", snapshotId: "observation-1", sessionId: "session-test" });
+
+  assert.equal(result.result?.ok, true);
+  assert.equal(result.result?.postActionDocumentChanged, true);
+  const actionCall = fixture.executeScriptCalls.find((call) => call.functionName === "pageOperation");
+  assert.equal(actionCall?.args?.[0]?.__expectedActionUrl, oldDocument.url);
+  assert.equal(actionCall?.args?.[0]?.__expectedActionTimeOrigin, oldDocument.timeOrigin);
+  assert.equal(actionCall?.args?.[0]?.__expectedActionToken, oldDocument.token);
+});
+
+test("a dispatched page action remains uncertain when its post-action document identity cannot be verified", async () => {
+  const oldDocument = { url: "https://example.test/action", timeOrigin: 1, token: "old-document" };
+  const fixture = loadExtension({
+    pageGenerationSequence: [oldDocument, {}],
+    executeScriptResults: { pageOperation: { ok: true, operation: "click", ref: "e1" } },
+  });
+  fixture.tabs.set(324, { id: 324, windowId: 1, title: "action", url: oldDocument.url, status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", { tabId: 324, operation: "click", ref: "e1", snapshotId: "observation-1", sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN"
+      && error?.details?.actionState === "unknown"
+      && error?.details?.inspectFirst === true,
+  );
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), true);
+});
+
+test("a side effect is not dispatched when its source document identity is unavailable", async () => {
+  const fixture = loadExtension({
+    pageGenerationSequence: [{}],
+    executeScriptResults: { pageOperation: { ok: true, operation: "click", ref: "e1" } },
+  });
+  fixture.tabs.set(325, { id: 325, windowId: 1, title: "action", url: "https://example.test/action", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", { tabId: 325, operation: "click", ref: "e1", snapshotId: "observation-1", sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN" && error?.details?.actionState === "unknown",
+  );
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
+test("wait-false navigation returns a transition-pending handle without probing a changing document", async () => {
+  const fixture = loadExtension({ pageGenerationSequence: [undefined] });
+  fixture.tabs.set(326, { id: 326, windowId: 1, title: "old", url: "https://example.test/old", status: "complete" });
+
+  const result = await fixture.api.handleRequest("navigate", {
+    tabId: 326,
+    url: "https://example.test/new",
+    wait: false,
+    sessionId: "session-test",
+  });
+
+  assert.equal(result.tab.id, 326);
+  assert.equal(result.tab.url, "https://example.test/new");
+  assert.equal(result.tab.transitionPending, true);
+  assert.equal(result.tab.handle.incarnation, undefined);
+  assert.equal(result.tab.handle.title, undefined);
+  assert.equal(result.tab.handle.url, undefined);
+  assert.match(result.tab.handle.tabFence, /^tab:/);
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageGeneration"), false);
+});
+
+test("a transition-pending handle remains usable for the required load wait", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(334, { id: 334, windowId: 1, title: "source", url: "https://example.test/source", status: "complete" });
+  const transition = await fixture.api.handleRequest("navigate", {
+    tabId: 334,
+    url: "https://example.test/destination",
+    wait: false,
+    sessionId: "session-test",
+  });
+  assert.equal(transition.tab.handle.url, undefined);
+  const waiting = fixture.api.handleRequest("wait", { handle: transition.tab.handle, state: "load", sessionId: "session-test" });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  fixture.tabs.get(334).status = "complete";
+  await fixture.emitTabUpdated(334, { status: "complete" }, fixture.tabs.get(334));
+  const ready = await waiting;
+  assert.equal(ready.condition, "load");
+  assert.equal(ready.tab.id, 334);
+});
+
+test("a claimed transition-pending handle remains usable for the required load wait", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(335, { id: 335, windowId: 1, title: "source", url: "https://example.test/source", status: "complete" });
+  await fixture.api.handleRequest("claim_tab", { tabId: 335, sessionId: "session-test" });
+  const transition = await fixture.api.handleRequest("navigate", {
+    tabId: 335,
+    url: "https://example.test/destination",
+    wait: false,
+    sessionId: "session-test",
+  });
+
+  const waiting = fixture.api.handleRequest("wait", { handle: transition.tab.handle, state: "load", sessionId: "session-test" });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  fixture.tabs.get(335).status = "complete";
+  await fixture.emitTabUpdated(335, { status: "complete" }, fixture.tabs.get(335));
+  const ready = await waiting;
+
+  assert.equal(ready.condition, "load");
+  assert.equal(ready.tab.id, 335);
+});
+
+test("history back falls back to a fenced CDP history entry when Tabs API falsely reports no entry", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(330, { id: 330, windowId: 1, title: "history", url: "https://example.test/current", status: "complete" });
+  fixture.chrome.tabs.goBack = async () => { throw new Error("Cannot find a next page in history."); };
+  const commands = [];
+  fixture.chrome.debugger.sendCommand = async (_debuggee, method, params = {}) => {
+    commands.push({ method, params });
+    if (method === "Page.getNavigationHistory") {
+      return { currentIndex: 1, entries: [{ id: 10, url: "https://example.test/previous" }, { id: 11, url: "https://example.test/current" }] };
+    }
+    if (method === "Page.navigateToHistoryEntry") return {};
+    return {};
+  };
+
+  const result = await fixture.api.handleRequest("back", { tabId: 330, sessionId: "session-test" });
+
+  assert.equal(result.tab.transitionPending, true);
+  assert.equal(result.tab.handle.incarnation, undefined);
+  assert.deepEqual(commands.map((entry) => entry.method), ["Page.getNavigationHistory", "Page.navigateToHistoryEntry"]);
+  assert.equal(commands[1].params.entryId, 10);
+  assert.equal(fixture.api.pendingDocumentTransitions.get("test-extension::330")?.observed, false);
+});
+
+test("history fallback fails closed when the document changes while selecting an entry", async () => {
+  const current = { url: "https://example.test/current", timeOrigin: 1, token: "source" };
+  const replacement = { ...current, token: "replacement" };
+  const fixture = loadExtension({ pageGenerationSequence: [current, current, replacement, replacement] });
+  fixture.tabs.set(336, { id: 336, windowId: 1, title: "history", url: current.url, status: "complete" });
+  fixture.chrome.tabs.goBack = async () => { throw new Error("Cannot find a next page in history."); };
+  const commands = [];
+  fixture.chrome.debugger.sendCommand = async (_debuggee, method) => {
+    commands.push(method);
+    if (method === "Page.getNavigationHistory") {
+      return { currentIndex: 1, entries: [{ id: 10, url: "https://example.test/previous" }, { id: 11, url: current.url }] };
+    }
+    return {};
+  };
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("back", { tabId: 336, sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_DOCUMENT_CHANGED" && error?.details?.actionState === "not_completed",
+  );
+  assert.deepEqual(commands, ["Page.getNavigationHistory"]);
+  assert.equal(fixture.api.pendingDocumentTransitions.has("test-extension::336"), false);
+});
+
+test("history back without an adjacent CDP entry fails deterministically before dispatch", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(331, { id: 331, windowId: 1, title: "history", url: "https://example.test/first", status: "complete" });
+  fixture.chrome.tabs.goBack = async () => { throw new Error("Cannot find a next page in history."); };
+  fixture.chrome.debugger.sendCommand = async (_debuggee, method) => method === "Page.getNavigationHistory"
+    ? { currentIndex: 0, entries: [{ id: 12, url: "https://example.test/first" }] }
+    : {};
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("back", { tabId: 331, sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_HISTORY_UNAVAILABLE" && error?.details?.direction === "back",
+  );
+  assert.equal(fixture.api.pendingDocumentTransitions.has("test-extension::331"), false);
+});
+
+test("reload returns a transition-pending handle without probing a changing document", async () => {
+  const fixture = loadExtension({ pageGenerationSequence: [undefined] });
+  fixture.tabs.set(329, { id: 329, windowId: 1, title: "reload", url: "https://example.test/reload", status: "complete" });
+  const result = await fixture.api.handleRequest("reload", { tabId: 329, sessionId: "session-test" });
+
+  assert.equal(result.tab.transitionPending, true);
+  assert.equal(result.tab.handle.incarnation, undefined);
+  assert.equal(result.tab.handle.url, undefined);
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageGeneration"), false);
+});
+
+test("document-bound requests reject an unobserved Agent transition before injecting into the source page", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(333, { id: 333, windowId: 1, title: "source", url: "https://example.test/source", status: "complete" });
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  const tab = listed.tabs.find((entry) => entry.id === 333);
+  assert.ok(tab?.handle?.tabFence);
+  fixture.api.pendingDocumentTransitions.set("test-extension::333", {
+    tabId: 333,
+    tabFence: tab.handle.tabFence,
+    startedAt: Date.now(),
+    observed: false,
+    completed: false,
+  });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("evaluate", { tabId: 333, sessionId: "session-test", expression: "document.title" }),
+    (error) => error?.code === "BROWSER_DOCUMENT_CHANGED" && error?.details?.transitionPending === true,
+  );
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageGeneration"), false);
+});
+
+test("load wait does not accept the source document before an Agent transition emits lifecycle", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(332, { id: 332, windowId: 1, title: "source", url: "https://example.test/source", status: "complete" });
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  const tab = listed.tabs.find((entry) => entry.id === 332);
+  assert.ok(tab?.handle?.tabFence);
+  const key = "test-extension::332";
+  fixture.api.pendingDocumentTransitions.set(key, {
+    tabId: 332,
+    tabFence: tab.handle.tabFence,
+    startedAt: Date.now(),
+    observed: false,
+    completed: false,
+  });
+  let settled = false;
+  const waiting = fixture.api.waitForTabState(332, { state: "load", timeoutMs: 1000 }, undefined, tab.handle.tabFence).then((result) => {
+    settled = true;
+    return result;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 125));
+  assert.equal(settled, false);
+  fixture.tabs.get(332).status = "loading";
+  await fixture.emitTabUpdated(332, { status: "loading" }, fixture.tabs.get(332));
+  fixture.tabs.get(332).status = "complete";
+  await fixture.emitTabUpdated(332, { status: "complete" }, fixture.tabs.get(332));
+  const ready = await waiting;
+  assert.equal(ready.status, "complete");
+  assert.equal(fixture.api.pendingDocumentTransitions.has(key), false);
+});
+
+test("ordinary ownership refresh remains uncertain for a verified page transition", async () => {
+  const fixture = loadExtension({
+    pageGenerationSequence: [
+      { url: "https://example.test/first", timeOrigin: 1, token: "one" },
+      { url: "https://example.test/second", timeOrigin: 2, token: "two" },
+    ],
+  });
+  fixture.tabs.set(327, { id: 327, windowId: 1, title: "first", url: "https://example.test/first", status: "complete" });
+  fixture.storage[ownedTabsKey] = {
+    version: 3,
+    records: {
+      "edge:test-extension:profile-id::327": record(327, "temporary", "first", "https://example.test/first"),
+    },
+  };
+
+  await assert.rejects(
+    () => fixture.api.refreshOwnedTabDocument(327, "tab:327", "session-test"),
+    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN" && error?.details?.pageChanged === true,
+  );
+});
+
+test("waited navigation ownership refresh does not bypass a tab-fence mismatch", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(328, { id: 328, windowId: 1, title: "fenced", url: "https://example.test/fenced", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.refreshOwnedTabDocument(328, "tab:not-328", "session-test", { allowPageChange: true }),
+    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN" && error?.details?.pageChanged !== true,
+  );
+});
+
+test("waited navigation ownership refresh tolerates a later verified page transition without overwriting cache", async () => {
+  const fixture = loadExtension({
+    pageGenerationSequence: [
+      { url: "https://example.test/first", timeOrigin: 1, token: "one" },
+      { url: "https://example.test/second", timeOrigin: 2, token: "two" },
+    ],
+  });
+  fixture.tabs.set(325, { id: 325, windowId: 1, title: "first", url: "https://example.test/first", status: "complete" });
+  fixture.storage[ownedTabsKey] = {
+    version: 3,
+    records: {
+      "edge:test-extension:profile-id::325": record(325, "temporary", "first", "https://example.test/first"),
+    },
+  };
+
+  const refreshed = await fixture.api.refreshOwnedTabDocument(325, "tab:325", "session-test", { allowPageChange: true });
+
+  assert.equal(refreshed, undefined);
+  assert.equal(storedRecord(fixture, 325)?.url, "https://example.test/first");
+});
+
+test("title-only tab updates retain remembered page and DOM observations", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(321, { id: 321, windowId: 1, title: "initial", url: "https://example.test/live-ref", status: "complete" });
+  fixture.api.pageSnapshotStates.set("test-extension::321", { snapshotId: "observation-1", observations: new Map([["observation-1", { url: "https://example.test/live-ref", timeOrigin: 1, token: "fixture-document-token" }]]) });
+  fixture.api.domSnapshotStates.set("test-extension::321", { snapshotId: "dom-observation-1", observations: new Map([["dom-observation-1", { url: "https://example.test/live-ref", timeOrigin: 1, token: "fixture-document-token" }]]) });
+
+  fixture.tabs.get(321).title = "updated";
+  await fixture.emitTabUpdated(321, { title: "updated" }, fixture.tabs.get(321));
+
+  assert.equal(fixture.api.pageSnapshotStates.get("test-extension::321")?.observations?.has("observation-1"), true);
+  assert.equal(fixture.api.pageSnapshotStates.get("test-extension::321")?.observations?.get("observation-1")?.invalidated, undefined);
+  assert.equal(fixture.api.domSnapshotStates.get("test-extension::321")?.observations?.has("dom-observation-1"), true);
+  assert.equal(fixture.api.domSnapshotStates.get("test-extension::321")?.observations?.get("dom-observation-1")?.invalidated, undefined);
+});
+
+test("document lifecycle tab updates retain bounded provenance for a precise stale-document diagnostic", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(322, { id: 322, windowId: 1, title: "initial", url: "https://example.test/live-ref", status: "complete" });
+  fixture.api.pageSnapshotStates.set("test-extension::322", { snapshotId: "observation-1", observations: new Map([["observation-1", { url: "https://example.test/live-ref", timeOrigin: 1, token: "fixture-document-token" }]]) });
+  fixture.api.domSnapshotStates.set("test-extension::322", { snapshotId: "dom-observation-1", observations: new Map([["dom-observation-1", { url: "https://example.test/live-ref", timeOrigin: 1, token: "fixture-document-token" }]]) });
+  fixture.api.accessibilitySnapshotStates.set("test-extension::322", { snapshotId: "accessibility-1", nodes: [] });
+
+  await fixture.emitTabUpdated(322, { status: "loading" }, fixture.tabs.get(322));
+
+  assert.equal(fixture.api.pageSnapshotStates.get("test-extension::322")?.observations?.has("observation-1"), true);
+  assert.equal(fixture.api.pageSnapshotStates.get("test-extension::322")?.observations?.get("observation-1")?.invalidated, true);
+  assert.equal(fixture.api.domSnapshotStates.get("test-extension::322")?.observations?.has("dom-observation-1"), true);
+  assert.equal(fixture.api.domSnapshotStates.get("test-extension::322")?.observations?.get("dom-observation-1")?.invalidated, true);
+  assert.equal(fixture.api.pageOperationParams(322, { snapshotId: "observation-1" }).__snapshotObservationInvalidated, true);
+  assert.equal(fixture.api.domCuaOperationParams(322, { snapshotId: "dom-observation-1" }).__domObservationInvalidated, true);
+  assert.equal(fixture.api.accessibilitySnapshotStates.get("test-extension::322"), undefined);
+});
+
+test("delayed document-transition fallback does not invalidate a new destination observation", async () => {
+  const fixture = loadExtension();
+  const key = "test-extension::323";
+  const oldObservation = { url: "https://example.test/old", timeOrigin: 1, token: "old" };
+  const newObservation = { url: "https://example.test/new", timeOrigin: 2, token: "new" };
+  const oldAccessibility = { snapshotId: "old", nodes: [] };
+  const newAccessibility = { snapshotId: "new", nodes: [] };
+  fixture.api.pageSnapshotStates.set(key, { snapshotId: "old", observations: new Map([["old", oldObservation]]) });
+  fixture.api.domSnapshotStates.set(key, { snapshotId: "old-dom", observations: new Map([["old-dom", oldObservation]]) });
+  fixture.api.accessibilitySnapshotStates.set(key, oldAccessibility);
+
+  const sourceObservations = fixture.api.capturePageObservationState(323);
+  fixture.api.pageSnapshotStates.get(key).observations.set("new", newObservation);
+  fixture.api.domSnapshotStates.get(key).observations.set("new-dom", newObservation);
+  fixture.api.accessibilitySnapshotStates.set(key, newAccessibility);
+  fixture.api.invalidatePageObservationStateAfterDocumentTransition(323, sourceObservations);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(oldObservation.invalidated, true);
+  assert.equal(newObservation.invalidated, undefined);
+  assert.equal(fixture.api.accessibilitySnapshotStates.get(key), newAccessibility);
+});
+
+test("internal ownership snapshots tolerate title-only changes but retain window and URL fences", () => {
+  const fixture = loadExtension();
+  const before = { windowId: 12, title: "Initial title", url: "https://example.test/page" };
+  assert.equal(fixture.api.tabSnapshotMatches(before, { ...before, title: "Updated title" }), true);
+  assert.equal(fixture.api.tabSnapshotMatches(before, { ...before, url: "https://example.test/other" }), false);
+  assert.equal(fixture.api.tabSnapshotMatches(before, { ...before, windowId: 13 }), false);
 });
 
 test("complete document handles tolerate title-only updates", async () => {

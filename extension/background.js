@@ -12,6 +12,9 @@ const MAX_EVENTS = 500;
 const CREATION_RESERVATION_TTL_MS = 30_000;
 const DOWNLOAD_CACHE_MAX = 200;
 const DOWNLOAD_CACHE_RETENTION_MS = 15 * 60_000;
+const PAGE_OBSERVATION_HISTORY_LIMIT = 16;
+const DOCUMENT_TRANSITION_TTL_MS = 30_000;
+const DOCUMENT_TRANSITION_HISTORY_LIMIT = 128;
 const EXTENSION_CAPABILITIES = Object.freeze({
   turnCleanup: true,
   turnScopedMarks: true,
@@ -24,6 +27,9 @@ const EXTENSION_CAPABILITIES = Object.freeze({
   requestCancellation: true,
   snapshotRefs: true,
   domCuaSnapshots: true,
+  liveRefs: true,
+  semanticRebind: true,
+  axRefs: false,
   tabIncarnationFence: true,
 });
 
@@ -77,6 +83,11 @@ let tabFenceStateLoaded = false;
 let ownedTabsMutationTail = Promise.resolve();
 const tabWaitBarriers = new Map();
 const downloadWaitBarriers = new Map();
+// Tracks Agent-dispatched document transitions until a following wait has seen
+// the corresponding browser lifecycle event. Without this, an immediately
+// following `browser_wait({ state: "load" })` can mistake the source page's
+// still-`complete` tab status for the destination having loaded.
+const pendingDocumentTransitions = new Map();
 const activeRequestControllers = new Map();
 const activeRequestDetails = new Map();
 let cleanupInFlight = Promise.resolve();
@@ -236,6 +247,74 @@ function stateForTab(tabId) {
     devtoolsState.set(key, state);
   }
   return state;
+}
+
+function beginDocumentTransition(tabId, expectedFence) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id) || id < 0 || typeof expectedFence !== "string") return undefined;
+  const key = runtimeStateKey(id);
+  const transition = {
+    tabId: id,
+    tabFence: expectedFence,
+    startedAt: Date.now(),
+    observed: false,
+    completed: false,
+  };
+  pendingDocumentTransitions.set(key, transition);
+  while (pendingDocumentTransitions.size > DOCUMENT_TRANSITION_HISTORY_LIMIT) pendingDocumentTransitions.delete(pendingDocumentTransitions.keys().next().value);
+  return transition;
+}
+
+function pendingDocumentTransition(tabId, expectedFence) {
+  const id = Number(tabId);
+  const key = runtimeStateKey(id);
+  const transition = pendingDocumentTransitions.get(key);
+  if (!transition) return undefined;
+  const currentFence = tabFenceTokens.get(key);
+  if (Date.now() - Number(transition.startedAt || 0) > DOCUMENT_TRANSITION_TTL_MS
+    || (typeof expectedFence === "string" && transition.tabFence !== expectedFence)
+    || (typeof currentFence === "string" && transition.tabFence !== currentFence)) {
+    pendingDocumentTransitions.delete(key);
+    return undefined;
+  }
+  return transition;
+}
+
+function clearDocumentTransition(tabId, expectedFence, expectedTransition) {
+  const id = Number(tabId);
+  const key = runtimeStateKey(id);
+  const transition = pendingDocumentTransitions.get(key);
+  if (!transition || (typeof expectedFence === "string" && transition.tabFence !== expectedFence)
+    || (expectedTransition !== undefined && transition !== expectedTransition)) return;
+  pendingDocumentTransitions.delete(key);
+}
+
+function observeDocumentTransition(tabId, changeInfo = {}) {
+  const transition = pendingDocumentTransition(tabId);
+  if (!transition) return;
+  const started = changeInfo.url !== undefined || changeInfo.status === "loading" || changeInfo.discarded === true;
+  if (started) {
+    transition.observed = true;
+    transition.observedAt = Date.now();
+  }
+  if (transition.observed === true && changeInfo.status === "complete") {
+    transition.completed = true;
+    transition.completedAt = Date.now();
+  }
+}
+
+function documentTransitionPendingError(tabId, method) {
+  const error = new Error("The tab document is transitioning; wait for load or URL completion and re-observe before this operation");
+  error.code = "BROWSER_DOCUMENT_CHANGED";
+  error.details = {
+    tabId: Number(tabId),
+    operation: method,
+    transitionPending: true,
+    actionState: "not_completed",
+    retryable: true,
+    inspectFirst: true,
+  };
+  return error;
 }
 
 function boundedEventText(value, limit = 4096) {
@@ -581,14 +660,21 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo = {}) => {
   const id = Number(tabId);
   if (!Number.isInteger(id) || id < 0) return;
   const key = runtimeStateKey(id);
-  // Any tab update can invalidate refs; URL/loading changes also reset debugger data tied to the old document.
-  pageSnapshotStates.delete(key);
-  domSnapshotStates.delete(key);
-  accessibilitySnapshotStates.delete(key);
-  if (changeInfo.url !== undefined || changeInfo.status === "loading") {
-    const state = devtoolsState.get(key) || (persistentDebuggers.has(key) ? stateForTab(id) : undefined);
-    if (state) resetDebuggerDocumentState(state, state.mainFrameId);
-  }
+  observeDocumentTransition(id, changeInfo);
+  // Metadata, focus, and title changes do not replace a document or invalidate its live refs.
+  // PageAgent owns live refs per document. The background keeps bounded provenance
+  // across document changes, but marks it non-actionable as soon as navigation starts
+  // so an old ref reports document_changed rather than becoming an arbitrary stale snapshot.
+  const documentMayHaveChanged = changeInfo.url !== undefined
+    || changeInfo.status === "loading"
+    || changeInfo.discarded === true;
+  if (!documentMayHaveChanged) return;
+  // Keep the provenance record so a late old ref produces a precise
+  // BROWSER_DOCUMENT_CHANGED diagnostic, but prevent an action during the
+  // short interval between Chrome's loading event and old-document unload.
+  invalidatePageObservationState(id);
+  const state = devtoolsState.get(key) || (persistentDebuggers.has(key) ? stateForTab(id) : undefined);
+  if (state) resetDebuggerDocumentState(state, state.mainFrameId);
 });
 
 chrome.tabs?.onCreated?.addListener((tab) => {
@@ -663,6 +749,7 @@ chrome.tabs?.onCreated?.addListener((tab) => {
 chrome.tabs?.onRemoved?.addListener((tabId) => {
   const id = Number(tabId);
   const key = runtimeStateKey(id);
+  pendingDocumentTransitions.delete(key);
   const removalIntent = tabRemovalIntents.get(key);
   if (removalIntent) removalIntent.removalObserved = true;
   const previous = tabRemovalTombstones.get(key);
@@ -819,6 +906,8 @@ chrome.tabs?.onReplaced?.addListener((addedTabId, removedTabId) => {
   const removedId = Number(removedTabId);
   if (!Number.isInteger(addedId) || !Number.isInteger(removedId)) return;
   const removedKey = runtimeStateKey(removedId);
+  pendingDocumentTransitions.delete(removedKey);
+  pendingDocumentTransitions.delete(runtimeStateKey(addedId));
   const existingTombstone = tabRemovalTombstones.get(removedKey);
   if (existingTombstone?.replaced && Number(existingTombstone.addedTabId) === addedId) return;
   if (existingTombstone?.superseded && !existingTombstone.replaced) return;
@@ -833,6 +922,7 @@ chrome.tabs?.onReplaced?.addListener((addedTabId, removedTabId) => {
   createdTabEvents.delete(removedKey);
   pageSnapshotStates.delete(removedKey);
   domSnapshotStates.delete(removedKey);
+  accessibilitySnapshotStates.delete(removedKey);
   devtoolsState.delete(removedKey);
   const removedDebugger = persistentDebuggers.get(removedKey);
   const removedOrphan = orphanedDebuggerAttaches.get(removedKey);
@@ -847,6 +937,7 @@ chrome.tabs?.onReplaced?.addListener((addedTabId, removedTabId) => {
   tombstone.replacementTransferInFlight = true;
   pageSnapshotStates.delete(addedKey);
   domSnapshotStates.delete(addedKey);
+  accessibilitySnapshotStates.delete(addedKey);
   devtoolsState.delete(addedKey);
   const addedDebugger = persistentDebuggers.get(addedKey);
   if (addedDebugger?.releaseTimer !== undefined) clearTimeout(addedDebugger.releaseTimer);
@@ -1277,9 +1368,9 @@ async function connect() {
               const readyTab = await waitAfterEffect("navigate", async () => {
                 await waitForTabState(navigationTabId, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: params.url }) }, requestController.signal, navigationTabFence);
                 await assertTabFence(navigationTabId, navigationTabFence, "read");
-                await refreshOwnedTabDocument(navigationTabId, navigationTabFence, params.sessionId);
+                await refreshOwnedTabDocument(navigationTabId, navigationTabFence, params.sessionId, { allowPageChange: true });
                 return tabEntryFor(navigationTabId, navigationTabFence, "navigate");
-              }, { tabId: navigationTabId });
+              }, { tabId: navigationTabId, phase: "bridge_waited_navigation" });
               if (socket !== next || next.readyState !== WebSocket.OPEN) response = { ok: false, error: { code: "BROWSER_OPERATION_UNCERTAIN", message: "Browser navigation completed after its Bridge connection became stale; inspect the current page before retrying" } };
               else response = { ok: true, result: { tab: readyTab } };
             }
@@ -1420,6 +1511,7 @@ function enqueueBridgeRequest(task) {
 }
 
 const TAB_REQUEST_METHODS = new Set(["selected_tab", "select_tab", "wait", "navigate", "back", "forward", "reload", "close_tab", "extract", "snapshot", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable", "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard", "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable"]);
+const STABLE_DOCUMENT_TAB_REQUESTS = new Set(["claim_tab", "extract", "snapshot", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard", "keypress", "scroll"]);
 
 function sessionBarrierKey(key, sessionId) {
   return JSON.stringify([sessionKey(sessionId), String(key)]);
@@ -1789,7 +1881,7 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
   });
 }
 
-async function refreshOwnedTabDocument(tabId, expectedFence, sessionId) {
+async function refreshOwnedTabDocument(tabId, expectedFence, sessionId, options = {}) {
   try {
     const currentTab = await chrome.tabs.get(Number(tabId));
     const currentFence = await tabFenceFor(tabId, true);
@@ -1812,6 +1904,11 @@ async function refreshOwnedTabDocument(tabId, expectedFence, sessionId) {
       return refreshed;
     });
   } catch (error) {
+    // A waited navigation already proved that a destination document loaded.
+    // Its ownership record is only cached metadata, so an intervening user/page
+    // transition during this refresh must not retroactively make navigation's
+    // known browser effect uncertain. Do not overwrite a record we cannot prove.
+    if (options.allowPageChange === true && error?.details?.pageChanged === true) return undefined;
     if (error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
     const uncertain = uncertainBrowserOperationError("document refresh", { tabId: Number(tabId) });
     uncertain.cause = error;
@@ -1877,7 +1974,10 @@ function attachTabFence(tab, fence) {
 
 function tabSnapshotMatches(left, right) {
   const same = (key) => left?.[key] === undefined || (right?.[key] !== undefined && String(left[key] || "") === String(right[key] || ""));
-  return same("windowId") && same("title") && same("url");
+  // A title is mutable presentation metadata. Explicit claim title checks remain
+  // strict, but internal ownership/document transactions fence window, URL, and
+  // document incarnation rather than failing on a harmless title update.
+  return same("windowId") && same("url");
 }
 function creationFlightMatches(tab, flight) {
   if (!flight || flight.active !== true) return false;
@@ -2130,7 +2230,9 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
     if (record.sessionId !== sessionKey(requestSessionId) && !allowCrossSessionRead) throw new Error(`Cannot use tab ${tab.id}; it belongs to another Agent session`);
     await assertOwnedTabFence(record, "use");
     if (explicitTabId !== undefined && !allowRecordedSnapshotChange && !hasCompleteNestedHandle && record.owner === "claimed") {
-      if (Number(record.windowId) !== Number(tab.windowId) || String(record.title ?? "") !== String(tab.title ?? "") || String(record.url ?? "") !== String(tab.url ?? "")) {
+      // A claimed tab's title is user-visible metadata, not document identity. Users and
+      // sites commonly update it while Agent work continues in the same document.
+      if (Number(record.windowId) !== Number(tab.windowId) || String(record.url ?? "") !== String(tab.url ?? "")) {
         throw new Error("Owned tab changed since it was recorded; take a new browser_tabs snapshot");
       }
       const incarnation = await readTabIncarnation(tab.id, fenceAfterVerification);
@@ -2190,8 +2292,10 @@ async function listTabs() {
     const currentFence = await tabFenceFor(tab.id, true);
     if (currentFence !== tabFence) throw uncertainBrowserOperationError("list_tabs", { tabId: tab.id });
     tab = currentTab;
+    const transition = pendingDocumentTransition(tab.id, currentFence);
+    const transitionPending = transition !== undefined && transition.completed !== true;
     const checksDocument = record?.owner === "claimed";
-    const incarnation = record ? await readTabIncarnation(tab.id, currentFence) : undefined;
+    const incarnation = record && !transitionPending ? await readTabIncarnation(tab.id, currentFence) : undefined;
     return {
       id: tab.id,
       browserId: identity.browserId,
@@ -2208,8 +2312,18 @@ async function listTabs() {
       ownership: record?.owner,
       sessionId: record?.sessionId,
       lifecycle: record?.lifecycle,
-      handle: { tabId: tab.id, browserId: identity.browserId, windowId: tab.windowId, title: tab.title || "", url: tab.url || "", groupId: tab.groupId, sessionId: record?.sessionId, tabFence: currentFence, ...(incarnation === undefined ? {} : { incarnation }) },
-      stale: record !== undefined && (record.runtimeId !== runtimeInstanceIdentity || Number(record.windowId) !== Number(tab.windowId) || record.tabFence !== currentFence || (checksDocument && (record.url !== (tab.url || "") || record.title !== (tab.title || "") || (record.incarnation === undefined || incarnation !== record.incarnation)))),
+      ...(transitionPending ? { transitionPending: true } : {}),
+      handle: {
+        tabId: tab.id,
+        browserId: identity.browserId,
+        windowId: tab.windowId,
+        ...(transitionPending ? {} : { title: tab.title || "", url: tab.url || "" }),
+        groupId: tab.groupId,
+        sessionId: record?.sessionId,
+        tabFence: currentFence,
+        ...(incarnation === undefined ? {} : { incarnation }),
+      },
+      stale: transitionPending || (record !== undefined && (record.runtimeId !== runtimeInstanceIdentity || Number(record.windowId) !== Number(tab.windowId) || record.tabFence !== currentFence || (checksDocument && (record.url !== (tab.url || "") || record.incarnation === undefined || incarnation !== record.incarnation)))),
     };
   }))).filter((entry) => entry !== undefined);
   return {
@@ -2226,6 +2340,51 @@ async function tabEntryFor(tabId, expectedFence, action = "read") {
   await assertTabFence(tabId, expectedFence, action);
   if (!listed) throw new Error(`Tab ${tabId} was not present while assembling the response`);
   return listed;
+}
+
+// `tabs.update({ url })` confirms dispatch but intentionally returns before the
+// destination document is stable when `wait: false`. Do not use listTabs() here:
+// it probes document incarnation and can race a transition that the caller just
+// requested. The returned handle has the tab fence but deliberately no document
+// incarnation, so callers must wait/re-observe before using document-bound APIs.
+async function transitionTabEntry(tabId, expectedFence, action = "navigate") {
+  const id = Number(tabId);
+  await assertTabFence(id, expectedFence, action);
+  const tab = await chrome.tabs.get(id);
+  const currentFence = await tabFenceFor(id, true);
+  if (currentFence !== expectedFence) throw uncertainBrowserOperationError(action, { tabId: id });
+  const identity = browserIdentity();
+  const stored = (await ownedTabs())[targetStateKey(id)];
+  const record = stored && (stored.browserId === undefined || stored.browserId === identity.browserId) ? stored : undefined;
+  return {
+    id,
+    browserId: identity.browserId,
+    favicon: typeof tab.favIconUrl === "string" && /^https?:\/\//i.test(tab.favIconUrl) ? tab.favIconUrl.slice(0, 2048) : "",
+    windowId: tab.windowId,
+    index: tab.index,
+    active: Boolean(tab.active),
+    pinned: Boolean(tab.pinned),
+    title: tab.title || "",
+    url: tab.url || "",
+    status: tab.status,
+    groupId: tab.groupId,
+    owner: record?.owner === "agent" ? "agent" : "user",
+    ownership: record?.owner,
+    sessionId: record?.sessionId,
+    lifecycle: record?.lifecycle,
+    transitionPending: true,
+    // A claimed tab's persisted document identity has necessarily become stale
+    // after dispatch; expose that fact without guessing a new incarnation.
+    stale: record?.owner === "claimed" || record?.runtimeId !== runtimeInstanceIdentity || record?.tabFence !== currentFence,
+    handle: {
+      tabId: id,
+      browserId: identity.browserId,
+      windowId: tab.windowId,
+      groupId: tab.groupId,
+      sessionId: record?.sessionId,
+      tabFence: currentFence,
+    },
+  };
 }
 
 async function recoverRetiredTabWithoutFence(tabId, tombstone, sessionId, browserId) {
@@ -2814,7 +2973,6 @@ function collectAccessibilitySnapshot(options = {}) {
 }
 
 function collectSnapshot(options = {}) {
-  const includeLiveState = false;
   const MAX_CHARS = 100_000;
   const MAX_NODES = 1_000;
   const DEFAULT_CHARS = 20_000;
@@ -2837,26 +2995,8 @@ function collectSnapshot(options = {}) {
     return `${text.slice(0, limit - 3)}...`;
   };
   const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
-  const domFingerprint = () => {
-    let hash = 2166136261;
-    const add = (value) => { for (const character of String(value ?? "")) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619); };
-    const visit = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) { add(`text:${node.nodeValue}`); return; }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      add(`<${node.tagName}`);
-      for (const attribute of Array.from(node.attributes).sort((left, right) => left.name.localeCompare(right.name))) {
-        if (attribute.name.startsWith("data-pi-control-chrome-") || ["data-pi-snapshot-id", "data-pi-dom-snapshot-id"].includes(attribute.name)) continue;
-        add(`${attribute.name}=${attribute.value}`);
-      }
-      if (includeLiveState && "value" in node) add(`value:${node.value}`);
-      if (includeLiveState && "checked" in node) add(`checked:${node.checked}`);
-      if (includeLiveState && "selected" in node) add(`selected:${node.selected}`);
-      for (const child of Array.from(node.childNodes)) visit(child);
-      add("</>");
-    };
-    visit(document.documentElement);
-    return String(hash >>> 0);
-  };
+  const pageAgent = globalThis["__piControlChromePageAgent"];
+  if (!pageAgent || typeof pageAgent.remember !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const isContentEditableHost = (element) => {
     const attr = element.getAttribute("contenteditable");
     return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
@@ -2937,18 +3077,6 @@ function collectSnapshot(options = {}) {
     documentToken = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
     try { Object.defineProperty(globalThis, documentTokenKey, { configurable: false, enumerable: false, value: documentToken }); } catch { globalThis[documentTokenKey] = documentToken; }
   }
-  document.querySelectorAll("[data-pi-control-chrome-ref]").forEach((element) => element.removeAttribute("data-pi-control-chrome-ref"));
-  document.documentElement.setAttribute("data-pi-snapshot-id", snapshotId);
-  const observerKey = "__piControlChromeSnapshotObserver";
-  globalThis[observerKey]?.disconnect?.();
-  const observer = new MutationObserver((mutations) => {
-    if (!mutations.some((mutation) => mutation.type === "childList" || mutation.type === "characterData" || (mutation.type === "attributes" && !["data-pi-dom-snapshot-id", "data-pi-snapshot-id"].includes(mutation.attributeName)))) return;
-    const root = document.documentElement;
-    if (root.hasAttribute("data-pi-snapshot-id")) root.setAttribute("data-pi-snapshot-id", crypto.randomUUID());
-    if (root.hasAttribute("data-pi-dom-snapshot-id")) root.setAttribute("data-pi-dom-snapshot-id", crypto.randomUUID());
-  });
-  observer.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
-  globalThis[observerKey] = observer;
   const root = (() => {
     if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
     try {
@@ -2965,6 +3093,7 @@ function collectSnapshot(options = {}) {
   if (root.matches?.(candidateSelector)) candidates.push(root);
   candidates.push(...Array.from(root.querySelectorAll(candidateSelector)));
   const elements = [];
+  const refRecords = new Map();
   let elementCharCount = 0;
   let elementsTruncated = false;
   let counter = 0;
@@ -2991,18 +3120,39 @@ function collectSnapshot(options = {}) {
       elementsTruncated = true;
       break;
     }
-    element.setAttribute("data-pi-control-chrome-ref", ref);
+    refRecords.set(ref, {
+      // Keep the original node without retaining removed application subtrees forever.
+      element: typeof WeakRef === "function" ? new WeakRef(element) : element,
+      descriptor: {
+        tag: entry.tag,
+        role: entry.role,
+        name: entry.name,
+        label: labelTextOf(element) || undefined,
+        placeholder: element.getAttribute("placeholder") || undefined,
+        testId: element.getAttribute("data-testid") || undefined,
+        id: element.id || undefined,
+        nameAttribute: element.getAttribute("name") || undefined,
+        inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
+      },
+      constraints: {
+        editable: isValueBearing(element),
+        actionable: true,
+        inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
+      },
+    });
     elements.push(entry);
     elementCharCount += cost;
   }
-  const snapshotFingerprint = domFingerprint();
-  document.documentElement.setAttribute("data-pi-control-chrome-snapshot-fingerprint", snapshotFingerprint);
-  observer.takeRecords();
+  // Do not publish a partially populated observation if a page getter throws
+  // while we are walking a hostile or concurrently changing DOM.
+  pageAgent.remember("snapshot", snapshotId, {
+    refs: refRecords,
+    documentIdentity: { url: location.href, timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined, token: documentToken },
+  });
   const rawPageText = root.innerText || root.textContent || "";
   const pageText = bound(rawPageText.replace(/\n{3,}/g, "\n\n"), pageTextLimit);
   return {
     snapshotId,
-    __piControlChromeSnapshotFingerprint: snapshotFingerprint,
     __piControlChromeSnapshotUrl: location.href,
     __piControlChromeSnapshotTimeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
     __piControlChromeSnapshotToken: documentToken,
@@ -3075,7 +3225,6 @@ function extractPage(options = {}) {
 }
 
 async function pageOperation(params = {}) {
-  const includeLiveState = false;
   try {
     const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
     const matches = (value, matcher, exact) => {
@@ -3088,26 +3237,6 @@ async function pageOperation(params = {}) {
       const parsed = value === undefined ? fallback : Number(value);
       if (!Number.isFinite(parsed) || parsed < 1) throw new Error("timeoutMs must be a positive finite number");
       return Math.min(parsed, maximum);
-    };
-    const domFingerprint = () => {
-      let hash = 2166136261;
-      const add = (value) => { for (const character of String(value ?? "")) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619); };
-      const visit = (node) => {
-        if (node.nodeType === Node.TEXT_NODE) { add(`text:${node.nodeValue}`); return; }
-        if (node.nodeType !== Node.ELEMENT_NODE) return;
-        add(`<${node.tagName}`);
-        for (const attribute of Array.from(node.attributes).sort((left, right) => left.name.localeCompare(right.name))) {
-          if (attribute.name.startsWith("data-pi-control-chrome-") || ["data-pi-snapshot-id", "data-pi-dom-snapshot-id"].includes(attribute.name)) continue;
-          add(`${attribute.name}=${attribute.value}`);
-        }
-      if (includeLiveState && "value" in node) add(`value:${node.value}`);
-      if (includeLiveState && "checked" in node) add(`checked:${node.checked}`);
-      if (includeLiveState && "selected" in node) add(`selected:${node.selected}`);
-      for (const child of Array.from(node.childNodes)) visit(child);
-        add("</>");
-      };
-      visit(document.documentElement);
-      return String(hash >>> 0);
     };
   const isVisible = (element) => {
     const rect = element.getBoundingClientRect();
@@ -3289,9 +3418,8 @@ async function pageOperation(params = {}) {
     const candidates = allElements(root);
     let elements;
     if (spec.ref !== undefined) {
-      const ref = String(spec.ref);
-      if (!/^e\d+$/.test(ref)) throw new Error("Element ref must match eN, such as e12");
-      elements = candidates.filter((element) => element.getAttribute("data-pi-control-chrome-ref") === ref);
+      const element = resolveSnapshotRef(String(spec.ref), root);
+      elements = root === document || root.contains(element) ? [element] : [];
     } else if (spec.selector !== undefined) {
       elements = selectorElements(root, spec.selector);
     } else if (spec.role !== undefined) {
@@ -3363,7 +3491,6 @@ async function pageOperation(params = {}) {
     const deadline = Date.now() + timeoutLimit(timeoutMs, 5000, 30000);
     let lastCount = 0;
     while (Date.now() < deadline) {
-      if (containsRefTarget(spec)) requireCurrentSnapshot();
       const found = elementsFor(spec, { projectTextToActionable: true, indexAfterVisibility: true }).filter(isInteractable);
       lastCount = found.length;
       if (found.length === 1) {
@@ -3407,26 +3534,144 @@ async function pageOperation(params = {}) {
     }
     return matches(pageVisibleText(), text, false);
   };
-  const containsRefTarget = (value) => Boolean(value && typeof value === "object" && !Array.isArray(value) && (value.ref !== undefined || ((value.combine === "and" || value.combine === "or") && (containsRefTarget(value.left) || containsRefTarget(value.right)))));
-  const staleSnapshotError = () => {
-    const error = new Error("Snapshot is stale; take a new browser_snapshot before using this ref");
+  const pageAgent = globalThis["__piControlChromePageAgent"];
+  const isMapLike = (value) => Boolean(value
+    && typeof value.get === "function"
+    && typeof value.set === "function"
+    && typeof value.values === "function");
+  const refResolution = new WeakMap();
+  const documentIdentity = () => ({
+    url: location.href,
+    timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
+    token: globalThis["__piControlChromeDocumentToken"],
+  });
+  const sameDocument = (left, right) => Boolean(left && right
+    && left.url === right.url
+    && left.timeOrigin === right.timeOrigin
+    && typeof left.token === "string"
+    && typeof right.token === "string"
+    && left.token === right.token);
+  const expectedMatches = (expected, current) => (expected.url === undefined || expected.url === current.url)
+    && (expected.timeOrigin === undefined || expected.timeOrigin === current.timeOrigin)
+    && (expected.token === undefined || expected.token === current.token);
+  const staleSnapshotError = (reason = "observation_unavailable") => {
+    const error = new Error("Snapshot reference is unavailable; take a new browser_snapshot before using this ref");
     error.code = "STALE_SNAPSHOT";
-    error.details = { snapshotId: params.snapshotId };
+    error.details = { snapshotId: params.snapshotId, reason };
     return error;
   };
-  const requireCurrentSnapshot = () => {
-    const currentSnapshotId = document.documentElement?.getAttribute("data-pi-snapshot-id");
-    const expectedFingerprint = params.__expectedSnapshotFingerprint;
-    const expectedUrl = params.__expectedSnapshotUrl;
-    const expectedTimeOrigin = params.__expectedSnapshotTimeOrigin;
-    const expectedToken = params.__expectedSnapshotToken;
-    const currentToken = globalThis["__piControlChromeDocumentToken"];
-    if (typeof params.snapshotId !== "string" || !params.snapshotId || currentSnapshotId !== params.snapshotId
-      || typeof expectedFingerprint !== "string" || domFingerprint() !== expectedFingerprint
-      || typeof expectedUrl !== "string" || location.href !== expectedUrl
-      || (typeof expectedTimeOrigin === "number" && performance.timeOrigin !== expectedTimeOrigin)
-      || (typeof expectedToken === "string" && currentToken !== expectedToken)) throw staleSnapshotError();
+  const documentChangedError = () => {
+    const error = new Error("Snapshot reference belongs to an earlier document; inspect the current page before retrying");
+    error.code = "BROWSER_DOCUMENT_CHANGED";
+    error.details = { snapshotId: params.snapshotId, actionState: "not_completed", retryable: true, inspectFirst: true };
+    return error;
   };
+  // The background reads a generation before dispatch. Check that exact
+  // document again immediately before a side effect so a shared user's
+  // navigation cannot turn a semantic locator into an action on its new page.
+  // A navigation caused by the action itself still returns success: this guard
+  // runs before the event-dispatching call, while the background verifies the
+  // readable post-action identity separately.
+  const expectedActionDocument = {
+    url: params.__expectedActionUrl,
+    timeOrigin: params.__expectedActionTimeOrigin,
+    token: params.__expectedActionToken,
+  };
+  const hasExpectedActionDocument = expectedActionDocument.url !== undefined
+    || expectedActionDocument.timeOrigin !== undefined
+    || expectedActionDocument.token !== undefined;
+  const actionDocumentChangedError = () => {
+    const error = new Error("The tab document changed before the page operation could execute; inspect the current page before retrying");
+    error.code = "BROWSER_DOCUMENT_CHANGED";
+    error.details = { actionState: "not_completed", retryable: true, inspectFirst: true };
+    return error;
+  };
+  const assertExpectedActionDocument = () => {
+    if (hasExpectedActionDocument && !sameDocument(expectedActionDocument, documentIdentity())) throw actionDocumentChangedError();
+  };
+  const descriptorMatches = (element, descriptor = {}) => {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+    if (descriptor.tag && element.tagName.toLowerCase() !== String(descriptor.tag).toLowerCase()) return false;
+    if (descriptor.role && roleOf(element) !== descriptor.role) return false;
+    if (descriptor.testId && element.getAttribute("data-testid") !== descriptor.testId) return false;
+    if (descriptor.id && element.id !== descriptor.id) return false;
+    if (descriptor.nameAttribute && element.getAttribute("name") !== descriptor.nameAttribute) return false;
+    if (descriptor.inputType && (!(element instanceof HTMLInputElement) || String(element.type || "text").toLowerCase() !== descriptor.inputType)) return false;
+    if (descriptor.placeholder && element.getAttribute("placeholder") !== descriptor.placeholder) return false;
+    if (descriptor.label && !matches(labelTextOf(element), descriptor.label, true)) return false;
+    if (descriptor.name && !matches(nameOf(element), descriptor.name, true)) return false;
+    return true;
+  };
+  // Do not treat a tag/role pair alone as enough provenance to move an action to a
+  // replacement node. A rebind needs at least one stable semantic discriminator.
+  const canSemanticRebind = (descriptor = {}) => Boolean(
+    descriptor.testId || descriptor.id || descriptor.nameAttribute || descriptor.label || descriptor.placeholder || descriptor.name,
+  );
+  const rebindCandidates = (descriptor, root = document) => {
+    const candidates = root === document
+      ? allElements(document)
+      : [root, ...allElements(root)];
+    return candidates
+      .filter((element) => element.isConnected && element.ownerDocument === document)
+      .filter((element) => descriptorMatches(element, descriptor));
+  };
+  const detachedSnapshotRefError = (reason = "no_equivalent_target", rebound = false) => {
+    const error = new Error("Referenced element was detached and could not be safely rebound; take a new browser_snapshot before retrying");
+    error.code = "ELEMENT_TARGET_DETACHED";
+    error.details = { snapshotId: params.snapshotId, rebound, reason };
+    return error;
+  };
+  const changedSnapshotRefError = (rebound = false) => {
+    const error = new Error("Referenced element changed semantic identity; inspect the current page before retrying");
+    error.code = "ELEMENT_TARGET_NOT_FOUND";
+    error.details = { snapshotId: params.snapshotId, rebound, reason: "original_target_changed", inspectFirst: true };
+    return error;
+  };
+  const resolveSnapshotRef = (ref, candidateRoot = document) => {
+    if (!/^e\d+$/.test(ref)) throw new Error("Element ref must match eN, such as e12");
+    if (typeof params.snapshotId !== "string" || !params.snapshotId || !pageAgent || typeof pageAgent.lookup !== "function") throw staleSnapshotError();
+    if (params.__snapshotObservationInvalidated === true) throw documentChangedError();
+    const currentDocument = documentIdentity();
+    const expectedDocument = {
+      url: params.__expectedSnapshotUrl,
+      timeOrigin: params.__expectedSnapshotTimeOrigin,
+      token: params.__expectedSnapshotToken,
+    };
+    if ((typeof expectedDocument.url === "string" || typeof expectedDocument.timeOrigin === "number" || typeof expectedDocument.token === "string")
+      && !expectedMatches(expectedDocument, currentDocument)) throw documentChangedError();
+    const observation = pageAgent.lookup("snapshot", params.snapshotId);
+    if (!observation || !isMapLike(observation.refs)) throw staleSnapshotError();
+    if (!sameDocument(observation.documentIdentity, currentDocument)) throw documentChangedError();
+    const record = observation.refs.get(ref);
+    if (!record) throw staleSnapshotError("ref_not_found");
+    const original = typeof record.element?.deref === "function" ? record.element.deref() : record.element;
+    if (original?.isConnected && original.ownerDocument === document) {
+      const rebound = record.rebound === true;
+      if (!descriptorMatches(original, record.descriptor)) throw changedSnapshotRefError(rebound);
+      refResolution.set(original, { resolvedBy: rebound ? "semantic_rebind" : "original_ref", rebound });
+      return original;
+    }
+    // A ref may move once to a proven equivalent replacement. Persist that
+    // replacement as the record target so a later framework replacement cannot
+    // turn one provenance check into an unbounded chain of redirects.
+    if (record.rebound === true) throw detachedSnapshotRefError("rebind_already_used", true);
+    if (!canSemanticRebind(record.descriptor)) throw detachedSnapshotRefError("descriptor_not_strong_enough");
+    const candidates = rebindCandidates(record.descriptor, candidateRoot);
+    if (candidates.length === 1) {
+      record.element = typeof WeakRef === "function" ? new WeakRef(candidates[0]) : candidates[0];
+      record.rebound = true;
+      refResolution.set(candidates[0], { resolvedBy: "semantic_rebind", rebound: true });
+      return candidates[0];
+    }
+    if (candidates.length > 1) {
+      const error = new Error(`Snapshot reference resolved to ${candidates.length} equivalent elements; narrow the target before retrying`);
+      error.code = "ELEMENT_TARGET_AMBIGUOUS";
+      error.details = { count: candidates.length, rebound: true, snapshotId: params.snapshotId };
+      throw error;
+    }
+    throw detachedSnapshotRefError();
+  };
+  const resolutionDetails = (element) => refResolution.get(element) || undefined;
   if (params.pageOperation === "wait") {
     const state = String(params.state || "load");
     if (state === "text" || state === "text_gone") {
@@ -3435,7 +3680,6 @@ async function pageOperation(params = {}) {
       return { matched: state === "text" ? present : !present };
     }
     if (!["visible", "hidden", "enabled"].includes(state)) throw new Error(`Unsupported page wait state: ${state}`);
-    if (containsRefTarget(params.target)) requireCurrentSnapshot();
     const found = elementsFor(params.target, { projectTextToActionable: true, indexAfterVisibility: state !== "hidden" });
     const visible = found.filter(isVisible);
     if (state === "hidden") return { matched: visible.length === 0, count: visible.length };
@@ -3459,14 +3703,9 @@ async function pageOperation(params = {}) {
     };
   }
   if (params.pageOperation === "interaction") {
-    const targetUsesRef = containsRefTarget(params.target);
-    if (params.ref !== undefined || targetUsesRef) {
-      requireCurrentSnapshot();
-    } else if (params.snapshotId !== undefined) {
-      requireCurrentSnapshot();
-    }
     let element;
     if (params.operation === "scroll") {
+      assertExpectedActionDocument();
       window.scrollBy(Number(params.deltaX || 0), Number(params.deltaY || 0));
       return { ok: true, operation: params.operation };
     }
@@ -3479,6 +3718,7 @@ async function pageOperation(params = {}) {
       element = await waitForElement({ ref: String(params.ref) }, params.timeoutMs);
     }
     if (!element) throw new Error(`Element not found: ${params.target ? targetText(params.target) : params.ref || params.selector || "unknown"}`);
+    assertExpectedActionDocument();
     if (params.operation === "click") element.click();
     else if (params.operation === "double_click") dispatchDoubleClick(element);
     else if (params.operation === "focus") element.focus();
@@ -3528,17 +3768,12 @@ async function pageOperation(params = {}) {
       if (Boolean(element.checked) !== checked) element.click();
       if (Boolean(element.checked) !== checked) throw new Error(`Could not set checked state to ${checked}`);
     } else throw new Error(`Unsupported interaction operation: ${params.operation}`);
-    if (params.target !== undefined) return { ok: true, operation: params.operation, target: params.target, element: describe(element) };
-    return { ok: true, operation: params.operation, ref: params.ref || params.selector };
+    const resolution = resolutionDetails(element);
+    if (params.target !== undefined) return { ok: true, operation: params.operation, target: params.target, element: describe(element), ...(resolution || {}) };
+    return { ok: true, operation: params.operation, ref: params.ref || params.selector, ...(resolution || {}) };
   }
   const locator = params.locator || params.target || { strategy: "css", value: "*" };
   const action = String(params.action || "");
-  const usesRef = (value) => Boolean(value && typeof value === "object" && !Array.isArray(value) && (value.ref !== undefined || ((value.combine === "and" || value.combine === "or") && (usesRef(value.left) || usesRef(value.right)))));
-  if (usesRef(locator)) {
-    requireCurrentSnapshot();
-  } else if (params.snapshotId !== undefined) {
-    requireCurrentSnapshot();
-  }
   const actionProjection = action === "focus" || ["click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "isVisible", "isEnabled", "first", "last", "nth"].includes(action);
   const resolve = () => elementsFor(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection });
   if (action === "filter") return { ...locator, hasText: params.value !== undefined ? String(params.value) : locator.hasText, hasSelector: params.hasSelector ?? locator.hasSelector };
@@ -3552,9 +3787,10 @@ async function pageOperation(params = {}) {
   if (action === "getAttribute") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).getAttribute(String(params.attribute));
   if (action === "isVisible") return isVisible(strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }));
   if (action === "isEnabled") return !isDisabled(strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }));
-  if (action === "focus") { const element = actionProjection ? await waitForElement(locator, params.timeoutMs) : strict(locator); element.focus(); return { ok: true }; }
+  if (action === "focus") { const element = actionProjection ? await waitForElement(locator, params.timeoutMs) : strict(locator); assertExpectedActionDocument(); element.focus(); return { ok: true }; }
   if (["click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover"].includes(action)) {
     const element = actionProjection ? await waitForElement(locator, params.timeoutMs) : strict(locator);
+    assertExpectedActionDocument();
     if (action === "click") element.click();
     else if (action === "dblclick") dispatchDoubleClick(element);
     else if (action === "hover") element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
@@ -3596,16 +3832,13 @@ async function pageOperation(params = {}) {
       if (Boolean(element.checked) !== checked) throw new Error(`Could not set checked state to ${checked}`);
     }
     const rect = element.getBoundingClientRect();
-    return { ok: true, element: describe(element), rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+    return { ok: true, element: describe(element), rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, ...(resolutionDetails(element) || {}) };
   }
   if (action === "waitFor") {
     const deadline = Date.now() + timeoutLimit(params.timeoutMs, 5000, 30000);
     while (Date.now() < deadline) {
       const found = resolve().filter(isVisible);
-      if (found.length > 0) {
-        if (usesRef(locator)) requireCurrentSnapshot();
-        return { ok: true, count: found.length };
-      }
+      if (found.length > 0) return { ok: true, count: found.length };
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
     }
     throw new Error("Timed out waiting for locator");
@@ -3629,7 +3862,6 @@ async function pageOperation(params = {}) {
 }
 
 function collectVisibleDom(options = {}) {
-  const includeLiveState = true;
   const MAX_CHARS = 100_000;
   const MAX_NODES = 1_000;
   const DEFAULT_CHARS = 20_000;
@@ -3649,27 +3881,8 @@ function collectVisibleDom(options = {}) {
     if (limit <= 3) return text.slice(0, limit);
     return `${text.slice(0, limit - 3)}...`;
   };
-  const domFingerprint = () => {
-    let hash = 2166136261;
-    const add = (value) => { for (const character of String(value ?? "")) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619); };
-    const visit = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) { add(`text:${node.nodeValue}`); return; }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      add(`<${node.tagName}`);
-      for (const attribute of Array.from(node.attributes).sort((left, right) => left.name.localeCompare(right.name))) {
-        if (attribute.name.startsWith("data-pi-control-chrome-") || ["data-pi-snapshot-id", "data-pi-dom-snapshot-id"].includes(attribute.name)) continue;
-        add(`${attribute.name}=${attribute.value}`);
-      }
-      if (includeLiveState && "value" in node) add(`value:${node.value}`);
-      if (includeLiveState && "checked" in node) add(`checked:${node.checked}`);
-      if (includeLiveState && "selected" in node) add(`selected:${node.selected}`);
-      for (const child of Array.from(node.childNodes)) visit(child);
-      add("</>");
-    };
-    visit(document.documentElement);
-    return String(hash >>> 0);
-  };
-  document.querySelectorAll("[data-pi-control-chrome-dom-id]").forEach((element) => element.removeAttribute("data-pi-control-chrome-dom-id"));
+  const pageAgent = globalThis["__piControlChromePageAgent"];
+  if (!pageAgent || typeof pageAgent.remember !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const snapshotId = crypto.randomUUID();
   const documentTokenKey = "__piControlChromeDocumentToken";
   let documentToken = globalThis[documentTokenKey];
@@ -3677,17 +3890,7 @@ function collectVisibleDom(options = {}) {
     documentToken = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
     try { Object.defineProperty(globalThis, documentTokenKey, { configurable: false, enumerable: false, value: documentToken }); } catch { globalThis[documentTokenKey] = documentToken; }
   }
-  document.documentElement?.setAttribute("data-pi-dom-snapshot-id", snapshotId);
-  const observerKey = "__piControlChromeSnapshotObserver";
-  globalThis[observerKey]?.disconnect?.();
-  const observer = new MutationObserver((mutations) => {
-    if (!mutations.some((mutation) => mutation.type === "childList" || mutation.type === "characterData" || (mutation.type === "attributes" && !["data-pi-dom-snapshot-id", "data-pi-snapshot-id"].includes(mutation.attributeName)))) return;
-    const root = document.documentElement;
-    if (root?.hasAttribute("data-pi-snapshot-id")) root.setAttribute("data-pi-snapshot-id", crypto.randomUUID());
-    if (root?.hasAttribute("data-pi-dom-snapshot-id")) root.setAttribute("data-pi-dom-snapshot-id", crypto.randomUUID());
-  });
-  observer.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
-  globalThis[observerKey] = observer;
+  const nodeRecords = new Map();
   let counter = 0;
   const nodes = [];
   let charCount = 0;
@@ -3730,16 +3933,27 @@ function collectVisibleDom(options = {}) {
     let node;
     if (include) {
       const id = `d${++counter}`;
-      element.setAttribute("data-pi-control-chrome-dom-id", id);
       const rect = element.getBoundingClientRect();
       const text = bound(element.innerText || element.textContent || "");
       node = { node_id: id, parent_id: parentId, tag: element.tagName.toLowerCase(), role: bound(element.getAttribute("role") || "", 64) || undefined, text, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, children: [] };
       const cost = JSON.stringify(node).length + (nodes.length > 0 ? 1 : 0);
       if (nodes.length >= maxNodes || charCount + cost > maxChars) {
         truncated = true;
-        element.removeAttribute("data-pi-control-chrome-dom-id");
         return undefined;
       }
+      nodeRecords.set(id, {
+        // A WeakRef lets a removed DOM subtree be collected; resolver then uses the
+        // bounded semantic descriptor only when it has one unambiguous replacement.
+        element: typeof WeakRef === "function" ? new WeakRef(element) : element,
+        descriptor: {
+          tag: node.tag,
+          role: node.role,
+          text: node.text,
+          id: element.id || undefined,
+          testId: element.getAttribute("data-testid") || undefined,
+          inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
+        },
+      });
       nodes.push(node);
       charCount += cost;
       currentParent = id;
@@ -3769,12 +3983,14 @@ function collectVisibleDom(options = {}) {
     return node?.node_id || firstDescendantId;
   };
   if (root) walk(root);
-  const domFingerprintValue = domFingerprint();
-  document.documentElement?.setAttribute("data-pi-control-chrome-dom-fingerprint", domFingerprintValue);
-  observer.takeRecords();
+  // Store only the completed observation. A selector failure or output budget
+  // truncation must not leave a blank/partially populated registry entry.
+  pageAgent.remember("dom", snapshotId, {
+    nodes: nodeRecords,
+    documentIdentity: { url: location.href, timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined, token: documentToken },
+  });
   return {
     snapshotId,
-    __piControlChromeDomFingerprint: domFingerprintValue,
     __piControlChromeDomUrl: location.href,
     __piControlChromeDomTimeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
     __piControlChromeDomToken: documentToken,
@@ -3788,39 +4004,119 @@ function collectVisibleDom(options = {}) {
   };
 }
 
-function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __expectedDomFingerprint, __expectedDomUrl, __expectedDomTimeOrigin, __expectedDomToken }) {
-  const includeLiveState = true;
+function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __domObservationInvalidated, __expectedDomUrl, __expectedDomTimeOrigin, __expectedDomToken, __expectedActionUrl, __expectedActionTimeOrigin, __expectedActionToken }) {
   try {
-  const domFingerprint = () => {
-    let hash = 2166136261;
-    const add = (value) => { for (const character of String(value ?? "")) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619); };
-    const visit = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) { add(`text:${node.nodeValue}`); return; }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      add(`<${node.tagName}`);
-      for (const attribute of Array.from(node.attributes).sort((left, right) => left.name.localeCompare(right.name))) {
-        if (attribute.name.startsWith("data-pi-control-chrome-") || ["data-pi-snapshot-id", "data-pi-dom-snapshot-id"].includes(attribute.name)) continue;
-        add(`${attribute.name}=${attribute.value}`);
-      }
-      if (includeLiveState && "value" in node) add(`value:${node.value}`);
-      if (includeLiveState && "checked" in node) add(`checked:${node.checked}`);
-      if (includeLiveState && "selected" in node) add(`selected:${node.selected}`);
-      for (const child of Array.from(node.childNodes)) visit(child);
-      add("</>");
-    };
-    visit(document.documentElement);
-    return String(hash >>> 0);
-  };
   if (!["get_visible_dom", "click", "double_click", "type", "keypress", "scroll"].includes(action)) throw new Error("DOM CUA action must be get_visible_dom, click, double_click, type, keypress or scroll");
-  const expectedFingerprint = __expectedDomFingerprint;
-  const currentSnapshotId = document.documentElement?.getAttribute("data-pi-dom-snapshot-id");
-  if (nodeId !== undefined && (!snapshotId || currentSnapshotId !== String(snapshotId) || typeof expectedFingerprint !== "string" || domFingerprint() !== expectedFingerprint || typeof __expectedDomUrl !== "string" || location.href !== __expectedDomUrl || (typeof __expectedDomTimeOrigin === "number" && performance.timeOrigin !== __expectedDomTimeOrigin) || (typeof __expectedDomToken === "string" && globalThis["__piControlChromeDocumentToken"] !== __expectedDomToken))) {
-    const error = new Error("DOM snapshot is stale; take a new browser_dom_cua get_visible_dom snapshot before using this node");
+  const pageAgent = globalThis["__piControlChromePageAgent"];
+  const isMapLike = (value) => Boolean(value
+    && typeof value.get === "function"
+    && typeof value.set === "function"
+    && typeof value.values === "function");
+  const currentDocument = {
+    url: location.href,
+    timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
+    token: globalThis["__piControlChromeDocumentToken"],
+  };
+  const expectedMatches = (expected, current) => (expected.url === undefined || expected.url === current.url)
+    && (expected.timeOrigin === undefined || expected.timeOrigin === current.timeOrigin)
+    && (expected.token === undefined || expected.token === current.token);
+  const sameDocument = (left, right) => Boolean(left && right
+    && left.url === right.url
+    && left.timeOrigin === right.timeOrigin
+    && typeof left.token === "string"
+    && typeof right.token === "string"
+    && left.token === right.token);
+  const expectedActionDocument = {
+    url: __expectedActionUrl,
+    timeOrigin: __expectedActionTimeOrigin,
+    token: __expectedActionToken,
+  };
+  const hasExpectedActionDocument = expectedActionDocument.url !== undefined
+    || expectedActionDocument.timeOrigin !== undefined
+    || expectedActionDocument.token !== undefined;
+  const actionDocumentChanged = () => {
+    const error = new Error("The tab document changed before the DOM action could execute; inspect the current page before retrying");
+    error.code = "BROWSER_DOCUMENT_CHANGED";
+    error.details = { snapshotId, actionState: "not_completed", retryable: true, inspectFirst: true };
+    return error;
+  };
+  const assertExpectedActionDocument = () => {
+    if (hasExpectedActionDocument && !sameDocument(expectedActionDocument, currentDocument)) throw actionDocumentChanged();
+  };
+  const staleDomSnapshot = (reason = "observation_unavailable") => {
+    const error = new Error("DOM snapshot reference is unavailable; take a new browser_dom_cua get_visible_dom snapshot before using this node");
     error.code = "STALE_DOM_SNAPSHOT";
-    error.details = { snapshotId };
-    throw error;
-  }
-  const element = nodeId ? document.querySelector(`[data-pi-control-chrome-dom-id="${CSS.escape(String(nodeId))}"]`) : undefined;
+    error.details = { snapshotId, reason };
+    return error;
+  };
+  const documentChanged = () => {
+    const error = new Error("DOM node belongs to an earlier document; inspect the current page before retrying");
+    error.code = "BROWSER_DOCUMENT_CHANGED";
+    error.details = { snapshotId, actionState: "not_completed", retryable: true, inspectFirst: true };
+    return error;
+  };
+  const normalizedText = (target) => String(target ?? "").replace(/\s+/g, " ").trim();
+  const descriptorMatches = (target, descriptor = {}, includeText = false) => {
+    if (!target || target.nodeType !== Node.ELEMENT_NODE) return false;
+    if (descriptor.tag && target.tagName.toLowerCase() !== String(descriptor.tag).toLowerCase()) return false;
+    if (descriptor.role && String(target.getAttribute("role") || "").trim().toLowerCase() !== descriptor.role) return false;
+    if (descriptor.id && target.id !== descriptor.id) return false;
+    if (descriptor.testId && target.getAttribute("data-testid") !== descriptor.testId) return false;
+    if (descriptor.inputType && (!(target instanceof HTMLInputElement) || String(target.type || "text").toLowerCase() !== descriptor.inputType)) return false;
+    if (includeText && descriptor.text && normalizedText(target.innerText || target.textContent) !== normalizedText(descriptor.text)) return false;
+    return true;
+  };
+  const canSemanticRebind = (descriptor = {}) => Boolean(descriptor.id || descriptor.testId || normalizedText(descriptor.text));
+  const detachedNodeError = (reason = "no_equivalent_target", rebound = false) => {
+    const error = new Error(`DOM node not found: ${nodeId}`);
+    error.code = "DOM_NODE_NOT_FOUND";
+    error.details = { nodeId, snapshotId, rebound, reason };
+    return error;
+  };
+  const changedNodeError = (rebound = false) => {
+    const error = new Error(`DOM node changed identity: ${nodeId}`);
+    error.code = "DOM_NODE_NOT_FOUND";
+    error.details = { nodeId, snapshotId, rebound, reason: "original_target_changed", inspectFirst: true };
+    return error;
+  };
+  const resolveNode = () => {
+    if (nodeId === undefined) return { element: undefined, resolvedBy: undefined, rebound: false };
+    if (!snapshotId || !pageAgent || typeof pageAgent.lookup !== "function") throw staleDomSnapshot();
+    if (__domObservationInvalidated === true) throw documentChanged();
+    const expectedDocument = { url: __expectedDomUrl, timeOrigin: __expectedDomTimeOrigin, token: __expectedDomToken };
+    if (!expectedMatches(expectedDocument, currentDocument)) throw documentChanged();
+    const observation = pageAgent.lookup("dom", String(snapshotId));
+    if (!observation || !isMapLike(observation.nodes)) throw staleDomSnapshot();
+    if (!sameDocument(observation.documentIdentity, currentDocument)) throw documentChanged();
+    const record = observation.nodes.get(String(nodeId));
+    if (!record) throw staleDomSnapshot("node_not_found");
+    const original = typeof record.element?.deref === "function" ? record.element.deref() : record.element;
+    if (original?.isConnected && original.ownerDocument === document) {
+      const rebound = record.rebound === true;
+      if (!descriptorMatches(original, record.descriptor, true)) throw changedNodeError(rebound);
+      return { element: original, resolvedBy: rebound ? "semantic_rebind" : "original_node", rebound };
+    }
+    // Just as snapshot refs do, DOM-CUA node ids get one unique same-document
+    // replacement only; a second detachment requires a fresh observation.
+    if (record.rebound === true) throw detachedNodeError("rebind_already_used", true);
+    if (!canSemanticRebind(record.descriptor)) throw detachedNodeError("descriptor_not_strong_enough");
+    const candidates = Array.from(document.querySelectorAll("*"))
+      .filter((target) => target.isConnected && descriptorMatches(target, record.descriptor, true));
+    if (candidates.length === 1) {
+      record.element = typeof WeakRef === "function" ? new WeakRef(candidates[0]) : candidates[0];
+      record.rebound = true;
+      return { element: candidates[0], resolvedBy: "semantic_rebind", rebound: true };
+    }
+    if (candidates.length > 1) {
+      const error = new Error(`DOM node resolved to ${candidates.length} equivalent elements; take a new visible DOM snapshot before retrying`);
+      error.code = "DOM_NODE_AMBIGUOUS";
+      error.details = { nodeId, snapshotId, count: candidates.length, rebound: true };
+      throw error;
+    }
+    throw detachedNodeError();
+  };
+  const resolution = resolveNode();
+  const element = resolution.element;
   const isActionable = (target) => {
     const rect = target.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return false;
@@ -3851,6 +4147,7 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __e
   if (!element && action !== "get_visible_dom" && action !== "scroll") { const error = new Error(`DOM node not found: ${nodeId}`); error.code = "DOM_NODE_NOT_FOUND"; throw error; }
   if (element && action !== "get_visible_dom" && !isActionable(element)) { const error = new Error(`DOM node is not actionable: ${nodeId}`); error.code = "DOM_NODE_NOT_ACTIONABLE"; throw error; }
   if (element && action === "type" && !isEditable(element)) { const error = new Error(`DOM node is not editable: ${nodeId}`); error.code = "DOM_NODE_NOT_EDITABLE"; throw error; }
+  if (action !== "get_visible_dom") assertExpectedActionDocument();
   if (action === "click") element.click();
   else if (action === "double_click") dispatchDoubleClick(element);
   else if (action === "type") {
@@ -3867,7 +4164,7 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __e
   } else if (action === "scroll") {
     if (element) element.scrollBy(Number(deltaX || 0), Number(deltaY || 0)); else window.scrollBy(Number(deltaX || 0), Number(deltaY || 0));
   }
-  return { ok: true, action, nodeId };
+  return { ok: true, action, nodeId, ...(resolution.resolvedBy === undefined ? {} : { resolvedBy: resolution.resolvedBy, rebound: resolution.rebound }) };
   } catch (error) {
     const message = error && typeof error === "object" && "message" in error ? String(error.message) : String(error);
     const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "BROWSER_ERROR";
@@ -3876,9 +4173,24 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __e
   }
 }
 
+const PAGE_AGENT_FUNCTIONS = new Set(["collectSnapshot", "pageOperation", "collectVisibleDom", "runDomCua"]);
+
+async function ensurePageAgent(tabId, expectedFence) {
+  const fence = expectedFence ?? await tabFenceFor(tabId, true);
+  await assertTabFence(tabId, fence, "page agent injection");
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["page-agent.js"] });
+  } catch (error) {
+    if (isRestrictedPageError(error)) throw pageUnavailableError(tabId);
+    throw error;
+  }
+  await assertTabFence(tabId, fence, "page agent injection");
+}
+
 async function executeInTab(tabId, func, args = [], expectedFence) {
   const fence = expectedFence ?? await tabFenceFor(tabId, true);
   await assertTabFence(tabId, fence, "access");
+  if (PAGE_AGENT_FUNCTIONS.has(func?.name)) await ensurePageAgent(tabId, fence);
   let result;
   try {
     result = await chrome.scripting.executeScript({ target: { tabId }, func, args });
@@ -4010,59 +4322,128 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
   };
 }
 
-function rememberPageSnapshot(tabId, snapshot) {
-  if (!snapshot || typeof snapshot !== "object" || typeof snapshot.snapshotId !== "string" || typeof snapshot.__piControlChromeSnapshotFingerprint !== "string") return;
-  pageSnapshotStates.set(runtimeStateKey(tabId), {
-    snapshotId: snapshot.snapshotId,
-    fingerprint: snapshot.__piControlChromeSnapshotFingerprint,
-    url: typeof snapshot.__piControlChromeSnapshotUrl === "string" ? snapshot.__piControlChromeSnapshotUrl : "",
-    timeOrigin: snapshot.__piControlChromeSnapshotTimeOrigin,
-    token: typeof snapshot.__piControlChromeSnapshotToken === "string" ? snapshot.__piControlChromeSnapshotToken : undefined,
-  });
-  delete snapshot.__piControlChromeSnapshotFingerprint;
-  delete snapshot.__piControlChromeSnapshotUrl;
-  delete snapshot.__piControlChromeSnapshotTimeOrigin;
-  delete snapshot.__piControlChromeSnapshotToken;
+function isObservationMap(value) {
+  return Boolean(value
+    && typeof value.get === "function"
+    && typeof value.set === "function"
+    && typeof value.values === "function");
 }
 
-function rememberDomSnapshot(tabId, snapshot) {
-  if (!snapshot || typeof snapshot !== "object" || typeof snapshot.snapshotId !== "string" || typeof snapshot.__piControlChromeDomFingerprint !== "string") return;
-  domSnapshotStates.set(runtimeStateKey(tabId), {
-    snapshotId: snapshot.snapshotId,
-    fingerprint: snapshot.__piControlChromeDomFingerprint,
-    url: typeof snapshot.__piControlChromeDomUrl === "string" ? snapshot.__piControlChromeDomUrl : "",
-    timeOrigin: snapshot.__piControlChromeDomTimeOrigin,
-    token: typeof snapshot.__piControlChromeDomToken === "string" ? snapshot.__piControlChromeDomToken : undefined,
-  });
-  delete snapshot.__piControlChromeDomFingerprint;
-  delete snapshot.__piControlChromeDomUrl;
-  delete snapshot.__piControlChromeDomTimeOrigin;
-  delete snapshot.__piControlChromeDomToken;
+function observationRecordsAt(store, key) {
+  const observations = store.get(key)?.observations;
+  return isObservationMap(observations) ? [...observations.entries()] : [];
 }
 
-function pageOperationParams(tabId, params = {}) {
-  const snapshotId = typeof params.snapshotId === "string" ? params.snapshotId : undefined;
-  const state = pageSnapshotStates.get(runtimeStateKey(tabId));
-  const match = snapshotId !== undefined && state?.snapshotId === snapshotId;
+function invalidateDocumentObservations(store, key, capturedRecords) {
+  const observations = store.get(key)?.observations;
+  if (!isObservationMap(observations)) return;
+  const records = Array.isArray(capturedRecords) ? capturedRecords : [...observations.entries()];
+  for (const [observationId, captured] of records) {
+    const observation = observations.get(observationId);
+    // A delayed transition fallback must only poison the observations that existed
+    // when the transition started, never a newly observed destination document.
+    if (observation && (capturedRecords === undefined || observation === captured)) observation.invalidated = true;
+  }
+}
+
+function invalidatePageObservationState(tabId, captured) {
+  const key = runtimeStateKey(tabId);
+  invalidateDocumentObservations(pageSnapshotStates, key, captured?.page);
+  invalidateDocumentObservations(domSnapshotStates, key, captured?.dom);
+  // AX revision state has no ref records to mark. Clear the captured source state,
+  // but do not let a deferred fallback erase a revision recorded on the destination.
+  if (captured === undefined || accessibilitySnapshotStates.get(key) === captured.accessibility) accessibilitySnapshotStates.delete(key);
+}
+
+function capturePageObservationState(tabId) {
+  const key = runtimeStateKey(tabId);
   return {
-    ...params,
-    __expectedSnapshotFingerprint: match ? state.fingerprint : undefined,
-    __expectedSnapshotUrl: match ? state.url : undefined,
-    __expectedSnapshotTimeOrigin: match ? state.timeOrigin : undefined,
-    __expectedSnapshotToken: match ? state.token : undefined,
+    page: observationRecordsAt(pageSnapshotStates, key),
+    dom: observationRecordsAt(domSnapshotStates, key),
+    accessibility: accessibilitySnapshotStates.get(key),
   };
 }
 
-function domCuaOperationParams(tabId, params = {}) {
-  const snapshotId = typeof params.snapshotId === "string" ? params.snapshotId : undefined;
-  const state = domSnapshotStates.get(runtimeStateKey(tabId));
-  const match = snapshotId !== undefined && state?.snapshotId === snapshotId;
+function invalidatePageObservationStateAfterDocumentTransition(tabId, captured = capturePageObservationState(tabId)) {
+  // Chrome may deliver the loading/URL update synchronously inside tabs.update().
+  // The lifecycle listener covers that normal path. If it has not arrived yet,
+  // defer exactly one task so the navigation's own post-effect refresh can begin
+  // before this fallback closes the following-request race. Captured records keep
+  // it from poisoning a newly observed destination document.
+  const timer = setTimeout(() => invalidatePageObservationState(tabId, captured), 0);
+  timer.unref?.();
+}
+
+function rememberObservation(store, tabId, snapshot, fields) {
+  if (!snapshot || typeof snapshot !== "object" || typeof snapshot.snapshotId !== "string") return;
+  const key = runtimeStateKey(tabId);
+  const state = store.get(key);
+  const observations = isObservationMap(state?.observations) ? state.observations : new Map();
+  const observation = {
+    url: typeof snapshot[fields.url] === "string" ? snapshot[fields.url] : "",
+    timeOrigin: snapshot[fields.timeOrigin],
+    token: typeof snapshot[fields.token] === "string" ? snapshot[fields.token] : undefined,
+  };
+  observations.set(snapshot.snapshotId, observation);
+  while (observations.size > PAGE_OBSERVATION_HISTORY_LIMIT) observations.delete(observations.keys().next().value);
+  store.set(key, { snapshotId: snapshot.snapshotId, ...observation, observations });
+  for (const field of Object.values(fields)) delete snapshot[field];
+}
+
+function rememberedObservation(store, tabId, snapshotId) {
+  if (typeof snapshotId !== "string" || snapshotId.length === 0) return undefined;
+  const state = store.get(runtimeStateKey(tabId));
+  if (isObservationMap(state?.observations)) return state.observations.get(snapshotId);
+  return state?.snapshotId === snapshotId ? state : undefined;
+}
+
+function rememberPageSnapshot(tabId, snapshot) {
+  rememberObservation(pageSnapshotStates, tabId, snapshot, {
+    url: "__piControlChromeSnapshotUrl",
+    timeOrigin: "__piControlChromeSnapshotTimeOrigin",
+    token: "__piControlChromeSnapshotToken",
+  });
+}
+
+function rememberDomSnapshot(tabId, snapshot) {
+  rememberObservation(domSnapshotStates, tabId, snapshot, {
+    url: "__piControlChromeDomUrl",
+    timeOrigin: "__piControlChromeDomTimeOrigin",
+    token: "__piControlChromeDomToken",
+  });
+}
+
+function pageOperationParams(tabId, params = {}, expectedActionGeneration) {
+  const observation = rememberedObservation(pageSnapshotStates, tabId, params.snapshotId);
+  const actionGeneration = pageGenerationIdentity(expectedActionGeneration) === undefined ? undefined : expectedActionGeneration;
   return {
     ...params,
-    __expectedDomFingerprint: match ? state.fingerprint : undefined,
-    __expectedDomUrl: match ? state.url : undefined,
-    __expectedDomTimeOrigin: match ? state.timeOrigin : undefined,
-    __expectedDomToken: match ? state.token : undefined,
+    __snapshotObservationInvalidated: observation?.invalidated === true,
+    __expectedSnapshotUrl: observation?.url,
+    __expectedSnapshotTimeOrigin: observation?.timeOrigin,
+    __expectedSnapshotToken: observation?.token,
+    ...(actionGeneration === undefined ? {} : {
+      __expectedActionUrl: actionGeneration.url,
+      __expectedActionTimeOrigin: actionGeneration.timeOrigin,
+      __expectedActionToken: actionGeneration.token,
+    }),
+  };
+}
+
+function domCuaOperationParams(tabId, params = {}, expectedActionGeneration) {
+  const observation = rememberedObservation(domSnapshotStates, tabId, params.snapshotId);
+  const actionGeneration = pageGenerationIdentity(expectedActionGeneration) === undefined ? undefined : expectedActionGeneration;
+  return {
+    ...params,
+    __domObservationInvalidated: observation?.invalidated === true,
+    __expectedDomUrl: observation?.url,
+    __expectedDomTimeOrigin: observation?.timeOrigin,
+    __expectedDomToken: observation?.token,
+    ...(actionGeneration === undefined ? {} : {
+      __expectedActionUrl: actionGeneration.url,
+      __expectedActionTimeOrigin: actionGeneration.timeOrigin,
+      __expectedActionToken: actionGeneration.token,
+    }),
   };
 }
 
@@ -4132,7 +4513,13 @@ async function waitAfterEffect(method, wait, details = {}) {
     return await wait();
   } catch (error) {
     if (method === "wait" || isTabFenceError(error)) throw error;
-    throw uncertainBrowserOperationError(method, details);
+    // Preserve only bounded diagnostics: timeout messages can contain page
+    // title/URL details that do not belong in an uncertainty envelope.
+    throw uncertainBrowserOperationError(method, {
+      ...details,
+      ...(typeof error?.code === "string" ? { postEffectErrorCode: error.code } : {}),
+      ...(error?.details?.pageChanged === true ? { postEffectPageChanged: true } : {}),
+    });
   }
 }
 
@@ -4156,7 +4543,7 @@ function isSideEffectingPageOperation(params) {
   return SIDE_EFFECTING_PAGE_ACTIONS.has(String(params.operation || params.action || ""));
 }
 
-const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
+const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
 
 function isStructuredPageError(error) {
   return Boolean(error && typeof error === "object" && STRUCTURED_PAGE_ERROR_CODES.has(error.code));
@@ -4167,6 +4554,23 @@ function uncertainPageFailure(params, error) {
   const uncertain = uncertainBrowserOperationError(params.pageOperation || params.operation || "page", { action: String(params.action || params.operation || "") });
   uncertain.cause = error;
   return uncertain;
+}
+
+// A page action that returned its explicit success envelope has already been
+// dispatched. If the post-action read observes a different *valid* document,
+// that proves a transition happened after the action rather than making its
+// result unknown. Only an unavailable or malformed post-action identity keeps
+// the operation uncertain.
+function pageActionResultAfterDocumentFence(params, value, before, after) {
+  if (pageGenerationsMatch(before, after)) return value;
+  const actionCompleted = isSideEffectingPageOperation(params)
+    && value !== null
+    && typeof value === "object"
+    && value.ok === true
+    && pageGenerationIdentity(before) !== undefined
+    && pageGenerationIdentity(after) !== undefined;
+  if (actionCompleted) return { ...value, postActionDocumentChanged: true };
+  throw uncertainPageOperationError();
 }
 
 function isSemanticLocator(value) {
@@ -4186,11 +4590,12 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
     const remaining = Math.max(1, deadline - Date.now());
     try {
       const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
-      const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);
+      if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
+      const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
       const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
-      if (!pageGenerationsMatch(before, after)) throw uncertainPageOperationError();
+      const fencedValue = pageActionResultAfterDocumentFence(params, value, before, after);
       assertRequestActive(signal);
-      return value;
+      return fencedValue;
     } catch (error) {
       lastError = error;
       if (signal?.aborted) {
@@ -4221,11 +4626,12 @@ async function executeLocatorOperation(tabId, params, signal, expectedFence) {
 async function executeDomCuaOperation(tabId, params, signal, expectedFence) {
   try {
     const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    const value = await executeInTab(tabId, runDomCua, [domCuaOperationParams(tabId, params)], expectedFence);
+    if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
+    const value = await executeInTab(tabId, runDomCua, [domCuaOperationParams(tabId, params, before)], expectedFence);
     const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    if (!pageGenerationsMatch(before, after)) throw uncertainPageOperationError();
+    const fencedValue = pageActionResultAfterDocumentFence(params, value, before, after);
     if (signal?.aborted && params.action !== "get_visible_dom") throw uncertainPageOperationError();
-    return value;
+    return fencedValue;
   } catch (error) {
     if (isLostExecutionContext(error)) throw uncertainPageOperationError();
     if (signal?.aborted && params.action !== "get_visible_dom") throw uncertainPageOperationError();
@@ -4248,12 +4654,20 @@ function pageGenerationsMatch(left, right) {
 
 async function executePageOperation(tabId, params, signal, expectedFence) {
   try {
-    const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    const value = params.pageOperation === "interaction" && params.target !== undefined
-      ? await executeWithLocatorWait(tabId, params, signal, expectedFence)
-      : await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);
-    const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    if (!pageGenerationsMatch(before, after)) throw uncertainPageOperationError();
+    let value;
+    if (params.pageOperation === "interaction" && params.target !== undefined) {
+      // The locator helper owns both action attempts and their document fence.
+      // Do not perform a second post-action injection here: it could lose an
+      // already verified destination context and incorrectly turn success into
+      // BROWSER_OPERATION_UNCERTAIN.
+      value = await executeWithLocatorWait(tabId, params, signal, expectedFence);
+    } else {
+      const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
+      if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
+      value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
+      const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
+      value = pageActionResultAfterDocumentFence(params, value, before, after);
+    }
     if (signal?.aborted) {
       if (isSideEffectingPageOperation(params)) throw uncertainPageOperationError();
       throw abortError(signal, "Browser request aborted");
@@ -4390,7 +4804,11 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
     await assertTabFence(tabId, expectedFence, "wait");
     assertRequestActive(signal);
     if (Date.now() >= deadline) break;
-    if (tabUrlMatches(tab, params)) {
+    // An Agent-dispatched transition may not yet have produced its loading/URL
+    // event. Never evaluate the source document as though it were the requested
+    // destination while that transition is still unobserved.
+    const transition = pendingDocumentTransition(tabId, expectedFence);
+    if ((!transition || transition.observed === true) && tabUrlMatches(tab, params)) {
       const observedUrl = String(tab.url || "");
       const observedPage = await executeReadOnlyPageOperation(tabId, { ...params, pageOperation: "wait" }, signal, expectedFence);
       if (expectedIncarnation !== undefined && pageGenerationIdentity(observedPage?.generation) !== expectedIncarnation) {
@@ -4424,7 +4842,14 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
           && typeof observedPage?.generation?.token === "string"
           && typeof currentGeneration?.token === "string"
           && observedPage.generation.token === currentGeneration.token;
-        if (urlStable && generationStable && tabUrlMatches(currentTab, params)) return { result: { ...lastResult, elapsedMs: Date.now() - startedAt }, generation: currentGeneration };
+        if (urlStable && generationStable && tabUrlMatches(currentTab, params)) {
+          const currentTransition = pendingDocumentTransition(tabId, expectedFence);
+          // A page-condition read has already proved a stable current document
+          // after lifecycle observation, so it is sufficient re-observation to
+          // end the transition fence even if the tab has not reached `complete`.
+          if (currentTransition?.observed === true) clearDocumentTransition(tabId, expectedFence, currentTransition);
+          return { result: { ...lastResult, elapsedMs: Date.now() - startedAt }, generation: currentGeneration };
+        }
         lastResult = { ...lastResult, matched: false, urlMatched: false };
       }
     } else {
@@ -5085,16 +5510,23 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
     await assertExpectedIncarnation();
     assertRequestActive(signal);
     if (Date.now() >= deadline) break;
+    const transition = pendingDocumentTransition(tabId, expectedFence);
+    const transitionReady = !transition || (params.state === "url" ? transition.observed === true : transition.completed === true);
     const urlMatches = tabUrlMatches(tab, params);
     const stateMatches = (params.state === "url" && urlMatches) || (params.state !== "url" && tab.status === "complete" && urlMatches);
-    if (stateMatches) {
+    if (transitionReady && stateMatches) {
       const currentTab = await chrome.tabs.get(Number(tabId));
       await assertTabFence(tabId, expectedFence, "wait");
       await assertExpectedIncarnation();
       assertRequestActive(signal);
+      const currentTransition = pendingDocumentTransition(tabId, expectedFence);
+      const currentTransitionReady = !currentTransition || (params.state === "url" ? currentTransition.observed === true : currentTransition.completed === true);
       const currentUrlMatches = tabUrlMatches(currentTab, params);
       const currentStateMatches = params.state === "url" ? currentUrlMatches : currentTab.status === "complete" && currentUrlMatches;
-      if (currentStateMatches) return currentTab;
+      if (currentTransitionReady && currentStateMatches) {
+        if (currentTransition) clearDocumentTransition(tabId, expectedFence, currentTransition);
+        return currentTab;
+      }
     }
     await waitWithSignal(100, signal);
   }
@@ -5726,6 +6158,74 @@ async function documentFencedDebuggerOperation(tabId, callback, sessionId, expec
   return result;
 }
 
+function historyUnavailableError(method, tabId) {
+  const error = new Error(`Tab ${Number(tabId)} has no ${method === "back" ? "previous" : "next"} history entry`);
+  error.code = "BROWSER_HISTORY_UNAVAILABLE";
+  error.details = { tabId: Number(tabId), direction: method };
+  return error;
+}
+
+function historyDocumentChangedError(tabId) {
+  const error = new Error("The tab document changed while history navigation was being prepared; inspect the current page before retrying");
+  error.code = "BROWSER_DOCUMENT_CHANGED";
+  error.details = { tabId: Number(tabId), actionState: "not_completed", retryable: true, inspectFirst: true };
+  return error;
+}
+
+function isHistoryUnavailableError(error) {
+  return error?.code === "BROWSER_HISTORY_UNAVAILABLE"
+    || /cannot find a next page in history\.?/i.test(String(error?.message || ""));
+}
+
+// Edge has intermittently reported "Cannot find a next page in history" from
+// tabs.goBack/goForward even while the tab's DevTools navigation controller has
+// a valid adjacent entry. Use the ordinary Tabs API first, then make one fenced
+// CDP fallback only after that deterministic no-entry response. Before dispatch,
+// re-check the current tab/document so the fallback cannot redirect a document
+// the user replaced while the history entry was being read.
+async function navigateHistoryViaDebugger(tabId, method, sessionId, expectedFence) {
+  const id = Number(tabId);
+  let dispatched = false;
+  try {
+    return await withDebugger(id, async (sendCommand) => {
+      const beforeTab = await chrome.tabs.get(id);
+      const beforeIncarnation = await readTabIncarnation(id, expectedFence, true);
+      const history = await sendCommand("Page.getNavigationHistory");
+      const currentTab = await chrome.tabs.get(id);
+      await assertTabFence(id, expectedFence, method);
+      const currentIncarnation = await readTabIncarnation(id, expectedFence, true);
+      // CDP history selection is a new side effect after the Tabs API's known
+      // no-entry response. Do not issue it unless both pre-dispatch document
+      // reads are stable and comparable; URL equality alone cannot distinguish
+      // a same-URL reload/replacement by a shared user.
+      if (typeof beforeIncarnation !== "string" || typeof currentIncarnation !== "string") {
+        throw documentIdentityUnavailableError(id, `${method} history fallback`);
+      }
+      const documentChanged = !tabSnapshotMatches(beforeTab, currentTab) || beforeIncarnation !== currentIncarnation;
+      if (documentChanged) throw historyDocumentChangedError(id);
+      const entries = Array.isArray(history?.entries) ? history.entries : [];
+      const currentIndex = Number(history?.currentIndex);
+      const targetIndex = currentIndex + (method === "back" ? -1 : 1);
+      const target = Number.isInteger(currentIndex) ? entries[targetIndex] : undefined;
+      if (!target || !Number.isFinite(Number(target.id))) throw historyUnavailableError(method, id);
+      dispatched = true;
+      await sendCommand("Page.navigateToHistoryEntry", { entryId: Number(target.id) });
+      return { entryId: Number(target.id) };
+    }, sessionId, expectedFence);
+  } catch (error) {
+    if (dispatched) {
+      if (error?.code === "BROWSER_OPERATION_UNCERTAIN") {
+        error.details = { ...(error.details || {}), historyDispatchStarted: true };
+        throw error;
+      }
+      const uncertain = uncertainBrowserOperationError(method, { tabId: id, historyDispatchStarted: true });
+      uncertain.cause = error;
+      throw uncertain;
+    }
+    throw error;
+  }
+}
+
 async function captureScreenshot(tab, params, expectedFence, signal) {
   const format = params.format || "png";
   return readOnlyWithRetry("screenshot", tab.id, signal, async () => {
@@ -5820,7 +6320,11 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     await awaitWithSignal(waitForAllDownloadBarriers(cleanupSessionId), signal);
     assertRequestActive(signal);
   } else if (TAB_REQUEST_METHODS.has(method)) {
-    const allowRecordedSnapshotChange = dispatchOptions.expectedTabFence !== undefined || method === "dialog";
+    // A wait is the recovery/re-observation path after a returned
+    // transition-pending tab. It must be able to use a claimed tab by id even
+    // though its recorded source document has already changed. A supplied
+    // complete handle still undergoes its own incarnation validation below.
+    const allowRecordedSnapshotChange = dispatchOptions.expectedTabFence !== undefined || method === "dialog" || method === "wait";
     const allowReadOnlyDocumentChange = allowsReadOnlyDocumentChange(method, params);
     if (method === "devtools_disable") {
       try {
@@ -5840,6 +6344,11 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     if (requestTab && Number(requestTab.id) !== Number(dispatchOptions.skipTabId)) {
       await awaitWithSignal(waitForTabBarrier(requestTab.id, params.sessionId), signal);
       assertRequestActive(signal);
+    }
+    if (requestTab && STABLE_DOCUMENT_TAB_REQUESTS.has(method)) {
+      const transition = pendingDocumentTransition(requestTab.id, requestTabFence);
+      if (transition?.completed === true) clearDocumentTransition(requestTab.id, requestTabFence, transition);
+      else if (transition) throw documentTransitionPendingError(requestTab.id, method);
     }
   }
   if (method === "download" && dispatchOptions.skipDownloadBarrier !== true && !["list", "cancel", "erase"].includes(params.action) && params.downloadId !== undefined) {
@@ -5914,49 +6423,75 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
     await assertTabFence(tab.id, expectedFence, "navigate");
+    // Capture the source observation before requesting the transition. If Chrome
+    // completes unusually quickly, the deferred fallback must never invalidate a
+    // destination observation created before tabs.update() resolves.
+    const sourceObservations = capturePageObservationState(tab.id);
+    const transition = beginDocumentTransition(tab.id, expectedFence);
     let updated;
     try {
       updated = await chrome.tabs.update(tab.id, { url: String(params.url) });
     } catch (error) {
+      clearDocumentTransition(tab.id, expectedFence, transition);
       const uncertain = uncertainBrowserOperationError(method, { tabId: tab.id });
       uncertain.cause = error;
       throw uncertain;
     }
+    // chrome.tabs.onUpdated can arrive inside tabs.update(); defer this redundant
+    // fallback marker so it cannot invalidate the navigation's own verification.
+    invalidatePageObservationStateAfterDocumentTransition(tab.id, sourceObservations);
     if (signal?.aborted) throw uncertainBrowserOperationError(method);
     let ready = updated;
     if (params.wait !== false) {
       try {
-        ready = await waitAfterEffect("navigate", () => waitForTabState(updated.id, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: String(params.url) }) }, signal, expectedFence), { tabId: updated.id });
+        ready = await waitAfterEffect("navigate", () => waitForTabState(updated.id, { state: "load", timeoutMs: params.timeoutMs, ...(params.allowRedirects === true ? {} : { url: String(params.url) }) }, signal, expectedFence), { tabId: updated.id, phase: "direct_navigation_load" });
       } catch (error) {
         if (signal?.aborted) throw uncertainBrowserOperationError(method);
         throw error;
       }
     }
     if (signal?.aborted) throw uncertainBrowserOperationError(method);
-    if (params.wait !== false) await refreshOwnedTabDocument(tab.id, expectedFence, params.sessionId);
-    const listed = await waitAfterEffect("navigate", () => tabEntryFor(ready.id, expectedFence, "navigate"), { tabId: tab.id });
+    if (params.wait === false) return { tab: await transitionTabEntry(updated.id, expectedFence) };
+    await refreshOwnedTabDocument(tab.id, expectedFence, params.sessionId, { allowPageChange: true });
+    const listed = await waitAfterEffect("navigate", () => tabEntryFor(ready.id, expectedFence, "navigate"), { tabId: tab.id, phase: "navigation_dispatch_response" });
     return { tab: listed };
   }
   if (method === "back" || method === "forward" || method === "reload") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
     await assertTabFence(tab.id, expectedFence, method);
+    const sourceObservations = capturePageObservationState(tab.id);
+    const transition = beginDocumentTransition(tab.id, expectedFence);
     try {
       if (method === "back") await chrome.tabs.goBack(tab.id);
       if (method === "forward") await chrome.tabs.goForward(tab.id);
       if (method === "reload") await chrome.tabs.reload(tab.id, { bypassCache: params.bypassCache === true });
     } catch (error) {
-      const uncertain = uncertainBrowserOperationError(method, { tabId: tab.id });
-      uncertain.cause = error;
-      throw uncertain;
+      if ((method === "back" || method === "forward") && isHistoryUnavailableError(error)) {
+        try {
+          await navigateHistoryViaDebugger(tab.id, method, params.sessionId, expectedFence);
+        } catch (fallbackError) {
+          if (fallbackError?.details?.historyDispatchStarted !== true) clearDocumentTransition(tab.id, expectedFence, transition);
+          if (["BROWSER_HISTORY_UNAVAILABLE", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_DOCUMENT_CHANGED", "BROWSER_PAGE_CHANGING", "BROWSER_PAGE_UNAVAILABLE", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED"].includes(fallbackError?.code)) throw fallbackError;
+          const uncertain = uncertainBrowserOperationError(method, { tabId: tab.id, phase: "history_fallback_dispatch" });
+          uncertain.cause = fallbackError;
+          throw uncertain;
+        }
+      } else {
+        clearDocumentTransition(tab.id, expectedFence, transition);
+        const uncertain = uncertainBrowserOperationError(method, { tabId: tab.id, phase: "history_or_reload_dispatch" });
+        uncertain.cause = error;
+        throw uncertain;
+      }
     }
+    // back/forward/reload are document-transition requests even before Chrome emits
+    // the loading update. Close the following-request window without requiring a
+    // race-prone document refresh in the same response path. As with navigate's
+    // wait:false form, callers receive a fenced transition-pending tab and must
+    // wait/re-observe for a fresh document incarnation.
+    invalidatePageObservationStateAfterDocumentTransition(tab.id, sourceObservations);
     if (signal?.aborted) throw uncertainBrowserOperationError(method);
-    const listed = await waitAfterEffect(method, async () => {
-      await assertTabFence(tab.id, expectedFence, method);
-      await refreshOwnedTabDocument(tab.id, expectedFence, params.sessionId);
-      return tabEntryFor(tab.id, expectedFence, method);
-    }, { tabId: tab.id });
-    return { tab: listed };
+    return { tab: await transitionTabEntry(tab.id, expectedFence, method) };
   }
   if (method === "close_tab") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
