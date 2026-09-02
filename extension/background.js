@@ -2996,7 +2996,8 @@ function collectSnapshot(options = {}) {
   };
   const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (!pageAgent || typeof pageAgent.remember !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
+  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  const documentIdentity = pageAgent.documentIdentity();
   const isContentEditableHost = (element) => {
     const attr = element.getAttribute("contenteditable");
     return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
@@ -3071,12 +3072,6 @@ function collectSnapshot(options = {}) {
   };
   const disabled = (element) => Boolean(element.matches?.(":disabled") || element.disabled || String(element.getAttribute("aria-disabled") || "").toLowerCase() === "true");
   const snapshotId = crypto.randomUUID();
-  const documentTokenKey = "__piControlChromeDocumentToken";
-  let documentToken = globalThis[documentTokenKey];
-  if (typeof documentToken !== "string" || documentToken.length === 0) {
-    documentToken = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-    try { Object.defineProperty(globalThis, documentTokenKey, { configurable: false, enumerable: false, value: documentToken }); } catch { globalThis[documentTokenKey] = documentToken; }
-  }
   const root = (() => {
     if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
     try {
@@ -3122,7 +3117,7 @@ function collectSnapshot(options = {}) {
     }
     refRecords.set(ref, {
       // Keep the original node without retaining removed application subtrees forever.
-      element: typeof WeakRef === "function" ? new WeakRef(element) : element,
+      element: pageAgent.retain(element),
       descriptor: {
         tag: entry.tag,
         role: entry.role,
@@ -3147,17 +3142,17 @@ function collectSnapshot(options = {}) {
   // while we are walking a hostile or concurrently changing DOM.
   pageAgent.remember("snapshot", snapshotId, {
     refs: refRecords,
-    documentIdentity: { url: location.href, timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined, token: documentToken },
+    documentIdentity,
   });
   const rawPageText = root.innerText || root.textContent || "";
   const pageText = bound(rawPageText.replace(/\n{3,}/g, "\n\n"), pageTextLimit);
   return {
     snapshotId,
-    __piControlChromeSnapshotUrl: location.href,
-    __piControlChromeSnapshotTimeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
-    __piControlChromeSnapshotToken: documentToken,
+    __piControlChromeSnapshotUrl: documentIdentity.url,
+    __piControlChromeSnapshotTimeOrigin: documentIdentity.timeOrigin,
+    __piControlChromeSnapshotToken: documentIdentity.token,
     title: bound(document.title, 240),
-    url: location.href,
+    url: documentIdentity.url,
     text: pageText,
     textTruncated: rawPageText.length > pageTextLimit,
     selectedText: bound(window.getSelection?.()?.toString() || "", 240),
@@ -3535,25 +3530,9 @@ async function pageOperation(params = {}) {
     return matches(pageVisibleText(), text, false);
   };
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  const isMapLike = (value) => Boolean(value
-    && typeof value.get === "function"
-    && typeof value.set === "function"
-    && typeof value.values === "function");
+  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  const { documentIdentity, sameDocument, resolveObservedElement } = pageAgent;
   const refResolution = new WeakMap();
-  const documentIdentity = () => ({
-    url: location.href,
-    timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
-    token: globalThis["__piControlChromeDocumentToken"],
-  });
-  const sameDocument = (left, right) => Boolean(left && right
-    && left.url === right.url
-    && left.timeOrigin === right.timeOrigin
-    && typeof left.token === "string"
-    && typeof right.token === "string"
-    && left.token === right.token);
-  const expectedMatches = (expected, current) => (expected.url === undefined || expected.url === current.url)
-    && (expected.timeOrigin === undefined || expected.timeOrigin === current.timeOrigin)
-    && (expected.token === undefined || expected.token === current.token);
   const staleSnapshotError = (reason = "observation_unavailable") => {
     const error = new Error("Snapshot reference is unavailable; take a new browser_snapshot before using this ref");
     error.code = "STALE_SNAPSHOT";
@@ -3629,47 +3608,42 @@ async function pageOperation(params = {}) {
   };
   const resolveSnapshotRef = (ref, candidateRoot = document) => {
     if (!/^e\d+$/.test(ref)) throw new Error("Element ref must match eN, such as e12");
-    if (typeof params.snapshotId !== "string" || !params.snapshotId || !pageAgent || typeof pageAgent.lookup !== "function") throw staleSnapshotError();
-    if (params.__snapshotObservationInvalidated === true) throw documentChangedError();
-    const currentDocument = documentIdentity();
+    if (typeof params.snapshotId !== "string" || !params.snapshotId) throw staleSnapshotError();
     const expectedDocument = {
       url: params.__expectedSnapshotUrl,
       timeOrigin: params.__expectedSnapshotTimeOrigin,
       token: params.__expectedSnapshotToken,
     };
-    if ((typeof expectedDocument.url === "string" || typeof expectedDocument.timeOrigin === "number" || typeof expectedDocument.token === "string")
-      && !expectedMatches(expectedDocument, currentDocument)) throw documentChangedError();
-    const observation = pageAgent.lookup("snapshot", params.snapshotId);
-    if (!observation || !isMapLike(observation.refs)) throw staleSnapshotError();
-    if (!sameDocument(observation.documentIdentity, currentDocument)) throw documentChangedError();
-    const record = observation.refs.get(ref);
-    if (!record) throw staleSnapshotError("ref_not_found");
-    const original = typeof record.element?.deref === "function" ? record.element.deref() : record.element;
-    if (original?.isConnected && original.ownerDocument === document) {
-      const rebound = record.rebound === true;
-      if (!descriptorMatches(original, record.descriptor)) throw changedSnapshotRefError(rebound);
-      refResolution.set(original, { resolvedBy: rebound ? "semantic_rebind" : "original_ref", rebound });
-      return original;
-    }
-    // A ref may move once to a proven equivalent replacement. Persist that
-    // replacement as the record target so a later framework replacement cannot
-    // turn one provenance check into an unbounded chain of redirects.
-    if (record.rebound === true) throw detachedSnapshotRefError("rebind_already_used", true);
-    if (!canSemanticRebind(record.descriptor)) throw detachedSnapshotRefError("descriptor_not_strong_enough");
-    const candidates = rebindCandidates(record.descriptor, candidateRoot);
-    if (candidates.length === 1) {
-      record.element = typeof WeakRef === "function" ? new WeakRef(candidates[0]) : candidates[0];
-      record.rebound = true;
-      refResolution.set(candidates[0], { resolvedBy: "semantic_rebind", rebound: true });
-      return candidates[0];
-    }
-    if (candidates.length > 1) {
-      const error = new Error(`Snapshot reference resolved to ${candidates.length} equivalent elements; narrow the target before retrying`);
+    const hasExpectedDocument = typeof expectedDocument.url === "string"
+      || typeof expectedDocument.timeOrigin === "number"
+      || typeof expectedDocument.token === "string";
+    const resolution = resolveObservedElement({
+      kind: "snapshot",
+      observationId: params.snapshotId,
+      recordId: ref,
+      observationInvalidated: params.__snapshotObservationInvalidated === true,
+      expectedDocument: hasExpectedDocument ? expectedDocument : undefined,
+      matchesDescriptor: descriptorMatches,
+      canSemanticRebind,
+      findCandidates: (descriptor) => rebindCandidates(descriptor, candidateRoot),
+    });
+    if (resolution.state === "document_changed") throw documentChangedError();
+    if (resolution.state === "observation_unavailable") throw staleSnapshotError();
+    if (resolution.state === "record_unavailable") throw staleSnapshotError("ref_not_found");
+    if (resolution.state === "changed") throw changedSnapshotRefError(resolution.rebound);
+    if (resolution.state === "detached") throw detachedSnapshotRefError(resolution.reason, resolution.rebound);
+    if (resolution.state === "ambiguous") {
+      const error = new Error(`Snapshot reference resolved to ${resolution.count} equivalent elements; narrow the target before retrying`);
       error.code = "ELEMENT_TARGET_AMBIGUOUS";
-      error.details = { count: candidates.length, rebound: true, snapshotId: params.snapshotId };
+      error.details = { count: resolution.count, rebound: true, snapshotId: params.snapshotId };
       throw error;
     }
-    throw detachedSnapshotRefError();
+    if (resolution.state !== "resolved") throw staleSnapshotError();
+    refResolution.set(resolution.element, {
+      resolvedBy: resolution.rebound ? "semantic_rebind" : "original_ref",
+      rebound: resolution.rebound,
+    });
+    return resolution.element;
   };
   const resolutionDetails = (element) => refResolution.get(element) || undefined;
   if (params.pageOperation === "wait") {
@@ -3882,14 +3856,9 @@ function collectVisibleDom(options = {}) {
     return `${text.slice(0, limit - 3)}...`;
   };
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (!pageAgent || typeof pageAgent.remember !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
+  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  const documentIdentity = pageAgent.documentIdentity();
   const snapshotId = crypto.randomUUID();
-  const documentTokenKey = "__piControlChromeDocumentToken";
-  let documentToken = globalThis[documentTokenKey];
-  if (typeof documentToken !== "string" || documentToken.length === 0) {
-    documentToken = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-    try { Object.defineProperty(globalThis, documentTokenKey, { configurable: false, enumerable: false, value: documentToken }); } catch { globalThis[documentTokenKey] = documentToken; }
-  }
   const nodeRecords = new Map();
   let counter = 0;
   const nodes = [];
@@ -3944,7 +3913,7 @@ function collectVisibleDom(options = {}) {
       nodeRecords.set(id, {
         // A WeakRef lets a removed DOM subtree be collected; resolver then uses the
         // bounded semantic descriptor only when it has one unambiguous replacement.
-        element: typeof WeakRef === "function" ? new WeakRef(element) : element,
+        element: pageAgent.retain(element),
         descriptor: {
           tag: node.tag,
           role: node.role,
@@ -3987,13 +3956,13 @@ function collectVisibleDom(options = {}) {
   // truncation must not leave a blank/partially populated registry entry.
   pageAgent.remember("dom", snapshotId, {
     nodes: nodeRecords,
-    documentIdentity: { url: location.href, timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined, token: documentToken },
+    documentIdentity,
   });
   return {
     snapshotId,
-    __piControlChromeDomUrl: location.href,
-    __piControlChromeDomTimeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
-    __piControlChromeDomToken: documentToken,
+    __piControlChromeDomUrl: documentIdentity.url,
+    __piControlChromeDomTimeOrigin: documentIdentity.timeOrigin,
+    __piControlChromeDomToken: documentIdentity.token,
     viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY },
     nodes,
     nodeCount: nodes.length,
@@ -4008,24 +3977,9 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
   try {
   if (!["get_visible_dom", "click", "double_click", "type", "keypress", "scroll"].includes(action)) throw new Error("DOM CUA action must be get_visible_dom, click, double_click, type, keypress or scroll");
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  const isMapLike = (value) => Boolean(value
-    && typeof value.get === "function"
-    && typeof value.set === "function"
-    && typeof value.values === "function");
-  const currentDocument = {
-    url: location.href,
-    timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
-    token: globalThis["__piControlChromeDocumentToken"],
-  };
-  const expectedMatches = (expected, current) => (expected.url === undefined || expected.url === current.url)
-    && (expected.timeOrigin === undefined || expected.timeOrigin === current.timeOrigin)
-    && (expected.token === undefined || expected.token === current.token);
-  const sameDocument = (left, right) => Boolean(left && right
-    && left.url === right.url
-    && left.timeOrigin === right.timeOrigin
-    && typeof left.token === "string"
-    && typeof right.token === "string"
-    && left.token === right.token);
+  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  const { documentIdentity, sameDocument, resolveObservedElement } = pageAgent;
+  const currentDocument = documentIdentity();
   const expectedActionDocument = {
     url: __expectedActionUrl,
     timeOrigin: __expectedActionTimeOrigin,
@@ -4081,39 +4035,36 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
   };
   const resolveNode = () => {
     if (nodeId === undefined) return { element: undefined, resolvedBy: undefined, rebound: false };
-    if (!snapshotId || !pageAgent || typeof pageAgent.lookup !== "function") throw staleDomSnapshot();
-    if (__domObservationInvalidated === true) throw documentChanged();
-    const expectedDocument = { url: __expectedDomUrl, timeOrigin: __expectedDomTimeOrigin, token: __expectedDomToken };
-    if (!expectedMatches(expectedDocument, currentDocument)) throw documentChanged();
-    const observation = pageAgent.lookup("dom", String(snapshotId));
-    if (!observation || !isMapLike(observation.nodes)) throw staleDomSnapshot();
-    if (!sameDocument(observation.documentIdentity, currentDocument)) throw documentChanged();
-    const record = observation.nodes.get(String(nodeId));
-    if (!record) throw staleDomSnapshot("node_not_found");
-    const original = typeof record.element?.deref === "function" ? record.element.deref() : record.element;
-    if (original?.isConnected && original.ownerDocument === document) {
-      const rebound = record.rebound === true;
-      if (!descriptorMatches(original, record.descriptor, true)) throw changedNodeError(rebound);
-      return { element: original, resolvedBy: rebound ? "semantic_rebind" : "original_node", rebound };
-    }
-    // Just as snapshot refs do, DOM-CUA node ids get one unique same-document
-    // replacement only; a second detachment requires a fresh observation.
-    if (record.rebound === true) throw detachedNodeError("rebind_already_used", true);
-    if (!canSemanticRebind(record.descriptor)) throw detachedNodeError("descriptor_not_strong_enough");
-    const candidates = Array.from(document.querySelectorAll("*"))
-      .filter((target) => target.isConnected && descriptorMatches(target, record.descriptor, true));
-    if (candidates.length === 1) {
-      record.element = typeof WeakRef === "function" ? new WeakRef(candidates[0]) : candidates[0];
-      record.rebound = true;
-      return { element: candidates[0], resolvedBy: "semantic_rebind", rebound: true };
-    }
-    if (candidates.length > 1) {
-      const error = new Error(`DOM node resolved to ${candidates.length} equivalent elements; take a new visible DOM snapshot before retrying`);
+    if (!snapshotId) throw staleDomSnapshot();
+    const resolution = resolveObservedElement({
+      kind: "dom",
+      observationId: String(snapshotId),
+      recordId: String(nodeId),
+      observationInvalidated: __domObservationInvalidated === true,
+      expectedDocument: { url: __expectedDomUrl, timeOrigin: __expectedDomTimeOrigin, token: __expectedDomToken },
+      currentDocument,
+      matchesDescriptor: (target, descriptor) => descriptorMatches(target, descriptor, true),
+      canSemanticRebind,
+      findCandidates: (descriptor) => Array.from(document.querySelectorAll("*"))
+        .filter((target) => target.isConnected && descriptorMatches(target, descriptor, true)),
+    });
+    if (resolution.state === "document_changed") throw documentChanged();
+    if (resolution.state === "observation_unavailable") throw staleDomSnapshot();
+    if (resolution.state === "record_unavailable") throw staleDomSnapshot("node_not_found");
+    if (resolution.state === "changed") throw changedNodeError(resolution.rebound);
+    if (resolution.state === "detached") throw detachedNodeError(resolution.reason, resolution.rebound);
+    if (resolution.state === "ambiguous") {
+      const error = new Error(`DOM node resolved to ${resolution.count} equivalent elements; take a new visible DOM snapshot before retrying`);
       error.code = "DOM_NODE_AMBIGUOUS";
-      error.details = { nodeId, snapshotId, count: candidates.length, rebound: true };
+      error.details = { nodeId, snapshotId, count: resolution.count, rebound: true };
       throw error;
     }
-    throw detachedNodeError();
+    if (resolution.state !== "resolved") throw staleDomSnapshot();
+    return {
+      element: resolution.element,
+      resolvedBy: resolution.rebound ? "semantic_rebind" : "original_node",
+      rebound: resolution.rebound,
+    };
   };
   const resolution = resolveNode();
   const element = resolution.element;
@@ -4173,7 +4124,7 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
   }
 }
 
-const PAGE_AGENT_FUNCTIONS = new Set(["collectSnapshot", "pageOperation", "collectVisibleDom", "runDomCua"]);
+const PAGE_AGENT_FUNCTIONS = new Set(["collectSnapshot", "pageOperation", "collectVisibleDom", "runDomCua", "pageGeneration"]);
 
 async function ensurePageAgent(tabId, expectedFence) {
   const fence = expectedFence ?? await tabFenceFor(tabId, true);
@@ -4704,17 +4655,9 @@ async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence
 }
 
 function pageGeneration() {
-  const tokenKey = "__piControlChromeDocumentToken";
-  let token = globalThis[tokenKey];
-  if (typeof token !== "string" || token.length === 0) {
-    token = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-    try { Object.defineProperty(globalThis, tokenKey, { configurable: false, enumerable: false, value: token }); } catch { globalThis[tokenKey] = token; }
-  }
-  return {
-    url: location.href,
-    timeOrigin: typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined,
-    token,
-  };
+  const pageAgent = globalThis["__piControlChromePageAgent"];
+  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  return pageAgent.documentIdentity();
 }
 
 function isRestrictedPageError(error) {

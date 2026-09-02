@@ -53,7 +53,6 @@ function compactTab(value, currentSessionId) {
   if (typeof result.url === "string") result.url = bounded(result.url, 4_096);
   if (isRecord(result.handle) && typeof result.handle.title === "string") result.handle.title = bounded(result.handle.title, FIELD_MAX_CHARS);
   if (isRecord(result.handle) && typeof result.handle.url === "string") result.handle.url = bounded(result.handle.url, 4_096);
-  if (typeof result.favicon === "string" && !/^https?:\/\//i.test(result.favicon)) delete result.favicon;
   return result;
 }
 
@@ -286,7 +285,7 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
   };
 }
 
-/** Project tab descriptors and remove favicon data payloads. */
+/** Project tab descriptors without favicon payloads. */
 export function compactTabsResult(value, currentSessionId) {
   if (!isRecord(value)) return value;
   const hasSession = typeof currentSessionId === "string" && currentSessionId.length > 0;
