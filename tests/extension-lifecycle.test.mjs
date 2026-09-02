@@ -34,6 +34,7 @@ function loadExtension(options = {}) {
   let nextTabId = Number(options.nextTabId ?? 1000);
   let pageGenerationCalls = 0;
   const executeScriptCalls = [];
+  const debuggerCommandCalls = [];
   const removeFailures = new Set();
   let detachFailure = false;
   let debuggerCommandFailure = false;
@@ -169,8 +170,10 @@ function loadExtension(options = {}) {
       async attach(debuggee) { attachedDebuggerTabs.add(Number(debuggee.tabId)); },
       async getTargets() { return [...attachedDebuggerTabs].map((tabId) => ({ tabId, attached: true, id: `target-${tabId}` })); },
       async detach(debuggee) { if (detachFailure) throw new Error("simulated debugger detach failure"); attachedDebuggerTabs.delete(Number(debuggee.tabId)); },
-      async sendCommand(_debuggee, method) {
+      async sendCommand(_debuggee, method, params) {
+        debuggerCommandCalls.push({ method, params: clone(params) });
         if (debuggerCommandFailure && method !== "Page.captureScreenshot") throw new Error("simulated debugger command failure");
+        if (typeof options.debuggerCommandResult === "function") return clone(await options.debuggerCommandResult(method, params));
         if (method === "Runtime.evaluate" && options.debuggerEvaluateResult !== undefined) return { result: { type: "object", value: clone(options.debuggerEvaluateResult) } };
         return method === "Page.captureScreenshot" ? { data: "debugger-data" } : {};
       },
@@ -255,7 +258,7 @@ function loadExtension(options = {}) {
     }
     return originalExecuteScript(details);
   };
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
     chrome,
@@ -278,6 +281,7 @@ function loadExtension(options = {}) {
     heartbeatMessages,
     heartbeatIntervals: intervalCallbacks,
     executeScriptCalls,
+    debuggerCommandCalls,
     removeFailures,
     setDetachFailure(value) { detachFailure = value; },
     setDebuggerCommandFailure(value) { debuggerCommandFailure = value; },
@@ -390,7 +394,7 @@ test("advertises live-ref and semantic-rebind capabilities", async () => {
 
   assert.equal(status.capabilities.liveRefs, true);
   assert.equal(status.capabilities.semanticRebind, true);
-  assert.equal(status.capabilities.axRefs, false);
+  assert.equal(status.capabilities.axRefs, true);
 });
 
 test("keeps the extension Bridge socket alive with application heartbeats", async () => {
@@ -743,6 +747,237 @@ test("page selector failures retain a deterministic diagnostic", async () => {
       && error?.details?.selector === "main",
   );
 });
+
+test("accessibility snapshots use Chromium AX and preserve the bounded public tree", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-ax-1",
+        __piControlChromeSnapshotUrl: "https://example.test/ax",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "AX test",
+        url: "https://example.test/ax",
+        text: "Save",
+        elements: [],
+      },
+    },
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-main" } } };
+      if (method === "Accessibility.enable") return {};
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [
+          { nodeId: "root", role: { type: "role", value: "RootWebArea" }, name: { type: "string", value: "AX test" }, ignored: false },
+          { nodeId: "button", backendDOMNodeId: 42, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false, properties: [{ name: "disabled", value: { type: "boolean", value: false } }] },
+          { nodeId: "password", backendDOMNodeId: 43, role: { type: "role", value: "textbox" }, name: { type: "string", value: "Account" }, value: { type: "string", value: "hunter2" }, ignored: false },
+          { nodeId: "hidden", backendDOMNodeId: 44, role: { type: "role", value: "button" }, name: { type: "string", value: "Hidden" }, ignored: true },
+        ],
+      };
+      if (method === "DOM.describeNode" && params?.backendNodeId === 43) return { node: { nodeName: "INPUT", attributes: ["autocomplete", "current-password", "type", "text"] } };
+      return {};
+    },
+  });
+  fixture.tabs.set(309, { id: 309, windowId: 1, title: "AX test", url: "https://example.test/ax", status: "complete" });
+
+  const result = await fixture.api.handleRequest("snapshot", { tabId: 309, accessibilityOnly: true, sessionId: "session-test" });
+  const accessibility = result.snapshot.accessibility;
+  assert.equal(accessibility.source, "chromium_ax");
+  assert.equal(accessibility.mode, "full");
+  assert.equal(accessibility.children.length, 2);
+  assert.equal(accessibility.children[0].role, "button");
+  assert.equal(accessibility.children[0].name, "Save");
+  assert.equal(accessibility.children[0].value, undefined);
+  assert.equal(accessibility.children[1].role, "textbox");
+  assert.equal(accessibility.children[1].name, "Account");
+  assert.equal(accessibility.children[1].value, undefined);
+  assert.match(accessibility.state, /\[ref=a1\]/);
+  assert.match(accessibility.state, /\[ref=a2\]/);
+  assert.equal(JSON.stringify(accessibility).includes("backendDOMNodeId"), false);
+  assert.equal(JSON.stringify(accessibility).includes("hunter2"), false);
+  assert.ok(fixture.debuggerCommandCalls.some(({ method }) => method === "Accessibility.enable"));
+  assert.ok(fixture.debuggerCommandCalls.some(({ method }) => method === "Accessibility.getFullAXTree"));
+  const limited = await fixture.api.handleRequest("snapshot", { tabId: 309, accessibilityOnly: true, maxChars: 1, sessionId: "session-test" });
+  assert.equal(limited.snapshot.accessibility.truncated, true);
+});
+
+test("accessibility selector reads use a main-frame partial AX tree", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-ax-selector",
+        __piControlChromeSnapshotUrl: "https://example.test/ax-selector",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "AX selector",
+        url: "https://example.test/ax-selector",
+        text: "Continue",
+        elements: [],
+      },
+    },
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main" } } };
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 2 };
+      if (method === "DOM.describeNode") return { node: { backendNodeId: 52 } };
+      if (method === "Accessibility.getPartialAXTree") return {
+        nodes: [{ nodeId: "button", backendDOMNodeId: 52, role: { type: "role", value: "button" }, name: { type: "string", value: "Continue" }, ignored: false, childIds: [] }],
+      };
+      return {};
+    },
+  });
+  fixture.tabs.set(310, { id: 310, windowId: 1, title: "AX selector", url: "https://example.test/ax-selector", status: "complete" });
+
+  const result = await fixture.api.handleRequest("snapshot", { tabId: 310, selector: "main", accessibilityOnly: true, sessionId: "session-test" });
+  assert.equal(result.snapshot.accessibility.children.length, 1);
+  assert.equal(result.snapshot.accessibility.children[0].role, "button");
+  const methods = fixture.debuggerCommandCalls.map(({ method }) => method);
+  assert.ok(methods.indexOf("Accessibility.enable") < methods.indexOf("DOM.enable"));
+  assert.ok(methods.indexOf("DOM.querySelector") < methods.indexOf("Accessibility.getPartialAXTree"));
+  const partial = fixture.debuggerCommandCalls.find(({ method }) => method === "Accessibility.getPartialAXTree");
+  assert.equal(partial.params.fetchRelatives, true);
+});
+
+test("accessibility reads report a changing frame instead of mixing AX trees", async () => {
+  let frameRead = 0;
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-ax-changing-frame",
+        __piControlChromeSnapshotUrl: "https://example.test/ax-changing-frame",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "AX changing frame",
+        url: "https://example.test/ax-changing-frame",
+        text: "Changing frame",
+        elements: [],
+      },
+    },
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: `loader-${++frameRead}` } } };
+      if (method === "Accessibility.enable") return {};
+      if (method === "Accessibility.getFullAXTree") return { nodes: [{ nodeId: "button", backendDOMNodeId: 62, role: { type: "role", value: "button" }, name: { type: "string", value: "Continue" }, ignored: false }] };
+      return {};
+    },
+  });
+  fixture.tabs.set(313, { id: 313, windowId: 1, title: "AX changing frame", url: "https://example.test/ax-changing-frame", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("snapshot", { tabId: 313, accessibilityOnly: true, sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_PAGE_CHANGING" && error?.details?.frameChanged === true,
+  );
+});
+
+test("unavailable Chromium AX falls back to the DOM semantic collector", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-ax-fallback",
+        __piControlChromeSnapshotUrl: "https://example.test/ax-fallback",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "AX fallback",
+        url: "https://example.test/ax-fallback",
+        text: "Fallback",
+        elements: [],
+      },
+      collectDomAccessibilitySnapshot: {
+        role: "document",
+        name: "AX fallback",
+        children: [{ role: "button", name: "Fallback" }],
+        state: "- button \\\"Fallback\\\"",
+        nodeCount: 1,
+        maxChars: 20000,
+        maxNodes: 200,
+      },
+    },
+    debuggerCommandResult: async (method) => {
+      if (method === "Accessibility.enable") throw new Error("Method not found");
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main" } } };
+      return {};
+    },
+  });
+  fixture.tabs.set(311, { id: 311, windowId: 1, title: "AX fallback", url: "https://example.test/ax-fallback", status: "complete" });
+
+  const result = await fixture.api.handleRequest("snapshot", { tabId: 311, accessibilityOnly: true, sessionId: "session-test" });
+  assert.equal(result.snapshot.accessibility.source, "dom_semantic");
+  assert.equal(result.snapshot.accessibility.children.length, 1);
+  assert.equal(result.snapshot.accessibility.children[0].role, "button");
+  assert.equal(result.snapshot.accessibility.children[0].name, "Fallback");
+  assert.equal(fixture.debuggerCommandCalls.some(({ method }) => method === "Accessibility.getFullAXTree"), false);
+});
+
+test("AX refs map to backend DOM nodes, fence frames, and allow one semantic rebind", async () => {
+  let backendNodeId = 42;
+  let frameLoaderId = "loader-1";
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-ax-ref",
+        __piControlChromeSnapshotUrl: "https://example.test/ax-ref",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "AX ref",
+        url: "https://example.test/ax-ref",
+        text: "Save",
+        elements: [],
+      },
+    },
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: frameLoaderId } } };
+      if (method === "Accessibility.enable") return {};
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [
+          { nodeId: "root", role: { type: "role", value: "RootWebArea" }, name: { type: "string", value: "AX ref" }, ignored: false },
+          { nodeId: `button-${backendNodeId}`, backendDOMNodeId: backendNodeId, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false },
+          { nodeId: "password", backendDOMNodeId: 45, role: { type: "role", value: "textbox" }, name: { type: "string", value: "Account" }, value: { type: "string", value: "hunter2" }, ignored: false },
+        ],
+      };
+      if (method === "DOM.describeNode" && params?.backendNodeId === 45) return { node: { nodeName: "INPUT", attributes: ["autocomplete", "current-password", "type", "text"] } };
+      if (method === "DOM.resolveNode") return { object: { objectId: "ax-object" } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "getAttribute") return { result: { type: "string", value: params?.arguments?.[3]?.value === true ? null : "safe" } };
+        return { result: { type: "object", value: { ok: true, operation } } };
+      }
+      if (method === "Runtime.releaseObject") return {};
+      return {};
+    },
+  });
+  fixture.tabs.set(312, { id: 312, windowId: 1, title: "AX ref", url: "https://example.test/ax-ref", status: "complete" });
+
+  const snapshot = await fixture.api.handleRequest("snapshot", { tabId: 312, accessibilityOnly: true, sessionId: "session-test" });
+  const ref = snapshot.snapshot.accessibility.children[0].ref;
+  assert.match(ref, /^a\d+$/);
+
+  const direct = await fixture.api.resolveAccessibilityNode(312, { ref, snapshotId: snapshot.snapshot.snapshotId, sessionId: "session-test" }, "session-test");
+  assert.equal(direct.value.resolvedBy, "ax_backend_node");
+  assert.equal(direct.value.rebound, false);
+
+  const action = await fixture.api.handleRequest("interaction", { tabId: 312, ref, snapshotId: snapshot.snapshot.snapshotId, operation: "click", sessionId: "session-test" });
+  assert.equal(action.result.ok, true);
+  const sensitiveRef = snapshot.snapshot.accessibility.children.find(node => node.name === "Account").ref;
+  const sensitiveValue = await fixture.api.handleRequest("locator", { tabId: 312, target: { ref: sensitiveRef }, snapshotId: snapshot.snapshot.snapshotId, action: "getAttribute", attribute: "value", sessionId: "session-test" });
+  assert.equal(sensitiveValue.result, null);
+  assert.equal(action.result.resolvedBy, "ax_backend_node");
+  assert.equal(action.result.rebound, false);
+  assert.equal(action.result.element.ref, ref);
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+  assert.ok(fixture.debuggerCommandCalls.some(({ method }) => method === "DOM.resolveNode"));
+  assert.equal(fixture.debuggerCommandCalls.some(({ method, params }) => method === "Runtime.callFunctionOn" && params?.arguments?.[0]?.value === "click"), true);
+
+  backendNodeId = 43;
+  const rebound = await fixture.api.handleRequest("interaction", { ref, snapshotId: snapshot.snapshot.snapshotId, operation: "click", sessionId: "session-test", tabId: 312 });
+  assert.equal(rebound.result.resolvedBy, "ax_semantic_rebind");
+  assert.equal(rebound.result.rebound, true);
+
+  backendNodeId = 44;
+  frameLoaderId = "loader-2";
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", { tabId: 312, ref, snapshotId: snapshot.snapshot.snapshotId, operation: "click", sessionId: "session-test" }),
+    (error) => error?.code === "BROWSER_DOCUMENT_CHANGED" && error?.details?.snapshotId === snapshot.snapshot.snapshotId,
+  );
+});
+
 test("extract accepts an unowned user tab without a returned document handle", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(316, { id: 316, windowId: 1, title: "user tab", url: "https://example.test/user" });

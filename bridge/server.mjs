@@ -404,11 +404,21 @@ function sendPendingFailure(entry, code, message) {
   return sendError(entry.client, entry.clientRequestId, failure.code, failure.message, failure.details);
 }
 
+function hasAccessibilityReference(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return (typeof value.ref === "string" && /^a\d+$/.test(value.ref))
+    || hasAccessibilityReference(value.target)
+    || hasAccessibilityReference(value.locator)
+    || hasAccessibilityReference(value.left)
+    || hasAccessibilityReference(value.right);
+}
+
 function missingExtensionCapabilities(message, extension) {
   const params = requestParams(message);
   const required = [];
   if (message.method === "dom_cua") required.push("domCuaSnapshots");
   if (["interaction", "locator", "wait"].includes(message.method) && params.snapshotId !== undefined) required.push("snapshotRefs");
+  if (["interaction", "locator", "wait"].includes(message.method) && hasAccessibilityReference(params)) required.push("axRefs");
   if (message.method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery", "tabIncarnationFence");
   if (message.method === "cleanup" && params.recoverStale === true) required.push("tabIncarnationFence", "debuggerLeaseRecovery");
   if ((message.method === "mark_handoff" || message.method === "mark_deliverable") && params.turnId !== undefined) required.push("turnScopedMarks");

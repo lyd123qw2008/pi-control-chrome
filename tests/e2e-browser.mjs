@@ -57,7 +57,7 @@ const site = `<!doctype html>
 <label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label>
 <label><input id="agree" type="checkbox"> Agree</label>
 <label for="email">Email</label><input id="email" placeholder="Email">
-<input id="readonly" value="secret-value" readonly>
+<input id="readonly" value="secret-value" autocomplete="current-password" readonly>
 <label for="editor">Editor</label><div id="editor" role="textbox" contenteditable></div>
 <input id="file" type="file">
 <button id="go" data-testid="submit-button">Submit</button>
@@ -473,12 +473,55 @@ try {
   assert.ok(scopedSnapshot.snapshot.elements.every((element) => element.name.includes("Text") || element.name.includes("target") || element.name.includes("now")));
   const axFull = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true });
   assert.equal(axFull.snapshot.accessibility.mode, "full");
+  assert.equal(axFull.snapshot.accessibility.source, "chromium_ax");
+  const axName = axFull.snapshot.accessibility.children.find((node) => node.role === "textbox" && node.name === "Name");
+  const axSubmit = axFull.snapshot.accessibility.children.find((node) => node.role === "button" && node.name === "Submit");
+  const axChoice = axFull.snapshot.accessibility.children.find((node) => node.role === "combobox" && node.name === "Choice");
+  const axAgree = axFull.snapshot.accessibility.children.find((node) => node.role === "checkbox" && node.name === "Agree");
+  assert.match(axName?.ref || "", /^a\d+$/);
+  assert.match(axSubmit?.ref || "", /^a\d+$/);
+  assert.match(axChoice?.ref || "", /^a\d+$/);
+  assert.match(axAgree?.ref || "", /^a\d+$/);
+  assert.equal(JSON.stringify(axFull.snapshot.accessibility).includes("secret-value"), false);
+  const axSensitive = axFull.snapshot.accessibility.children.find((node) => node.readonly === true);
+  assert.match(axSensitive?.ref || "", /^a\d+$/);
+  const axSensitiveValue = await request("locator", { tabId: selected.tab.id, target: { ref: axSensitive.ref }, snapshotId: axFull.snapshot.snapshotId, action: "getAttribute", attribute: "value" });
+  assert.equal(axSensitiveValue.result, null);
+  const axDisabled = axFull.snapshot.accessibility.children.find((node) => node.role === "button" && node.name === "Disabled action");
+  assert.match(axDisabled?.ref || "", /^a\d+$/);
   const axUnchanged = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true });
   assert.equal(axUnchanged.snapshot.accessibility.mode, "unchanged");
+  assert.equal(JSON.stringify(axUnchanged).includes("secret-value"), false);
+  const axWait = await request("wait", { tabId: selected.tab.id, state: "visible", target: { ref: axSubmit.ref }, snapshotId: axFull.snapshot.snapshotId, timeoutMs: 1000 });
+  assert.equal(axWait.matched, true);
+  const axLocatorText = await request("locator", { tabId: selected.tab.id, target: { ref: axName.ref }, snapshotId: axFull.snapshot.snapshotId, action: "getAttribute", attribute: "placeholder" });
+  assert.equal(axLocatorText.result, "Name");
+  const axFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: axName.ref, snapshotId: axFull.snapshot.snapshotId, value: "AX value" });
+  assert.equal(axFill.result?.resolvedBy, "ax_backend_node");
+  assert.equal(axFill.result?.rebound, false);
+  const axSelect = await request("locator", { tabId: selected.tab.id, target: { ref: axChoice.ref }, snapshotId: axFull.snapshot.snapshotId, action: "select", value: "two" });
+  assert.equal(axSelect.result?.resolvedBy, "ax_backend_node");
+  const axCheck = await request("locator", { tabId: selected.tab.id, target: { ref: axAgree.ref }, snapshotId: axFull.snapshot.snapshotId, action: "check" });
+  assert.equal(axCheck.result?.resolvedBy, "ax_backend_node");
+  const axValue = await request("evaluate", { tabId: selected.tab.id, expression: "({ name: document.querySelector('#name').value, choice: document.querySelector('#choice').value, agree: document.querySelector('#agree').checked })" });
+  assert.deepEqual(axValue.result?.result?.value, { name: "AX value", choice: "two", agree: true });
+  const axClick = await request("interaction", { tabId: selected.tab.id, operation: "click", ref: axSubmit.ref, snapshotId: axFull.snapshot.snapshotId });
+  assert.equal(axClick.result?.resolvedBy, "ax_backend_node");
+  assert.equal(axClick.result?.rebound, false);
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, operation: "click", ref: axDisabled.ref, snapshotId: axFull.snapshot.snapshotId }),
+    (error) => error?.code === "AX_NODE_DISABLED",
+  );
+  const axAfterClick = await request("snapshot", { tabId: selected.tab.id });
+  assert.match(axAfterClick.snapshot.text, /Hello AX value/);
   await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#aria-label-button').setAttribute('aria-label', 'Changed accessibility')" });
   const axDiff = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true });
   assert.equal(axDiff.snapshot.accessibility.mode, "diff");
   assert.match(axDiff.snapshot.accessibility.state, /Changed accessibility/);
+  assert.equal(JSON.stringify(axDiff).includes("secret-value"), false);
+  const axScoped = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, selector: "main", disableDiffing: true });
+  assert.equal(axScoped.snapshot.accessibility.source, "chromium_ax");
+  assert.ok(axScoped.snapshot.accessibility.children.some((node) => node.role === "button" && node.ref));
   const compactAx = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true, responseMode: "compact" });
   assert.equal(compactAx.children, undefined);
   assert.equal(compactAx.snapshot, undefined);

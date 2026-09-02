@@ -136,6 +136,7 @@ function statusValue(browserId = "edge:test") {
       tabIncarnationFence: true,
       semanticTargets: true,
       pageWaitStates: true,
+      axRefs: true,
     },
   };
 }
@@ -422,6 +423,33 @@ test("Pi omits blank browser fields before dispatch", async () => {
     await mock.close();
   }
 });
+test("Pi refuses AX ref operations when the extension capability is missing", async () => {
+  const mock = await createMockBridge();
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    mock.enqueue("status", async (_message, respond) => {
+      const status = statusValue();
+      const capabilities = { ...status.capabilities };
+      delete capabilities.axRefs;
+      respond({ ...status, capabilities });
+    });
+    const result = await harness.tools.get("browser_click").execute("ax-click", { tabId: 7, ref: "a1", snapshotId: "snapshot-1" });
+    assert.equal(result.details.code, "BRIDGE_CAPABILITY_MISSING");
+    assert.match(result.content[0].text, /axRefs/);
+    assert.equal(mock.requests.filter(message => message.method === "interaction").length, 0);
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
+
 test("Pi refuses stale-runtime recovery when the extension capability is missing", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();

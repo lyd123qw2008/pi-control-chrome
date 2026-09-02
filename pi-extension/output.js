@@ -126,8 +126,14 @@ function accessibilityLine(node, prefix = "- ") {
   const name = text(node.name);
   const value = node.value === undefined || text(node.value).length === 0 ? "" : ` value=${quote(node.value)}`;
   const disabled = node.disabled === true ? " disabled" : "";
-  const checked = node.checked === undefined ? "" : ` checked=${node.checked === true}`;
-  return `${prefix}${role}${name ? ` ${quote(name)}` : ""}${value}${disabled}${checked}`;
+  const checked = node.checked === undefined ? "" : ` checked=${node.checked === "mixed" ? "mixed" : node.checked === true}`;
+  const states = ["expanded", "selected", "pressed", "required", "readonly", "editable"]
+    .filter(key => node[key] !== undefined)
+    .map(key => ` ${key}=${node[key] === true}`)
+    .join("");
+  const level = node.level === undefined ? "" : ` level=${node.level}`;
+  const ref = typeof node.ref === "string" ? ` [ref=${node.ref}]` : "";
+  return `${prefix}${role}${name ? ` ${quote(name)}` : ""}${value}${disabled}${checked}${states}${level}${ref}`;
 }
 
 function snapshotState(snapshot, maxChars, maxNodes) {

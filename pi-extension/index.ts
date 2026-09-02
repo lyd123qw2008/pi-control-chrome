@@ -602,6 +602,16 @@ function compactResponseParams(method: string, params: Record<string, unknown>, 
   return { ...params, responseMode: "compact" };
 }
 
+function hasAccessibilityReference(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (typeof record.ref === 'string' && /^a\d+$/.test(record.ref))
+    || hasAccessibilityReference(record.target)
+    || hasAccessibilityReference(record.locator)
+    || hasAccessibilityReference(record.left)
+    || hasAccessibilityReference(record.right);
+}
+
 function assertBridgeRequestCapabilities(method: string, params: Record<string, unknown>, health: unknown, status?: unknown): void {
   const bridgeCapabilities = health && typeof health === "object" ? (health as { capabilities?: unknown }).capabilities : undefined;
   const bridgeRecord = bridgeCapabilities && typeof bridgeCapabilities === "object" && !Array.isArray(bridgeCapabilities) ? bridgeCapabilities as Record<string, unknown> : {};
@@ -626,6 +636,7 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
   }
   if (TAB_INCARNATION_METHODS.has(method)) requiredExtension.push("tabIncarnationFence");
   if (["interaction", "locator", "wait"].includes(method) && params.snapshotId !== undefined) requiredExtension.push("snapshotRefs");
+  if (["interaction", "locator", "wait"].includes(method) && hasAccessibilityReference(params)) requiredExtension.push("axRefs");
   const missing = [
     ...requiredBridge.filter(name => bridgeRecord[name] !== true),
     ...requiredExtension.filter(name => extensionRecord[name] !== true),
@@ -1158,7 +1169,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_accessibility_snapshot",
     label: "Browser Accessibility Snapshot",
-    description: "Return the bounded accessibility-oriented semantic tree as full, incremental diff or unchanged text; the first read is full and later reads may be diff or unchanged.",
+    description: "Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.",
     parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
@@ -1172,7 +1183,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_locator",
     label: "Browser Locator",
-    description: "Playwright-style locator operations using semantic targets, css, role, text, label, placeholder and testid strategies plus count, first, last, nth, text, attributes and actions; ref locators require the matching snapshotId.",
+    description: "Playwright-style locator operations using semantic targets, CSS, role, text, label, placeholder, testid, or document-scoped eN/aN refs plus count, first, last, nth, text, attributes and actions; ref locators require the matching snapshotId. AX refs are revalidated against the current Chromium tree before DOM mapping.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
@@ -1224,7 +1235,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_wait",
     label: "Wait for Browser Page",
-    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; ref targets require the matching snapshotId.",
+    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; eN/aN ref targets require the matching snapshotId, and AX refs are revalidated against the current Chromium tree.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
@@ -1246,7 +1257,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_click",
     label: "Click Browser Element",
-    description: "Click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
+    description: "Click one visible element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1258,7 +1269,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_double_click",
     label: "Double Click Browser Element",
-    description: "Double-click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
+    description: "Double-click one visible element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1270,7 +1281,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_fill",
     label: "Fill Browser Field",
-    description: "Fill one input, textarea or contenteditable element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
+    description: "Fill one input, textarea or contenteditable element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, value: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1282,7 +1293,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_type",
     label: "Type Browser Text",
-    description: "Type or append text into one focused browser field selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
+    description: "Type or append text into one focused browser field selected by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, value: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1294,7 +1305,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_press_key",
     label: "Press Browser Key",
-    description: "Dispatch a keyboard key to one element selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
+    description: "Dispatch a keyboard key to one element selected by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, key: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {

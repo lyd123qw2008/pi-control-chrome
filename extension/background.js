@@ -29,7 +29,7 @@ const EXTENSION_CAPABILITIES = Object.freeze({
   domCuaSnapshots: true,
   liveRefs: true,
   semanticRebind: true,
-  axRefs: false,
+  axRefs: true,
   tabIncarnationFence: true,
 });
 
@@ -57,6 +57,7 @@ const orphanedDebuggerAttaches = new Map();
 const pageSnapshotStates = new Map();
 const domSnapshotStates = new Map();
 const accessibilitySnapshotStates = new Map();
+const accessibilitySnapshotObservations = new Map();
 const tabFenceTokens = new Map();
 const createdTabReservations = new Map();
 const createdTabFlights = new Set();
@@ -777,7 +778,7 @@ chrome.tabs?.onRemoved?.addListener((tabId) => {
   createdTabEvents.delete(key);
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
-  accessibilitySnapshotStates.delete(key);
+  clearAccessibilitySnapshotState(key);
   void (async () => {
     await ensureTabFenceState();
     if (tabRemovalTombstones.get(key) !== tombstone) return;
@@ -922,7 +923,7 @@ chrome.tabs?.onReplaced?.addListener((addedTabId, removedTabId) => {
   createdTabEvents.delete(removedKey);
   pageSnapshotStates.delete(removedKey);
   domSnapshotStates.delete(removedKey);
-  accessibilitySnapshotStates.delete(removedKey);
+  clearAccessibilitySnapshotState(removedKey);
   devtoolsState.delete(removedKey);
   const removedDebugger = persistentDebuggers.get(removedKey);
   const removedOrphan = orphanedDebuggerAttaches.get(removedKey);
@@ -937,7 +938,7 @@ chrome.tabs?.onReplaced?.addListener((addedTabId, removedTabId) => {
   tombstone.replacementTransferInFlight = true;
   pageSnapshotStates.delete(addedKey);
   domSnapshotStates.delete(addedKey);
-  accessibilitySnapshotStates.delete(addedKey);
+  clearAccessibilitySnapshotState(addedKey);
   devtoolsState.delete(addedKey);
   const addedDebugger = persistentDebuggers.get(addedKey);
   if (addedDebugger?.releaseTimer !== undefined) clearTimeout(addedDebugger.releaseTimer);
@@ -2048,7 +2049,7 @@ function prepareCreatedTabRuntimeState(tabId, fence) {
   }
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
-  accessibilitySnapshotStates.delete(key);
+  clearAccessibilitySnapshotState(key);
   devtoolsState.delete(key);
   return true;
 }
@@ -2105,7 +2106,7 @@ async function reconcileUnreservedCreatedTabNow(tab, eventObservedAt) {
   const nextFence = rotateTabFence(id);
   pageSnapshotStates.delete(key);
   domSnapshotStates.delete(key);
-  accessibilitySnapshotStates.delete(key);
+  clearAccessibilitySnapshotState(key);
   devtoolsState.delete(key);
   const debuggerRecord = persistentDebuggers.get(key);
   if (debuggerRecord?.releaseTimer !== undefined) clearTimeout(debuggerRecord.releaseTimer);
@@ -2804,7 +2805,7 @@ async function putInPiGroup(tab, expectedFence) {
   return groupId;
 }
 
-function collectAccessibilitySnapshot(options = {}) {
+function collectDomAccessibilitySnapshot(options = {}) {
   const MAX_CHARS = 100_000;
   const MAX_NODES = 1_000;
   const DEFAULT_CHARS = 20_000;
@@ -2970,6 +2971,391 @@ function collectAccessibilitySnapshot(options = {}) {
     maxNodes,
     __piControlChromeAccessibilityNodes: nodes,
   };
+}
+
+const AX_OMIT_ROLES = new Set([
+  "document", "generic", "group", "inlinetextbox", "listitem", "none", "presentation", "rootwebarea", "statictext", "webarea",
+]);
+const AX_ACTIONABLE_ROLES = new Set([
+  "button", "checkbox", "combobox", "link", "listbox", "menuitem", "option", "radio", "searchbox", "slider", "spinbutton",
+  "switch", "tab", "textbox", "treeitem",
+]);
+const AX_CONTENT_ROLES = new Set([
+  ...AX_ACTIONABLE_ROLES, "alert", "dialog", "heading", "img", "main", "progressbar", "tablist",
+]);
+const AX_SENSITIVE_HINT = /password|passcode|one[-_ ]?time|otp|token|secret|api[-_ ]?key|access[-_ ]?key|auth|credential|credit[-_ ]?card|cc[-_ ]?(?:number|exp(?:iry)?|csc|cvv)|bank[-_ ]?account|routing[-_ ]?number|private[-_ ]?key|license[-_ ]?key|ssn|social[-_ ]?security|tax[-_ ]?id|pin|cvv|cvc|security[-_ ]?code|bearer/i;
+
+function axValue(value) {
+  if (value === undefined || value === null) return undefined;
+  return isRecordObject(value) ? value.value : value;
+}
+
+function axBound(value, limit = 240) {
+  const text = String(axValue(value) ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  if (limit <= 3) return text.slice(0, limit);
+  return `${text.slice(0, limit - 3)}...`;
+}
+
+function axBoolean(value) {
+  const normalized = axValue(value);
+  if (typeof normalized === "boolean") return normalized;
+  if (typeof normalized === "string") {
+    if (normalized.toLowerCase() === "true") return true;
+    if (normalized.toLowerCase() === "false") return false;
+  }
+  return undefined;
+}
+
+function axBooleanOrMixed(value) {
+  const normalized = axValue(value);
+  if (normalized === "mixed") return "mixed";
+  return axBoolean(normalized);
+}
+
+function axProperties(node) {
+  const properties = new Map();
+  for (const property of Array.isArray(node?.properties) ? node.properties : []) {
+    const name = String(property?.name || "").trim().toLowerCase();
+    if (name) properties.set(name, axValue(property?.value));
+  }
+  return properties;
+}
+
+function axNumber(value) {
+  const normalized = axValue(value);
+  const number = typeof normalized === "number" ? normalized : Number(normalized);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function axNodeRole(node) {
+  const role = axValue(node?.role);
+  return typeof role === "string" ? role.trim().toLowerCase().slice(0, 64) : "";
+}
+
+function axNodeSensitive(role, name, description, properties, value) {
+  if (role === "password" || role === "passwordtext") return true;
+  const hints = [role, name, description, value, properties.get("autocomplete"), properties.get("html-input-type"), properties.get("inputtype")]
+    .filter(value => value !== undefined && value !== null).join(" ");
+  return AX_SENSITIVE_HINT.test(hints);
+}
+
+function axNodeLineCost(node) {
+  return JSON.stringify(publicAccessibilityNode(node)).length + 1;
+}
+
+function normalizeAxNodes(rawNodes, frameId, maxChars, maxNodes, includeRefs = false, refCounter = { value: 0 }, frameLoaderId, sensitiveBackendNodeIds = new Set()) {
+  const nodes = [];
+  let chars = 0;
+  let truncated = false;
+  for (const raw of Array.isArray(rawNodes) ? rawNodes : []) {
+    if (!isRecordObject(raw)) continue;
+    const role = axNodeRole(raw);
+    const properties = axProperties(raw);
+    const name = axBound(raw.name);
+    const description = axBound(raw.description);
+    const value = axValue(raw.value);
+    const ignored = raw.ignored === true || axBoolean(properties.get("ignored")) === true;
+    if (!role || AX_OMIT_ROLES.has(role) || ignored) continue;
+    if (!name && value === undefined && !AX_CONTENT_ROLES.has(role)) continue;
+    const backendNodeId = raw.backendDOMNodeId === undefined || raw.backendDOMNodeId === null
+      ? undefined
+      : Number.isInteger(Number(raw.backendDOMNodeId)) && Number(raw.backendDOMNodeId) > 0 ? Number(raw.backendDOMNodeId) : undefined;
+    const nodeId = raw.nodeId === undefined || raw.nodeId === null ? undefined : String(raw.nodeId);
+    if (backendNodeId === undefined && nodeId === undefined) continue;
+    const sensitive = axNodeSensitive(role, name, description, properties, value)
+      || sensitiveBackendNodeIds.has(backendNodeId)
+      || (value !== undefined && backendNodeId === undefined);
+    const editableValue = properties.get("editable");
+    const editable = editableValue === undefined ? undefined : !["false", "readonly", "none"].includes(String(editableValue).toLowerCase());
+    const inputType = properties.get("html-input-type") ?? properties.get("inputtype");
+    const node = {
+      key: `${String(frameId || "main")}\u0000${backendNodeId === undefined ? `node:${nodeId}` : `backend:${backendNodeId}`}`,
+      __stableKey: backendNodeId !== undefined,
+      ...(includeRefs && backendNodeId !== undefined && (AX_ACTIONABLE_ROLES.has(role) || axBoolean(properties.get("focusable")) === true)
+        ? { ref: `a${++refCounter.value}` }
+        : {}),
+      role,
+      name,
+      value: sensitive || value === undefined ? undefined : axBound(value),
+      disabled: axBoolean(properties.get("disabled")),
+      checked: axBooleanOrMixed(properties.get("checked")),
+      expanded: axBoolean(properties.get("expanded")),
+      selected: axBoolean(properties.get("selected")),
+      pressed: axBooleanOrMixed(properties.get("pressed")),
+      required: axBoolean(properties.get("required")),
+      readonly: axBoolean(properties.get("readonly")),
+      editable,
+      focusable: axBoolean(properties.get("focusable")),
+      level: axNumber(properties.get("level")),
+      __sensitive: sensitive,
+      __axNodeId: nodeId,
+      __backendNodeId: backendNodeId,
+      __frameId: String(frameId || "main"),
+      ...(typeof frameLoaderId === "string" && frameLoaderId.length > 0 ? { __frameLoaderId: frameLoaderId } : {}),
+      __descriptor: { role, name, inputType: inputType === undefined ? undefined : String(inputType) },
+    };
+    const cost = axNodeLineCost(node);
+    if (nodes.length >= maxNodes || chars + cost > maxChars) {
+      truncated = true;
+      break;
+    }
+    nodes.push(node);
+    chars += cost;
+  }
+  return { nodes, chars, truncated };
+}
+
+function frameRecords(frameTree, result = []) {
+  const tree = frameTree?.frameTree && typeof frameTree.frameTree === "object" ? frameTree.frameTree : frameTree;
+  const frame = tree?.frame;
+  if (typeof frame?.id === "string") result.push(frame);
+  for (const child of Array.isArray(tree?.childFrames) ? tree.childFrames : []) frameRecords(child, result);
+  return result;
+}
+
+function accessibilityFrameIdentity(frames) {
+  return JSON.stringify((Array.isArray(frames) ? frames : []).map(frame => ({
+    frameId: String(frame?.id ?? frame?.frameId ?? "main"),
+    frameLoaderId: typeof (frame?.loaderId ?? frame?.frameLoaderId) === "string" ? (frame.loaderId ?? frame.frameLoaderId) : undefined,
+  })).sort((left, right) => left.frameId.localeCompare(right.frameId)));
+}
+
+function accessibilityProtocolError(error, method) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/-32601|method not found|unknown (?:command|method)|not implemented|not supported|cannot find context|wasn['’]?t found|does not exist/i.test(message)) {
+    const unavailable = new Error(`Chromium Accessibility domain is unavailable for ${method}: ${message}`);
+    unavailable.code = "BROWSER_AX_UNAVAILABLE";
+    return unavailable;
+  }
+  return error;
+}
+
+function axSubtreeNodes(rawNodes, backendNodeId) {
+  const nodes = Array.isArray(rawNodes) ? rawNodes.filter(isRecordObject) : [];
+  const target = nodes.find(node => Number.isInteger(Number(node.backendDOMNodeId)) && Number(node.backendDOMNodeId) === Number(backendNodeId));
+  if (!target || target.nodeId === undefined) return undefined;
+  const byId = new Map(nodes.map(node => [String(node.nodeId), node]));
+  const included = new Set([String(target.nodeId)]);
+  const pending = [target];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    for (const childId of Array.isArray(node?.childIds) ? node.childIds : []) {
+      const child = byId.get(String(childId));
+      if (child && !included.has(String(child.nodeId))) {
+        included.add(String(child.nodeId));
+        pending.push(child);
+      }
+    }
+  }
+  return nodes.filter(node => included.has(String(node.nodeId)));
+}
+
+function axDomNodeSensitive(node) {
+  if (!isRecordObject(node)) return true;
+  const attributes = Array.isArray(node.attributes) ? node.attributes : [];
+  return AX_SENSITIVE_HINT.test([node.nodeName, ...attributes].filter(value => value !== undefined && value !== null).join(" "));
+}
+
+async function axSensitiveBackendNodeIds(sendCommand, rawNodes) {
+  const valueNodes = [];
+  const sensitive = new Set();
+  for (const node of Array.isArray(rawNodes) ? rawNodes : []) {
+    if (!isRecordObject(node) || axValue(node.value) === undefined || !Number.isInteger(Number(node.backendDOMNodeId)) || Number(node.backendDOMNodeId) <= 0) continue;
+    const backendNodeId = Number(node.backendDOMNodeId);
+    if (axNodeSensitive(axNodeRole(node), axBound(node.name), axBound(node.description), axProperties(node), axValue(node.value))) sensitive.add(backendNodeId);
+    else valueNodes.push({ node, backendNodeId });
+  }
+  if (valueNodes.length === 0) return sensitive;
+  try {
+    await sendCommand("DOM.enable");
+  } catch {
+    // Metadata failures redact values instead of risking model-visible secrets.
+    for (const { backendNodeId } of valueNodes) sensitive.add(backendNodeId);
+    return sensitive;
+  }
+  for (const { backendNodeId } of valueNodes) {
+    try {
+      const described = await sendCommand("DOM.describeNode", { backendNodeId });
+      if (axDomNodeSensitive(described?.node)) sensitive.add(backendNodeId);
+    } catch {
+      sensitive.add(backendNodeId);
+    }
+  }
+  return sensitive;
+}
+
+async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
+  try {
+    await sendCommand("Accessibility.enable");
+  } catch (error) {
+    throw accessibilityProtocolError(error, "Accessibility.enable");
+  }
+  const selector = options.selector === undefined ? "" : String(options.selector).trim();
+  const readFrameTree = async () => {
+    try {
+      return await sendCommand("Page.getFrameTree");
+    } catch (error) {
+      throw accessibilityProtocolError(error, "Page.getFrameTree");
+    }
+  };
+  if (selector) {
+    const frameTree = await readFrameTree();
+    const initialFrames = frameRecords(frameTree);
+    const mainFrameId = initialFrames[0]?.id;
+    try {
+      await sendCommand("DOM.enable");
+    } catch (error) {
+      throw accessibilityProtocolError(error, "DOM.enable");
+    }
+    let document;
+    try {
+      document = await sendCommand("DOM.getDocument", { depth: 0, pierce: true });
+    } catch (error) {
+      throw accessibilityProtocolError(error, "DOM.getDocument");
+    }
+    let match;
+    try {
+      match = await sendCommand("DOM.querySelector", { nodeId: document?.root?.nodeId, selector });
+    } catch (error) {
+      const normalized = accessibilityProtocolError(error, "DOM.querySelector");
+      if (normalized?.code === "BROWSER_AX_UNAVAILABLE") throw normalized;
+      const invalid = new Error(`Invalid snapshot selector: ${selector}`);
+      invalid.code = "BROWSER_SELECTOR_INVALID";
+      invalid.cause = error;
+      throw invalid;
+    }
+    if (!Number.isInteger(Number(match?.nodeId)) || Number(match.nodeId) === 0) {
+      const error = new Error(`Snapshot selector did not match any element: ${selector}`);
+      error.code = "BROWSER_SELECTOR_NOT_FOUND";
+      throw error;
+    }
+    let description;
+    try {
+      description = await sendCommand("DOM.describeNode", { nodeId: Number(match.nodeId) });
+    } catch (error) {
+      throw accessibilityProtocolError(error, "DOM.describeNode");
+    }
+    const selectedBackendNodeId = description?.node?.backendNodeId;
+    if (!Number.isInteger(Number(selectedBackendNodeId)) || Number(selectedBackendNodeId) <= 0) {
+      const error = new Error(`The snapshot selector could not be mapped to a Chromium accessibility node: ${selector}`);
+      error.code = "BROWSER_AX_UNAVAILABLE";
+      throw error;
+    }
+    let partial;
+    try {
+      partial = await sendCommand("Accessibility.getPartialAXTree", { nodeId: Number(match.nodeId), fetchRelatives: true });
+    } catch (error) {
+      throw accessibilityProtocolError(error, "Accessibility.getPartialAXTree");
+    }
+    const finalFrameTree = await readFrameTree();
+    if (accessibilityFrameIdentity(initialFrames) !== accessibilityFrameIdentity(frameRecords(finalFrameTree))) {
+      throw pageChangingDuringReadError("accessibility", { frameChanged: true });
+    }
+    const scopedNodes = axSubtreeNodes(partial?.nodes, selectedBackendNodeId);
+    if (!scopedNodes) {
+      const error = new Error(`The snapshot selector did not produce a scoped Chromium accessibility subtree: ${selector}`);
+      error.code = "BROWSER_AX_UNAVAILABLE";
+      throw error;
+    }
+    const mainFrame = initialFrames[0];
+    return {
+      frames: [{ frameId: mainFrameId || "main", frameLoaderId: mainFrame?.loaderId, nodes: scopedNodes, sensitiveBackendNodeIds: await axSensitiveBackendNodeIds(sendCommand, scopedNodes) }],
+      frameCount: 1,
+      frameFailures: 0,
+      selector,
+    };
+  }
+  const frameTree = await readFrameTree();
+  const frames = frameRecords(frameTree);
+  const initialFrameIdentity = accessibilityFrameIdentity(frames);
+  const targets = frames.length > 0 ? frames : [{ id: undefined }];
+  const results = [];
+  const failures = [];
+  for (const frame of targets) {
+    try {
+      let response;
+      try {
+        response = frame.id === undefined
+          ? await sendCommand("Accessibility.getFullAXTree")
+          : await sendCommand("Accessibility.getFullAXTree", { frameId: frame.id });
+      } catch (error) {
+        if (frame.id !== frames[0]?.id) throw error;
+        response = await sendCommand("Accessibility.getFullAXTree");
+      }
+      const nodes = Array.isArray(response?.nodes) ? response.nodes : [];
+      results.push({ frameId: frame.id || "main", frameLoaderId: typeof frame.loaderId === "string" ? frame.loaderId : undefined, nodes, sensitiveBackendNodeIds: await axSensitiveBackendNodeIds(sendCommand, nodes) });
+    } catch (error) {
+      const normalizedError = accessibilityProtocolError(error, "Accessibility.getFullAXTree");
+      if (frame.id === frames[0]?.id || targets.length === 1) throw normalizedError;
+      failures.push(frame.id);
+    }
+  }
+  const finalFrameTree = await readFrameTree();
+  if (initialFrameIdentity !== accessibilityFrameIdentity(frameRecords(finalFrameTree))) {
+    throw pageChangingDuringReadError("accessibility", { frameChanged: true });
+  }
+  return { frames: results, frameCount: targets.length, frameFailures: failures.length };
+}
+
+async function collectChromiumAccessibilitySnapshot(tabId, options = {}, sessionId, expectedFence, expectedGeneration, fallbackTitle) {
+  const positiveLimit = (value, fallback, maximum) => {
+    if (value === undefined) return fallback;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < 1) throw new Error("Snapshot output limits must be positive integers");
+    return Math.min(number, maximum);
+  };
+  const maxChars = positiveLimit(options.maxChars, 20_000, 100_000);
+  const maxNodes = positiveLimit(options.maxNodes, 200, 1_000);
+  try {
+    await assertPageGenerationStable(tabId, expectedFence, expectedGeneration, "snapshot", true);
+    return await documentFencedDebuggerOperation(tabId, async (sendCommand) => {
+      const captured = await captureChromiumAccessibilityNodes(sendCommand, options);
+      const nodes = [];
+      let charCount = 0;
+      let truncated = captured.frameFailures > 0;
+      const refCounter = { value: 0 };
+      for (const frame of captured.frames) {
+        const normalized = normalizeAxNodes(frame.nodes, frame.frameId, maxChars, maxNodes, options.includeRefs === true, refCounter, frame.frameLoaderId, frame.sensitiveBackendNodeIds);
+        if (normalized.truncated) truncated = true;
+        for (const node of normalized.nodes) {
+          const cost = axNodeLineCost(node);
+          if (nodes.length >= maxNodes || charCount + cost > maxChars) {
+            truncated = true;
+            break;
+          }
+          nodes.push(node);
+          charCount += cost;
+        }
+        if (nodes.length >= maxNodes || charCount >= maxChars) {
+          truncated = true;
+          break;
+        }
+      }
+      const rawNodes = captured.frames.flatMap(frame => frame.nodes || []);
+      const root = rawNodes.find(node => ["rootwebarea", "webarea"].includes(axNodeRole(node)));
+      return {
+        role: "document",
+        name: axBound(root?.name) || String(fallbackTitle || ""),
+        state: accessibilityStateText(nodes),
+        nodeCount: nodes.length,
+        charCount,
+        truncated,
+        maxChars,
+        maxNodes,
+        source: "chromium_ax",
+        frameCount: captured.frameCount,
+        frameFailures: captured.frameFailures,
+        ...(captured.selector === undefined ? {} : { selector: captured.selector }),
+        __piControlChromeAccessibilityNodes: nodes,
+        __piControlChromeAccessibilityFrames: captured.frames.map(frame => ({ frameId: frame.frameId, frameLoaderId: frame.frameLoaderId })),
+      };
+    }, sessionId, expectedFence, "snapshot");
+  } catch (error) {
+    if (!(error && typeof error === "object" && error.code === "BROWSER_AX_UNAVAILABLE")) throw error;
+    const fallback = await executeInTab(tabId, collectDomAccessibilitySnapshot, [options], expectedFence);
+    return { ...fallback, source: "dom_semantic", axFallback: true };
+  }
 }
 
 function collectSnapshot(options = {}) {
@@ -4185,8 +4571,7 @@ async function executeInTab(tabId, func, args = [], expectedFence) {
 
 function publicAccessibilityNode(node) {
   if (!isRecordObject(node)) return node;
-  const { key: _key, ...publicNode } = node;
-  return publicNode;
+  return Object.fromEntries(Object.entries(node).filter(([key, value]) => key !== "key" && !key.startsWith("__") && value !== undefined));
 }
 
 function accessibilityNodeLine(node, prefix = "- ") {
@@ -4194,9 +4579,14 @@ function accessibilityNodeLine(node, prefix = "- ") {
   const name = typeof node?.name === "string" && node.name.length > 0 ? ` ${JSON.stringify(node.name.slice(0, 240))}` : "";
   const value = node?.value === undefined ? "" : ` value=${JSON.stringify(String(node.value).slice(0, 240))}`;
   const disabled = node?.disabled === true ? " disabled" : "";
-  const checked = node?.checked === undefined ? "" : ` checked=${node.checked === true}`;
+  const checked = node?.checked === undefined ? "" : ` checked=${node.checked === "mixed" ? "mixed" : node.checked === true}`;
+  const states = ["expanded", "selected", "pressed", "required", "readonly", "editable"]
+    .filter((key) => node?.[key] !== undefined)
+    .map((key) => ` ${key}=${node[key] === true}`)
+    .join("");
   const level = node?.level === undefined ? "" : ` level=${node.level}`;
-  return `${prefix}${role}${name}${value}${disabled}${checked}${level}`;
+  const ref = typeof node?.ref === "string" ? ` [ref=${node.ref}]` : "";
+  return `${prefix}${role}${name}${value}${disabled}${checked}${states}${level}${ref}`;
 }
 
 function accessibilityStateText(nodes, prefix = "- ") {
@@ -4216,7 +4606,20 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     token: typeof snapshot?.__piControlChromeSnapshotToken === "string" ? snapshot.__piControlChromeSnapshotToken : undefined,
   };
   const previous = accessibilitySnapshotStates.get(key);
+  const source = typeof accessibility?.source === "string" ? accessibility.source : "dom_semantic";
+  const frameIdentity = accessibilityFrameIdentity(accessibility?.__piControlChromeAccessibilityFrames);
+  const incomplete = accessibility?.truncated === true || Number(accessibility?.frameFailures || 0) > 0;
+  const stableAxIdentity = source !== "chromium_ax" || rawNodes.every(node => node.__stableKey === true);
+  const previousStableAxIdentity = source !== "chromium_ax" || previous?.nodes?.every(node => node.__stableKey === true);
   const sameDocument = previous !== undefined
+    && stableAxIdentity
+    && previousStableAxIdentity
+    && previous.invalidated !== true
+    && previous.truncated !== true
+    && previous.frameFailures === 0
+    && !incomplete
+    && previous.source === source
+    && previous.frameIdentity === frameIdentity
     && previous.url === generation.url
     && previous.timeOrigin === generation.timeOrigin
     && previous.token === generation.token;
@@ -4250,13 +4653,22 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     }
   }
   const publicNodes = rawNodes.map(publicAccessibilityNode);
-  if (remember) accessibilitySnapshotStates.set(key, {
-    snapshotId: String(snapshot?.snapshotId || ""),
-    url: generation.url,
-    timeOrigin: generation.timeOrigin,
-    token: generation.token,
-    nodes: rawNodes.map((node) => ({ ...node })),
-  });
+  if (remember) {
+    const next = {
+      snapshotId: String(snapshot?.snapshotId || ""),
+      url: generation.url,
+      timeOrigin: generation.timeOrigin,
+      token: generation.token,
+      source,
+      frameIdentity,
+      truncated: incomplete,
+      frameFailures: Number(accessibility?.frameFailures || 0),
+      selector: typeof accessibility?.selector === "string" ? accessibility.selector : undefined,
+      nodes: rawNodes.map(cloneAccessibilityNode),
+    };
+    accessibilitySnapshotStates.set(key, next);
+    rememberAccessibilityObservation(key, next);
+  }
   return {
     role: "document",
     name: typeof accessibility?.name === "string" ? accessibility.name : "",
@@ -4270,7 +4682,398 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     truncated: accessibility?.truncated === true,
     maxChars: accessibility?.maxChars,
     maxNodes: accessibility?.maxNodes,
+    ...(typeof accessibility?.source === "string" ? { source: accessibility.source } : {}),
+    ...(typeof accessibility?.frameCount === "number" ? { frameCount: accessibility.frameCount } : {}),
+    ...(typeof accessibility?.frameFailures === "number" && accessibility.frameFailures > 0 ? { frameFailures: accessibility.frameFailures } : {}),
   };
+}
+
+function cloneAccessibilityNode(node) {
+  if (!isRecordObject(node)) return node;
+  return {
+    ...node,
+    ...(isRecordObject(node.__descriptor) ? { __descriptor: { ...node.__descriptor } } : {}),
+  };
+}
+
+function rememberAccessibilityObservation(key, state) {
+  if (!state || typeof state.snapshotId !== "string" || state.snapshotId.length === 0) return;
+  const observations = accessibilitySnapshotObservations.get(key) || new Map();
+  observations.set(state.snapshotId, state);
+  while (observations.size > PAGE_OBSERVATION_HISTORY_LIMIT) observations.delete(observations.keys().next().value);
+  accessibilitySnapshotObservations.set(key, observations);
+}
+
+function rememberedAccessibilityObservation(tabId, snapshotId) {
+  if (typeof snapshotId !== "string" || snapshotId.length === 0) return undefined;
+  const key = runtimeStateKey(tabId);
+  const observations = accessibilitySnapshotObservations.get(key);
+  if (isObservationMap(observations)) return observations.get(snapshotId);
+  const current = accessibilitySnapshotStates.get(key);
+  return current?.snapshotId === snapshotId ? current : undefined;
+}
+
+function clearAccessibilitySnapshotState(key) {
+  accessibilitySnapshotStates.delete(key);
+  accessibilitySnapshotObservations.delete(key);
+}
+
+function invalidateAccessibilityObservations(key, captured) {
+  const observations = accessibilitySnapshotObservations.get(key);
+  if (!isObservationMap(observations)) return;
+  const records = captured === undefined
+    ? [...observations.entries()]
+    : [
+      ...(Array.isArray(captured.accessibilityObservations) ? captured.accessibilityObservations : []),
+      ...(captured.accessibility ? [[captured.accessibility.snapshotId, captured.accessibility]] : []),
+    ];
+  for (const [observationId, capturedObservation] of records) {
+    const observation = observations.get(observationId);
+    if (observation && (captured === undefined || observation === capturedObservation)) observation.invalidated = true;
+  }
+}
+
+const AX_REFERENCE_PATTERN = /^a\d+$/;
+
+function isAccessibilityReference(value) {
+  return AX_REFERENCE_PATTERN.test(String(value || ""));
+}
+
+function accessibilityReference(params = {}) {
+  const values = [];
+  const visit = (value) => {
+    if (!isRecordObject(value)) return;
+    if (typeof value.ref === "string" && value.ref.length > 0) values.push(value.ref);
+    visit(value.target);
+    visit(value.locator);
+    visit(value.left);
+    visit(value.right);
+  };
+  visit(params);
+  const references = [...new Set(values.filter(isAccessibilityReference))];
+  if (references.length > 1) {
+    const error = new Error("Element target contains more than one accessibility reference");
+    error.code = "INVALID_ELEMENT_TARGET";
+    throw error;
+  }
+  return references[0];
+}
+
+function accessibilityTarget(params = {}) {
+  if (isRecordObject(params.target)) return params.target;
+  if (isRecordObject(params.locator)) return params.locator;
+  return undefined;
+}
+
+function accessibilityReferenceError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.details = details;
+  return error;
+}
+
+function accessibilityDocumentChangedError(snapshotId) {
+  return accessibilityReferenceError(
+    "BROWSER_DOCUMENT_CHANGED",
+    "The accessibility reference belongs to an earlier document; take a new browser_accessibility_snapshot before using it",
+    { snapshotId, actionState: "not_completed", retryable: true, inspectFirst: true },
+  );
+}
+
+function accessibilitySnapshotUnavailableError(snapshotId, reason = "observation_unavailable") {
+  return accessibilityReferenceError(
+    "STALE_AX_SNAPSHOT",
+    "Accessibility snapshot reference is unavailable; take a new browser_accessibility_snapshot before using this ref",
+    { snapshotId, reason },
+  );
+}
+
+function accessibilityNodeDescriptorMatches(expected, actual) {
+  if (!expected || !actual || expected.role !== actual.role || expected.name !== actual.name) return false;
+  return expected.inputType === undefined || expected.inputType === actual.__descriptor?.inputType;
+}
+
+function accessibilityNodeBackendId(node) {
+  return Number.isInteger(Number(node?.__backendNodeId)) && Number(node.__backendNodeId) > 0 ? Number(node.__backendNodeId) : undefined;
+}
+
+function accessibilityNodesForResolution(captured) {
+  return (Array.isArray(captured?.frames) ? captured.frames : []).flatMap((frame) => normalizeAxNodes(frame.nodes, frame.frameId, 1_000_000, 10_000, false, { value: 0 }, frame.frameLoaderId, frame.sensitiveBackendNodeIds).nodes);
+}
+
+function resolveCurrentAccessibilityNode(record, captured, snapshotId) {
+  const backendNodeId = accessibilityNodeBackendId(record);
+  if (backendNodeId === undefined) throw accessibilitySnapshotUnavailableError(snapshotId, "node_not_mappable");
+  const frame = (Array.isArray(captured?.frames) ? captured.frames : []).find(entry => String(entry?.frameId || "main") === String(record.__frameId || "main"));
+  if (!frame) throw accessibilityReferenceError("AX_NODE_NOT_FOUND", "The accessibility frame is no longer available; take a new browser_accessibility_snapshot before retrying", { snapshotId, rebound: false, reason: "frame_not_found" });
+  if (typeof record.__frameLoaderId === "string" && record.__frameLoaderId.length > 0 && record.__frameLoaderId !== frame.frameLoaderId) {
+    throw accessibilityDocumentChangedError(snapshotId);
+  }
+  const candidates = accessibilityNodesForResolution(captured).filter(node => node.__frameId === record.__frameId);
+  const exact = candidates.find(node => accessibilityNodeBackendId(node) === backendNodeId);
+  if (exact) {
+    if (!accessibilityNodeDescriptorMatches(record.__descriptor, exact)) {
+      throw accessibilityReferenceError("AX_NODE_CHANGED", "The accessibility node changed identity; take a new accessibility snapshot before retrying", { snapshotId, reason: "original_target_changed" });
+    }
+    return { node: exact, resolvedBy: "ax_backend_node", rebound: false };
+  }
+  if (record.__rebound === true || typeof record.__descriptor?.name !== "string" || record.__descriptor.name.length === 0) {
+    throw accessibilityReferenceError("AX_NODE_NOT_FOUND", "The accessibility node is no longer attached to the current document", { snapshotId, rebound: record.__rebound === true, reason: "no_equivalent_target" });
+  }
+  const matches = candidates.filter(node => accessibilityNodeDescriptorMatches(record.__descriptor, node));
+  if (matches.length > 1) {
+    throw accessibilityReferenceError("AX_NODE_AMBIGUOUS", "The accessibility node resolved to multiple equivalent elements; take a new accessibility snapshot before retrying", { snapshotId, count: matches.length, rebound: true });
+  }
+  if (matches.length === 0) {
+    throw accessibilityReferenceError("AX_NODE_NOT_FOUND", "The accessibility node is no longer attached to the current document", { snapshotId, rebound: false, reason: "no_equivalent_target" });
+  }
+  const replacement = matches[0];
+  record.__rebound = true;
+  record.__backendNodeId = replacement.__backendNodeId;
+  record.__axNodeId = replacement.__axNodeId;
+  record.__sensitive = replacement.__sensitive;
+  return { node: replacement, resolvedBy: "ax_semantic_rebind", rebound: true };
+}
+
+async function resolveAccessibilityNode(tabId, params, sessionId, expectedFence, callback) {
+  const reference = accessibilityReference(params);
+  if (!reference) throw new Error("An accessibility reference is required");
+  const snapshotId = typeof params.snapshotId === "string" ? params.snapshotId : "";
+  if (!snapshotId) throw accessibilitySnapshotUnavailableError(snapshotId, "snapshot_id_missing");
+  const state = rememberedAccessibilityObservation(tabId, snapshotId);
+  if (!state || state.source !== "chromium_ax") throw accessibilitySnapshotUnavailableError(snapshotId);
+  if (state.invalidated === true) throw accessibilityDocumentChangedError(snapshotId);
+  const target = accessibilityTarget(params);
+  if (target?.scopeSelector !== undefined && String(target.scopeSelector) !== String(state.selector || "")) {
+    const error = new Error("Accessibility reference scope does not match its snapshot");
+    error.code = "INVALID_ELEMENT_TARGET";
+    throw error;
+  }
+  const record = state.nodes.find(node => node.ref === reference);
+  if (!record) throw accessibilitySnapshotUnavailableError(snapshotId, "ref_not_found");
+  const expectedIdentity = pageGenerationIdentity(state);
+  const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
+  if (expectedIdentity === undefined || pageGenerationIdentity(before) !== expectedIdentity) throw accessibilityDocumentChangedError(snapshotId);
+  const value = await withDebugger(tabId, async (sendCommand) => {
+    const captured = await captureChromiumAccessibilityNodes(sendCommand, state.selector ? { selector: state.selector } : {});
+    const resolution = resolveCurrentAccessibilityNode(record, captured, snapshotId);
+    const backendNodeId = accessibilityNodeBackendId(resolution.node);
+    let objectId;
+    try {
+      await sendCommand("DOM.enable");
+      const resolved = await sendCommand("DOM.resolveNode", { backendNodeId, objectGroup: "pi-control-chrome-ax" });
+      objectId = resolved?.object?.objectId;
+      if (typeof objectId !== "string" || objectId.length === 0) throw new Error("DOM.resolveNode returned no remote object");
+      return callback
+        ? await callback(sendCommand, { ...resolution, objectId }, state, snapshotId)
+        : { ...resolution, objectId };
+    } catch (error) {
+      if (["AX_NODE_CHANGED", "AX_NODE_NOT_FOUND", "AX_NODE_AMBIGUOUS", "AX_NODE_OPERATION_FAILED", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED"].includes(error?.code)) throw error;
+      const mapped = accessibilityReferenceError("AX_NODE_NOT_RESOLVABLE", "The accessibility node could not be mapped to the current DOM", { snapshotId, rebound: resolution.rebound === true });
+      mapped.cause = error;
+      throw mapped;
+    } finally {
+      if (typeof objectId === "string") await sendCommand("Runtime.releaseObject", { objectId }).catch((error) => log("could not release AX remote object", error));
+    }
+  }, sessionId, expectedFence);
+  return { value, before, state, reference };
+}
+
+function accessibilityDomOperation(operation, value, attribute, sensitive) {
+  const element = this;
+  const fail = (code, message) => ({ __piControlError: true, error: { code, message } });
+  if (!(element instanceof Element) || !element.isConnected) return fail("AX_NODE_NOT_RESOLVABLE", "The accessibility node is no longer attached to the current document");
+  const visible = () => {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    let current = element;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {
+      const style = getComputedStyle(current);
+      if (current.hidden || String(current.getAttribute("aria-hidden") || "").toLowerCase() === "true" || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || style.contentVisibility === "hidden" || Number.parseFloat(style.opacity || "1") <= 0 || style.pointerEvents === "none") return false;
+      current = current.parentElement;
+    }
+    return true;
+  };
+  const disabled = () => Boolean(element.matches?.(":disabled") || element.disabled || String(element.getAttribute("aria-disabled") || "").toLowerCase() === "true");
+  const editable = () => {
+    if (element.readOnly || String(element.getAttribute("aria-readonly") || "").toLowerCase() === "true") return false;
+    if (element.isContentEditable === true) return true;
+    if (element instanceof HTMLTextAreaElement) return true;
+    if (!(element instanceof HTMLInputElement)) return false;
+    return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(String(element.type || "text").toLowerCase());
+  };
+  if (operation === "isVisible") return visible();
+  if (operation === "isEnabled") return !disabled();
+  if (operation === "textContent") return sensitive === true ? "" : element.textContent;
+  if (operation === "innerText") return sensitive === true ? "" : element.innerText;
+  if (operation === "getAttribute") {
+    const attributeName = String(attribute || "").toLowerCase();
+    return sensitive === true && (attributeName === "value" || /password|passcode|otp|token|secret|api[-_]?key|credential|credit[-_]?card|bank[-_]?account|pin|cvv|cvc/i.test(attributeName)) ? null : element.getAttribute(attributeName);
+  }
+  if (!visible()) return fail("AX_NODE_NOT_ACTIONABLE", "The accessibility node is not visible or actionable");
+  if (disabled()) return fail("AX_NODE_DISABLED", "The accessibility node is disabled");
+  if (["fill", "type"].includes(operation) && !editable()) return fail("AX_NODE_NOT_EDITABLE", "The accessibility node is not editable");
+  if (operation === "click") element.click();
+  else if (operation === "double_click" || operation === "dblclick") {
+    for (const detail of [1, 2]) {
+      element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, detail, button: 0, buttons: 1 }));
+      element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, detail, button: 0, buttons: 0 }));
+      element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window, detail, button: 0, buttons: 0 }));
+    }
+    element.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window, detail: 2, button: 0, buttons: 0 }));
+  } else if (operation === "focus") element.focus();
+  else if (operation === "hover") element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
+  else if (operation === "fill" || operation === "type") {
+    element.focus();
+    const text = String(value ?? "");
+    const current = operation === "type" && "value" in element ? String(element.value || "") : "";
+    if ("value" in element) {
+      const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      if (setter) setter.call(element, current + text); else element.value = current + text;
+    } else {
+      if (operation === "fill") document.execCommand("selectAll", false);
+      document.execCommand("insertText", false, text);
+    }
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    if (operation === "fill") element.dispatchEvent(new Event("change", { bubbles: true }));
+  } else if (operation === "press") {
+    element.focus();
+    const key = String(value || "Enter");
+    const keydown = new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true });
+    element.dispatchEvent(keydown);
+    element.dispatchEvent(new KeyboardEvent("keyup", { key, code: key, bubbles: true }));
+    if (key === "Enter" && !keydown.defaultPrevented && element.form) element.form.requestSubmit?.();
+  } else if (operation === "select") {
+    if (!(element instanceof HTMLSelectElement)) return fail("AX_NODE_NOT_ACTIONABLE", "select requires a <select> element");
+    const values = (Array.isArray(value) ? value : [value]).map(String);
+    if (!element.multiple && values.length > 1) return fail("AX_NODE_NOT_ACTIONABLE", "Cannot select multiple values in a single-select element");
+    const options = Array.from(element.options);
+    if (values.some(selected => !options.some(option => option.value === selected || option.label === selected))) return fail("AX_NODE_NOT_FOUND", "Select value did not match any option");
+    for (const option of options) option.selected = values.includes(option.value) || values.includes(option.label);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  } else if (["check", "uncheck", "set_checked"].includes(operation)) {
+    if (!("checked" in element)) return fail("AX_NODE_NOT_ACTIONABLE", "check/uncheck/set_checked requires a checkbox or radio element");
+    const checked = operation === "check" ? true : operation === "uncheck" ? false : Boolean(value);
+    if (Boolean(element.checked) !== checked) element.click();
+    if (Boolean(element.checked) !== checked) return fail("AX_NODE_NOT_ACTIONABLE", `Could not set checked state to ${checked}`);
+  } else return fail("AX_NODE_OPERATION_FAILED", `Unsupported accessibility operation: ${operation}`);
+  return { ok: true, operation };
+}
+
+async function callAccessibilityDomOperation(sendCommand, objectId, operation, value, attribute, sensitive, snapshotId) {
+  let response;
+  try {
+    response = await sendCommand("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: accessibilityDomOperation.toString(),
+      arguments: [
+        { value: operation },
+        { value: value === undefined ? null : value },
+        { value: attribute === undefined ? null : attribute },
+        { value: sensitive === true },
+      ],
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+    });
+  } catch (error) {
+    const mapped = accessibilityReferenceError("AX_NODE_OPERATION_FAILED", "The accessibility operation could not be evaluated", { snapshotId, actionState: "unknown", retryable: false, inspectFirst: true });
+    mapped.cause = error;
+    throw mapped;
+  }
+  if (response?.exceptionDetails) {
+    const mapped = accessibilityReferenceError("AX_NODE_OPERATION_FAILED", "The accessibility operation failed in the page", { snapshotId, actionState: "unknown", retryable: false, inspectFirst: true });
+    throw mapped;
+  }
+  const valueResult = response?.result?.value;
+  if (["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus"].includes(operation) && valueResult === undefined) {
+    throw accessibilityReferenceError("AX_NODE_OPERATION_FAILED", "The accessibility operation returned no result", { snapshotId, actionState: "unknown", retryable: false, inspectFirst: true });
+  }
+  if (valueResult && valueResult.__piControlError === true && valueResult.error) {
+    const sideEffecting = ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus"].includes(operation);
+    const error = accessibilityReferenceError(
+      typeof valueResult.error.code === "string" ? valueResult.error.code : "AX_NODE_OPERATION_FAILED",
+      typeof valueResult.error.message === "string" ? valueResult.error.message : "The accessibility operation failed",
+      { snapshotId, ...(sideEffecting && valueResult.error.code === "AX_NODE_OPERATION_FAILED" ? { actionState: "unknown", retryable: false, inspectFirst: true } : {}) },
+    );
+    throw error;
+  }
+  return valueResult;
+}
+
+async function executeAccessibilityPageOperation(tabId, params, signal, expectedFence) {
+  if (signal?.aborted) throw abortError(signal, "Browser request aborted");
+  const sideEffect = isSideEffectingPageOperation(params);
+  if (sideEffect && params.pageOperation !== "interaction" && params.pageOperation !== "locator") throw new Error("Accessibility references are not supported for this operation");
+  let dispatched = false;
+  try {
+    const resolved = await resolveAccessibilityNode(tabId, params, params.sessionId, expectedFence, async (sendCommand, mapping, state, snapshotId) => {
+      const node = mapping.node;
+      const publicNode = publicAccessibilityNode({ ...node, ref: accessibilityReference(params) });
+      if (params.pageOperation === "wait") {
+        const waitState = String(params.state || "load");
+        const visible = await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, node.__sensitive, snapshotId);
+        const enabled = visible ? await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isEnabled", undefined, undefined, node.__sensitive, snapshotId) : false;
+        if (waitState === "hidden") return { matched: !visible, count: visible ? 1 : 0, ...(visible ? { element: publicNode } : {}) };
+        if (waitState === "visible") return { matched: visible, count: visible ? 1 : 0, ...(visible ? { element: publicNode } : {}) };
+        if (waitState === "enabled") return { matched: visible && enabled, count: visible ? 1 : 0, ...(visible ? { element: publicNode } : {}) };
+        throw new Error(`Unsupported accessibility wait state: ${waitState}`);
+      }
+      if (params.pageOperation === "interaction") {
+        const operation = String(params.operation || "");
+        if (sideEffect) dispatched = true;
+        await callAccessibilityDomOperation(sendCommand, mapping.objectId, operation, operation === "press" ? params.key : params.value, undefined, node.__sensitive, snapshotId);
+        return {
+          ok: true,
+          operation,
+          ...(params.target !== undefined ? { target: params.target } : { ref: params.ref || referenceFromAccessibilityParams(params) }),
+          element: publicNode,
+          resolvedBy: mapping.resolvedBy,
+          rebound: mapping.rebound,
+        };
+      }
+      const locator = isRecordObject(params.locator) ? params.locator : isRecordObject(params.target) ? params.target : { ref: referenceFromAccessibilityParams(params) };
+      const action = String(params.action || "");
+      if (action === "count") return 1;
+      if (action === "all") return [publicNode];
+      if (action === "allTextContents") return [await callAccessibilityDomOperation(sendCommand, mapping.objectId, "textContent", undefined, undefined, node.__sensitive, snapshotId)];
+      if (action === "textContent" || action === "innerText") return callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, undefined, node.__sensitive, snapshotId);
+      if (action === "getAttribute") return callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, params.attribute, node.__sensitive, snapshotId);
+      if (action === "isVisible" || action === "isEnabled") return callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, undefined, node.__sensitive, snapshotId);
+      if (["first", "last", "nth"].includes(action)) return { ...locator, index: action === "first" ? 0 : action === "last" ? 0 : Number(params.index) };
+      if (action === "waitFor") {
+        const visible = await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, node.__sensitive, snapshotId);
+        if (!visible) throw accessibilityReferenceError("AX_NODE_NOT_FOUND", "Timed out waiting for a visible accessibility node", { snapshotId });
+        return { ok: true, count: 1 };
+      }
+      if (LOCATOR_ACTIONS.has(action)) {
+        if (sideEffect) dispatched = true;
+        await callAccessibilityDomOperation(sendCommand, mapping.objectId, action, action === "press" ? params.key : params.value, undefined, node.__sensitive, snapshotId);
+        return { ok: true, action, element: publicNode, resolvedBy: mapping.resolvedBy, rebound: mapping.rebound };
+      }
+      throw new Error(`Unsupported locator action: ${action}`);
+    });
+    const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
+    if (!pageGenerationsMatch(resolved.before, after)) return undefined;
+    if (params.pageOperation === "wait") return { value: resolved.value, generation: after };
+    if (!sideEffect) return resolved.value;
+    return pageActionResultAfterDocumentFence(params, resolved.value, resolved.before, after);
+  } catch (error) {
+    if (signal?.aborted) throw sideEffect || dispatched ? uncertainPageOperationError() : abortError(signal, "Browser request aborted");
+    if (isLostExecutionContext(error)) throw sideEffect || dispatched ? uncertainPageOperationError() : error;
+    if (sideEffect && dispatched && (!isStructuredPageError(error) || error?.details?.actionState === "unknown")) {
+      const uncertain = uncertainPageOperationError();
+      uncertain.cause = error;
+      throw uncertain;
+    }
+    throw error;
+  }
+}
+
+function referenceFromAccessibilityParams(params = {}) {
+  return accessibilityReference(params);
 }
 
 function isObservationMap(value) {
@@ -4281,7 +5084,8 @@ function isObservationMap(value) {
 }
 
 function observationRecordsAt(store, key) {
-  const observations = store.get(key)?.observations;
+  const state = store.get(key);
+  const observations = isObservationMap(state) ? state : state?.observations;
   return isObservationMap(observations) ? [...observations.entries()] : [];
 }
 
@@ -4301,8 +5105,9 @@ function invalidatePageObservationState(tabId, captured) {
   const key = runtimeStateKey(tabId);
   invalidateDocumentObservations(pageSnapshotStates, key, captured?.page);
   invalidateDocumentObservations(domSnapshotStates, key, captured?.dom);
-  // AX revision state has no ref records to mark. Clear the captured source state,
-  // but do not let a deferred fallback erase a revision recorded on the destination.
+  invalidateAccessibilityObservations(key, captured);
+  // Keep invalidated AX provenance long enough for a later AX ref to report a
+  // document change rather than silently resolving against a new document.
   if (captured === undefined || accessibilitySnapshotStates.get(key) === captured.accessibility) accessibilitySnapshotStates.delete(key);
 }
 
@@ -4312,6 +5117,7 @@ function capturePageObservationState(tabId) {
     page: observationRecordsAt(pageSnapshotStates, key),
     dom: observationRecordsAt(domSnapshotStates, key),
     accessibility: accessibilitySnapshotStates.get(key),
+    accessibilityObservations: observationRecordsAt(accessibilitySnapshotObservations, key),
   };
 }
 
@@ -4494,7 +5300,7 @@ function isSideEffectingPageOperation(params) {
   return SIDE_EFFECTING_PAGE_ACTIONS.has(String(params.operation || params.action || ""));
 }
 
-const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
+const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "STALE_AX_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "AX_NODE_NOT_FOUND", "AX_NODE_AMBIGUOUS", "AX_NODE_CHANGED", "AX_NODE_NOT_RESOLVABLE", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED", "AX_NODE_OPERATION_FAILED", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
 
 function isStructuredPageError(error) {
   return Boolean(error && typeof error === "object" && STRUCTURED_PAGE_ERROR_CODES.has(error.code));
@@ -4531,7 +5337,31 @@ function isSemanticLocator(value) {
   return ["ref", "selector", "role", "label", "placeholder", "text", "testId"].some((key) => value[key] !== undefined);
 }
 
+function retryableAccessibilityObservationError(error) {
+  return ["AX_NODE_NOT_FOUND", "AX_NODE_NOT_RESOLVABLE"].includes(error?.code) && error?.details?.rebound !== true;
+}
+
+async function executeAccessibilityLocatorWait(tabId, params, signal, expectedFence) {
+  const timeoutMs = boundedTimeout(params.timeoutMs, 5000, 30000);
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    assertRequestActive(signal);
+    try {
+      return await executeAccessibilityPageOperation(tabId, params, signal, expectedFence);
+    } catch (error) {
+      if (!retryableAccessibilityObservationError(error)) throw error;
+      lastError = error;
+      await waitWithSignal(Math.min(100, Math.max(1, deadline - Date.now())), signal);
+    }
+  }
+  throw lastError || accessibilitySnapshotUnavailableError(params.snapshotId);
+}
+
 async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
+  if (accessibilityReference(params)) return params.action === "waitFor"
+    ? executeAccessibilityLocatorWait(tabId, params, signal, expectedFence)
+    : executeAccessibilityPageOperation(tabId, params, signal, expectedFence);
   const timeoutMs = boundedTimeout(params.timeoutMs, 5000, 30000);
   const deadline = Date.now() + timeoutMs;
   let lastError;
@@ -4606,7 +5436,9 @@ function pageGenerationsMatch(left, right) {
 async function executePageOperation(tabId, params, signal, expectedFence) {
   try {
     let value;
-    if (params.pageOperation === "interaction" && params.target !== undefined) {
+    if (accessibilityReference(params)) {
+      value = await executeAccessibilityPageOperation(tabId, params, signal, expectedFence);
+    } else if (params.pageOperation === "interaction" && params.target !== undefined) {
       // The locator helper owns both action attempts and their document fence.
       // Do not perform a second post-action injection here: it could lose an
       // already verified destination context and incorrectly turn success into
@@ -4638,6 +5470,7 @@ async function executePageOperation(tabId, params, signal, expectedFence) {
 async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence) {
   if (signal?.aborted) throw abortError(signal, "Browser request aborted");
   await assertTabFence(tabId, expectedFence, "access");
+  if (accessibilityReference(params)) return executeAccessibilityPageOperation(tabId, params, signal, expectedFence);
   try {
     const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
     const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);
@@ -4753,7 +5586,19 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
     const transition = pendingDocumentTransition(tabId, expectedFence);
     if ((!transition || transition.observed === true) && tabUrlMatches(tab, params)) {
       const observedUrl = String(tab.url || "");
-      const observedPage = await executeReadOnlyPageOperation(tabId, { ...params, pageOperation: "wait" }, signal, expectedFence);
+      let observedPage;
+      try {
+        observedPage = await executeReadOnlyPageOperation(tabId, { ...params, pageOperation: "wait" }, signal, expectedFence);
+      } catch (error) {
+        if (!retryableAccessibilityObservationError(error)) throw error;
+        if (String(params.state || "") === "hidden" && error?.code === "AX_NODE_NOT_FOUND") {
+          const generation = await executeInTab(tabId, pageGeneration, [], expectedFence);
+          lastResult = { matched: true, count: 0 };
+          return { result: { ...lastResult, elapsedMs: Date.now() - startedAt }, generation };
+        }
+        await waitWithSignal(Math.min(100, Math.max(1, deadline - Date.now())), signal);
+        continue;
+      }
       if (expectedIncarnation !== undefined && pageGenerationIdentity(observedPage?.generation) !== expectedIncarnation) {
         const stale = new Error(`Tab ${tabId} document changed while waiting; take a new browser_tabs snapshot`);
         stale.code = "BROWSER_TAB_FENCE_CHANGED";
@@ -6488,11 +7333,14 @@ async function handleRequest(method, params, dispatchOptions = {}) {
       ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
       ...(params.maxNodes === undefined ? {} : { maxNodes: params.maxNodes }),
       ...(params.selector === undefined ? {} : { selector: params.selector }),
+      ...(params.accessibilityOnly === true ? { includeRefs: true } : {}),
     };
     return readOnlyWithRetry("snapshot", tab.id, signal, async () => {
       const snapshot = await executeInTab(tab.id, collectSnapshot, [snapshotOptions], expectedFence);
       const snapshotGeneration = snapshot && { url: snapshot.__piControlChromeSnapshotUrl, timeOrigin: snapshot.__piControlChromeSnapshotTimeOrigin, token: snapshot.__piControlChromeSnapshotToken };
-      const accessibility = snapshot ? await executeInTab(tab.id, collectAccessibilitySnapshot, [snapshotOptions], expectedFence) : undefined;
+      const accessibility = snapshot
+        ? await collectChromiumAccessibilitySnapshot(tab.id, snapshotOptions, params.sessionId, expectedFence, snapshotGeneration, snapshot.title)
+        : undefined;
       let frameTree;
       try { frameTree = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.getFrameTree"), params.sessionId, expectedFence); } catch (error) {
         if (error && typeof error === "object" && ["BROWSER_OPERATION_UNCERTAIN", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED"].includes(error.code)) throw error;

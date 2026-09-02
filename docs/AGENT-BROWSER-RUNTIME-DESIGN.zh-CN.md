@@ -1,6 +1,8 @@
 # Agent-first 浏览器运行时重构方案
 
-> 状态：P0–P2 首轮实现完成；P3（真实 Chromium AX ref）和发布迁移仍待单独评审。
+> 状态：P0–P2 首轮实现完成；0.5.1 发布迁移已完成；P3a/P3b/P3c 首轮实现完成，待目标浏览器重载后的持续验收。当前 `browser_accessibility_snapshot` 优先使用真实 Chromium AX，AX domain 不可用时回退 DOM semantic tree；`axRefs` 已开启并受 document/fence/lease 约束。
+>
+> 详细设计：[真实 Chromium Accessibility Tree 接入设计](./REAL-CHROMIUM-AX-DESIGN.zh-CN.md)。
 >
 > 范围：Chrome/Edge 扩展中的页面观察与交互层；Bridge、tab ownership、turn cleanup 和 debugger lease 保持既有安全边界。
 >
@@ -289,9 +291,9 @@ snapshotId + eN
 
 ## 7. Observation 与 AX-first 策略
 
-### 7.1 第一阶段：统一 semantic observation
+### 7.1 普通 snapshot 与 DOM fallback
 
-短期先统一现有 DOM 派生的：
+现有 DOM 派生的 semantic observation 继续用于普通 snapshot 和 AX fallback，覆盖：
 
 - role；
 - accessible name；
@@ -303,31 +305,26 @@ snapshotId + eN
 
 普通 `browser_snapshot` 可以继续返回 `[ref=eN]`，但其 ref 由 Page Agent 的 live resolver 支持。
 
-### 7.2 第二阶段：真实 Chromium Accessibility Tree
+### 7.2 P3：真实 Chromium Accessibility Tree
 
-为更接近真正的人机交互模型，后续通过已有 CDP/debugger 能力评估并接入：
+当前 `browser_accessibility_snapshot` 优先通过已有 CDP/debugger lease 只读采集真实 AX；AX domain 不可用时保留 DOM 派生 semantic tree 作为安全 fallback：
 
 ```text
 Accessibility.enable
+Page.getFrameTree
 Accessibility.getFullAXTree
-Accessibility.getPartialAXTree
-DOM.resolveNode
+DOM.enable / DOM.getDocument / DOM.querySelector / DOM.describeNode   # selector 与敏感属性元数据
+Accessibility.getPartialAXTree   # selector 范围
 ```
 
-目标是使 `browser_accessibility_snapshot` 输出真正的 AX 节点和可操作 AX ref：
+P3a 已替换 `browser_accessibility_snapshot` 的 observation source，保留现有 `full/diff/unchanged`、预算、敏感字段过滤和 fallback；P3b 使用 `DOM.resolveNode` 做受 document/frame 约束的内部映射；P3c 对可映射 actionable/focusable 节点生成 `aN`，并通过当前 AX tree 解析后执行有限交互。AX ref 不暴露 raw node id，仍受一次 semantic rebind、actionability、tab/document fencing 和副作用 uncertainty 约束。
 
-```text
-- textbox "Email" [ref=a17]
-- button "Continue" [ref=a18]
-- checkbox "Remember me" checked=false [ref=a19]
-```
-
-真实 AX tree 接入前必须验证：
+真实 AX 接入必须验证：
 
 - iframe / cross-origin frame 对应关系；
-- backend DOM node ID 的生命周期；
+- backend DOM node ID 和 AX node ID 的生命周期；
 - AX value 中的敏感信息过滤；
-- 页面动态重绘后的 AX ref rebind；
+- 动态重绘、虚拟列表和 ignored/hidden 状态；
 - debugger lease 与常规页面操作的性能和并发影响。
 
 ### 7.3 Agent 的默认交互梯度
@@ -379,9 +376,11 @@ MutationObserver 不再负责轮换 snapshot ID 或使 ref 自动失效。
 | tab 已关闭 | `BROWSER_TAB_CLOSED` |
 | tab fence / browser target 改变 | `BROWSER_TAB_FENCE_CHANGED` / `BROWSER_TARGET_MISMATCH` |
 | document 已替换 | `BROWSER_DOCUMENT_CHANGED` 或现有不确定性契约 |
-| 原 node 被删除且不能重定位 | `ELEMENT_TARGET_DETACHED` / `ELEMENT_TARGET_NOT_FOUND` |
-| rebind 出现多个候选 | `ELEMENT_TARGET_AMBIGUOUS` |
-| 元素不显示、禁用或不可编辑 | `ELEMENT_TARGET_NOT_FOUND` / `ELEMENT_TARGET_DISABLED` / `ELEMENT_NOT_EDITABLE` |
+| 原 eN node 被删除且不能重定位 | `ELEMENT_TARGET_DETACHED` / `ELEMENT_TARGET_NOT_FOUND` |
+| 原 aN node 被删除且不能重定位 | `AX_NODE_NOT_FOUND` / `AX_NODE_NOT_RESOLVABLE` |
+| rebind 出现多个候选 | `ELEMENT_TARGET_AMBIGUOUS` / `AX_NODE_AMBIGUOUS` |
+| AX node identity 改变 | `AX_NODE_CHANGED` |
+| 元素不显示、禁用或不可编辑 | `ELEMENT_TARGET_NOT_FOUND` / `ELEMENT_TARGET_DISABLED` / `ELEMENT_NOT_EDITABLE`；AX 对应 `AX_NODE_NOT_ACTIONABLE` / `AX_NODE_DISABLED` / `AX_NODE_NOT_EDITABLE` |
 | 动作期间 document 丢失 | `BROWSER_OPERATION_UNCERTAIN` |
 
 错误 details 应只包含安全的原因、tab ID、是否发生 rebind、候选计数和下一步，不暴露敏感页面内容。
@@ -409,16 +408,16 @@ browser_dom_cua
 {
   "liveRefs": true,
   "semanticRebind": true,
-  "axRefs": false
+  "axRefs": true
 }
 ```
 
 迁移策略：
 
-1. 新扩展声明 `liveRefs` 和 `semanticRebind`；当前实现也显式声明 `axRefs: false`；
+1. 新扩展声明 `liveRefs`、`semanticRebind` 和已实现的 `axRefs`；
 2. `snapshotId + eN` 的请求格式不变，因此 Pi/DSH 不必为了新行为切换 wire dialect；它们可通过 capability 做诊断、升级提示或后续策略选择；
 3. 旧扩展继续保持 legacy strict snapshot 行为，宿主不把 `liveRefs` 作为兼容请求的强制前置条件；
-4. 真正 AX ref 完成后再声明 `axRefs`；
+4. AX ref 只在 accessibility snapshot 生成，并由 capability gate 保护；
 5. 兼容期内 `snapshotId` 继续接受，空值按现有参数清理规则处理。
 
 动作成功结果可增加非敏感诊断字段：
@@ -526,19 +525,22 @@ P1 直接解决 title、tab focus 和无关 DOM 变化引发的误判。
 
 P2 是 Agent-first 交互模型的核心实现。
 
-### P3：真实 AX adapter（待评审）
+### P3：真实 AX adapter（P3a/P3b/P3c 首轮实现完成）
 
-- 评估并实现 Chromium AX tree；
-- 暴露 AX ref；
-- 实现 AX diff、敏感内容过滤与 frame 处理；
-- 让 AX/semantic target 成为工具和 Skill 的默认推荐路径。
+- P3a：通过 debugger lease 读取 Chromium AX tree，完成 normalization、脱敏、预算、selector 和安全 fallback；
+- P3b：使用 `backendDOMNodeId` + `DOM.resolveNode` 做受 frame/document identity 约束的内部映射，并支持一次 semantic rebind；
+- P3c：对可映射 actionable/focusable 节点生成 `aN`，支持有限 locator 读取、visible/enabled wait 和 click/fill/type/press/select/check/hover/focus；
+- AX ref 操作继续 fail closed 处理 detached、changed、ambiguous、not editable、disabled、取消和副作用不确定性；
+- mock CDP、Edge 隔离 E2E、输出投影和 capability gate 已通过；目标浏览器重载后的持续性能与跨域/OOPIF 验收仍待完成。
 
-### P4：文档、迁移与发布（进行中）
+详见 [真实 Chromium Accessibility Tree 接入设计](./REAL-CHROMIUM-AX-DESIGN.zh-CN.md)。
 
-- 更新 Skill、README、FEATURES、错误恢复说明；
-- 标记 legacy strict snapshot 路径；
-- 增加 release note 和 upgrade 指南；
-- 在真实 Pi、DSH、Chrome、Edge 环境完成验收（Edge 隔离 smoke、Chrome for Testing 149.0.7827.55 的单/双 profile smoke，以及人工加载 Chrome 的 Skill 集成流程均已通过）。
+### P4：文档、迁移与发布（0.5.1 已完成）
+
+- Skill、README、FEATURES、错误恢复说明和 CHANGELOG 已同步；
+- 根包、Manifest、DSH 包、lockfile、私有 Profile 和 Active DSH Profile 已完成 0.5.1 迁移；
+- Edge 隔离 smoke、Chrome for Testing 149.0.7827.55 的单/双 profile smoke，以及人工加载 Chrome 的 Skill 集成流程已通过；
+- 当前仍待实际运行时重载 0.5.1 extension 后进行目标明确的实时验收。
 
 ## 12. 测试与验收
 
@@ -575,7 +577,7 @@ P2 是 Agent-first 交互模型的核心实现。
 
 ## 13. 风险与待决策项
 
-1. **真实 AX tree 的性能与兼容性**：需要先验证 debugger attach 成本、iframe 和浏览器版本差异；P3 不应阻塞 P1/P2。
+1. **真实 AX tree 的性能与兼容性**：首轮实现已覆盖 Edge 隔离 smoke，仍需在目标浏览器验证 debugger attach 成本、iframe 和浏览器版本差异；在完成验证前不再扩展现有 AX ref 支持范围。
 2. **Rebind 的保守程度**：默认只允许一次、唯一、强等价 rebind；高风险动作可进一步限制策略。
 3. **Ref 生命周期**：TTL/容量需要在模型多轮任务、内存占用和安全性之间取平衡。
 4. **页面 agent 注入方式**：已在 Edge 和 Chrome for Testing 149.0.7827.55 的隔离启动中验证 `executeScript({ files })` 与 isolated-world global state；仍应在未来 Chrome/Edge 版本、navigation 与 worker restart 组合中持续回归。当前 Edge 隔离 profile 已覆盖 `navigate(wait:false)`、reload、back/forward 的 transitionPending 生命周期，并在 Edge `tabs.goBack/goForward` 错报 history unavailable 时以同 tab-fence 的 CDP history entry 做一次受限 fallback。
@@ -593,4 +595,4 @@ P2 是 Agent-first 交互模型的核心实现。
   -> 单独评审 P3（真实 AX adapter）
 ```
 
-首轮实现已快速修复当前用户可见问题，同时以低风险方式完成核心交互层迁移；ownership、cleanup、Bridge 与 debugger lease 没有被卷入一次大规模重写。点击触发导航的结果按可验证时序定义：若页面 action 已返回且随后才观察到导航，则 action 是已完成；只有 action 后的 document 身份无法验证时才返回 `BROWSER_OPERATION_UNCERTAIN`，且绝不自动重放。下一步应先在 Chrome for Testing 或等效隔离环境完成 smoke、收集真实使用中的 rebind 诊断，再单独评审 P3 的 Chromium Accessibility Tree 接入。
+首轮实现已快速修复当前用户可见问题，同时以低风险方式完成核心交互层迁移；ownership、cleanup、Bridge 与 debugger lease 没有被卷入一次大规模重写。点击触发导航的结果按可验证时序定义：若页面 action 已返回且随后才观察到导航，则 action 是已完成；只有 action 后的 document 身份无法验证时才返回 `BROWSER_OPERATION_UNCERTAIN`，且绝不自动重放。0.5.1 发布迁移已完成；P3a/P3b/P3c 首轮代码已在独立工作树实现，待目标浏览器重载后的持续验收。

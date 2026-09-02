@@ -15,7 +15,7 @@ Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's exist
 - Closes unmarked Agent temporary tabs at turn end, releases claimed user tabs without closing them, and preserves only handoff or deliverable tabs marked for the current turn.
 - Provides DOM, accessibility, locator, coordinate, and native CDP controls.
 - Returns bounded semantic page state by default: visible/actionable snapshot nodes, 20,000-character/200-node snapshot and DOM-CUA budgets, and a shared 12,000-character extract budget. `browser_snapshot` keeps refs and `snapshotId` while Pi/DSH projections omit duplicate raw accessibility and frameTree data; the Bridge advertises `capabilities.compactResponses` and negotiates compact page-read responses, while unspecified mode remains raw-compatible for older consumers; when tab metadata already carries title and URL, projections do not repeat them inside page results, and full page text is reserved for `browser_extract` when no semantic state is available.
-- Supports full, incremental-diff, and unchanged accessibility reads; pass `disableDiffing: true` only when a complete AX state is required. Snapshot, accessibility, extract, and DOM-CUA reads accept optional `selector` and output budgets. Pi and DSH adapters omit blank optional `selector`, `snapshotId`, `incarnation`, and screenshot `path` fields before dispatch.
+- Accessibility reads prefer the real Chromium AX tree and support full, incremental-diff, and unchanged states; actionable/focusable AX nodes may carry document-scoped `aN` refs, which require the matching `snapshotId` for operations. Sensitive values stay redacted in AX and locator results. If the Accessibility domain is unavailable, reads safely fall back to the DOM semantic tree. Pass `disableDiffing: true` only when a complete AX state is required. Snapshot, accessibility, extract, and DOM-CUA reads accept optional `selector` and output budgets. Pi and DSH adapters omit blank optional `selector`, `snapshotId`, `incarnation`, and screenshot `path` fields before dispatch.
 - Bounds `browser_evaluate` results to depth 8, 2,000 array items, 200 object fields, and 200,000 characters before returning them through the Bridge.
 - Supports screenshots, page extraction, Console, Network, JavaScript dialogs, file upload, downloads, and clipboard text. Console and Network listings retain at most 200 entries and 20,000 serialized characters per read.
 - Captures ordinary active-tab viewport screenshots without opening a DevTools debugger session; full-page and background-tab captures use a short session-owned debugger lease.
@@ -174,7 +174,7 @@ This requests a unique temporary `--user-data-dir` rather than the normal user p
 - [`BROWSER-ACTIVATION-DESIGN.zh-CN.md`](./BROWSER-ACTIVATION-DESIGN.zh-CN.md) — browser capability activation and on-demand Skill design.
 - [`docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md`](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md) — implemented Codex-aligned browser lifecycle.
 - [`docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md`](./docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md) — implemented bounded model-facing browser output and AX revision design.
-- [`docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md`](./docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md) — Agent-first live-ref runtime design, implementation status, and AX roadmap.
+- [`docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md`](./docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md) — Agent-first live-ref runtime design, implementation status, and AX runtime status.
 
 ## Current future scope
 

@@ -52,7 +52,7 @@
 
 - Accessibility Snapshot；
 - 默认返回可见语义页面状态，snapshot 和 DOM CUA 使用 20,000 字符/200 节点预算，extract 使用共享 12,000 字符预算；Pi/DSH 模型结果不暴露重复 raw accessibility 和 frameTree；Bridge health 宣告 `capabilities.compactResponses=true`，页面读取协商 `responseMode=compact`，旧消费者省略 mode 时仍保留 raw 兼容，人工/开发者可显式使用 CLI `--raw`；当 Tab 已携带标题和 URL 时，snapshot、Accessibility 和 extract 不在内部重复这些字段；有交互元素或 Accessibility 节点时不再追加重复的页面全文，完整正文请使用 `browser_extract`；空的可选 `selector`、`snapshotId`、`incarnation` 和截图 `path` 会在发送前按省略处理；
-- Accessibility 支持 full、增量 diff 和 unchanged；需要完整树时显式传 `disableDiffing: true`；snapshot、Accessibility、extract 和 DOM CUA 支持可选 selector 与预算参数；
+- Accessibility Snapshot 优先读取真实 Chromium AX，支持 full、增量 diff 和 unchanged；AX actionable/focusable 节点可带 document-scoped `aN` ref，操作前须携带匹配的 `snapshotId`；AX 和 locator 结果中的敏感值保持脱敏；Accessibility domain 不可用时安全回退 DOM semantic tree；需要完整树时显式传 `disableDiffing: true`；snapshot、Accessibility、extract 和 DOM CUA 支持可选 selector 与预算参数；
 - `browser_evaluate` 返回值限制为深度 8、数组 2,000 项、对象 200 个字段和字符串 200,000 字符；
 - DOM 和 Locator 操作；
 - click、fill、type、press、scroll；

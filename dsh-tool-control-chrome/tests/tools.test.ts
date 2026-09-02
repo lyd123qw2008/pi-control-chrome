@@ -284,6 +284,16 @@ describe('DSH browser tool catalog', () => {
     expect(locatorResult).toEqual({ method: 'locator', params: { action: 'count', target, sessionId: 'session-test', expectedBrowserId: 'edge:test', locator: target } })
   })
 
+  it('requires the AX ref capability before dispatching aN operations', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.0', capabilities: { snapshotRefs: true, tabIncarnationFence: true, axRefs: false } }
+      : { method })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    await expect(harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'a1', snapshotId: 'snapshot-1' }, execution(harness.agent))).rejects.toThrow(/axRefs/)
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
+  })
+
   it('drops blank legacy ref fields beside a semantic interaction target', async () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { semanticTargets: true, tabIncarnationFence: true } }

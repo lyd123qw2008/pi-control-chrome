@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-本文是 `pi-control-chrome` 浏览器工具输出压缩方案和实现记录，用于说明模型可见结果、扩展侧边界、兼容性选择和发布结果。阶段 A～E 已实现；当前又完成了 Bridge compact response 协议迁移，浏览器操作的安全 fencing、快照引用和副作用不确定性语义保持不变。
+本文是 `pi-control-chrome` 浏览器工具输出压缩方案和实现记录，用于说明模型可见结果、扩展侧边界、兼容性选择和发布结果。阶段 A～F 已实现并随 0.5.1 发布，浏览器操作的安全 fencing、快照引用和副作用不确定性语义保持不变。真实 Chromium AX 的 P3a/P3b/P3c 首轮实现已落盘；当前 accessibility 结果优先来自 Chromium AX，明确不可用时回退 DOM 派生 semantic tree，AX ref 受 capability 和 document fencing 约束。
 
 目标发布面包括：Pi Extension、DSH browser tools、Manifest V3 扩展和本地 Bridge。实现优先保持浏览器操作的安全 fencing、快照引用和副作用不确定性语义不变。
 
@@ -150,7 +150,7 @@ Bridge 现在可以直接返回上述 compact response；未指定 `responseMode
   "snapshotId": "ax-2",
   "baseSnapshotId": "ax-1",
   "mode": "diff",
-  "state": "+ button \\\"保存\\\" [ref=e7]\\n~ textbox \\\"搜索\\\" value=\\\"订单\\\"",
+  "state": "+ button \"保存\" [ref=a1]\n~ textbox \"搜索\" value=\"订单\" [ref=a2]",
   "nodeCount": 2,
   "charCount": 72,
   "truncated": false
@@ -163,7 +163,7 @@ Bridge 现在可以直接返回上述 compact response；未指定 `responseMode
 - `diff`：同一 tab fence 和 document incarnation 下，返回新增、删除、变化的语义节点。
 - `unchanged`：页面状态没有发生可观察变化，只返回计数和当前 snapshot 标识。
 
-第一阶段不让 AX diff 单独承担 ref 操作。需要进行 ref 操作时，模型使用最新的普通 `browser_snapshot`，或使用语义 target。这样可以避免模型只收到 diff 后却无法知道未变化节点的完整引用集合。
+AX diff 的 state 只携带本次新增或变化节点的 `aN`；模型必须保留产生该 ref 的 `snapshotId`，不能把 diff 中的 ref 当作跨 observation 的稳定 id。敏感控件的 value 不进入 children、state、diff 或 locator read 结果。需要未变化节点时，重新请求 `disableDiffing: true` 的完整 AX snapshot，或改用语义 target。
 
 ### 5.3 `browser_tabs`
 
@@ -201,7 +201,7 @@ Bridge 现在可以直接返回上述 compact response；未指定 `responseMode
 
 ### 6.1 语义节点筛选
 
-`collectAccessibilitySnapshot()` 应按以下顺序处理：
+当前 `collectDomAccessibilitySnapshot()` 是真实 AX 不可用时的 fallback，应按以下顺序处理：
 
 1. 先判断元素是否可见。
 2. 只保留显式 ARIA role、隐式语义 role、标题、表单控件、链接、按钮、可编辑控件和其他可操作节点。
@@ -291,6 +291,7 @@ document incarnation
 - 优先使用当前 document 内可验证的 DOM/backend identity；
 - 没有稳定 identity 时使用父节点路径、role、ordinal 和局部属性组合；
 - identity 大规模变化时放弃 diff，返回新的 `full`；
+- Chromium AX 跨读取只使用 backend identity；缺少稳定 identity 时仅保留当前读取的临时 key，并放弃 diff；
 - 不因为 diff 失败而复用旧 ref。
 
 ### 7.3 Diff 退化规则
@@ -424,15 +425,17 @@ state lines + ref map + counts + truncation
 
 普通 `browser_snapshot` 默认输出 `state`，不再输出 `text`、`elements`、`accessibility` 的重复组合。Bridge 通过 `responseMode=compact` 在 wire 层直接提供同一 contract；未指定 mode 的旧请求仍可获得 raw 兼容字段。
 
-### 阶段 C：AX revision diff（已实现）
+### 阶段 C：DOM 派生 semantic revision diff（已实现）
 
-新增每个 tab/document 的 accessibility revision：
+新增每个 tab/document 的 accessibility-oriented semantic revision：
 
 - 第一次返回 full；
 - 后续默认 diff；
 - 无变化返回 unchanged；
 - navigation、fence、incarnation 或 revision 不确定时返回 full；
 - diff 结果不自动承诺旧 ref 仍可用。
+
+当前 revision 可由 DOM semantic 或 Chromium AX observation 驱动；只有 `source: "chromium_ax"` 的结果才代表真实 AX observation。AX ref、映射和交互设计见 [REAL-CHROMIUM-AX-DESIGN.zh-CN.md](./REAL-CHROMIUM-AX-DESIGN.zh-CN.md)。
 
 ### 阶段 D：按需范围读取（已实现）
 
@@ -456,7 +459,7 @@ Pi 与 DSH 已完成双通道验证，compact projection 作为默认发布行�
 - Profile 解析结果；
 - README、Codex 对齐文档和 CHANGELOG。
 
-### 阶段 F：Bridge raw consumer 迁移（已在工作树实现，待下一次显式发布）
+### 阶段 F：Bridge raw consumer 迁移（已实现并随 0.5.1 发布）
 
 - Bridge health 宣告 `compactResponses`，并校验 `responseMode=compact|raw`。
 - Bridge 在响应发送前对 snapshot、Accessibility、extract、tabs、selected tab 和 visible DOM 执行 canonical compact projection。
@@ -540,18 +543,18 @@ CHANGELOG.md
 - compact 响应保留 `browserId`、`connectionId`、`connectionGeneration`、tab handle、snapshot/DOM refs 和计数，且 Pi/DSH 二次 projection 不改变语义。
 
 
-阶段 A～E 与 Bridge raw consumer 迁移已在工作树实现，默认的模型和 Skill CLI 页面读取使用 compact response；Bridge raw 字段仍由未指定 mode 的旧请求和显式 raw 调试路径保留。当前实现采用以下决策：
+阶段 A～F 已实现并随 0.5.1 发布，默认的模型和 Skill CLI 页面读取使用 compact response；Bridge raw 字段仍由未指定 mode 的旧请求和显式 raw 调试路径保留。真实 Chromium AX 的 P3a/P3b/P3c 首轮实现已完成，当前实现采用以下决策：
 
 - generic 容器过滤、字段上限和扩展侧预算先于模型 projection 执行，避免大报文在 Bridge 中生成和传输。
 - 普通 snapshot 只向 Pi/DSH 暴露单一有界 `state`，ref map、snapshot id 和 fencing 仍由扩展内部维护；交互元素或 AX 节点已经描述页面时，省略的页面全文不会把语义 state 标记为截断。
-- AX 读取默认使用 `full`、`diff`、`unchanged` revision；需要完整 AX 树时显式传 `disableDiffing: true`。
+- AX 读取默认使用 Chromium AX 的 `full`、`diff`、`unchanged` revision；AX domain 不可用时安全回退 DOM semantic tree；需要完整 AX 树时显式传 `disableDiffing: true`；真实 AX accessibility snapshot 的 actionable/focusable 节点可带 `aN`，交互前仍重新解析并执行 document/fence 校验。
 - `maxChars`、`maxNodes` 和 `selector` 由扩展执行，projection 作为第二道边界；selector 不绕过可见性、敏感字段和 snapshot fencing。
 - 同一个用户 Tab 可能在读取期间被用户或 DSH UI 导航/重载。只读读取最多重新观察一次，连续变化返回 `BROWSER_PAGE_CHANGING`；副作用结果不使用这一重试路径。
 - 自动化验证使用 Agent-owned 测试 Tab 或隔离浏览器 Profile；用户明确要求时仍可读取或操作现有用户 Tab。
 - `responseMode=compact` 是新 Pi、DSH 和 Skill CLI 的默认页面读取模式；旧 Bridge 未宣告该能力时，宿主侧本地 projection 提供兼容降级。
 - raw 字段只为未指定 mode 的旧消费者和显式人工/开发者诊断保留；后续独立删除 raw wire 字段仍需另行提高协议版本，不在本次兼容变更中隐式执行。
 
-发布前仍需完成真实长页面体积测量、所有消费者迁移确认、文档和 CHANGELOG 复核；在此之前不 bump 版本、不 commit、不 publish。
+0.5.1 的发布、消费者迁移、lockfile、Profile 和 CHANGELOG 已完成。本次 P3a/P3b/P3c 代码位于独立工作树，mock CDP 与 Edge 隔离 smoke 已通过；合并或发布前仍需完成目标浏览器 extension 重载后的持续验收并单独决定版本变更。
 
 ## 14. 已确认的评审决策
 

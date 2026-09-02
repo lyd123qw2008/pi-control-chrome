@@ -55,6 +55,23 @@ test("Pi accessibility projection preserves diff metadata", () => {
   assert.equal(result.children, undefined);
 });
 
+test("Pi accessibility projection preserves AX refs and states", () => {
+  const result = compactAccessibilityResult({ snapshot: {
+    snapshotId: "snapshot-ax",
+    accessibility: {
+      mode: "full",
+      children: [{ ref: "a1", role: "checkbox", name: "Agree", checked: "mixed", expanded: false, required: true }],
+      state: "- checkbox \\\"Agree\\\" checked=mixed expanded=false required=true [ref=a1]",
+      nodeCount: 1,
+    },
+  } });
+  assert.match(result.state, /checked=mixed/);
+  assert.match(result.state, /expanded=false/);
+  assert.match(result.state, /required=true/);
+  assert.ok(result.state.includes("[ref=a1]"));
+  assert.equal(result.children, undefined);
+});
+
 test("Pi DOM CUA projection emits bounded node lines", () => {
   const result = compactDomCuaResult({ dom: { snapshotId: "dom-1", nodes: [{ node_id: "d1", tag: "button", text: "Submit" }] } });
   assert.match(result.dom.state, /node_id=d1/);
