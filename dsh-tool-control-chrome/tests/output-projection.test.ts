@@ -92,6 +92,23 @@ describe('browser output projections', () => {
     expect(dom.nodes).toBeUndefined()
   })
 
+  it('preserves a transition-pending tab handle without an invented document identity', () => {
+    const result = record(compactTabsResult({
+      tabs: [{
+        id: 7,
+        url: 'https://example.test/destination',
+        transitionPending: true,
+        handle: { tabId: 7, browserId: 'edge:test', tabFence: 'tab:7' },
+      }],
+    }))
+    const tabs = result.tabs as unknown[]
+    const tab = record(tabs[0])
+    expect(tab.transitionPending).toBe(true)
+    expect(record(tab.handle).incarnation).toBeUndefined()
+    expect(record(tab.handle).url).toBeUndefined()
+    expect(record(tab.handle).tabFence).toBe('tab:7')
+  })
+
   it('accepts an already compact Bridge snapshot response', () => {
     const result = record(compactSnapshotResult({
       browserId: 'edge:test',

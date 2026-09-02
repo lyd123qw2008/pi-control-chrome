@@ -46,7 +46,7 @@ function compactTab(value: unknown, currentSessionId?: string): unknown {
   if (!isRecord(value)) return value
   const keys = [
     'id', 'browserId', 'windowId', 'index', 'active', 'pinned', 'title', 'url', 'status', 'groupId',
-    'tabFence', 'incarnation', 'owner', 'ownership', 'sessionId', 'lifecycle', 'stale', 'handle',
+    'tabFence', 'incarnation', 'owner', 'ownership', 'sessionId', 'lifecycle', 'stale', 'transitionPending', 'handle',
   ] as const
   const result: RecordValue = {}
   for (const key of keys) {
