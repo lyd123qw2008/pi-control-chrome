@@ -26,6 +26,7 @@
 - [Codex 对齐的浏览器生命周期实施方案](./docs/BROWSER-LIFECYCLE-CODEX-ALIGNED.zh-CN.md)
 - [浏览器模型输出压缩实施方案](./docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md)
 - [Agent-first 浏览器运行时重构方案](./docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md)
+- [多 Agent 能力与 Skill 驱动架构讨论（提案）](./docs/AGENT-CAPABILITY-ARCHITECTURE.zh-CN.md)
 
 本项目的浏览器工具采用 Skill 门控：当前会话显式加载 `pi-control-chrome` Skill 之前，Pi 和 DSH 都不会向模型提供完整的 `browser_*` schema。普通公开网页搜索不会因此启动当前浏览器。仓库内的 `skills/pi-control-chrome/scripts/browser.mjs` 只用于明确的人工/开发者流程和自动化测试，不能作为模型绕过 Skill 门控的路径。用于管理标签页的 CLI `open` 和 `cleanup` 必须显式提供 `--session <id>`；非临时 `view` 还必须提供 `--turn <n>`，不再使用进程 PID 作为会话标识。只有在用户明确决定恢复扩展运行时之后，CLI `cleanup` 才应使用 `--recover-stale`；它不会关闭未知 runtime 的 Tab。用户 Tab 可以作为浏览器目标，但页面文档可能在用户或 DSH 界面活动时被替换；只读读取会有限重新观察一次，副作用操作继续严格校验文档身份。自动化浏览器验证应使用 Agent-owned 测试 Tab 或隔离浏览器 Profile，不要使用正在聊天的 DSH GUI Tab。
 
