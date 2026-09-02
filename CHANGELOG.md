@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0 - 2026-09-02
+
+- Reworked `snapshotId + eN` snapshot refs and `snapshotId + nodeId` DOM-CUA targets as document-scoped live observations. Title/focus changes, later observations, and unrelated same-document DOM churn no longer invalidate a still-connected original target.
+
+- Permit one fail-closed, same-document semantic rebind only when a detached original has exactly one strongly equivalent replacement within its original scope. Ambiguous, weak, changed, cross-document, and second-hop replacements remain rejected.
+
+- Added pre-dispatch document fencing for side-effecting page and DOM-CUA operations, retained invalidated observation provenance for explicit document-change errors, and preserved successful confirmed actions when a readable post-action document identity changes.
+
+- Made `navigate(wait: false)`, back, forward, and reload return fenced `transitionPending` handles without unstable title, URL, or document-incarnation fields. Document-bound requests reject while a transition is pending until `browser_wait` completes.
+
+- Added a bounded isolated-world Page Agent registry, Chrome/Edge history fallback fencing, Pi/DSH transition-pending projections, and real-browser regression coverage on Edge and Chrome for Testing.
+
 ## 0.4.4 - 2026-08-31
 
 - Hardened `browser_new_tab` waiting and tab identity: normal URL canonicalization such as a trailing `/` is accepted with `allowRedirects: false`, an optional `windowId` is forwarded to tab creation, and `wait: true` returns a refreshed post-load handle with the current tab fence and document incarnation.
