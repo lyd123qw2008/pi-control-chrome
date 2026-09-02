@@ -340,7 +340,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_snapshot',
-    description: 'Read the active page title and one bounded semantic page state with snapshot-scoped eN refs; ref actions require the returned snapshotId. Read-only observation may retry once if the tab document changes.',
+    description: 'Read the active page title and one bounded semantic page state with document-scoped live eN refs; ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, while navigation remains a hard boundary. Read-only observation may retry once if the tab document changes.',
     parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES },
     method: 'snapshot',
   },
@@ -358,7 +358,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_navigate',
-    description: 'Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete.',
+    description: 'Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete. With wait: false, the returned tab is marked transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait or re-observe before document-bound work.',
     parameters: {
       tabId: TAB_ID,
       url: requiredString('Destination URL.'),
@@ -386,39 +386,39 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_back',
-    description: 'Navigate the selected browser tab back in history.',
+    description: 'Navigate the selected browser tab back in history. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work.',
     parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
     method: 'back',
   },
   {
     name: 'browser_forward',
-    description: 'Navigate the selected browser tab forward in history.',
+    description: 'Navigate the selected browser tab forward in history. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work.',
     parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
     method: 'forward',
   },
   {
     name: 'browser_reload',
-    description: 'Reload the selected browser tab.',
+    description: 'Reload the selected browser tab. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work.',
     parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
     method: 'reload',
   },
   {
     name: 'browser_click',
-    description: 'Click one visible element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.',
+    description: 'Click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
     parameters: { tabId: TAB_ID, snapshotId: OPTIONAL_STRING, ref: OPTIONAL_STRING, selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS },
     method: 'interaction',
     prepare: args => ({ ...args, operation: 'click' }),
   },
   {
     name: 'browser_double_click',
-    description: 'Double-click one visible element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.',
+    description: 'Double-click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
     parameters: { tabId: TAB_ID, snapshotId: OPTIONAL_STRING, ref: OPTIONAL_STRING, selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS },
     method: 'interaction',
     prepare: args => ({ ...args, operation: 'double_click' }),
   },
   {
     name: 'browser_fill',
-    description: 'Fill one input, textarea, or contenteditable element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.',
+    description: 'Fill one input, textarea, or contenteditable element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
     parameters: {
       tabId: TAB_ID,
       snapshotId: OPTIONAL_STRING,
@@ -433,7 +433,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_type',
-    description: 'Type or append text into one focused field selected by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.',
+    description: 'Type or append text into one focused field selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
     parameters: {
       tabId: TAB_ID,
       snapshotId: OPTIONAL_STRING,
@@ -448,7 +448,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_press_key',
-    description: 'Dispatch a keyboard key to one element selected by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.',
+    description: 'Dispatch a keyboard key to one element selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
     parameters: {
       tabId: TAB_ID,
       snapshotId: OPTIONAL_STRING,
@@ -548,7 +548,7 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_dom_cua',
-    description: 'Use visible DOM node ids from the latest browser_dom_cua snapshot; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations.',
+    description: 'Use visible DOM node ids from a matching browser_dom_cua observation; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations. Unrelated same-document UI changes do not stale a node, while navigation remains a hard boundary.',
     parameters: {
       tabId: TAB_ID,
       action: DOM_CUA_ACTION,
