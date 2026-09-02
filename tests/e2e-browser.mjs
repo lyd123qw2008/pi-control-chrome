@@ -61,6 +61,8 @@ const site = `<!doctype html>
 <label for="editor">Editor</label><div id="editor" role="textbox" contenteditable></div>
 <input id="file" type="file">
 <button id="go" data-testid="submit-button">Submit</button>
+<button id="history-action" type="button">History action</button>
+<button id="navigate-action" type="button">Navigate action</button>
 <button id="dialog" type="button">Dialog</button>
 <span id="aria-name">Accessible action</span><button id="aria-button" aria-labelledby="aria-name">Icon</button>
 <button id="aria-label-button" aria-label="Labelled action">Icon</button>
@@ -79,6 +81,14 @@ const marker = new URLSearchParams(location.search).get('marker');
 if (marker) document.querySelector('h1').textContent = marker;
 const out = document.querySelector('#out');
 document.querySelector('#go').addEventListener('click', () => { out.textContent = 'Hello ' + document.querySelector('#name').value; });
+document.querySelector('#history-action').addEventListener('click', () => {
+  history.pushState({}, '', '?marker=History%20action');
+  document.querySelector('h1').textContent = 'History action';
+});
+document.querySelector('#navigate-action').addEventListener('click', () => {
+  // Let the injected click return before the real document navigation begins.
+  setTimeout(() => { location.href = '/?marker=Navigate%20action'; }, 150);
+});
 document.querySelector('#dialog').addEventListener('click', () => setTimeout(() => alert('e2e-dialog'), 0));
 document.querySelector('#indexed-visible').addEventListener('click', () => { out.textContent = 'Indexed visible'; });
 console.log('page-ready');
@@ -112,6 +122,10 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function spawnProcess(command, args) {
   return spawn(command, args, { stdio: "ignore", windowsHide: true });
+}
+
+function isInstalledGoogleChrome(executable) {
+  return /(?:^|[\\/])Google[\\/]Chrome[\\/]Application[\\/]chrome\.exe$/i.test(String(executable));
 }
 
 function waitForExit(child, timeoutMs = 5000) {
@@ -219,7 +233,9 @@ try {
     } catch {}
   }
   if (edgeProcess.exitCode !== null) throw new Error(`browser process exited before extension handshake; isolated launch may have been delegated (exit=${edgeProcess.exitCode})`);
-  assert.equal(health?.extensionConnected, true, `extension did not connect: ${JSON.stringify(health)}`);
+  assert.equal(health?.extensionConnected, true, `${isInstalledGoogleChrome(browserExecutable)
+    ? "Installed Google Chrome ignored command-line unpacked-extension loading (Chrome logged that --disable-extensions-except is not allowed). Use Chrome for Testing for this isolated smoke, or manually load extension/ in chrome://extensions for a normal-profile check."
+    : "extension did not connect"}: ${JSON.stringify(health)}`);
   assert.equal(health.instanceId, bridgeHealth.instanceId);
   assert.equal(health.port, bridgePort);
   await sleep(1500);
@@ -337,20 +353,108 @@ try {
   }), /Timed out waiting for page condition enabled/);
   await sleep(100);
   const staleSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const staleNameInput = staleSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(staleNameInput?.ref);
   const compactWireSnapshot = await request("snapshot", { tabId: selected.tab.id, responseMode: "compact" });
   assert.equal(compactWireSnapshot.snapshot.elements, undefined);
   assert.equal(compactWireSnapshot.snapshot.accessibility, undefined);
   assert.equal(compactWireSnapshot.snapshot.text, undefined);
   assert.equal(compactWireSnapshot.frameTree, undefined);
   assert.match(compactWireSnapshot.snapshot.state, /\[ref=/);
-   const staleButton = staleSnapshot.snapshot.elements.find((element) => element.tag === "button");
-   await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-stale-test', '1')" });
-   await assert.rejects(() => request("interaction", { tabId: selected.tab.id, operation: "click", ref: staleButton.ref, snapshotId: staleSnapshot.snapshot.snapshotId }), /Snapshot is stale/);
-   const snapshot = await request("snapshot", { tabId: selected.tab.id });
-   const snapshotBytes = Buffer.byteLength(JSON.stringify(snapshot));
-   const projectedSnapshot = compactBrowserResult("browser_snapshot", {}, snapshot);
-   const projectedSnapshotBytes = Buffer.byteLength(JSON.stringify(projectedSnapshot));
-   assert.ok(projectedSnapshotBytes <= 120_000);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.title = 'Pi Control Chrome E2E · observed'; document.querySelector('#async-status').textContent = 'Unrelated UI update'" });
+  const resilientFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: staleNameInput.ref, snapshotId: staleSnapshot.snapshot.snapshotId, value: "Live ref" });
+  assert.equal(resilientFill.result?.resolvedBy, "original_ref");
+  assert.equal(resilientFill.result?.rebound, false);
+  const resilientValue = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').value" });
+  assert.equal(resilientValue.result?.result?.value, "Live ref");
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.title = 'Pi Control Chrome E2E'" });
+
+  // The user may switch from tab_a to an Agent-created tab_b to observe work. That
+  // visibility change must not invalidate tab_b's ref while its document is intact.
+  const observedTab = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, wait: true, sessionId: "e2e-session" });
+  const observedSnapshot = await request("snapshot", { tabId: observedTab.tab.id });
+  const observedInput = observedSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(observedInput?.ref);
+  await request("select_tab", { tabId: observedTab.tab.id });
+  await request("evaluate", { tabId: observedTab.tab.id, expression: "document.title = 'Pi Control Chrome E2E · tab_b'; document.querySelector('#async-status').textContent = 'Observed tab update'" });
+  const observedFill = await request("interaction", { tabId: observedTab.tab.id, operation: "fill", ref: observedInput.ref, snapshotId: observedSnapshot.snapshot.snapshotId, value: "Visible tab" });
+  assert.equal(observedFill.result?.resolvedBy, "original_ref");
+  await request("close_tab", { tabId: observedTab.tab.id });
+  await assert.rejects(
+    () => request("interaction", { tabId: observedTab.tab.id, operation: "fill", ref: observedInput.ref, snapshotId: observedSnapshot.snapshot.snapshotId, value: "must not fill" }),
+    (error) => error.code === "BROWSER_TAB_CLOSED",
+  );
+
+  // A real document replacement is still a hard boundary: an old observation must
+  // never rebind into the newly navigated page.
+  const navigationTab = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, wait: true, sessionId: "e2e-session" });
+  const navigationSnapshot = await request("snapshot", { tabId: navigationTab.tab.id });
+  const navigationInput = navigationSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(navigationInput?.ref);
+  await request("navigate", { tabId: navigationTab.tab.id, url: `http://127.0.0.1:${pagePort}/?marker=New%20document`, wait: true });
+  await assert.rejects(
+    () => request("interaction", { tabId: navigationTab.tab.id, operation: "fill", ref: navigationInput.ref, snapshotId: navigationSnapshot.snapshot.snapshotId, value: "must not fill" }),
+    (error) => error.code === "BROWSER_DOCUMENT_CHANGED",
+  );
+  await request("close_tab", { tabId: navigationTab.tab.id });
+
+  // `wait: false` returns before the slow destination has loaded. The old ref
+  // must nevertheless be blocked during that loading interval, not merely after
+  // a later snapshot observes the destination document.
+  const loadingTransitionTab = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, wait: true, sessionId: "e2e-session" });
+  const loadingTransitionSnapshot = await request("snapshot", { tabId: loadingTransitionTab.tab.id });
+  const loadingTransitionInput = loadingTransitionSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(loadingTransitionInput?.ref);
+  const loadingTransition = await request("navigate", { tabId: loadingTransitionTab.tab.id, url: `http://127.0.0.1:${pagePort}/slow?marker=Loading%20destination`, wait: false });
+  assert.equal(loadingTransition.tab?.transitionPending, true);
+  assert.equal(loadingTransition.tab?.handle?.incarnation, undefined);
+  assert.equal(loadingTransition.tab?.handle?.url, undefined);
+  // Dispatch an action immediately after the response: the transition fallback
+  // must already fence the old observation, not rely on an arbitrary delay.
+  await assert.rejects(
+    () => request("interaction", { tabId: loadingTransitionTab.tab.id, operation: "fill", ref: loadingTransitionInput.ref, snapshotId: loadingTransitionSnapshot.snapshot.snapshotId, value: "must not fill during loading" }),
+    (error) => error.code === "BROWSER_DOCUMENT_CHANGED",
+  );
+  await request("wait", { tabId: loadingTransitionTab.tab.id, state: "load", timeoutMs: 5000 });
+  const reloadTransitionSnapshot = await request("snapshot", { tabId: loadingTransitionTab.tab.id });
+  const reloadTransitionInput = reloadTransitionSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(reloadTransitionInput?.ref);
+  await request("reload", { tabId: loadingTransitionTab.tab.id });
+  await assert.rejects(
+    () => request("interaction", { tabId: loadingTransitionTab.tab.id, operation: "fill", ref: reloadTransitionInput.ref, snapshotId: reloadTransitionSnapshot.snapshot.snapshotId, value: "must not fill during reload" }),
+    (error) => error.code === "BROWSER_DOCUMENT_CHANGED",
+  );
+  await request("wait", { tabId: loadingTransitionTab.tab.id, state: "load", timeoutMs: 5000 });
+
+  // Back and forward are document transitions too. Their own completion response
+  // must not leave a window where a ref from the page being left is usable.
+  const historyBeforeBack = await request("evaluate", { tabId: loadingTransitionTab.tab.id, expression: "history.length" });
+  assert.ok(Number(historyBeforeBack.result?.result?.value) >= 2);
+  const backTransitionSnapshot = await request("snapshot", { tabId: loadingTransitionTab.tab.id });
+  const backTransitionInput = backTransitionSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(backTransitionInput?.ref);
+  await request("back", { tabId: loadingTransitionTab.tab.id });
+  await assert.rejects(
+    () => request("interaction", { tabId: loadingTransitionTab.tab.id, operation: "fill", ref: backTransitionInput.ref, snapshotId: backTransitionSnapshot.snapshot.snapshotId, value: "must not fill after back" }),
+    (error) => error.code === "BROWSER_DOCUMENT_CHANGED",
+  );
+  await request("wait", { tabId: loadingTransitionTab.tab.id, state: "load", timeoutMs: 5000 });
+  const forwardTransitionSnapshot = await request("snapshot", { tabId: loadingTransitionTab.tab.id });
+  const forwardTransitionInput = forwardTransitionSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(forwardTransitionInput?.ref);
+  await request("forward", { tabId: loadingTransitionTab.tab.id });
+  await assert.rejects(
+    () => request("interaction", { tabId: loadingTransitionTab.tab.id, operation: "fill", ref: forwardTransitionInput.ref, snapshotId: forwardTransitionSnapshot.snapshot.snapshotId, value: "must not fill after forward" }),
+    (error) => error.code === "BROWSER_DOCUMENT_CHANGED",
+  );
+  await request("wait", { tabId: loadingTransitionTab.tab.id, state: "load", timeoutMs: 5000 });
+  await request("close_tab", { tabId: loadingTransitionTab.tab.id });
+
+  const snapshot = await request("snapshot", { tabId: selected.tab.id });
+  const snapshotBytes = Buffer.byteLength(JSON.stringify(snapshot));
+  const projectedSnapshot = compactBrowserResult("browser_snapshot", {}, snapshot);
+  const projectedSnapshotBytes = Buffer.byteLength(JSON.stringify(projectedSnapshot));
+  assert.ok(projectedSnapshotBytes <= 120_000);
   const input = snapshot.snapshot.elements.find((element) => element.tag === "input");
   const button = snapshot.snapshot.elements.find((element) => element.tag === "button");
   assert.ok(input?.ref);
@@ -398,6 +502,104 @@ try {
   await request("interaction", { tabId: selected.tab.id, operation: "click", ref: afterFillButton.ref, snapshotId: afterFillSnapshot.snapshot.snapshotId });
   const after = await request("snapshot", { tabId: selected.tab.id });
   assert.match(after.snapshot.text, /Hello Pi/);
+
+  // The click result is known once the injected page action returns. A valid
+  // post-action document identity (including a history URL transition) must
+  // therefore preserve success rather than misreporting an uncertain effect.
+  const historyAction = await request("interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    target: { role: "button", name: "History action", exact: true },
+  });
+  assert.equal(historyAction.result?.ok, true);
+  assert.equal(historyAction.result?.postActionDocumentChanged, true);
+  await request("wait", { tabId: selected.tab.id, state: "url", urlIncludes: "marker=History%20action", timeoutMs: 5000 });
+  await request("navigate", { tabId: selected.tab.id, url: `http://127.0.0.1:${pagePort}/`, wait: true });
+
+  // A known-dispatched click is successful when it returns before a later real
+  // navigation becomes observable. The later navigation is verified separately;
+  // it must not retroactively turn the completed click into an uncertain result.
+  const knownDispatchTab = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, wait: true, sessionId: "e2e-session" });
+  const navigateAction = await request("interaction", {
+    tabId: knownDispatchTab.tab.id,
+    operation: "click",
+    target: { role: "button", name: "Navigate action", exact: true },
+  });
+  assert.equal(navigateAction.result?.ok, true);
+  await request("wait", { tabId: knownDispatchTab.tab.id, state: "url", urlIncludes: "marker=Navigate%20action", timeoutMs: 5000 });
+  await request("close_tab", { tabId: knownDispatchTab.tab.id });
+
+  const rebindSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const rebindInput = rebindSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(rebindInput?.ref);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').outerHTML = '<input id=\"name\" placeholder=\"Name\">'" });
+  const reboundFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: rebindInput.ref, snapshotId: rebindSnapshot.snapshot.snapshotId, value: "Rebound" });
+  assert.equal(reboundFill.result?.resolvedBy, "semantic_rebind");
+  assert.equal(reboundFill.result?.rebound, true);
+  const reboundValue = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').value" });
+  assert.equal(reboundValue.result?.result?.value, "Rebound");
+  // A single observation can make only one controlled hop. A second framework
+  // replacement must require a new snapshot rather than silently redirect again.
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').outerHTML = '<input id=\"name\" placeholder=\"Name\">'" });
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, operation: "fill", ref: rebindInput.ref, snapshotId: rebindSnapshot.snapshot.snapshotId, value: "must not rebind twice" }),
+    (error) => error.code === "ELEMENT_TARGET_DETACHED" && error.details?.reason === "rebind_already_used",
+  );
+
+  // Replacement is deliberately fail-closed when a formerly unique semantic field
+  // becomes ambiguous, and when it is removed without an equivalent replacement.
+  await request("evaluate", { tabId: selected.tab.id, expression: "(() => { const host = document.createElement('div'); host.id = 'rebind-ambiguous-host'; host.innerHTML = '<label>Rebind ambiguity <input placeholder=\"Rebind ambiguity\"></label>'; document.body.append(host); })()" });
+  const ambiguousRebindSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const ambiguousRebindInput = ambiguousRebindSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Rebind ambiguity");
+  assert.ok(ambiguousRebindInput?.ref);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#rebind-ambiguous-host').innerHTML = '<label>Rebind ambiguity <input placeholder=\"Rebind ambiguity\"></label><label>Rebind ambiguity <input placeholder=\"Rebind ambiguity\"></label>'" });
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, operation: "fill", ref: ambiguousRebindInput.ref, snapshotId: ambiguousRebindSnapshot.snapshot.snapshotId, value: "must not choose" }),
+    (error) => error.code === "ELEMENT_TARGET_AMBIGUOUS" && error.details?.count === 2,
+  );
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#rebind-ambiguous-host').remove()" });
+
+  await request("evaluate", { tabId: selected.tab.id, expression: "(() => { const host = document.createElement('div'); host.id = 'rebind-detached-host'; host.innerHTML = '<label>Rebind detached <input placeholder=\"Rebind detached\"></label>'; document.body.append(host); })()" });
+  const detachedRebindSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const detachedRebindInput = detachedRebindSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Rebind detached");
+  assert.ok(detachedRebindInput?.ref);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#rebind-detached-host').remove()" });
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, operation: "fill", ref: detachedRebindInput.ref, snapshotId: detachedRebindSnapshot.snapshot.snapshotId, value: "must not fill" }),
+    (error) => error.code === "ELEMENT_TARGET_DETACHED",
+  );
+
+  // A scoped ref cannot consume its one rebind on an equivalent control outside
+  // that scope. The later in-scope replacement must remain the only eligible hop.
+  await request("evaluate", { tabId: selected.tab.id, expression: "(() => { const left = document.createElement('div'); left.id = 'scoped-rebind-left'; left.innerHTML = '<label>Scoped rebind <input placeholder=\"Scoped rebind\"></label>'; const right = document.createElement('div'); right.id = 'scoped-rebind-right'; document.body.append(left, right); })()" });
+  const scopedRebindSnapshot = await request("snapshot", { tabId: selected.tab.id, selector: "#scoped-rebind-left" });
+  const scopedRebindInput = scopedRebindSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Scoped rebind");
+  assert.ok(scopedRebindInput?.ref);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#scoped-rebind-left').innerHTML = ''; document.querySelector('#scoped-rebind-right').innerHTML = '<label>Scoped rebind <input placeholder=\"Scoped rebind\"></label>'" });
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, operation: "fill", snapshotId: scopedRebindSnapshot.snapshot.snapshotId, target: { ref: scopedRebindInput.ref, scopeSelector: "#scoped-rebind-left" }, value: "must not escape scope" }),
+    (error) => error.code === "ELEMENT_TARGET_DETACHED",
+  );
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#scoped-rebind-left').innerHTML = '<label>Scoped rebind <input placeholder=\"Scoped rebind\"></label>'" });
+  const scopedReboundFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", snapshotId: scopedRebindSnapshot.snapshot.snapshotId, target: { ref: scopedRebindInput.ref, scopeSelector: "#scoped-rebind-left" }, value: "Scoped winner" });
+  assert.equal(scopedReboundFill.result?.resolvedBy, "semantic_rebind");
+  const scopedValues = await request("evaluate", { tabId: selected.tab.id, expression: "JSON.stringify([document.querySelector('#scoped-rebind-left input').value, document.querySelector('#scoped-rebind-right input').value])" });
+  assert.deepEqual(JSON.parse(scopedValues.result?.result?.value), ["Scoped winner", ""]);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#scoped-rebind-left').remove(); document.querySelector('#scoped-rebind-right').remove()" });
+
+  // A node that remains connected but changes its own semantic identity is not a
+  // framework replacement and must never be rebound to another target.
+  await request("evaluate", { tabId: selected.tab.id, expression: "(() => { const host = document.createElement('div'); host.id = 'changed-ref-host'; host.innerHTML = '<button id=\"changed-ref-button\">Original action</button>'; document.body.append(host); })()" });
+  const changedRefSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const changedRefButton = changedRefSnapshot.snapshot.elements.find((element) => element.tag === "button" && element.name === "Original action");
+  assert.ok(changedRefButton?.ref);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#changed-ref-button').textContent = 'Changed action'" });
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, operation: "click", ref: changedRefButton.ref, snapshotId: changedRefSnapshot.snapshot.snapshotId }),
+    (error) => error.code === "ELEMENT_TARGET_NOT_FOUND" && error.details?.reason === "original_target_changed",
+  );
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#changed-ref-host').remove()" });
+
   const semanticFill = await request("interaction", {
     tabId: selected.tab.id,
     operation: "fill",
@@ -537,22 +739,58 @@ try {
   assert.deepEqual(JSON.parse(controlState.result?.result?.value), { choice: "two", checked: true });
 
   const staleVisibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
-   const staleDomButton = staleVisibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
-           await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').setAttribute('data-dom-stale-test', '1')" });
-           await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: staleDomButton.node_id, snapshotId: staleVisibleDom.dom.snapshotId }), /DOM snapshot is stale/);
-    const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
-   const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
+  const staleDomButton = staleVisibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
+  assert.ok(staleDomButton?.node_id);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.title = 'Pi Control Chrome E2E · DOM observed'; document.querySelector('#async-status').textContent = 'Another unrelated UI update'" });
+  const resilientDomClick = await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: staleDomButton.node_id, snapshotId: staleVisibleDom.dom.snapshotId });
+  assert.equal(resilientDomClick.result?.resolvedBy, "original_node");
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.title = 'Pi Control Chrome E2E'" });
+  const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+  const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
   assert.ok(domButton?.node_id);
   await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domButton.node_id, snapshotId: visibleDom.dom.snapshotId });
-   const freshDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
-   const freshButton = freshDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
-   await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "type", nodeId: freshButton.node_id, snapshotId: freshDom.dom.snapshotId, value: "invalid" }), /not editable/);
-   const compactVisibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom", responseMode: "compact" });
-   assert.equal(compactVisibleDom.dom.nodes, undefined);
-   assert.equal(typeof compactVisibleDom.dom.state, "string");
-   assert.equal(typeof compactVisibleDom.dom.snapshotId, "string");
-  const inputRect = input.rect;
-  await request("cua", { tabId: selected.tab.id, action: "click", x: inputRect.x + 4, y: inputRect.y + 4 });
+  const freshDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+  const freshButton = freshDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
+  assert.ok(freshButton?.node_id);
+  await assert.rejects(() => request("dom_cua", { tabId: selected.tab.id, action: "type", nodeId: freshButton.node_id, snapshotId: freshDom.dom.snapshotId, value: "invalid" }), /not editable/);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').textContent = 'Changed Submit'" });
+  await assert.rejects(
+    () => request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: freshButton.node_id, snapshotId: freshDom.dom.snapshotId }),
+    (error) => error.code === "DOM_NODE_NOT_FOUND" && error.details?.reason === "original_target_changed",
+  );
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#go').textContent = 'Submit'" });
+
+  // DOM-CUA node ids follow the same one-hop rule as semantic snapshot refs.
+  await request("evaluate", { tabId: selected.tab.id, expression: "(() => { const host = document.createElement('div'); host.id = 'dom-rebind-host'; host.innerHTML = '<button id=\"dom-rebind-button\">DOM rebind</button>'; document.body.append(host); })()" });
+  const domRebindSnapshot = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
+  const domRebindButton = domRebindSnapshot.dom.nodes.find((node) => node.tag === "button" && node.text.includes("DOM rebind"));
+  assert.ok(domRebindButton?.node_id);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#dom-rebind-button').outerHTML = '<button id=\"dom-rebind-button\">DOM rebind</button>'" });
+  const domReboundClick = await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domRebindButton.node_id, snapshotId: domRebindSnapshot.dom.snapshotId });
+  assert.equal(domReboundClick.result?.resolvedBy, "semantic_rebind");
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#dom-rebind-button').outerHTML = '<button id=\"dom-rebind-button\">DOM rebind</button>'" });
+  await assert.rejects(
+    () => request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domRebindButton.node_id, snapshotId: domRebindSnapshot.dom.snapshotId }),
+    (error) => error.code === "DOM_NODE_NOT_FOUND" && error.details?.reason === "rebind_already_used",
+  );
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#dom-rebind-host').remove()" });
+
+  const compactVisibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom", responseMode: "compact" });
+  assert.equal(compactVisibleDom.dom.nodes, undefined);
+  assert.equal(typeof compactVisibleDom.dom.state, "string");
+  assert.equal(typeof compactVisibleDom.dom.snapshotId, "string");
+  // Coordinate input is viewport-relative, so take a current layout observation and
+  // foreground the isolated test tab before sending native mouse/keyboard events.
+  const cuaSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const cuaInput = cuaSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(cuaInput?.rect);
+  await request("select_tab", { tabId: selected.tab.id });
+  await request("cua", {
+    tabId: selected.tab.id,
+    action: "click",
+    x: cuaInput.rect.x + Math.max(1, cuaInput.rect.width / 2),
+    y: cuaInput.rect.y + Math.max(1, cuaInput.rect.height / 2),
+  });
   await request("cua", { tabId: selected.tab.id, action: "type", text: " CUA" });
   const cuaValue = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').value" });
   assert.match(cuaValue.result?.result?.value, /CUA/);

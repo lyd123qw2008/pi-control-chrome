@@ -1136,7 +1136,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_snapshot",
     label: "Browser Snapshot",
-    description: "Read the active page title and one bounded semantic page state with snapshot-scoped eN refs; ref actions require the returned snapshotId.",
+    description: "Read the active page title and one bounded semantic page state with document-scoped live eN refs; ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, but navigation remains a hard boundary.",
     parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES }),
     async execute(_toolCallId, params) {
       try { return textResult(compactBrowserResult("browser_snapshot", params, await call("snapshot", params))); } catch (error) { return errorResult(error); }
@@ -1212,7 +1212,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_navigate",
     label: "Navigate Browser",
-    description: "Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete.",
+    description: "Navigate a selected or specified browser tab to a URL and optionally wait for loading to complete. With wait: false, the returned tab is marked transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait or re-observe before document-bound work.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, url: Type.String(), wait: Type.Optional(Type.Boolean()), timeoutMs: TIMEOUT_MS, allowRedirects: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
@@ -1246,7 +1246,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_click",
     label: "Click Browser Element",
-    description: "Click one visible element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    description: "Click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1258,7 +1258,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_double_click",
     label: "Double Click Browser Element",
-    description: "Double-click one visible element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    description: "Double-click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1270,7 +1270,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_fill",
     label: "Fill Browser Field",
-    description: "Fill one input, textarea or contenteditable element by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    description: "Fill one input, textarea or contenteditable element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, value: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1282,7 +1282,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_type",
     label: "Type Browser Text",
-    description: "Type or append text into one focused browser field selected by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    description: "Type or append text into one focused browser field selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, value: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1294,7 +1294,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_press_key",
     label: "Press Browser Key",
-    description: "Dispatch a keyboard key to one element selected by semantic target, a snapshot-scoped eN ref with snapshotId, or CSS selector.",
+    description: "Dispatch a keyboard key to one element selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.",
     parameters: Type.Object({ tabId: TAB_ID,
       handle: TAB_HANDLE, snapshotId: Type.Optional(Type.String()), ref: Type.Optional(Type.String()), selector: SELECTOR, target: ELEMENT_TARGET, key: Type.String(), timeoutMs: TIMEOUT_MS }),
     async execute(_toolCallId, params) {
@@ -1318,7 +1318,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_dom_cua",
     label: "Browser DOM CUA",
-    description: "Use visible DOM node ids from the latest browser_dom_cua snapshot; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations.",
+    description: "Use visible DOM node ids from a matching browser_dom_cua observation; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations. Same-document unrelated UI changes do not stale a node, but navigation remains a hard boundary.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
@@ -1500,9 +1500,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   for (const [name, method, label, description] of [
-    ["browser_back", "back", "Browser Back", "Navigate the selected browser tab back in history."],
-    ["browser_forward", "forward", "Browser Forward", "Navigate the selected browser tab forward in history."],
-    ["browser_reload", "reload", "Browser Reload", "Reload the selected browser tab."],
+    ["browser_back", "back", "Browser Back", "Navigate the selected browser tab back in history. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work."],
+    ["browser_forward", "forward", "Browser Forward", "Navigate the selected browser tab forward in history. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work."],
+    ["browser_reload", "reload", "Browser Reload", "Reload the selected browser tab. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work."],
   ] as const) {
     pi.registerTool({
       executionMode: "sequential",

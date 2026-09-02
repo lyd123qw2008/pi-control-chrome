@@ -90,8 +90,8 @@ Bridge 线协议的页面读取响应现在支持显式 `responseMode`：
 - 同一页面重复读取时默认返回 diff 或 unchanged，而不是重复完整文本。
 - 所有完整结果都有字符、节点和时间预算。
 - 达到预算时返回明确的 `truncated` 标记和计数。
-- 操作引用仍然可以通过最新 snapshot 安全校验。
-- 页面导航、tab fence、document incarnation 和 DOM 变化仍然会使旧引用失效。
+- 操作引用携带来源 observation 的 `snapshotId`，并在当前 document 内由 live resolver 安全解析。
+- 页面导航、reload、document incarnation 或 tab fence 变化会使旧引用失效；标题、焦点和无关 DOM 变化本身不会。
 
 ### 4.2 内部实现目标
 
@@ -99,7 +99,7 @@ Bridge 线协议的页面读取响应现在支持显式 `responseMode`：
 
 - 当前页的 DOM 元素引用映射；
 - frame target 和 loader 映射；
-- snapshot fingerprint；
+- bounded Page Agent ref registry 和 observation provenance；
 - accessibility revision；
 - debugger lease 细节；
 - raw CDP frameTree。
@@ -137,7 +137,7 @@ Bridge 线协议第一阶段可以继续返回兼容字段，Pi/DSH 模型适配
 }
 ```
 
-普通结果不再默认同时包含 `text`、`elements`、`accessibility` 和 `frameTree`。内部仍保留 ref 映射，`ref` 操作继续携带 `snapshotId` 并经过当前页面 fingerprint 校验。
+普通结果不再默认同时包含 `text`、`elements`、`accessibility` 和 `frameTree`。内部仍保留 bounded ref registry，`ref` 操作继续携带匹配的 `snapshotId`，优先解析原 connected node，并只在当前 document 内存在唯一强等价目标时进行一次 rebind。
 
 Bridge 现在可以直接返回上述 compact response；未指定 `responseMode` 的旧请求继续获得 raw 兼容字段。确认所有消费者后，raw 字段是否最终删除仍需另行提高协议版本，不由本次兼容变更隐式执行。
 

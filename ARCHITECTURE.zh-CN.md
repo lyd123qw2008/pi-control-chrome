@@ -239,7 +239,7 @@ closed
 
 ## 五点五、标签页和文档身份
 
-数字 tab ID 只在一个标签页生命周期内有效，并由持久化的 `tabFence` 保护；生命周期事件不能授权对无关复用 ID 的操作。完整 Handle 还包含由 URL、`performance.timeOrigin` 和每个文档独有 Token 组成的 `incarnation`。同一文档只有标题变化时不会使完整 Handle 失效；导航会使 snapshot、DOM ref、dialog、file chooser 和 Network request-loader 映射失效；读取 Network response body 时，必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。用户 Tab 的只读页面读取会重新观察当前文档并在变化时重试一次，持续变化时返回 `BROWSER_PAGE_CHANGING`。有副作用的页面操作继续在执行前后检查文档身份；身份变化时，结果会标记为不确定且不可自动重试。受限的 `about:blank` 可以保留 Tab 身份但没有文档 incarnation，页面操作前应先导航到可注入脚本的 URL。
+数字 tab ID 只在一个标签页生命周期内有效，并由持久化的 `tabFence` 保护；生命周期事件不能授权对无关复用 ID 的操作。完整 Handle 还包含由 URL、`performance.timeOrigin` 和每个文档独有 Token 组成的 `incarnation`。snapshot ref 和 DOM-CUA node id 是来源 document 内有界的 live observation：标题/焦点变化、后续 observation 和无关 DOM churn 会保留仍满足语义的原 node；原 node 被移除时，最多只允许一次唯一、强等价的同 document rebind。同一文档只有标题变化时不会使完整 Handle 失效；导航、reload、document replacement、Tab 关闭或 tab fence 变化会以 `BROWSER_DOCUMENT_CHANGED` 使旧 observation 失效，dialog、file chooser 和 Network request-loader 映射也随之失效。`navigate(wait: false)`、`back`、`forward` 或 `reload` 的返回 Tab 明确标记为 `transitionPending`，其 handle 省略不稳定的 URL/title 和 incarnation，调用方必须先等待并重新观察后再进行 document-bound 操作；读取 Network response body 时，必须同时使用当前 listing 中匹配的 `requestId` 和 `loaderId`。用户 Tab 的只读页面读取会重新观察当前文档并在变化时重试一次，持续变化时返回 `BROWSER_PAGE_CHANGING`。有副作用的页面操作继续在执行前后检查文档身份：页面 action 已确认返回且 post-action identity 可读取时，即使随后发生页面转换也保持成功；只有注入结果丢失或 post-action identity 无法验证时才标记为不确定且不可自动重试。受限的 `about:blank` 可以保留 Tab 身份但没有文档 incarnation，页面操作前应先导航到可注入脚本的 URL。
 
 ## 五点六、Debugger lease 和创建竞态
 
@@ -440,7 +440,7 @@ Browser session 和 Pi session 绑定，但 Tab Handle 不能只依赖数字 tab
 - 页面关闭；
 - 浏览器重启；
 - 标签页 ID 被复用；
-- 页面标题或 URL 发生变化；
+- 页面 URL、document incarnation 或 tab fence 发生变化；
 
 必须重新获取标签页快照，不能盲目重试旧 Handle。
 
