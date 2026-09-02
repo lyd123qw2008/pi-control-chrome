@@ -229,6 +229,8 @@ function loadExtension(options = {}) {
     WebSocket: FakeWebSocket,
     navigator: { userAgent: "Edg/123.0" },
     crypto: { randomUUID: () => { randomUUIDCalls += 1; return randomUUIDCalls === 1 ? "profile-id" : `generated-${randomUUIDCalls}`; } },
+    location: { href: options.pageUrl ?? "https://example.test/page" },
+    performance: { timeOrigin: options.pageTimeOrigin ?? 1 },
     fetch: async () => ({ ok: true, status: 200, async json() { return { token: "token" }; } }),
     console: { debug() {}, error() {} },
     setTimeout,
@@ -253,7 +255,7 @@ function loadExtension(options = {}) {
     }
     return originalExecuteScript(details);
   };
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
     chrome,
@@ -283,13 +285,25 @@ function loadExtension(options = {}) {
   };
 }
 
-test("Page Agent injection is idempotent and bounds observation history", () => {
-  const context = vm.createContext({});
+test("Page Agent injection is idempotent, upgrades in place, and resolves bounded observations", () => {
+  const document = {};
+  const context = vm.createContext({
+    crypto: { randomUUID: () => "document-token" },
+    document,
+    location: { href: "https://example.test/page" },
+    performance: { timeOrigin: 123 },
+  });
   const source = readFileSync(pageAgentPath, "utf8");
 
   vm.runInContext(source, context, { filename: pageAgentPath });
   const agent = vm.runInContext("globalThis.__piControlChromePageAgent", context);
-  assert.equal(agent.version, 2);
+  assert.equal(agent.version, 4);
+  const identity = agent.documentIdentity();
+  assert.equal(identity.url, "https://example.test/page");
+  assert.equal(identity.timeOrigin, 123);
+  assert.equal(identity.token, "document-token");
+  assert.equal(agent.sameDocument(identity, agent.documentIdentity()), true);
+  assert.equal(agent.matchesDocument({ url: "https://example.test/page" }, identity), true);
   for (let index = 0; index < 20; index += 1) agent.remember("snapshot", `snapshot-${index}`, { value: index });
   assert.equal(agent.observations.size, 16);
   assert.equal(agent.lookup("snapshot", "snapshot-0"), undefined);
@@ -300,8 +314,61 @@ test("Page Agent injection is idempotent and bounds observation history", () => 
   agent.remember("snapshot", "expired", { createdAt: Date.now() - agent.ttlMs - 1 });
   assert.equal(agent.lookup("snapshot", "expired"), undefined);
 
+  const original = { isConnected: true, ownerDocument: document };
+  const replacement = { isConnected: true, ownerDocument: document };
+  agent.remember("snapshot", "resolver", {
+    refs: new Map([["e1", { element: agent.retain(original), descriptor: { id: "save" } }]]),
+    documentIdentity: identity,
+  });
+  const resolverOptions = {
+    kind: "snapshot",
+    observationId: "resolver",
+    recordId: "e1",
+    currentDocument: identity,
+    expectedDocument: identity,
+    matchesDescriptor: (element, descriptor) => (element === original || element === replacement) && descriptor.id === "save",
+    canSemanticRebind: (descriptor) => descriptor.id === "save",
+    findCandidates: () => [replacement],
+  };
+  const originalResolution = agent.resolveObservedElement(resolverOptions);
+  assert.equal(originalResolution.state, "resolved");
+  assert.equal(originalResolution.element, original);
+  assert.equal(originalResolution.rebound, false);
+  original.isConnected = false;
+  const reboundResolution = agent.resolveObservedElement(resolverOptions);
+  assert.equal(reboundResolution.state, "resolved");
+  assert.equal(reboundResolution.element, replacement);
+  assert.equal(reboundResolution.rebound, true);
+  replacement.isConnected = false;
+  const detachedResolution = agent.resolveObservedElement(resolverOptions);
+  assert.equal(detachedResolution.state, "detached");
+  assert.equal(detachedResolution.reason, "rebind_already_used");
+  assert.equal(agent.resolveObservedElement({ ...resolverOptions, expectedDocument: { ...identity, token: "other-document" } }).state, "document_changed");
+
+  agent.version = 3;
   vm.runInContext(source, context, { filename: pageAgentPath });
-  assert.equal(vm.runInContext("globalThis.__piControlChromePageAgent", context), agent);
+  const upgraded = vm.runInContext("globalThis.__piControlChromePageAgent", context);
+  assert.notEqual(upgraded, agent);
+  assert.equal(upgraded.version, 4);
+  assert.equal(upgraded.lookup("snapshot", "snapshot-19")?.value, 19);
+
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  assert.equal(vm.runInContext("globalThis.__piControlChromePageAgent", context), upgraded);
+});
+
+test("page generation reads the Page Agent document identity", async () => {
+  const url = "https://example.test/page-generation";
+  const fixture = loadExtension({ pageUrl: url, pageTimeOrigin: 321 });
+  fixture.tabs.set(399, { id: 399, windowId: 1, title: "page", url });
+
+  await fixture.api.executeInTab(399, fixture.api.pageGeneration);
+  const first = fixture.api.pageGeneration();
+  const second = fixture.api.pageGeneration();
+
+  assert.equal(first.url, url);
+  assert.equal(first.timeOrigin, 321);
+  assert.equal(typeof first.token, "string");
+  assert.deepEqual(second, first);
 });
 
 function record(tabId, lifecycle = "temporary", title = "", url = "") {

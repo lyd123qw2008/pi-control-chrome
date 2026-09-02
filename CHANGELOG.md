@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-09-02
+
+- Centralized Page Agent document identity, weak element retention, and bounded observed-element resolution behind the v4 runtime contract while preserving document fences, fail-closed errors, and one-time same-document semantic rebinds.
+
+- Exposed the typed `pi-control-chrome/pi-extension/output.js` projection subpath so host integrations can reuse the single bounded model-output implementation.
+
 ## 0.5.0 - 2026-09-02
 
 - Reworked `snapshotId + eN` snapshot refs and `snapshotId + nodeId` DOM-CUA targets as document-scoped live observations. Title/focus changes, later observations, and unrelated same-document DOM churn no longer invalidate a still-connected original target.
