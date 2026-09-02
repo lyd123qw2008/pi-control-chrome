@@ -7,7 +7,7 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 Install the DSH package in the active Profile:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.4.4
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.5.0
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -15,7 +15,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.4.4"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.5.0"
   }
 }
 ```
@@ -47,7 +47,7 @@ Put deployment settings in `<DSH_HOME>/settings.yaml`; copy the `control-chrome`
 
 The plugin uses the active DSH Agent session id as the browser ownership session id. `browser_cleanup` therefore only handles tabs created or claimed by that Agent session. An explicit `recoverStale: true` cleanup request forgets ownership records from an unknown extension runtime without closing those tabs and returns their ids in `recovered`; use it only after a human-approved recovery decision.
 
-Tab handles carry a tab fence and, when document scripting is available, a document incarnation. Title-only updates within the same document do not invalidate a complete handle; navigation invalidates snapshot refs, DOM-CUA nodes, dialog/file-chooser observations, and Network loader mappings. A new tab may initially be the restricted `about:blank` page, which has tab identity but no document incarnation; navigate it to a script-accessible URL before using page operations. To retrieve a Network response body, pass both `requestId` and its matching `loaderId` from the same current `browser_network` listing. Read-only page reads re-observe a user tab and retry once when its document changes during observation; a persistently changing document returns `BROWSER_PAGE_CHANGING`. Debugger lease identity is persisted across an MV3 worker restart; ordinary cleanup does not detach an untracked target, and stale-runtime recovery detaches only a persisted lease whose tab fence and CDP target identity remain verified before and after detach.
+Tab handles carry a tab fence and, when document scripting is available, a document incarnation. Snapshot refs and DOM-CUA nodes are live observations within their originating document: title/focus changes, user tab switching, later observations, and unrelated DOM churn do not invalidate them; a detached original node may rebind once only to a unique, strongly equivalent same-document replacement. Navigation, reload, document replacement, tab closure, and tab-fence changes remain hard boundaries and reject old observations with `BROWSER_DOCUMENT_CHANGED`; `browser_navigate` with `wait: false`, `browser_back`, `browser_forward`, and `browser_reload` return a tab marked `transitionPending` whose handle omits unstable URL/title and document-incarnation fields, so wait and re-observe before document-bound work. Dialog/file-chooser observations and Network loader mappings remain document-bound. A new tab may initially be the restricted `about:blank` page, which has tab identity but no document incarnation; navigate it to a script-accessible URL before using page operations. To retrieve a Network response body, pass both `requestId` and its matching `loaderId` from the same current `browser_network` listing. Read-only page reads re-observe a user tab and retry once when its document changes during observation; a persistently changing document returns `BROWSER_PAGE_CHANGING`. Debugger lease identity is persisted across an MV3 worker restart; ordinary cleanup does not detach an untracked target, and stale-runtime recovery detaches only a persisted lease whose tab fence and CDP target identity remain verified before and after detach.
 
 ## Tools
 
