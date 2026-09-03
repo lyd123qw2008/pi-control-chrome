@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
@@ -5,6 +8,8 @@ import CommandRuntime from '@deepseek-ai/dsh-commands'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import * as controlChrome from '../src/index.js'
+
+const readSkill = (path: string): string => readFileSync(path, 'utf8').replace(/\r\n?/gu, '\n')
 
 describe('dsh-tool-control-chrome real load path', () => {
   it('keeps the function-plugin namespace through Loader unwrapping', () => {
@@ -70,7 +75,7 @@ describe('dsh-tool-control-chrome real load path', () => {
     expect(candidates).toHaveLength(1)
     expect(candidates[0]).toMatchObject({
       name: 'pi-control-chrome',
-      description: 'Use when the user explicitly requests control of the existing Chrome or Edge browser, including tabs, logged-in pages, screenshots, interaction, uploads, downloads, dialogs, console, Network or CDP.',
+      description: 'Control the user\'s existing Chrome or Edge profile through pi-control-chrome browser tools and the local Bridge. Use for browser tabs, logged-in sessions, page inspection, interaction, screenshots, uploads, downloads, dialogs, clipboard, console/network/CDP, tab handoff or cleanup, and diagnosing Bridge, extension, browser-target, or stale-handle problems.',
       whenToUse: 'Only when the user explicitly requests control of the existing Chrome or Edge browser.',
       source: 'bundled',
       provider: 'control-chrome-bundled',
@@ -80,19 +85,19 @@ describe('dsh-tool-control-chrome real load path', () => {
         path: expect.stringContaining('dsh-tool-control-chrome'),
       },
       metadata: {
-        compatibility: expect.stringContaining('DSH pi-control-chrome'),
+        compatibility: expect.stringContaining('pi-control-chrome browser tools'),
       },
     })
     const definition = await provider!.get(candidates[0]!, {})
     expect(definition).toMatchObject({
       name: 'pi-control-chrome',
-      description: 'Use when the user explicitly requests control of the existing Chrome or Edge browser, including tabs, logged-in pages, screenshots, interaction, uploads, downloads, dialogs, console, Network or CDP.',
+      description: 'Control the user\'s existing Chrome or Edge profile through pi-control-chrome browser tools and the local Bridge. Use for browser tabs, logged-in sessions, page inspection, interaction, screenshots, uploads, downloads, dialogs, clipboard, console/network/CDP, tab handoff or cleanup, and diagnosing Bridge, extension, browser-target, or stale-handle problems.',
       whenToUse: 'Only when the user explicitly requests control of the existing Chrome or Edge browser.',
-      content: expect.stringContaining('# Pi Control Chrome for DSH'),
+      content: expect.stringContaining('# pi-control-chrome'),
       source: 'bundled',
       provider: 'control-chrome-bundled',
       metadata: {
-        compatibility: expect.stringContaining('DSH pi-control-chrome'),
+        compatibility: expect.stringContaining('pi-control-chrome browser tools'),
       },
     })
     expect(definition?.content).toBe(controlChrome.BROWSER_SKILL_CONTENT)
@@ -100,6 +105,15 @@ describe('dsh-tool-control-chrome real load path', () => {
     expect(definition?.content).not.toContain('/chrome group')
     expect(definition?.content).not.toContain('/chrome cleanup')
     await fiber.dispose()
+  })
+
+  it('keeps the Pi and DSH Skill copies and references identical', () => {
+    const testRoot = fileURLToPath(new URL('.', import.meta.url))
+    const piSkill = resolve(testRoot, '../../skills/pi-control-chrome')
+    const dshSkill = resolve(testRoot, '../skills/pi-control-chrome')
+    for (const relative of ['SKILL.md', 'references/recovery.md', 'references/workflows.md']) {
+      expect(readSkill(resolve(dshSkill, relative))).toBe(readSkill(resolve(piSkill, relative)))
+    }
   })
 
   it('falls back to runtime registration for legacy Skill services', async () => {
