@@ -83,6 +83,7 @@ const site = `<!doctype html>
 <div id="custom-combobox" role="combobox" aria-label="Custom choice" aria-expanded="false" tabindex="0">Choose</div>
 <iframe id="semantic-frame" title="Semantic frame" srcdoc="<!doctype html><button aria-label='Frame action'>Frame action</button>"></iframe>
 <iframe id="cross-origin-frame" title="Cross origin semantic frame" src="__CROSS_ORIGIN_FRAME_URL__"></iframe>
+<iframe id="oopif-frame" title="OOPIF semantic frame" src="__OOPIF_FRAME_URL__"></iframe>
 <button id="ambiguous-a">Ambiguous</button><button id="ambiguous-b">Ambiguous</button>
 <button id="indexed-hidden">Indexed action</button><button id="indexed-visible">Indexed action</button>
 <div id="out"></div>
@@ -185,19 +186,24 @@ async function closeSocket(client) {
 }
 
 const crossOriginFrame = `<!doctype html><title>Cross Origin Frame</title><h1>Cross origin frame</h1><button id="cross-frame-action" aria-label="Cross origin action">Cross origin action</button><label for="cross-frame-input">Cross frame field</label><input id="cross-frame-input"><script>document.querySelector('#cross-frame-action').addEventListener('click', event => { event.currentTarget.setAttribute('aria-label', 'Cross origin clicked'); event.currentTarget.textContent = 'Cross origin clicked'; });</script>`;
+const oopifFrame = `<!doctype html><title>OOPIF Frame</title><h1>OOPIF frame</h1><button aria-label="OOPIF action">OOPIF action</button>`;
+let crossOriginRequests = 0;
+let oopifRequests = 0;
 const crossOriginServer = createServer((req, res) => {
+  if (req.headers.host?.startsWith("127.0.0.2:")) oopifRequests += 1;
+  else crossOriginRequests += 1;
   if (req.url?.split("?", 1)[0] !== "/cross-origin-frame.html") {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
     return;
   }
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(crossOriginFrame);
+  res.end(req.headers.host?.startsWith("127.0.0.2:") ? oopifFrame : crossOriginFrame);
 });
 let crossOriginPort;
 await new Promise((resolve, reject) => {
   crossOriginServer.once("error", reject);
-  crossOriginServer.listen(0, "127.0.0.1", () => {
+  crossOriginServer.listen(0, "0.0.0.0", () => {
     const address = crossOriginServer.address();
     if (!address || typeof address === "string") {
       reject(new Error("E2E cross-origin server did not expose a TCP port"));
@@ -207,7 +213,9 @@ await new Promise((resolve, reject) => {
     resolve();
   });
 });
-const renderSite = () => site.replaceAll("__CROSS_ORIGIN_FRAME_URL__", `http://127.0.0.1:${crossOriginPort}/cross-origin-frame.html`);
+const renderSite = () => site
+  .replaceAll("__CROSS_ORIGIN_FRAME_URL__", `http://127.0.0.1:${crossOriginPort}/cross-origin-frame.html`)
+  .replaceAll("__OOPIF_FRAME_URL__", `http://127.0.0.2:${crossOriginPort}/cross-origin-frame.html`);
 const siteServer = createServer((req, res) => {
   if (req.url === "/api/data") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -387,13 +395,18 @@ try {
   assert.equal(submitEnabled.element?.resolvedBy, "chromium_ax");
 
   // Real-browser semantic matrix: Chromium-computed names/states, framework-like
-  // replacement, virtualized content, native/custom controls, and a cross-origin
-  // frame (which exercises the frame/OOPIF path rather than DOM traversal).
+  // replacement, virtualized content, native/custom controls, a cross-origin
+  // child frame, and a cross-site OOPIF. The OOPIF assertion below verifies
+  // that an unattached child target fails closed rather than using DOM fallback.
+  await sleep(100);
   const matrixAx = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true, responseMode: "raw" });
   assert.equal(matrixAx.snapshot.accessibility.source, "chromium_ax");
   assert.ok(matrixAx.snapshot.accessibility.frameCount >= 3, "cross-origin frame was not present in the AX frame set");
   assert.equal(matrixAx.snapshot.accessibility.frameFailures ?? 0, 0);
-  assert.ok(matrixAx.frameTree?.frameTree?.childFrames?.some(({ frame }) => frame?.url?.includes(`:${crossOriginPort}/`)), "cross-origin frame was not present in Page.getFrameTree");
+  assert.ok(crossOriginRequests > 0, "same-process cross-origin frame did not load");
+  assert.ok(oopifRequests > 0, "OOPIF frame did not load");
+  assert.ok(matrixAx.frameTree?.frameTree?.childFrames?.some(({ frame }) => frame?.url?.includes(`127.0.0.1:${crossOriginPort}/`)), "cross-origin frame was not present in Page.getFrameTree");
+  assert.ok(!matrixAx.frameTree?.frameTree?.childFrames?.some(({ frame }) => frame?.url?.includes(`127.0.0.2:${crossOriginPort}/`)), "OOPIF unexpectedly appeared in the top-target frame tree");
   assert.ok(matrixAx.snapshot.accessibility.children.some((node) => node.role === "button" && node.name === "Cross origin action"));
   const complexTarget = { role: "button", name: "Approve invoice 42 ready", exact: true };
   assert.equal((await request("locator", { tabId: selected.tab.id, target: complexTarget, action: "count" })).result, 1);
@@ -420,6 +433,12 @@ try {
   assert.equal((await request("locator", { tabId: selected.tab.id, target: { role: "option", name: "Virtual row 4", exact: true }, action: "count" })).result, 1);
   const crossTarget = { role: "button", name: "Cross origin action", exact: true };
   assert.equal((await request("locator", { tabId: selected.tab.id, target: crossTarget, action: "count", timeoutMs: 5000 })).result, 1);
+  const oopifTarget = { role: "button", name: "OOPIF action", exact: true };
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: oopifTarget, action: "count", timeoutMs: 5000 })).result, 0);
+  await assert.rejects(
+    () => request("interaction", { tabId: selected.tab.id, target: oopifTarget, operation: "click", timeoutMs: 5000 }),
+    (error) => error.code === "AX_NODE_NOT_FOUND",
+  );
   const crossClick = await request("interaction", { tabId: selected.tab.id, target: crossTarget, operation: "click", timeoutMs: 5000 });
   assert.equal(crossClick.result.resolvedBy, "chromium_ax");
   assert.equal((await request("interaction", { tabId: selected.tab.id, target: { label: "Cross frame field", exact: true }, operation: "fill", value: "cross-origin", timeoutMs: 5000 })).result.resolvedBy, "chromium_ax");
