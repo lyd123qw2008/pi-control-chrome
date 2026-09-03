@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Prefer the real Chromium Accessibility Tree for accessibility snapshots, retain bounded full/diff/unchanged output, safely fall back to the DOM semantic tree when the Accessibility domain is unavailable, and add document-scoped `aN` refs with fenced AX/DOM mapping and limited interactions.
+
+- Make ordinary role/name, label, and accessible-text locator, wait, and interaction targets AX-first. Chromium-computed semantics now resolve through the current backend DOM under the existing document/frame fences; ambiguous or incomplete AX results fail closed, and mapped actions report `resolvedBy: "chromium_ax"`. Added real Edge coverage for shadow DOM, same-origin frames, dynamic redraw, custom ARIA state, and AX-only semantic resolution.
+
 ## 0.5.1 - 2026-09-02
 
 - Centralized Page Agent document identity, weak element retention, and bounded observed-element resolution behind the v4 runtime contract while preserving document fences, fail-closed errors, and one-time same-document semantic rebinds.

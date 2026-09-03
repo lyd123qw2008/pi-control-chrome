@@ -160,8 +160,9 @@ function sameBrowserTarget(left: BrowserTarget, right: BrowserTarget): boolean {
 }
 
 class BrowserTargetTracker {
-  private acknowledged?: BrowserTarget
+  private acknowledged: BrowserTarget | undefined
   private readonly observed = new Set<string>()
+  private selectionRequired = false
 
   observe(value: unknown, acknowledgeBrowserId?: string): TargetStability {
     const target = readBrowserTarget(value)
@@ -182,14 +183,20 @@ class BrowserTargetTracker {
     const connectionChanged = previous !== undefined
       && previous.browserId === target.browserId
       && (previous.connectionId !== target.connectionId || previous.connectionGeneration !== target.connectionGeneration)
-    const acknowledged = previous === undefined || (!changed && !connectionChanged) || acknowledgeBrowserId === target.browserId
+    const explicitlySelected = acknowledgeBrowserId !== undefined && acknowledgeBrowserId === target.browserId
+    const acknowledged = this.selectionRequired
+      ? explicitlySelected
+      : previous === undefined || (!changed && !connectionChanged) || explicitlySelected
     this.observed.add(target.browserId)
-    if (acknowledged) this.acknowledged = target
+    if (acknowledged) {
+      this.acknowledged = target
+      if (explicitlySelected) this.selectionRequired = false
+    }
     return {
       stable: !changed && !connectionChanged,
       changed,
       acknowledged,
-      requiresAcknowledgement: (changed || connectionChanged) && !acknowledged,
+      requiresAcknowledgement: (changed || connectionChanged || this.selectionRequired) && !acknowledged,
       connectionChanged,
       competition: previous === undefined ? 'unknown' : changed ? 'changed' : connectionChanged ? 'reconnected' : 'stable_observed',
       browser: target.browser,
@@ -209,6 +216,15 @@ class BrowserTargetTracker {
 
   expectedBrowserId(): string | undefined {
     return this.acknowledged?.browserId
+  }
+
+  requiresExplicitSelection(): boolean {
+    return this.selectionRequired
+  }
+
+  requireExplicitSelection(browserId?: string): void {
+    if (browserId === undefined || this.acknowledged?.browserId === browserId) this.acknowledged = undefined
+    this.selectionRequired = true
   }
 
   route(): BrowserTargetRoute | undefined {
@@ -352,7 +368,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_accessibility_snapshot',
-    description: 'Return the accessibility-oriented semantic tree as bounded full or incremental text; the first read is full and later reads may be diff or unchanged.',
+    description: 'Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.',
     parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: OPTIONAL_BOOLEAN },
     method: 'snapshot',
   },
@@ -370,7 +386,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_wait',
-    description: 'Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state. For text states use text; for element states use target. Keep tab identity in handle and locator fields in target.',
+    description: 'Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state. For text states use text; for element states use target. Ordinary role/name, label, and accessible-text targets use Chromium AX first; eN/aN ref targets require the matching snapshotId. Keep tab identity in handle and locator fields in target.',
     parameters: {
       tabId: TAB_ID,
       state: WAIT_STATE,
@@ -404,21 +420,21 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_click',
-    description: 'Click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
+    description: 'Click one visible element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.',
     parameters: { tabId: TAB_ID, snapshotId: OPTIONAL_STRING, ref: OPTIONAL_STRING, selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS },
     method: 'interaction',
     prepare: args => ({ ...args, operation: 'click' }),
   },
   {
     name: 'browser_double_click',
-    description: 'Double-click one visible element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
+    description: 'Double-click one visible element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.',
     parameters: { tabId: TAB_ID, snapshotId: OPTIONAL_STRING, ref: OPTIONAL_STRING, selector: SELECTOR, target: ELEMENT_TARGET, timeoutMs: TIMEOUT_MS },
     method: 'interaction',
     prepare: args => ({ ...args, operation: 'double_click' }),
   },
   {
     name: 'browser_fill',
-    description: 'Fill one input, textarea, or contenteditable element by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
+    description: 'Fill one input, textarea, or contenteditable element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.',
     parameters: {
       tabId: TAB_ID,
       snapshotId: OPTIONAL_STRING,
@@ -433,7 +449,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_type',
-    description: 'Type or append text into one focused field selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
+    description: 'Type or append text into one focused field selected by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.',
     parameters: {
       tabId: TAB_ID,
       snapshotId: OPTIONAL_STRING,
@@ -448,7 +464,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_press_key',
-    description: 'Dispatch a keyboard key to one element selected by semantic target, a document-scoped live eN ref with matching snapshotId, or CSS selector.',
+    description: 'Dispatch a keyboard key to one element selected by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.',
     parameters: {
       tabId: TAB_ID,
       snapshotId: OPTIONAL_STRING,
@@ -505,7 +521,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_cleanup',
-    description: 'Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims, and optionally forget stale-runtime ownership without closing unknown tabs while keeping browser tools and the Bridge active.',
+    description: 'Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims, and optionally forget stale-runtime ownership without closing unknown tabs while keeping browser tools and the Bridge active. If the selected target is gone during recovery, choose a replacement explicitly with browser_status before retrying.',
     parameters: { recoverStale: OPTIONAL_BOOLEAN },
     method: 'cleanup',
   },
@@ -520,7 +536,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
 const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
   {
     name: 'browser_locator',
-    description: 'Use locator operations with one target object (role/name, label, placeholder, text, testId, ref, or CSS selector); keep tab identity in handle and never put locator fields there. Legacy top-level locator fields remain accepted.',
+    description: 'Use locator operations with one target object (role/name, label, placeholder, text, testId, eN/aN ref, or CSS selector); ordinary role/name, label, and accessible-text targets use Chromium AX first, while placeholder/testId/CSS targets remain DOM-driven. AX ambiguity or unsafe mapping fails closed; keep tab identity in handle and never put locator fields there. Legacy top-level locator fields remain accepted. AX refs are revalidated against the current Chromium tree before DOM mapping.',
     parameters: {
       tabId: TAB_ID,
       action: requiredString('Locator action such as count, click, fill, text or attribute.'),
@@ -917,6 +933,26 @@ function bridgeErrorCode(error: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined
 }
 
+function targetSelectionRequiredError(targets: readonly BrowserTarget[] = [], staleBrowserId?: string): Error & { readonly code?: string; readonly details?: unknown } {
+  const error = new Error('The previously selected browser target is unavailable; call browser_status with an explicit browserId before retrying cleanup or browser operations') as Error & { code?: string; details?: unknown }
+  error.code = 'TARGET_REQUIRED'
+  error.details = {
+    reason: 'stale_target_binding',
+    targetRequired: true,
+    nextAction: 'browser_status',
+    recommendation: 'select_browser_target',
+    ...(staleBrowserId === undefined ? {} : { staleBrowserId }),
+    targets,
+  }
+  return error
+}
+
+function withoutExpectedBrowserId(params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (params === undefined) return undefined
+  const { expectedBrowserId: _expectedBrowserId, ...rest } = params
+  return rest
+}
+
 function targetRecords(value: unknown): BrowserTarget[] {
   if (!isRecord(value) || !Array.isArray(value.targets)) return []
   return value.targets
@@ -1118,9 +1154,45 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
   })
 }
 
+type BrowserOperationErrorCode =
+  | 'EXTENSION_OFFLINE'
+  | 'TARGET_UNAVAILABLE'
+  | 'TARGET_CONNECTION_CHANGED'
+  | 'BROWSER_OPERATION_UNCERTAIN'
+  | 'BROWSER_TARGET_MISMATCH'
+  | 'BROWSER_PAGE_UNAVAILABLE'
+  | 'BROWSER_PAGE_CHANGING'
+  | 'BROWSER_WAIT_TIMEOUT'
+  | 'BROWSER_SELECTOR_NOT_FOUND'
+  | 'BROWSER_SELECTOR_INVALID'
+  | 'BROWSER_SCRIPT_ERROR'
+  | 'BROWSER_DOCUMENT_CHANGED'
+  | 'STALE_AX_SNAPSHOT'
+  | 'AX_NODE_NOT_FOUND'
+  | 'AX_NODE_AMBIGUOUS'
+  | 'AX_NODE_CHANGED'
+  | 'AX_NODE_NOT_RESOLVABLE'
+  | 'AX_NODE_NOT_ACTIONABLE'
+  | 'AX_NODE_NOT_EDITABLE'
+  | 'AX_NODE_DISABLED'
+  | 'AX_NODE_OPERATION_FAILED'
+
+const AX_OPERATION_ERROR_CODES = new Set<BrowserOperationErrorCode>([
+  'BROWSER_DOCUMENT_CHANGED',
+  'STALE_AX_SNAPSHOT',
+  'AX_NODE_NOT_FOUND',
+  'AX_NODE_AMBIGUOUS',
+  'AX_NODE_CHANGED',
+  'AX_NODE_NOT_RESOLVABLE',
+  'AX_NODE_NOT_ACTIONABLE',
+  'AX_NODE_NOT_EDITABLE',
+  'AX_NODE_DISABLED',
+  'AX_NODE_OPERATION_FAILED',
+])
+
 async function operationDisconnectedResult(
   bridge: BrowserBridgeClient,
-  code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' | 'BROWSER_OPERATION_UNCERTAIN' | 'BROWSER_TARGET_MISMATCH' | 'BROWSER_PAGE_UNAVAILABLE' | 'BROWSER_PAGE_CHANGING' | 'BROWSER_WAIT_TIMEOUT' | 'BROWSER_SELECTOR_NOT_FOUND' | 'BROWSER_SELECTOR_INVALID' | 'BROWSER_SCRIPT_ERROR' = 'EXTENSION_OFFLINE',
+  code: BrowserOperationErrorCode = 'EXTENSION_OFFLINE',
   details?: JsonValue,
 ): Promise<JsonValue> {
   if (code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR') return asJsonValue({
@@ -1141,6 +1213,28 @@ async function operationDisconnectedResult(
       ...(details === undefined ? {} : { details }),
     },
   })
+  if (AX_OPERATION_ERROR_CODES.has(code)) {
+    const uncertain = code === 'AX_NODE_OPERATION_FAILED' || (isRecord(details) && details.actionState === 'unknown')
+    const documentChanged = code === 'BROWSER_DOCUMENT_CHANGED'
+    return asJsonValue({
+      ok: false,
+      completed: false,
+      actionState: uncertain ? 'unknown' : 'not_completed',
+      retryable: code === 'AX_NODE_NOT_FOUND' || documentChanged,
+      inspectFirst: uncertain || documentChanged,
+      nextAction: documentChanged ? 'browser_tabs' : 'browser_accessibility_snapshot',
+      recommendation: documentChanged ? 'refresh_browser_document' : uncertain ? 'inspect_before_retry' : 'refresh_accessibility_snapshot',
+      error: {
+        code,
+        message: documentChanged
+          ? 'The accessibility reference belongs to an earlier document. Refresh browser_tabs and browser_accessibility_snapshot before retrying.'
+          : uncertain
+            ? 'The accessibility operation may have taken effect or could not be confirmed. Inspect the current page before retrying; do not replay side effects automatically.'
+            : 'The accessibility reference is no longer safely usable. Run browser_accessibility_snapshot again and use the new ref.',
+        ...(details === undefined ? {} : { details }),
+      },
+    })
+  }
   if (code === 'BROWSER_PAGE_CHANGING') return asJsonValue({
     ok: false,
     completed: false,
@@ -1205,7 +1299,7 @@ async function operationDisconnectedResult(
 
 type BrowserOperationResponse =
   | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false; readonly code: 'EXTENSION_OFFLINE' | 'TARGET_UNAVAILABLE' | 'TARGET_CONNECTION_CHANGED' | 'BROWSER_OPERATION_UNCERTAIN' | 'BROWSER_TARGET_MISMATCH' | 'BROWSER_PAGE_UNAVAILABLE' | 'BROWSER_PAGE_CHANGING' | 'BROWSER_WAIT_TIMEOUT' | 'BROWSER_SELECTOR_NOT_FOUND' | 'BROWSER_SELECTOR_INVALID' | 'BROWSER_SCRIPT_ERROR'; readonly details?: JsonValue }
+  | { readonly ok: false; readonly code: BrowserOperationErrorCode; readonly details?: JsonValue }
 
 function isTargetLocator(value: unknown): boolean {
   if (!isRecord(value)) return false
@@ -1247,6 +1341,16 @@ function compactResponseParams(toolName: string, params: Record<string, JsonValu
   return { ...params, responseMode: 'compact' }
 }
 
+function hasAccessibilityReference(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  return (typeof record.ref === 'string' && /^a\d+$/.test(record.ref))
+    || hasAccessibilityReference(record.target)
+    || hasAccessibilityReference(record.locator)
+    || hasAccessibilityReference(record.left)
+    || hasAccessibilityReference(record.right)
+}
+
 function assertBridgeRequestCapabilities(method: string, params: Record<string, JsonValue>, health: Record<string, unknown>, status?: unknown): void {
   const bridgeCapabilities = isRecord(health.capabilities) ? health.capabilities : {}
   const extensionCapabilities = isRecord(status) && isRecord(status.capabilities) ? status.capabilities : {}
@@ -1269,6 +1373,7 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
   }
   if (TAB_INCARNATION_METHODS.has(method)) requiredExtension.push('tabIncarnationFence')
   if (['interaction', 'locator', 'wait'].includes(method) && params.snapshotId !== undefined) requiredExtension.push('snapshotRefs')
+  if (['interaction', 'locator', 'wait'].includes(method) && hasAccessibilityReference(params)) requiredExtension.push('axRefs')
   const missing = [
     ...requiredBridge.filter(name => bridgeCapabilities[name] !== true),
     ...requiredExtension.filter(name => extensionCapabilities[name] !== true),
@@ -1287,9 +1392,9 @@ async function requestBrowserOperation(
     return { ok: true, value: await requestWithTarget(bridge, method, params, signal, target) }
   } catch (error) {
     const code = bridgeErrorCode(error)
-    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR') {
+    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
       const details = error && typeof error === 'object' && 'details' in error ? (error as { readonly details?: unknown }).details : undefined
-      return { ok: false, code, ...(details === undefined ? {} : { details: asJsonValue(details) }) }
+      return { ok: false, code: code as BrowserOperationErrorCode, ...(details === undefined ? {} : { details: asJsonValue(details) }) }
     }
     throw error
   }
@@ -1324,6 +1429,26 @@ async function browserStatus(
   const route = routeBrowserId === undefined ? tracker.route() : { browserId: routeBrowserId }
   const connection = await readBrowserConnection(bridge, sessionId, signal, extensionReadyTimeoutMs, route)
   if (connection.state !== 'connected') return connectionResult(connection)
+  if (tracker.requiresExplicitSelection() && selectionBrowserId === undefined) {
+    const base = isRecord(connection.status) ? connection.status : { status: connection.status }
+    return asJsonValue({
+      ...base,
+      state: 'target_required',
+      ok: false,
+      connected: false,
+      targetRequired: true,
+      completed: false,
+      retryable: true,
+      nextAction: 'browser_status',
+      recommendation: 'select_browser_target',
+      error: {
+        code: 'TARGET_REQUIRED',
+        message: 'The previously selected browser target is unavailable; call browser_status with an explicit browserId before retrying browser operations.',
+      },
+      targets: readyTargetRecords(connection.bridgeHealth),
+      bridgeHealth: compactBridgeHealth(connection.bridgeHealth),
+    })
+  }
   const preview = tracker.observe(connection.status)
   const previewTarget = readBrowserTarget(connection.status)
   if (requiresTargetCleanup && preview.changed && selectionBrowserId !== undefined && previewTarget?.browserId === selectionBrowserId) {
@@ -1809,6 +1934,7 @@ export function registerBrowserTools(
   }
   const cleanupSession = (session: AgentSession, mode: CleanupMode, signal?: AbortSignal, turnIdOverride?: number, reservedFlight = false, options: { readonly recoverStale?: boolean } = {}): Promise<CleanupOutcome> => {
     const previous = cleanupTails.get(session)
+    const tracker = trackerFor(session)
     let attemptedParams: Record<string, unknown> | undefined
     let attemptedRoute: BrowserTargetRoute | undefined
     const run = (async (): Promise<CleanupOutcome> => {
@@ -1823,6 +1949,7 @@ export function registerBrowserTools(
           throw error
         }
         recoveryRequested = options.recoverStale === true || recoveryRequiredSessions.has(session)
+        if (tracker.requiresExplicitSelection()) throw targetSelectionRequiredError()
         const needsCleanup = hasBrowserUsage(session) || recoveryRequested
         if (!needsCleanup) {
           if (mode === 'turn') {
@@ -1835,7 +1962,6 @@ export function registerBrowserTools(
           }
           return { ok: true, value: { removed: [], released: [], retained: [], failed: [], recovered: [] } }
         }
-        const tracker = trackerFor(session)
         const recovery = recoveryRecords.get(sessionId(session))
         const expectedBrowserId = tracker.expectedBrowserId()
         const cleanupParams = recoveryRequested && recovery?.params !== undefined
@@ -1863,10 +1989,23 @@ export function registerBrowserTools(
         }
         return { ok: true, value }
       } catch (error) {
+        const staleBrowserId = attemptedRoute?.browserId
+          ?? (isRecord(attemptedParams) && typeof attemptedParams.expectedBrowserId === 'string' ? attemptedParams.expectedBrowserId : undefined)
+        const targetSelectionFailure = recoveryRequested
+          && staleBrowserId !== undefined
+          && (bridgeErrorCode(error) === 'TARGET_UNAVAILABLE' || bridgeErrorCode(error) === 'TARGET_CONNECTION_CHANGED')
+        let failure = error
+        if (targetSelectionFailure) {
+          tracker.requireExplicitSelection(staleBrowserId)
+          attemptedParams = withoutExpectedBrowserId(attemptedParams)
+          attemptedRoute = undefined
+          const targets = await bridge.health().then(health => readyTargetRecords(health)).catch(() => [])
+          failure = targetSelectionRequiredError(targets, staleBrowserId)
+        }
         cleanupFailures.add(session)
-        if (isRecord(error) && error.code === 'BROWSER_OPERATION_UNCERTAIN') inspectionRequiredSessions.add(session)
+        if (isRecord(failure) && failure.code === 'BROWSER_OPERATION_UNCERTAIN') inspectionRequiredSessions.add(session)
         retainRecoveryFailure(session, recoveryRequested, attemptedParams, attemptedRoute)
-        return { ok: false, error }
+        return { ok: false, error: failure }
       }
     })()
     const tail = run.then(() => undefined, () => undefined)
@@ -2024,6 +2163,7 @@ export function registerBrowserTools(
           return compactBrowserResult(spec.name, params, result.value)
         }
         const tracker = trackerFor(session)
+        if (tracker.requiresExplicitSelection() && spec.name !== 'browser_status') throw targetSelectionRequiredError()
         if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, operationSignal)
         if (spec.name === 'browser_status') {
           const acknowledgeBrowserId = optionalBrowserId(args.acknowledgeBrowserId)

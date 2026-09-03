@@ -121,6 +121,15 @@ function isTargetLocator(value) {
   return ["ref", "selector", "role", "label", "placeholder", "text", "testId"].some((key) => value[key] !== undefined);
 }
 
+function hasAccessibilityReference(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return (typeof value.ref === "string" && /^a\d+$/.test(value.ref))
+    || hasAccessibilityReference(value.target)
+    || hasAccessibilityReference(value.locator)
+    || hasAccessibilityReference(value.left)
+    || hasAccessibilityReference(value.right);
+}
+
 function isSideEffectingRequest(method, params = {}) {
   if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable"].includes(method)) return true;
   if (method === "interaction" || method === "locator") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || params.operation || ""));
@@ -333,6 +342,7 @@ class BridgeClient {
     }
     if (method === "dom_cua" && extensionCapabilities.domCuaSnapshots !== true) required.push("extension.domCuaSnapshots");
     if (["interaction", "locator", "wait"].includes(method) && params.snapshotId !== undefined && extensionCapabilities.snapshotRefs !== true) required.push("extension.snapshotRefs");
+    if (["interaction", "locator", "wait"].includes(method) && hasAccessibilityReference(params) && extensionCapabilities.axRefs !== true) required.push("extension.axRefs");
     if (method === "cleanup" && params.recoverStale === true && extensionCapabilities.tabIncarnationFence !== true) required.push("extension.tabIncarnationFence");
     if (required.length > 0) throw new Error(`EXTENSION_CAPABILITY_MISSING: the selected browser target does not support ${required.join(", ")}`);
     const previous = this.acknowledgedTarget;

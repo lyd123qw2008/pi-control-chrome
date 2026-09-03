@@ -284,6 +284,16 @@ describe('DSH browser tool catalog', () => {
     expect(locatorResult).toEqual({ method: 'locator', params: { action: 'count', target, sessionId: 'session-test', expectedBrowserId: 'edge:test', locator: target } })
   })
 
+  it('requires the AX ref capability before dispatching aN operations', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.0', capabilities: { snapshotRefs: true, tabIncarnationFence: true, axRefs: false } }
+      : { method })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    await expect(harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'a1', snapshotId: 'snapshot-1' }, execution(harness.agent))).rejects.toThrow(/axRefs/)
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
+  })
+
   it('drops blank legacy ref fields beside a semantic interaction target', async () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { semanticTargets: true, tabIncarnationFence: true } }
@@ -1165,6 +1175,63 @@ describe('DSH browser tool catalog', () => {
     const result = await harness.tools.get('browser_cleanup')?.execute({ recoverStale: true }, execution(harness.agent))
     expect(result).toMatchObject({ recovered: [7] })
     expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test', mode: 'task', expectedBrowserId: 'edge:test', recoverStale: true }, expect.any(AbortSignal), { browserId: 'edge:test' })
+  })
+
+  it('requires explicit target selection after stale-runtime recovery loses the selected target', async () => {
+    const replacement = {
+      browser: 'edge',
+      browserId: 'edge:replacement',
+      profile: 'replacement',
+      state: 'ready',
+      connectionId: 'replacement-connection',
+      connectionGeneration: 4,
+    }
+    const other = {
+      browser: 'chrome',
+      browserId: 'chrome:other',
+      profile: 'other',
+      state: 'ready',
+      connectionId: 'other-connection',
+      connectionGeneration: 2,
+    }
+    const request = vi.fn(async (method: string, _params: Record<string, unknown>, _signal?: AbortSignal, target?: { browserId?: string }) => {
+      if (method === 'status') {
+        if (target?.browserId === 'edge:test') {
+          const error = new Error('old target disconnected') as Error & { code?: string }
+          error.code = 'TARGET_UNAVAILABLE'
+          throw error
+        }
+        if (target?.browserId === 'edge:replacement') return { connected: true, browser: 'edge', browserId: 'edge:replacement', profile: 'replacement', connectionId: 'replacement-connection', connectionGeneration: 4, capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true } }
+        return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.7', capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true } }
+      }
+      if (method === 'cleanup') return { removed: [], released: [], retained: [], failed: [], recovered: [7] }
+      return { method }
+    })
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browser: 'edge',
+      browserId: 'edge:test',
+      targets: [replacement, other],
+      capabilities: { compactResponses: true },
+    }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    await expect(harness.tools.get('browser_cleanup')?.execute({ recoverStale: true }, execution(harness.agent))).rejects.toMatchObject({
+      code: 'TARGET_REQUIRED',
+      details: { reason: 'stale_target_binding', staleBrowserId: 'edge:test' },
+    })
+    expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(0)
+
+    const unselected = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    expect(unselected).toMatchObject({ state: 'target_required', recommendation: 'select_browser_target', targets: [replacement, other] })
+
+    const selected = await harness.tools.get('browser_status')?.execute({ browserId: 'edge:replacement', acknowledgeBrowserId: 'edge:replacement' }, execution(harness.agent))
+    expect(selected).toMatchObject({ browserId: 'edge:replacement', targetStability: { acknowledged: true } })
+
+    const recovered = await harness.tools.get('browser_cleanup')?.execute({ recoverStale: true }, execution(harness.agent))
+    expect(recovered).toMatchObject({ recovered: [7] })
+    expect(request).toHaveBeenLastCalledWith('cleanup', { sessionId: 'session-test', mode: 'task', recoverStale: true, expectedBrowserId: 'edge:replacement' }, expect.any(AbortSignal), { browserId: 'edge:replacement', connectionId: 'replacement-connection', connectionGeneration: 4 })
   })
 
   it('rejects stale-runtime recovery when the extension capability is missing', async () => {
