@@ -73,8 +73,16 @@ const site = `<!doctype html>
 <button id="disabled-nested" disabled data-probe="disabled-button"><span>Disabled nested</span></button>
 <div id="nested-editor" contenteditable><span>Nested editor</span></div>
 <div id="shadow-host"></div>
-<iframe id="semantic-frame" title="Semantic frame" srcdoc="<!doctype html><button aria-label='Frame action'>Frame action</button>"></iframe>
+<section aria-labelledby="complex-heading"><h2 id="complex-heading">Complex labels</h2><span id="complex-action-label">Approve</span><span id="complex-context">invoice 42</span><span id="complex-state">ready</span><button id="complex-action" aria-labelledby="complex-action-label complex-context complex-state">Fallback name</button></section>
+<label for="native-choice">Native choice</label><select id="native-choice"><option value="red">Red</option><option value="blue">Blue</option></select>
+<label><input id="native-agreement" type="checkbox"> Native agreement</label>
+<section aria-labelledby="react-heading"><h2 id="react-heading">React-style redraw</h2><div id="react-root"></div></section>
+<section aria-labelledby="vue-heading"><h2 id="vue-heading">Vue-style redraw</h2><div id="vue-root"></div></section>
+<section aria-labelledby="virtual-heading"><h2 id="virtual-heading">Virtual list</h2><div id="virtual-list" role="listbox" aria-label="Virtual results"></div><button id="virtual-next">Next virtual page</button></section>
+<div id="custom-switch" role="switch" aria-label="Custom switch" aria-checked="false" tabindex="0">Custom switch</div>
 <div id="custom-combobox" role="combobox" aria-label="Custom choice" aria-expanded="false" tabindex="0">Choose</div>
+<iframe id="semantic-frame" title="Semantic frame" srcdoc="<!doctype html><button aria-label='Frame action'>Frame action</button>"></iframe>
+<iframe id="cross-origin-frame" title="Cross origin semantic frame" src="__CROSS_ORIGIN_FRAME_URL__"></iframe>
 <button id="ambiguous-a">Ambiguous</button><button id="ambiguous-b">Ambiguous</button>
 <button id="indexed-hidden">Indexed action</button><button id="indexed-visible">Indexed action</button>
 <div id="out"></div>
@@ -93,6 +101,16 @@ document.querySelector('#navigate-action').addEventListener('click', () => {
   setTimeout(() => { location.href = '/?marker=Navigate%20action'; }, 150);
 });
 document.querySelector('#shadow-host').attachShadow({ mode: 'open' }).innerHTML = '<button aria-label="Shadow action">Shadow action</button>';
+const makeReactButton = (name) => { const button = document.createElement('button'); button.id = 'react-action'; button.setAttribute('aria-label', name); button.textContent = name; button.addEventListener('click', () => button.replaceWith(makeReactButton('React save ready'))); return button; };
+const makeVueButton = (name) => { const button = document.createElement('div'); button.id = 'vue-action'; button.setAttribute('role', 'button'); button.setAttribute('aria-label', name); button.tabIndex = 0; button.textContent = name; button.addEventListener('click', () => button.replaceWith(makeVueButton('Vue action ready'))); return button; };
+document.querySelector('#react-root').replaceChildren(makeReactButton('React save'));
+document.querySelector('#vue-root').replaceChildren(makeVueButton('Vue action'));
+let virtualPage = 0;
+const renderVirtual = () => { const list = document.querySelector('#virtual-list'); const start = virtualPage * 3; list.replaceChildren(...Array.from({ length: 3 }, (_, offset) => { const option = document.createElement('div'); option.setAttribute('role', 'option'); option.textContent = 'Virtual row ' + (start + offset + 1); return option; })); };
+renderVirtual();
+document.querySelector('#virtual-next').addEventListener('click', () => { virtualPage += 1; renderVirtual(); });
+document.querySelector('#custom-switch').addEventListener('click', (event) => event.currentTarget.setAttribute('aria-checked', String(event.currentTarget.getAttribute('aria-checked') !== 'true')));
+document.querySelector('#custom-combobox').addEventListener('click', (event) => event.currentTarget.setAttribute('aria-expanded', String(event.currentTarget.getAttribute('aria-expanded') !== 'true')));
 document.querySelector('#dialog').addEventListener('click', () => setTimeout(() => alert('e2e-dialog'), 0));
 document.querySelector('#indexed-visible').addEventListener('click', () => { out.textContent = 'Indexed visible'; });
 console.log('page-ready');
@@ -166,6 +184,30 @@ async function closeSocket(client) {
   });
 }
 
+const crossOriginFrame = `<!doctype html><title>Cross Origin Frame</title><h1>Cross origin frame</h1><button id="cross-frame-action" aria-label="Cross origin action">Cross origin action</button><label for="cross-frame-input">Cross frame field</label><input id="cross-frame-input"><script>document.querySelector('#cross-frame-action').addEventListener('click', event => { event.currentTarget.setAttribute('aria-label', 'Cross origin clicked'); event.currentTarget.textContent = 'Cross origin clicked'; });</script>`;
+const crossOriginServer = createServer((req, res) => {
+  if (req.url?.split("?", 1)[0] !== "/cross-origin-frame.html") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(crossOriginFrame);
+});
+let crossOriginPort;
+await new Promise((resolve, reject) => {
+  crossOriginServer.once("error", reject);
+  crossOriginServer.listen(0, "127.0.0.1", () => {
+    const address = crossOriginServer.address();
+    if (!address || typeof address === "string") {
+      reject(new Error("E2E cross-origin server did not expose a TCP port"));
+      return;
+    }
+    crossOriginPort = address.port;
+    resolve();
+  });
+});
+const renderSite = () => site.replaceAll("__CROSS_ORIGIN_FRAME_URL__", `http://127.0.0.1:${crossOriginPort}/cross-origin-frame.html`);
 const siteServer = createServer((req, res) => {
   if (req.url === "/api/data") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -180,16 +222,16 @@ const siteServer = createServer((req, res) => {
   if (req.url?.startsWith("/slow")) {
     setTimeout(() => {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(site);
+      res.end(renderSite());
     }, 400);
     return;
   }
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(site);
+  res.end(renderSite());
 });
 await new Promise((resolve, reject) => {
   siteServer.once("error", reject);
-  siteServer.listen(0, "127.0.0.1", () => {
+  siteServer.listen(0, "0.0.0.0", () => {
     const address = siteServer.address();
     if (!address || typeof address === "string") {
       reject(new Error("E2E site server did not expose a TCP port"));
@@ -343,6 +385,47 @@ try {
   });
   assert.equal(submitEnabled.matched, true);
   assert.equal(submitEnabled.element?.resolvedBy, "chromium_ax");
+
+  // Real-browser semantic matrix: Chromium-computed names/states, framework-like
+  // replacement, virtualized content, native/custom controls, and a cross-origin
+  // frame (which exercises the frame/OOPIF path rather than DOM traversal).
+  const matrixAx = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true, responseMode: "raw" });
+  assert.equal(matrixAx.snapshot.accessibility.source, "chromium_ax");
+  assert.ok(matrixAx.snapshot.accessibility.frameCount >= 3, "cross-origin frame was not present in the AX frame set");
+  assert.equal(matrixAx.snapshot.accessibility.frameFailures ?? 0, 0);
+  assert.ok(matrixAx.frameTree?.frameTree?.childFrames?.some(({ frame }) => frame?.url?.includes(`:${crossOriginPort}/`)), "cross-origin frame was not present in Page.getFrameTree");
+  assert.ok(matrixAx.snapshot.accessibility.children.some((node) => node.role === "button" && node.name === "Cross origin action"));
+  const complexTarget = { role: "button", name: "Approve invoice 42 ready", exact: true };
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: complexTarget, action: "count" })).result, 1);
+  assert.equal((await request("interaction", { tabId: selected.tab.id, target: complexTarget, operation: "click" })).result.resolvedBy, "chromium_ax");
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: { role: "combobox", name: "Native choice", exact: true }, action: "select", value: "blue" })).result.resolvedBy, "chromium_ax");
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: { role: "checkbox", name: "Native agreement", exact: true }, action: "check" })).result.resolvedBy, "chromium_ax");
+  const nativeState = await request("evaluate", { tabId: selected.tab.id, expression: "JSON.stringify({ choice: document.querySelector('#native-choice').value, agreement: document.querySelector('#native-agreement').checked })" });
+  assert.deepEqual(JSON.parse(nativeState.result?.result?.value), { choice: "blue", agreement: true });
+  const customSwitch = { role: "switch", name: "Custom switch", exact: true };
+  assert.equal((await request("interaction", { tabId: selected.tab.id, target: customSwitch, operation: "click" })).result.resolvedBy, "chromium_ax");
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: customSwitch, action: "getAttribute", attribute: "aria-checked" })).result, "true");
+  const customCombo = { role: "combobox", name: "Custom choice", exact: true };
+  assert.equal((await request("interaction", { tabId: selected.tab.id, target: customCombo, operation: "click" })).result.resolvedBy, "chromium_ax");
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: customCombo, action: "getAttribute", attribute: "aria-expanded" })).result, "true");
+  const reactTarget = { role: "button", name: "React save", exact: true };
+  assert.equal((await request("interaction", { tabId: selected.tab.id, target: reactTarget, operation: "click" })).result.resolvedBy, "chromium_ax");
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: { role: "button", name: "React save ready", exact: true }, action: "count" })).result, 1);
+  const vueTarget = { role: "button", name: "Vue action", exact: true };
+  assert.equal((await request("interaction", { tabId: selected.tab.id, target: vueTarget, operation: "click" })).result.resolvedBy, "chromium_ax");
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: { role: "button", name: "Vue action ready", exact: true }, action: "count" })).result, 1);
+  const virtualTarget = { role: "option", name: "Virtual row 1", exact: true };
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: virtualTarget, action: "count" })).result, 1);
+  await request("interaction", { tabId: selected.tab.id, target: { role: "button", name: "Next virtual page", exact: true }, operation: "click" });
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: { role: "option", name: "Virtual row 4", exact: true }, action: "count" })).result, 1);
+  const crossTarget = { role: "button", name: "Cross origin action", exact: true };
+  assert.equal((await request("locator", { tabId: selected.tab.id, target: crossTarget, action: "count", timeoutMs: 5000 })).result, 1);
+  const crossClick = await request("interaction", { tabId: selected.tab.id, target: crossTarget, operation: "click", timeoutMs: 5000 });
+  assert.equal(crossClick.result.resolvedBy, "chromium_ax");
+  assert.equal((await request("interaction", { tabId: selected.tab.id, target: { label: "Cross frame field", exact: true }, operation: "fill", value: "cross-origin", timeoutMs: 5000 })).result.resolvedBy, "chromium_ax");
+  const crossAfter = await request("snapshot", { tabId: selected.tab.id, accessibilityOnly: true, disableDiffing: true });
+  assert.ok(crossAfter.snapshot.accessibility.children.some((node) => node.role === "button" && node.name === "Cross origin clicked"));
+
   const absentHidden = await request("wait", {
     tabId: selected.tab.id,
     state: "hidden",
@@ -798,7 +881,7 @@ try {
   });
   assert.equal(filteredLocator.result.hasSelector, "input");
   const filteredCount = await request("locator", { tabId: selected.tab.id, locator: filteredLocator.result, action: "count" });
-  assert.equal(filteredCount.result, 2);
+  assert.equal(filteredCount.result, 3);
   await request("locator", {
     tabId: selected.tab.id,
     locator: { strategy: "placeholder", value: "Name", exact: true },
@@ -969,6 +1052,7 @@ try {
 } finally {
   await closeSocket(socket);
   await new Promise((resolve) => siteServer.close(resolve));
+  await new Promise((resolve) => crossOriginServer.close(resolve));
   await stopProcess(edgeProcess);
   await stopProcess(bridgeProcess);
   try { rmSync(temp, { recursive: true, force: true }); } catch {}
