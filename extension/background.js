@@ -5479,8 +5479,8 @@ async function executeAxSemanticOperation(tabId, params, signal, expectedFence) 
     const value = await withDebugger(tabId, async (sendCommand) => {
       assertRequestActive(signal);
       const captured = await captureChromiumAccessibilityNodes(sendCommand, target.scopeSelector === undefined ? {} : { selector: target.scopeSelector });
-      await assertChromiumAxSemanticFramesStable(sendCommand, captured, target.scopeSelector !== undefined);
       const nodes = chromiumAxSemanticNodes(captured);
+      await assertChromiumAxSemanticFramesStable(sendCommand, captured, target.scopeSelector !== undefined);
       const snapshotId = typeof params.snapshotId === "string" ? params.snapshotId : undefined;
       const publicNode = (node) => publicAccessibilityNode(node);
       const mappings = [];

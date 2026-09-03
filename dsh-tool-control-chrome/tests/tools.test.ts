@@ -844,6 +844,31 @@ describe('DSH browser tool catalog', () => {
     expect(JSON.stringify(result)).not.toContain('do not expose this')
   })
 
+  it('preserves structured AX and tab lifecycle errors', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return {
+        connected: true,
+        browser: 'edge',
+        browserId: 'edge:test',
+        profile: 'current',
+        extensionVersion: '0.5.1',
+        capabilities: { semanticTargets: true, snapshotRefs: true, axRefs: true, tabIncarnationFence: true },
+      }
+      const error = new Error(method === 'interaction' ? 'disabled' : 'closed') as Error & { code?: string; details?: unknown }
+      error.code = method === 'interaction' ? 'AX_NODE_DISABLED' : 'BROWSER_TAB_CLOSED'
+      error.details = method === 'interaction' ? { snapshotId: 'snapshot-ax', actionState: 'not_completed' } : { tabId: 7 }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const disabled = await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'a1', snapshotId: 'snapshot-ax' }, execution(harness.agent))
+    expect(disabled).toMatchObject({ ok: false, completed: false, actionState: 'not_completed', retryable: false, inspectFirst: false, recommendation: 'refresh_accessibility_snapshot', error: { code: 'AX_NODE_DISABLED', details: { snapshotId: 'snapshot-ax' } } })
+
+    const closed = await harness.tools.get('browser_locator')?.execute({ tabId: 7, action: 'count', target: { role: 'button' } }, execution(harness.agent))
+    expect(closed).toMatchObject({ ok: false, completed: false, actionState: 'not_completed', retryable: false, inspectFirst: true, nextAction: 'browser_tabs', recommendation: 'refresh_browser_tabs', error: { code: 'BROWSER_TAB_CLOSED', details: { tabId: 7 } } })
+  })
+
   it('returns a compact actionable result for a browser wait timeout', async () => {
     const request = vi.fn(async (method: string) => {
       if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { pageWaitStates: true, semanticTargets: true, tabIncarnationFence: true } }

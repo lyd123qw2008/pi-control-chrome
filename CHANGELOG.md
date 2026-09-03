@@ -6,6 +6,8 @@
 
 - Make ordinary role/name, label, and accessible-text locator, wait, and interaction targets AX-first. Chromium-computed semantics now resolve through the current backend DOM under the existing document/frame fences; ambiguous or incomplete AX results fail closed, and mapped actions report `resolvedBy: "chromium_ax"`. Added real Edge coverage for shadow DOM, same-origin frames, dynamic redraw, custom ARIA state, and AX-only semantic resolution.
 
+- Preserve structured tab-closed and tab-fence errors through DSH, fail closed before DOM fallback for incomplete or truncated AX trees, and add extension/Pi/DSH contract coverage for AX state, cancellation, mapping failures, and uncertain side effects.
+
 ## 0.5.1 - 2026-09-02
 
 - Centralized Page Agent document identity, weak element retention, and bounded observed-element resolution behind the v4 runtime contract while preserving document fences, fail-closed errors, and one-time same-document semantic rebinds.
