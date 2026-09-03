@@ -794,8 +794,9 @@ test("accessibility snapshots use Chromium AX and preserve the bounded public tr
   assert.match(accessibility.state, /\[ref=a2\]/);
   assert.equal(JSON.stringify(accessibility).includes("backendDOMNodeId"), false);
   assert.equal(JSON.stringify(accessibility).includes("hunter2"), false);
-  assert.ok(fixture.debuggerCommandCalls.some(({ method }) => method === "Accessibility.enable"));
-  assert.ok(fixture.debuggerCommandCalls.some(({ method }) => method === "Accessibility.getFullAXTree"));
+  const methods = fixture.debuggerCommandCalls.map(({ method }) => method);
+  assert.ok(methods.indexOf("DOM.enable") < methods.indexOf("Accessibility.enable"));
+  assert.ok(methods.indexOf("Accessibility.enable") < methods.indexOf("Accessibility.getFullAXTree"));
   const limited = await fixture.api.handleRequest("snapshot", { tabId: 309, accessibilityOnly: true, maxChars: 1, sessionId: "session-test" });
   assert.equal(limited.snapshot.accessibility.truncated, true);
 });
@@ -831,7 +832,7 @@ test("accessibility selector reads use a main-frame partial AX tree", async () =
   assert.equal(result.snapshot.accessibility.children.length, 1);
   assert.equal(result.snapshot.accessibility.children[0].role, "button");
   const methods = fixture.debuggerCommandCalls.map(({ method }) => method);
-  assert.ok(methods.indexOf("Accessibility.enable") < methods.indexOf("DOM.enable"));
+  assert.ok(methods.indexOf("DOM.enable") < methods.indexOf("Accessibility.enable"));
   assert.ok(methods.indexOf("DOM.querySelector") < methods.indexOf("Accessibility.getPartialAXTree"));
   const partial = fixture.debuggerCommandCalls.find(({ method }) => method === "Accessibility.getPartialAXTree");
   assert.equal(partial.params.fetchRelatives, true);
@@ -976,6 +977,238 @@ test("AX refs map to backend DOM nodes, fence frames, and allow one semantic reb
     () => fixture.api.handleRequest("interaction", { tabId: 312, ref, snapshotId: snapshot.snapshot.snapshotId, operation: "click", sessionId: "session-test" }),
     (error) => error?.code === "BROWSER_DOCUMENT_CHANGED" && error?.details?.snapshotId === snapshot.snapshot.snapshotId,
   );
+});
+
+test("ordinary role-name operations resolve through Chromium AX before DOM semantic fallback", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-semantic" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [
+          { nodeId: "root", role: { type: "role", value: "RootWebArea" }, name: { type: "string", value: "AX semantic" }, ignored: false },
+          { nodeId: "save", backendDOMNodeId: 71, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false },
+          { nodeId: "save-duplicate", backendDOMNodeId: 72, role: { type: "role", value: "button" }, name: { type: "string", value: "Duplicate" }, ignored: false },
+        ],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: `ax-${params?.backendNodeId}` } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "isVisible" || operation === "isEnabled") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "button", disabled: false, rect: { x: 0, y: 0, width: 80, height: 24 } } } };
+        return { result: { type: "object", value: { ok: true, operation } } };
+      }
+      return {};
+    },
+  });
+  fixture.tabs.set(314, { id: 314, windowId: 1, title: "AX semantic", url: "https://example.test/ax-semantic", status: "complete" });
+
+  const roleOnlyCount = await fixture.api.handleRequest("locator", {
+    tabId: 314,
+    target: { role: "button" },
+    action: "count",
+    sessionId: "session-test",
+  });
+  assert.equal(roleOnlyCount.result, 2);
+  const first = await fixture.api.handleRequest("locator", { tabId: 314, target: { role: "button" }, action: "first", sessionId: "session-test" });
+  const last = await fixture.api.handleRequest("locator", { tabId: 314, target: { role: "button" }, action: "last", sessionId: "session-test" });
+  const nth = await fixture.api.handleRequest("locator", { tabId: 314, locator: { role: "button" }, action: "nth", index: 1, sessionId: "session-test" });
+  assert.equal(first.result.index, 0);
+  assert.equal(last.result.index, 1);
+  assert.equal(nth.result.index, 1);
+
+  const count = await fixture.api.handleRequest("locator", {
+    tabId: 314,
+    target: { role: "button", name: "Save", exact: true },
+    action: "count",
+    sessionId: "session-test",
+  });
+  assert.equal(count.result, 1);
+  const locatorWait = await fixture.api.handleRequest("locator", {
+    tabId: 314,
+    target: { role: "button", name: "Save", exact: true },
+    action: "waitFor",
+    timeoutMs: 1000,
+    sessionId: "session-test",
+  });
+  assert.equal(locatorWait.result?.ok, true);
+  assert.equal(locatorWait.result?.count, 1);
+  const click = await fixture.api.handleRequest("interaction", {
+    tabId: 314,
+    target: { role: "button", name: "Save", exact: true },
+    operation: "click",
+    sessionId: "session-test",
+  });
+  assert.equal(click.result.resolvedBy, "chromium_ax");
+  assert.equal(click.result.element.tag, "button");
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+  assert.ok(fixture.debuggerCommandCalls.some(({ method }) => method === "Accessibility.getFullAXTree"));
+  assert.ok(fixture.debuggerCommandCalls.some(({ method, params }) => method === "DOM.resolveNode" && params?.backendNodeId === 71));
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 314,
+      target: { role: "button", name: "Missing", exact: true },
+      operation: "click",
+      timeoutMs: 100,
+      sessionId: "session-test",
+    }),
+    (error) => error?.code === "AX_NODE_NOT_FOUND",
+  );
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
+test("AX label targets use the current mapped DOM control when AX has no name", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-label" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ nodeId: "email", backendDOMNodeId: 73, role: { type: "role", value: "textbox" }, ignored: false }],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: "ax-email" } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "labelText") return { result: { type: "string", value: "Email" } };
+        if (operation === "isVisible" || operation === "isEnabled") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "input", disabled: false, rect: { x: 0, y: 0, width: 120, height: 24 } } } };
+        return { result: { type: "object", value: { ok: true, operation } } };
+      }
+      return {};
+    },
+  });
+  fixture.tabs.set(319, { id: 319, windowId: 1, title: "AX label", url: "https://example.test/ax-label", status: "complete" });
+
+  const result = await fixture.api.handleRequest("interaction", {
+    tabId: 319,
+    target: { label: "Email", exact: true },
+    operation: "fill",
+    value: "mapped",
+    sessionId: "session-test",
+  });
+  assert.equal(result.result.resolvedBy, "chromium_ax");
+  assert.equal(result.result.element.tag, "input");
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
+test("AX semantic ambiguity fails closed instead of falling back to DOM", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-ambiguous" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [
+          { nodeId: "one", backendDOMNodeId: 81, role: { type: "role", value: "button" }, name: { type: "string", value: "Same" }, ignored: false },
+          { nodeId: "two", backendDOMNodeId: 82, role: { type: "role", value: "button" }, name: { type: "string", value: "Same" }, ignored: false },
+        ],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: `ax-${params?.backendNodeId}` } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "isVisible") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "button", disabled: false, rect: { x: 0, y: 0, width: 80, height: 24 } } } };
+        return { result: { type: "object", value: { ok: true, operation } } };
+      }
+      return {};
+    },
+    executeScriptResults: { pageOperation: { ok: true } },
+  });
+  fixture.tabs.set(315, { id: 315, windowId: 1, title: "AX ambiguous", url: "https://example.test/ax-ambiguous", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 315,
+      target: { role: "button", name: "Same", exact: true },
+      operation: "click",
+      timeoutMs: 100,
+      sessionId: "session-test",
+    }),
+    (error) => error?.code === "AX_NODE_AMBIGUOUS" && error?.details?.count === 2,
+  );
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
+test("AX semantic operations recheck frame identity before mapping a target", async () => {
+  let frameReads = 0;
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: frameReads++ < 2 ? "loader-one" : "loader-two" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ nodeId: "save", backendDOMNodeId: 91, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false }],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: "ax-save" } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "isVisible" || operation === "isEnabled") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "button", disabled: false, rect: { x: 0, y: 0, width: 80, height: 24 } } } };
+        return { result: { type: "object", value: { ok: true, operation } } };
+      }
+      return {};
+    },
+  });
+  fixture.tabs.set(317, { id: 317, windowId: 1, title: "AX frame fence", url: "https://example.test/ax-frame-fence", status: "complete" });
+
+  const result = await fixture.api.handleRequest("interaction", {
+    tabId: 317,
+    target: { role: "button", name: "Save", exact: true },
+    operation: "click",
+    timeoutMs: 1000,
+    sessionId: "session-test",
+  });
+  assert.equal(result.result.resolvedBy, "chromium_ax");
+  assert.ok(frameReads >= 6);
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
+test("AX semantic side effects preserve uncertainty after dispatch", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-uncertain" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ nodeId: "save", backendDOMNodeId: 92, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false }],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: "ax-save" } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "isVisible") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "button", disabled: false, rect: { x: 0, y: 0, width: 80, height: 24 } } } };
+        return {};
+      }
+      return {};
+    },
+  });
+  fixture.tabs.set(318, { id: 318, windowId: 1, title: "AX uncertainty", url: "https://example.test/ax-uncertain", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 318,
+      target: { role: "button", name: "Save", exact: true },
+      operation: "click",
+      sessionId: "session-test",
+    }),
+    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN",
+  );
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
+test("semantic operations use the DOM path only when the AX domain is unavailable", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: {
+      pageOperation: { ok: true, element: { tag: "button", name: "Fallback" } },
+    },
+    debuggerCommandResult: async (method) => {
+      if (method === "Accessibility.enable") throw new Error("Method not found");
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-fallback-operation" } } };
+      return {};
+    },
+  });
+  fixture.tabs.set(316, { id: 316, windowId: 1, title: "AX fallback operation", url: "https://example.test/ax-fallback-operation", status: "complete" });
+
+  const result = await fixture.api.handleRequest("interaction", {
+    tabId: 316,
+    target: { role: "button", name: "Fallback", exact: true },
+    operation: "click",
+    sessionId: "session-test",
+  });
+  assert.equal(result.result.element.tag, "button");
+  assert.ok(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"));
 });
 
 test("extract accepts an unowned user tab without a returned document handle", async () => {

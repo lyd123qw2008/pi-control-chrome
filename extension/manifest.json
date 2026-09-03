@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Pi Control Chrome",
-  "version": "0.5.1",
+  "version": "0.5.1.1",
+  "version_name": "0.5.1-p3-live",
   "description": "Local Chrome/Edge bridge for Pi browser control.",
   "permissions": [
     "tabs",

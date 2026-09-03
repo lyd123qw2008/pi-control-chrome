@@ -368,6 +368,67 @@ test("Pi requires explicit target selection and routes later operations with the
     await mock.close();
   }
 });
+test("Pi clears a stale target binding only after explicit recovery and target selection", async () => {
+  const mock = await createMockBridge({
+    targets: [
+      { browser: "edge", browserId: "edge:replacement", profile: "profile-replacement", state: "ready", connectionId: "replacement-connection", connectionGeneration: 4 },
+      { browser: "chrome", browserId: "chrome:other", profile: "profile-other", state: "ready", connectionId: "other-connection", connectionGeneration: 2 },
+    ],
+  });
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    await harness.tools.get("browser_status").execute("bind", {});
+    mock.enqueue("status", async (_message, respond) => respond(undefined, { code: "TARGET_UNAVAILABLE", message: "old target disconnected" }));
+    await assert.rejects(
+      () => harness.tools.get("browser_cleanup").execute("recover-stale", { recoverStale: true }),
+      error => error?.code === "TARGET_REQUIRED"
+        && error?.details?.reason === "stale_target_binding"
+        && error?.details?.staleBrowserId === "edge:test",
+    );
+    assert.equal(mock.requests.filter(message => message.method === "cleanup").length, 0);
+
+    const statusCount = mock.requests.filter(message => message.method === "status").length;
+    const unselected = JSON.parse((await harness.tools.get("browser_status").execute("unselected", {})).content[0].text);
+    assert.equal(unselected.targetRequired, true);
+    assert.equal(unselected.error.code, "TARGET_REQUIRED");
+    assert.deepEqual(unselected.targets.map(target => target.browserId), ["edge:replacement", "chrome:other"]);
+    assert.equal(mock.requests.filter(message => message.method === "status").length, statusCount);
+
+    mock.enqueue("status", async (_message, respond) => respond({
+      ...statusValue("edge:replacement"),
+      connectionId: "replacement-connection",
+      connectionGeneration: 4,
+    }));
+    const selected = JSON.parse((await harness.tools.get("browser_status").execute("select", {
+      browserId: "edge:replacement",
+      acknowledgeBrowserId: "edge:replacement",
+    })).content[0].text);
+    assert.equal(selected.browserId, "edge:replacement");
+    assert.equal(selected.targetStability.acknowledged, true);
+
+    mock.enqueue("status", async (_message, respond) => respond({
+      ...statusValue("edge:replacement"),
+      connectionId: "replacement-connection",
+      connectionGeneration: 4,
+    }));
+    mock.enqueue("cleanup", async (_message, respond) => respond(cleanupValue()));
+    await harness.tools.get("browser_cleanup").execute("cleanup", { recoverStale: true });
+    const cleanup = mock.requests.filter(message => message.method === "cleanup").at(-1);
+    assert.equal(cleanup.params.expectedBrowserId, "edge:replacement");
+    assert.equal(cleanup.target.browserId, "edge:replacement");
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
+
 test("Pi forwards semantic wait and locator targets with session and connection fencing", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();

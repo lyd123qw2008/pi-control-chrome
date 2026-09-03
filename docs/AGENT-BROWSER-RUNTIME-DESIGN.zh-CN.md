@@ -330,13 +330,15 @@ P3a 已替换 `browser_accessibility_snapshot` 的 observation source，保留�
 ### 7.3 Agent 的默认交互梯度
 
 ```text
-AX ref / semantic target
+AX ref / AX-first semantic target
   -> live Playwright-style locator
   -> observation ref record
   -> DOM CUA
   -> coordinate CUA
   -> narrowly scoped browser_evaluate / CDP
 ```
+
+P4 中，普通 `role`/`name`、label 和 accessible-text target 的 locator、wait、interaction 会先读取当前 Chromium AX tree，再用 backend DOM identity 完成当前 document/frame 内的操作。成功的语义动作可带内部 `resolvedBy: "chromium_ax"` provenance；AX domain 不可用时才回退到 DOM semantic collector。AX 树不完整、候选不唯一、节点不能安全映射或副作用结果不确定时均 fail closed，不以 DOM fallback 掩盖问题。selector、testId、placeholder、combine 以及 AX 无法保留其结果形状的读取仍走 DOM。
 
 越靠前越接近人类所见语义；越靠后越偏工程兜底。CDP 不应替代常规页面交互。
 

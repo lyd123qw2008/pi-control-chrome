@@ -1,6 +1,6 @@
 # 真实 Chromium Accessibility Tree 接入设计
 
-> 状态：P3a、P3b、P3c 首轮实现已完成，待目标浏览器重载后的持续验收。
+> 状态：P3a、P3b、P3c 和 P4 首轮实现已完成；P4 已通过 mock CDP 与隔离 Edge 的真实 role/name、label、accessible-text、shadow DOM、frame、动态重绘和 AX state 验收。
 >
 > 当前 `browser_accessibility_snapshot` 优先使用真实 Chromium AX；AX domain 明确不可用时回退 DOM 派生的 accessibility-oriented semantic tree。`axRefs` 已开启：AX ref 仅在 accessibility snapshot 中生成，并继续受 tab fence、document identity、一次 semantic rebind、debugger lease 和副作用 uncertainty 约束。
 >
@@ -233,7 +233,7 @@ diff key 优先级：
 - AX 读取不完整且 diff 会造成误导；
 - revision provenance 被生命周期事件清除。
 
-AX diff 只描述模型认知状态，不单独授予对旧节点的操作权。使用 `aN + snapshotId` 执行动作时，扩展仍重新采集当前 AX tree、校验 document/frame 身份，并通过 `DOM.resolveNode` 得到当前 DOM 对象；普通 `eN + snapshotId` 和 semantic target 继续走原有 Page Agent 路径。
+AX diff 只描述模型认知状态，不单独授予对旧节点的操作权。使用 `aN + snapshotId` 执行动作时，扩展仍重新采集当前 AX tree、校验 document/frame 身份，并通过 `DOM.resolveNode` 得到当前 DOM 对象；普通 `eN + snapshotId` 仍走 Page Agent，支持的 role/name、label 和 accessible-text semantic target 则先走当前 Chromium AX，再映射到受 fence 约束的 DOM 对象。
 
 ## 10. 分阶段实现
 
@@ -258,12 +258,20 @@ AX diff 只描述模型认知状态，不单独授予对旧节点的操作权。
 - click、double-click、fill、type、press、select、check/uncheck、hover、focus、locator 读取、visible/enabled wait 均通过当前 AX 重新解析；
 - DOM 操作前执行 connected、visible、disabled、editable 检查，副作用使用 post-action document fence；
 - AX 重绘支持一次语义重绑定，第二次重绑定、歧义、节点改变和不可映射均 fail closed；
-- Pi/DSH 保留 state、ref 和 capability contract；
-- 后续仍需在目标浏览器重载后完成持续性能和跨域/OOPIF 验收。
+- Pi/DSH 保留 state、ref 和 capability contract。
+
+### P4：AX-first semantic operations（首轮已实现）
+
+- 普通 `role`/`name`、label 和 accessible-text target 的 locator、wait、interaction 先读取 Chromium AX tree；
+- label 在 AX name 不足时只通过当前已映射 DOM 控件读取 label 关联文本，不重新启动独立 DOM semantic 搜索；
+- `visible`、`enabled`、`disabled`、`checked`、`expanded` 等可由 AX 表达的状态随节点保留，动作前仍复核当前 DOM actionability；
+- backend identity 不能映射、AX tree 不完整或候选不唯一时 fail closed；只有 Accessibility domain 明确不可用才回退 DOM；
+- selector、testId、placeholder、combine 和 AX 无法保持结果形状的 text read 继续走 DOM；成功的 AX-first mapped action 返回 `resolvedBy: "chromium_ax"`；
+- 真实对比覆盖 shadow DOM、同源 iframe、custom ARIA combobox、动态 shadow redraw、复杂 accessible name、hidden/disabled 控件和 AX-only frame target。
 
 ## 11. 测试与验收
 
-当前已完成 mock CDP、Edge 隔离 E2E、AX ref action、semantic rebind、output projection 和 capability gate 验证；目标浏览器重载后的持续验收仍是发布后检查项。
+当前已完成 mock CDP、Edge 隔离 E2E、AX ref action、AX-first semantic operation、semantic rebind、output projection 和 capability gate 验证；普通 DOM semantic 与 AX-first 的对比已覆盖 shadow DOM、同源 iframe、custom ARIA state、动态 redraw、label 关联和 ambiguity fail-closed。
 
 ### 单元/契约测试
 
@@ -274,6 +282,7 @@ AX diff 只描述模型认知状态，不单独授予对旧节点的操作权。
 - backend key、frame key、identity 大规模变化时 full fallback；
 - `Accessibility.enable`、full tree、partial tree 的命令顺序；
 - AX domain 不可用时 DOM fallback；安全错误不被 fallback 吞掉；
+- role/name、label、accessible-text 的 AX-first dispatch、DOM mapping、AX provenance 和 ambiguity fail-closed；
 - compact Pi/DSH 结果仍保持同一 `full/diff/unchanged` 字段。
 
 ### 真实浏览器验收
@@ -299,7 +308,7 @@ AX diff 只描述模型认知状态，不单独授予对旧节点的操作权。
 - `extension/background.js`：CDP AX adapter、frame 采集、normalization、fallback 和 revision 输入；
 - `pi-extension/output.js`：只在需要展示新增 AX state 时扩展现有纯 projection，不引入第二套 serializer；
 - `tests/extension-lifecycle.test.mjs`：lease、fence、fallback 和生命周期测试；
-- `tests/e2e-browser.mjs`：真实 Chrome/Edge AX 语义、frame 和动态页面验收；
+- `tests/e2e-browser.mjs`：真实 Chrome/Edge AX 语义、frame、shadow DOM、custom ARIA 和动态页面验收；
 - `docs/AGENT-BROWSER-RUNTIME-DESIGN.zh-CN.md`、`docs/BROWSER-OUTPUT-COMPACTION-DESIGN.zh-CN.md`：只记录已实现和已批准设计，区分 DOM 派生树与真实 Chromium AX。
 
 Manifest 已有 debugger 能力时不新增依赖；若目标浏览器不支持 Accessibility domain，直接走 fallback。
@@ -307,7 +316,7 @@ Manifest 已有 debugger 能力时不新增依赖；若目标浏览器不支持 
 ## 13. 明确保留的取舍
 
 - DOM 派生树保留为 fallback，不继续把它命名成真实 AX；
-- P3a/P3b/P3c 保持现有 request/fence/lease 主干，只在 AX observation、内部映射和有限 interaction 分支增加最小实现；
+- P3a/P3b/P3c/P4 保持现有 request/fence/lease 主干，只在 AX observation、内部映射和有限 semantic operation 分支增加最小实现；
 - 不为 Pi 与 DSH 强造统一 schema DSL；
 - 不把 AX node ID 当作稳定 ref；
 - 不因为接入 AX 就放松 document fencing、tab fence、ownership、cleanup 或副作用不确定性；

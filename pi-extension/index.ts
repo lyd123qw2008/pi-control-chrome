@@ -69,6 +69,7 @@ type TargetStability = {
 };
 let acknowledgedTarget: BrowserTarget | undefined;
 const observedBrowserIds = new Set<string>();
+let targetSelectionRequired = false;
 
 function readBrowserTarget(value: unknown): BrowserTarget | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -521,7 +522,12 @@ export class BridgeClient {
 
 const bridge = new BridgeClient();
 
-type CleanupIntent = { readonly params: Record<string, unknown>; readonly priority: number; readonly inspectFirst?: boolean };
+type CleanupIntent = {
+  readonly params: Record<string, unknown>;
+  readonly priority: number;
+  readonly inspectFirst?: boolean;
+  readonly requiresTargetSelection?: boolean;
+};
 const pendingCleanupSessionIds = new Map<string, CleanupIntent>();
 const cleanupFlights = new Map<string, Promise<unknown>>();
 const cleanupTargetRoutes = new Map<string, BrowserTargetRoute>();
@@ -687,6 +693,53 @@ async function targetRecoveryResult(session: string, error: unknown): Promise<Re
     targets,
   };
 }
+
+function targetSelectionRequiredError(targets: BrowserTarget[] = [], staleBrowserId?: string): Error & { code?: string; details?: unknown } {
+  const error = new Error("The previously selected browser target is unavailable; call browser_status with an explicit browserId before retrying cleanup or browser operations") as Error & { code?: string; details?: unknown };
+  error.code = "TARGET_REQUIRED";
+  error.details = {
+    reason: "stale_target_binding",
+    targetRequired: true,
+    nextAction: "browser_status",
+    recommendation: "select_browser_target",
+    ...(staleBrowserId === undefined ? {} : { staleBrowserId }),
+    targets,
+  };
+  return error;
+}
+
+async function targetSelectionRequiredResult(session: string): Promise<Record<string, unknown>> {
+  return {
+    connected: false,
+    state: "target_required",
+    targetRequired: true,
+    completed: false,
+    retryable: true,
+    nextAction: "browser_status",
+    recommendation: "select_browser_target",
+    error: {
+      code: "TARGET_REQUIRED",
+      message: "The previously selected browser target is unavailable; call browser_status with an explicit browserId before retrying browser operations.",
+    },
+    targets: await targetRequiredDetails(session).catch(() => []),
+  };
+}
+
+function forgetStaleTargetBinding(session: string, browserId: string): void {
+  if (acknowledgedTarget?.browserId === browserId) acknowledgedTarget = undefined;
+  if (cleanupTargetRoutes.get(session)?.browserId === browserId) cleanupTargetRoutes.delete(session);
+  targetSelectionRequired = true;
+}
+
+function isTargetLoss(error: unknown): boolean {
+  return bridgeErrorCode(error) === "TARGET_UNAVAILABLE" || bridgeErrorCode(error) === "TARGET_CONNECTION_CHANGED";
+}
+
+function withoutExpectedBrowserId(params: Record<string, unknown>): Record<string, unknown> {
+  const { expectedBrowserId: _expectedBrowserId, ...rest } = params;
+  return rest;
+}
+
 function cleanupRetainsTabs(value: unknown): boolean {
   if (!value || typeof value !== "object" || !Array.isArray((value as { retained?: unknown }).retained)) return true;
   return (value as { retained: unknown[] }).retained.length > 0;
@@ -763,6 +816,7 @@ function cleanupInspectionRequiredError(session: string): Error & { code?: strin
 async function requestCleanup(session: string, params: Record<string, unknown> = {}, options: CleanupRequestOptions = {}): Promise<unknown> {
   const existingIntent = pendingCleanupSessionIds.get(session);
   if (options.automatic === true && existingIntent?.inspectFirst === true) throw cleanupInspectionRequiredError(session);
+  if (options.automatic === true && existingIntent?.requiresTargetSelection === true) throw targetSelectionRequiredError();
   abortActiveBrowserWaits();
   const previous = cleanupFlights.get(session);
   const run = (async () => {
@@ -773,11 +827,13 @@ async function requestCleanup(session: string, params: Record<string, unknown> =
       : params;
     let retryParams = { ...inheritedParams };
     let retryPriority = cleanupIntentPriority(retryParams);
+    let selectedBrowserId: string | undefined;
     try {
       if (options.automatic === true && pendingCleanupSessionIds.get(session)?.inspectFirst === true) throw cleanupInspectionRequiredError(session);
+      if (options.automatic === true && pendingCleanupSessionIds.get(session)?.requiresTargetSelection === true) throw targetSelectionRequiredError();
       const expectedBrowserId = typeof inheritedParams.expectedBrowserId === "string" ? inheritedParams.expectedBrowserId : undefined;
       let route = expectedBrowserId === undefined ? cleanupTargetRoutes.get(session) : routeForBrowserId(expectedBrowserId);
-      const selectedBrowserId = expectedBrowserId ?? route?.browserId;
+      selectedBrowserId = expectedBrowserId ?? route?.browserId;
       if (inheritedParams.mode === "turn") {
         route = await verifyTurnCleanupSupport(session, selectedBrowserId);
       } else {
@@ -793,12 +849,26 @@ async function requestCleanup(session: string, params: Record<string, unknown> =
       if (currentIntent === undefined || retryPriority >= currentIntent.priority) pendingCleanupSessionIds.delete(session);
       return value;
     } catch (error) {
-      const previousIntent = pendingCleanupSessionIds.get(session);
-      const inspectFirst = bridgeErrorCode(error) === "BROWSER_OPERATION_UNCERTAIN";
-      if (previousIntent === undefined || retryPriority >= previousIntent.priority || inspectFirst) {
-        pendingCleanupSessionIds.set(session, { params: retryParams, priority: retryPriority, ...(inspectFirst ? { inspectFirst: true } : {}) });
+      const targetSelectionFailure = inheritedParams.recoverStale === true && selectedBrowserId !== undefined && isTargetLoss(error);
+      let failure = error;
+      if (targetSelectionFailure) {
+        forgetStaleTargetBinding(session, selectedBrowserId!);
+        retryParams = withoutExpectedBrowserId(retryParams);
+        retryPriority = cleanupIntentPriority(retryParams);
+        failure = targetSelectionRequiredError(await targetRequiredDetails(session).catch(() => []), selectedBrowserId);
       }
-      throw error;
+      const previousIntent = pendingCleanupSessionIds.get(session);
+      const inspectFirst = bridgeErrorCode(failure) === "BROWSER_OPERATION_UNCERTAIN";
+      const requiresSelection = targetSelectionFailure || (targetSelectionRequired && previousIntent?.requiresTargetSelection === true);
+      if (previousIntent === undefined || retryPriority >= previousIntent.priority || inspectFirst || requiresSelection) {
+        pendingCleanupSessionIds.set(session, {
+          params: retryParams,
+          priority: retryPriority,
+          ...(inspectFirst ? { inspectFirst: true } : {}),
+          ...(requiresSelection ? { requiresTargetSelection: true } : {}),
+        });
+      }
+      throw failure;
     } finally {
       if (cleanupFlights.get(session) === run) cleanupFlights.delete(session);
     }
@@ -890,7 +960,7 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
   if (!options.allowInactive && !browserToolsActive) {
     throw new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control");
   }
-  if (sessionTransitionInFlight && method !== "cleanup") {
+  if (sessionTransitionInFlight && !["cleanup", "status", "doctor"].includes(method)) {
     const error = new Error("Pi browser session transition is in progress; wait for cleanup to finish before retrying browser operations") as Error & { code?: string };
     error.code = "BROWSER_SESSION_TRANSITION";
     throw error;
@@ -898,10 +968,12 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
   if (paused && !["status", "list_tabs", "selected_tab", "cleanup", "context_reset"].includes(method)) {
     throw new Error("Pi browser control is paused; run /chrome resume first");
   }
+  if (targetSelectionRequired && !["status", "doctor", "cleanup", "context_reset"].includes(method)) throw targetSelectionRequiredError();
   if (method === "wait") validateWaitRequest(params);
   if (method === "locator") validateLocatorRequest(params);
   if (method === "context_reset") return call("cleanup", params, options);
   if (method === "doctor") {
+    if (targetSelectionRequired) return targetSelectionRequiredResult(requestSessionId);
     const route = acknowledgedTarget === undefined ? undefined : routeForBrowserId(acknowledgedTarget.browserId);
     const result = await bridgeRequest("doctor", { sessionId: requestSessionId }, route, requestSignal);
     assertCurrent();
@@ -949,6 +1021,10 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
     const explicitBrowserId = optionalBrowserId(browserId);
     const normalizedAcknowledgement = optionalBrowserId(acknowledgeBrowserId);
     const selectionBrowserId = explicitBrowserId ?? normalizedAcknowledgement;
+    if (targetSelectionRequired && selectionBrowserId === undefined) {
+      assertCurrent();
+      return targetSelectionRequiredResult(requestSessionId);
+    }
     const requestedBrowserId = selectionBrowserId ?? acknowledgedTarget?.browserId;
     const route = requestedBrowserId === undefined ? undefined : routeForBrowserId(requestedBrowserId);
     let result;
@@ -985,6 +1061,7 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
     }
     const targetStability = selectionBrowserId === undefined ? preview : observeBrowserTarget(result, selectionBrowserId);
     const target = readBrowserTarget(result);
+    if (target !== undefined && selectionBrowserId !== undefined && targetStability.acknowledged) targetSelectionRequired = false;
     if (target !== undefined) {
       bridgeUsed = true;
       turnCleanupArmed = true;
@@ -1183,7 +1260,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_locator",
     label: "Browser Locator",
-    description: "Playwright-style locator operations using semantic targets, CSS, role, text, label, placeholder, testid, or document-scoped eN/aN refs plus count, first, last, nth, text, attributes and actions; ref locators require the matching snapshotId. AX refs are revalidated against the current Chromium tree before DOM mapping.",
+    description: "Playwright-style locator operations using semantic targets, CSS, role, text, label, placeholder, testid, or document-scoped eN/aN refs plus count, first, last, nth, text, attributes and actions; ordinary role/name, label, and accessible-text targets use Chromium AX first, while CSS/testid/placeholder targets remain DOM-driven. AX ambiguity or unsafe mapping fails closed; ref locators require the matching snapshotId and AX refs are revalidated against the current Chromium tree before DOM mapping.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
@@ -1235,7 +1312,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_wait",
     label: "Wait for Browser Page",
-    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; eN/aN ref targets require the matching snapshotId, and AX refs are revalidated against the current Chromium tree.",
+    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; ordinary role/name, label, and accessible-text targets use Chromium AX first, while eN/aN ref targets require the matching snapshotId and AX refs are revalidated against the current Chromium tree.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
@@ -1576,7 +1653,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_cleanup",
     label: "Finalize Browser Task",
-    description: "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims, and optionally forget stale-runtime ownership without closing unknown tabs while keeping browser tools and the Bridge active.",
+    description: "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims, and optionally forget stale-runtime ownership without closing unknown tabs while keeping browser tools and the Bridge active. If the selected target is gone during recovery, choose a replacement explicitly with browser_status before retrying.",
 
     parameters: Type.Object({ recoverStale: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
@@ -1662,6 +1739,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     browserActivation.reset();
     acknowledgedTarget = undefined;
     observedBrowserIds.clear();
+    targetSelectionRequired = false;
     paused = false;
     sessionId = randomUUID();
     turnNumber = 0;
@@ -1833,6 +1911,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     browserSkillPaths.clear();
     acknowledgedTarget = undefined;
     observedBrowserIds.clear();
+    targetSelectionRequired = false;
     bridgeUsed = false;
     browserTargetUsed = false;
     turnCleanupArmed = false;

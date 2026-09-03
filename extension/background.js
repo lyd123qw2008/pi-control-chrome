@@ -3044,7 +3044,7 @@ function axNodeLineCost(node) {
   return JSON.stringify(publicAccessibilityNode(node)).length + 1;
 }
 
-function normalizeAxNodes(rawNodes, frameId, maxChars, maxNodes, includeRefs = false, refCounter = { value: 0 }, frameLoaderId, sensitiveBackendNodeIds = new Set()) {
+function normalizeAxNodes(rawNodes, frameId, maxChars, maxNodes, includeRefs = false, refCounter = { value: 0 }, frameLoaderId, sensitiveBackendNodeIds = new Set(), includeUnnamed = false) {
   const nodes = [];
   let chars = 0;
   let truncated = false;
@@ -3057,7 +3057,7 @@ function normalizeAxNodes(rawNodes, frameId, maxChars, maxNodes, includeRefs = f
     const value = axValue(raw.value);
     const ignored = raw.ignored === true || axBoolean(properties.get("ignored")) === true;
     if (!role || AX_OMIT_ROLES.has(role) || ignored) continue;
-    if (!name && value === undefined && !AX_CONTENT_ROLES.has(role)) continue;
+    if (!includeUnnamed && !name && value === undefined && !AX_CONTENT_ROLES.has(role)) continue;
     const backendNodeId = raw.backendDOMNodeId === undefined || raw.backendDOMNodeId === null
       ? undefined
       : Number.isInteger(Number(raw.backendDOMNodeId)) && Number(raw.backendDOMNodeId) > 0 ? Number(raw.backendDOMNodeId) : undefined;
@@ -3186,12 +3186,17 @@ async function axSensitiveBackendNodeIds(sendCommand, rawNodes) {
 }
 
 async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
+  const selector = options.selector === undefined ? "" : String(options.selector).trim();
+  try {
+    await sendCommand("DOM.enable");
+  } catch (error) {
+    if (selector) throw accessibilityProtocolError(error, "DOM.enable");
+  }
   try {
     await sendCommand("Accessibility.enable");
   } catch (error) {
     throw accessibilityProtocolError(error, "Accessibility.enable");
   }
-  const selector = options.selector === undefined ? "" : String(options.selector).trim();
   const readFrameTree = async () => {
     try {
       return await sendCommand("Page.getFrameTree");
@@ -3203,11 +3208,6 @@ async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
     const frameTree = await readFrameTree();
     const initialFrames = frameRecords(frameTree);
     const mainFrameId = initialFrames[0]?.id;
-    try {
-      await sendCommand("DOM.enable");
-    } catch (error) {
-      throw accessibilityProtocolError(error, "DOM.enable");
-    }
     let document;
     try {
       document = await sendCommand("DOM.getDocument", { depth: 0, pierce: true });
@@ -4141,7 +4141,7 @@ async function pageOperation(params = {}) {
   if (action === "count") return resolve().length;
   if (action === "all") return resolve().map(describe);
   if (action === "allTextContents") return resolve().map((element) => element.textContent);
-  if (action === "first" || action === "last" || action === "nth") return { ...locator, index: action === "first" ? 0 : action === "last" ? Math.max(0, resolve().length - 1) : Number(params.index) };
+  if (action === "first" || action === "last" || action === "nth") return { ...locator, index: action === "first" ? 0 : action === "last" ? Math.max(0, resolve().length - 1) : Number(params.index ?? locator.index) };
   if (action === "textContent") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).textContent;
   if (action === "innerText") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).innerText;
   if (action === "getAttribute") return strict(locator, { projectTextToActionable: actionProjection, indexAfterVisibility: actionProjection }).getAttribute(String(params.attribute));
@@ -4797,8 +4797,8 @@ function accessibilityNodeBackendId(node) {
   return Number.isInteger(Number(node?.__backendNodeId)) && Number(node.__backendNodeId) > 0 ? Number(node.__backendNodeId) : undefined;
 }
 
-function accessibilityNodesForResolution(captured) {
-  return (Array.isArray(captured?.frames) ? captured.frames : []).flatMap((frame) => normalizeAxNodes(frame.nodes, frame.frameId, 1_000_000, 10_000, false, { value: 0 }, frame.frameLoaderId, frame.sensitiveBackendNodeIds).nodes);
+function accessibilityNodesForResolution(captured, includeUnnamed = false) {
+  return (Array.isArray(captured?.frames) ? captured.frames : []).flatMap((frame) => normalizeAxNodes(frame.nodes, frame.frameId, 1_000_000, 10_000, false, { value: 0 }, frame.frameLoaderId, frame.sensitiveBackendNodeIds, includeUnnamed).nodes);
 }
 
 function resolveCurrentAccessibilityNode(record, captured, snapshotId) {
@@ -4904,6 +4904,18 @@ function accessibilityDomOperation(operation, value, attribute, sensitive) {
   };
   if (operation === "isVisible") return visible();
   if (operation === "isEnabled") return !disabled();
+  if (operation === "describe") {
+    const rect = element.getBoundingClientRect();
+    return { tag: element.tagName.toLowerCase(), disabled: disabled(), rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+  }
+  if (operation === "labelText") {
+    const labels = [];
+    if (element.labels) labels.push(...Array.from(element.labels));
+    if (element.id) labels.push(...Array.from(document.querySelectorAll("label")).filter((label) => label.htmlFor === element.id));
+    const wrapping = element.closest?.("label");
+    if (wrapping) labels.push(wrapping);
+    return [...new Set(labels)].map((label) => String(label.innerText || label.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
+  }
   if (operation === "textContent") return sensitive === true ? "" : element.textContent;
   if (operation === "innerText") return sensitive === true ? "" : element.innerText;
   if (operation === "getAttribute") {
@@ -5300,7 +5312,7 @@ function isSideEffectingPageOperation(params) {
   return SIDE_EFFECTING_PAGE_ACTIONS.has(String(params.operation || params.action || ""));
 }
 
-const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "STALE_AX_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "AX_NODE_NOT_FOUND", "AX_NODE_AMBIGUOUS", "AX_NODE_CHANGED", "AX_NODE_NOT_RESOLVABLE", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED", "AX_NODE_OPERATION_FAILED", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
+const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "STALE_AX_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "AX_NODE_NOT_FOUND", "AX_NODE_AMBIGUOUS", "AX_NODE_CHANGED", "AX_NODE_NOT_RESOLVABLE", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED", "AX_NODE_OPERATION_FAILED", "BROWSER_AX_UNAVAILABLE", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
 
 function isStructuredPageError(error) {
   return Boolean(error && typeof error === "object" && STRUCTURED_PAGE_ERROR_CODES.has(error.code));
@@ -5338,7 +5350,8 @@ function isSemanticLocator(value) {
 }
 
 function retryableAccessibilityObservationError(error) {
-  return ["AX_NODE_NOT_FOUND", "AX_NODE_NOT_RESOLVABLE"].includes(error?.code) && error?.details?.rebound !== true;
+  return (["AX_NODE_NOT_FOUND", "AX_NODE_NOT_RESOLVABLE"].includes(error?.code) && error?.details?.rebound !== true)
+    || (error?.code === "BROWSER_PAGE_CHANGING" && error?.details?.frameChanged === true);
 }
 
 async function executeAccessibilityLocatorWait(tabId, params, signal, expectedFence) {
@@ -5358,10 +5371,254 @@ async function executeAccessibilityLocatorWait(tabId, params, signal, expectedFe
   throw lastError || accessibilitySnapshotUnavailableError(params.snapshotId);
 }
 
+const AX_SEMANTIC_TARGET_KEYS = new Set(["role", "name", "label", "text", "exact", "index", "scopeSelector"]);
+const AX_SEMANTIC_LABEL_ROLES = new Set(["button", "checkbox", "combobox", "listbox", "radio", "searchbox", "slider", "spinbutton", "textbox"]);
+const AX_SEMANTIC_LOCATOR_ACTIONS = new Set(["count", "allTextContents", "textContent", "innerText", "getAttribute", "isVisible", "isEnabled", "first", "last", "nth", ...LOCATOR_ACTIONS]);
+const AX_SEMANTIC_INTERACTION_OPERATIONS = new Set(["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus"]);
+
+function chromiumAxSemanticTarget(params = {}) {
+  const target = accessibilityTarget(params);
+  if (!isRecordObject(target) || target.ref !== undefined || target.combine === "and" || target.combine === "or") return undefined;
+  if (Object.keys(target).some((key) => !AX_SEMANTIC_TARGET_KEYS.has(key))) return undefined;
+  const primaryCount = ["role", "label", "text"].filter((key) => target[key] !== undefined).length;
+  if (primaryCount !== 1 || (target.role !== undefined && (typeof target.role !== "string" || !target.role.trim())) || (target.label !== undefined && typeof target.label !== "string") || (target.text !== undefined && typeof target.text !== "string")) return undefined;
+  if (target.name !== undefined && (target.role === undefined || typeof target.name !== "string")) return undefined;
+  if (target.exact !== undefined && typeof target.exact !== "boolean") return undefined;
+  if (target.scopeSelector !== undefined && (typeof target.scopeSelector !== "string" || !target.scopeSelector.trim())) return undefined;
+  if (target.index !== undefined && (!Number.isInteger(Number(target.index)) || Number(target.index) < 0)) return undefined;
+  return target;
+}
+
+function chromiumAxSemanticOperation(params = {}) {
+  const target = chromiumAxSemanticTarget(params);
+  if (!target) return undefined;
+  if (params.pageOperation === "wait") return ["visible", "hidden", "enabled"].includes(String(params.state || "load")) ? target : undefined;
+  if (params.pageOperation === "interaction") return AX_SEMANTIC_INTERACTION_OPERATIONS.has(String(params.operation || "")) ? target : undefined;
+  if (params.pageOperation === "locator") {
+    const action = String(params.action || "");
+    if (target.text !== undefined && ["getAttribute", "textContent", "innerText"].includes(action)) return undefined;
+    return AX_SEMANTIC_LOCATOR_ACTIONS.has(action) ? target : undefined;
+  }
+  return undefined;
+}
+
+function chromiumAxSemanticNameMatches(actual, expected, exact) {
+  if (expected === undefined) return true;
+  const left = String(actual ?? "").replace(/\s+/g, " ").trim();
+  const right = String(expected ?? "").replace(/\s+/g, " ").trim();
+  if (!right) return false;
+  return exact === true ? left === right : left.toLowerCase().includes(right.toLowerCase());
+}
+
+function chromiumAxSemanticError(code, message, details = {}) {
+  return accessibilityReferenceError(code, message, details);
+}
+
+function chromiumAxSemanticNodes(captured) {
+  if (Number(captured?.frameFailures || 0) > 0) {
+    throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "The Chromium accessibility tree is incomplete; retry after all frames finish loading", { reason: "frame_incomplete", retryable: true });
+  }
+  const nodes = [];
+  for (const frame of Array.isArray(captured?.frames) ? captured.frames : []) {
+    const normalized = normalizeAxNodes(frame.nodes, frame.frameId, 1_000_000, 10_000, false, { value: 0 }, frame.frameLoaderId, frame.sensitiveBackendNodeIds, true);
+    if (normalized.truncated) {
+      throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "The Chromium accessibility tree exceeded the semantic resolution budget; narrow the target or scope it with scopeSelector", { reason: "tree_truncated", retryable: false });
+    }
+    nodes.push(...normalized.nodes);
+  }
+  return nodes;
+}
+
+async function assertChromiumAxSemanticFramesStable(sendCommand, captured, scoped) {
+  let frameTree;
+  try {
+    frameTree = await sendCommand("Page.getFrameTree");
+  } catch (error) {
+    throw accessibilityProtocolError(error, "Page.getFrameTree");
+  }
+  const expectedFrames = Array.isArray(captured?.frames) ? captured.frames : [];
+  const expectedIds = new Set(expectedFrames.map((frame) => String(frame?.frameId || "main")));
+  const currentFrames = frameRecords(frameTree);
+  const relevantFrames = scoped ? currentFrames.filter((frame) => expectedIds.has(String(frame?.id || "main"))) : currentFrames;
+  if (accessibilityFrameIdentity(expectedFrames) !== accessibilityFrameIdentity(relevantFrames)) {
+    throw pageChangingDuringReadError("accessibility", { frameChanged: true });
+  }
+}
+
+function chromiumAxSemanticActionable(node) {
+  return AX_ACTIONABLE_ROLES.has(node?.role) || node?.focusable === true;
+}
+
+function chromiumAxSemanticMatches(nodes, target) {
+  const role = typeof target.role === "string" ? target.role.trim().toLowerCase() : undefined;
+  const expectedName = target.name ?? target.label ?? target.text;
+  return nodes.filter((node) => (role === undefined || node.role === role)
+    && (target.label === undefined || AX_SEMANTIC_LABEL_ROLES.has(node.role))
+    && chromiumAxSemanticNameMatches(node.name, expectedName, target.exact));
+}
+
+function chromiumAxSemanticIndex(nodes, target) {
+  if (target.index === undefined) return nodes;
+  const index = Number(target.index);
+  return nodes[index] === undefined ? [] : [nodes[index]];
+}
+
+async function executeAxSemanticOperation(tabId, params, signal, expectedFence) {
+  const target = chromiumAxSemanticOperation(params);
+  if (!target) throw new Error("The target is not supported by AX semantic resolution");
+  if (params.pageOperation === "locator" && ["first", "nth"].includes(String(params.action || ""))) {
+    return { ...target, index: params.action === "first" ? 0 : Number(params.index ?? target.index) };
+  }
+  if (signal?.aborted) throw abortError(signal, "Browser request aborted");
+  const sideEffect = isSideEffectingPageOperation(params);
+  let dispatched = false;
+  let before;
+  try {
+    before = await executeInTab(tabId, pageGeneration, [], expectedFence);
+    if (sideEffect && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
+    const value = await withDebugger(tabId, async (sendCommand) => {
+      assertRequestActive(signal);
+      const captured = await captureChromiumAccessibilityNodes(sendCommand, target.scopeSelector === undefined ? {} : { selector: target.scopeSelector });
+      await assertChromiumAxSemanticFramesStable(sendCommand, captured, target.scopeSelector !== undefined);
+      const nodes = chromiumAxSemanticNodes(captured);
+      const snapshotId = typeof params.snapshotId === "string" ? params.snapshotId : undefined;
+      const publicNode = (node) => publicAccessibilityNode(node);
+      const mappings = [];
+      const mappingByNode = new Map();
+      const map = async (node) => {
+        const backendNodeId = accessibilityNodeBackendId(node);
+        if (backendNodeId === undefined) throw chromiumAxSemanticError("AX_NODE_NOT_RESOLVABLE", "The matched Chromium accessibility node could not be mapped to the current DOM", { rebound: false });
+        let resolved;
+        try {
+          resolved = await sendCommand("DOM.resolveNode", { backendNodeId, objectGroup: "pi-control-chrome-ax" });
+        } catch (error) {
+          const mapped = chromiumAxSemanticError("AX_NODE_NOT_RESOLVABLE", "The matched Chromium accessibility node could not be mapped to the current DOM", { rebound: false });
+          mapped.cause = error;
+          throw mapped;
+        }
+        const objectId = resolved?.object?.objectId;
+        if (typeof objectId !== "string" || objectId.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_RESOLVABLE", "The matched Chromium accessibility node could not be mapped to the current DOM", { rebound: false });
+        return { node, objectId };
+      };
+      const mappingFor = async (node) => {
+        const existing = mappingByNode.get(node);
+        if (existing) return existing;
+        const mapping = await map(node);
+        mappings.push(mapping);
+        mappingByNode.set(node, mapping);
+        return mapping;
+      };
+      const release = async () => {
+        for (const mapping of mappings) await sendCommand("Runtime.releaseObject", { objectId: mapping.objectId }).catch((error) => log("could not release semantic AX remote object", error));
+      };
+      let matches = chromiumAxSemanticMatches(nodes, target);
+      if (target.label !== undefined && matches.length === 0) {
+        for (const node of nodes) {
+          if (!AX_SEMANTIC_LABEL_ROLES.has(node.role)) continue;
+          const mapping = await mappingFor(node);
+          const label = await callAccessibilityDomOperation(sendCommand, mapping.objectId, "labelText", undefined, undefined, node.__sensitive, snapshotId);
+          if (chromiumAxSemanticNameMatches(label, target.label, target.exact)) matches.push(node);
+        }
+      }
+      if (params.pageOperation === "locator" && params.action === "last") {
+        return { ...target, index: Math.max(0, chromiumAxSemanticIndex(matches, target).length - 1) };
+      }
+      try {
+        if (params.pageOperation === "wait") {
+          const waitState = String(params.state || "load");
+          const selected = waitState === "hidden" ? chromiumAxSemanticIndex(matches, target) : matches;
+          const selectedMappings = [];
+          for (const node of selected) selectedMappings.push(await mappingFor(node));
+          const visible = [];
+          for (const mapping of selectedMappings) {
+            if (await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, mapping.node.__sensitive, snapshotId)) visible.push(mapping);
+          }
+          if (waitState === "hidden") return { matched: visible.length === 0, count: visible.length, ...(visible.length === 1 ? { element: { ...await callAccessibilityDomOperation(sendCommand, visible[0].objectId, "describe", undefined, undefined, visible[0].node.__sensitive, snapshotId), ...publicNode(visible[0].node), resolvedBy: "chromium_ax" } } : {}) };
+          const visibleMatches = target.index === undefined ? visible : visible[Number(target.index)] === undefined ? [] : [visible[Number(target.index)]];
+          if (visibleMatches.length > 1) throw chromiumAxSemanticError("AX_NODE_AMBIGUOUS", "The semantic target matched multiple visible Chromium accessibility nodes; narrow the target before waiting", { count: visibleMatches.length, rebound: false });
+          const mapping = visibleMatches[0];
+          if (!mapping) return { matched: false, count: 0 };
+          const enabled = mapping.node.disabled !== true && await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isEnabled", undefined, undefined, mapping.node.__sensitive, snapshotId);
+          const element = { ...await callAccessibilityDomOperation(sendCommand, mapping.objectId, "describe", undefined, undefined, mapping.node.__sensitive, snapshotId), ...publicNode(mapping.node), resolvedBy: "chromium_ax" };
+          return { matched: waitState === "visible" ? true : enabled, count: 1, element };
+        }
+        if (params.pageOperation === "locator" && params.action === "count") return chromiumAxSemanticIndex(matches, target).length;
+        if (params.pageOperation === "locator" && params.action === "allTextContents") {
+          const selectedMappings = [];
+          for (const node of chromiumAxSemanticIndex(matches, target)) selectedMappings.push(await mappingFor(node));
+          return Promise.all(selectedMappings.map((mapping) => callAccessibilityDomOperation(sendCommand, mapping.objectId, "textContent", undefined, undefined, mapping.node.__sensitive, snapshotId)));
+        }
+        if (matches.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No matching Chromium accessibility node was found", { count: 0, rebound: false });
+        const action = params.pageOperation === "interaction" ? String(params.operation || "") : String(params.action || "");
+        const actionableMatches = sideEffect ? matches.filter(chromiumAxSemanticActionable) : matches;
+        if (sideEffect && actionableMatches.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_ACTIONABLE", "The semantic target does not resolve to an actionable Chromium accessibility node", { count: 0, rebound: false });
+        if (params.pageOperation === "locator" && action === "waitFor") {
+          const candidateMappings = [];
+          for (const node of matches) candidateMappings.push(await mappingFor(node));
+          const visible = [];
+          for (const mapping of candidateMappings) if (await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, mapping.node.__sensitive, snapshotId)) visible.push(mapping);
+          const selected = target.index === undefined ? visible : visible[Number(target.index)] === undefined ? [] : [visible[Number(target.index)]];
+          if (selected.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No visible Chromium accessibility node matched the semantic target", { count: 0, rebound: false });
+          return { ok: true, count: selected.length };
+        }
+        const candidates = sideEffect
+          ? actionableMatches
+          : chromiumAxSemanticIndex(matches, target);
+        if (sideEffect) {
+          const candidateMappings = [];
+          for (const node of candidates) candidateMappings.push(await mappingFor(node));
+          const visible = [];
+          for (const mapping of candidateMappings) if (await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, mapping.node.__sensitive, snapshotId)) visible.push(mapping);
+          const selected = target.index === undefined ? visible : visible[Number(target.index)] === undefined ? [] : [visible[Number(target.index)]];
+          if (selected.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No visible Chromium accessibility node matched the semantic target", { count: 0, rebound: false });
+          if (selected.length > 1) throw chromiumAxSemanticError("AX_NODE_AMBIGUOUS", "The semantic target matched multiple visible Chromium accessibility nodes; narrow the target before retrying", { count: selected.length, rebound: false });
+          const mapping = selected[0];
+          const element = { ...await callAccessibilityDomOperation(sendCommand, mapping.objectId, "describe", undefined, undefined, mapping.node.__sensitive, snapshotId), ...publicNode(mapping.node), resolvedBy: "chromium_ax" };
+          assertRequestActive(signal);
+          dispatched = true;
+          await callAccessibilityDomOperation(sendCommand, mapping.objectId, action, action === "press" ? params.key : params.value, undefined, mapping.node.__sensitive, snapshotId);
+          return params.pageOperation === "interaction"
+            ? { ok: true, operation: action, target: params.target, element, resolvedBy: "chromium_ax", rebound: false }
+            : { ok: true, action, element, rect: element.rect, resolvedBy: "chromium_ax", rebound: false };
+        }
+        if (params.pageOperation === "locator" && ["textContent", "innerText", "getAttribute", "isVisible", "isEnabled"].includes(action)) {
+          if (candidates.length > 1) throw chromiumAxSemanticError("AX_NODE_AMBIGUOUS", "The semantic target matched multiple Chromium accessibility nodes; narrow the target before reading it", { count: candidates.length, rebound: false });
+          if (candidates.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No matching Chromium accessibility node was found", { count: 0, rebound: false });
+          const mapping = await mappingFor(candidates[0]);
+          if (action === "isEnabled") return candidates[0].disabled !== true && await callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, undefined, candidates[0].__sensitive, snapshotId);
+          return callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, params.attribute, candidates[0].__sensitive, snapshotId);
+        }
+        throw new Error(`Unsupported AX semantic locator action: ${action}`);
+      } finally {
+        await release();
+      }
+    }, params.sessionId, expectedFence);
+    const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
+    if (!pageGenerationsMatch(before, after)) {
+      if (params.pageOperation === "wait") return undefined;
+      if (!sideEffect) throw pageChangingDuringReadError("accessibility", { tabId: Number(tabId), pageChanged: true });
+    }
+    if (params.pageOperation === "wait") return { value, generation: after };
+    if (!sideEffect) return value;
+    return pageActionResultAfterDocumentFence(params, value, before, after);
+  } catch (error) {
+    if (signal?.aborted) throw sideEffect || dispatched ? uncertainPageOperationError() : abortError(signal, "Browser request aborted");
+    if (isLostExecutionContext(error)) throw sideEffect || dispatched ? uncertainPageOperationError() : error;
+    if (sideEffect && dispatched && (!isStructuredPageError(error) || error?.details?.actionState === "unknown")) {
+      const uncertain = uncertainPageOperationError();
+      uncertain.cause = error;
+      throw uncertain;
+    }
+    throw error;
+  }
+}
+
 async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
   if (accessibilityReference(params)) return params.action === "waitFor"
     ? executeAccessibilityLocatorWait(tabId, params, signal, expectedFence)
     : executeAccessibilityPageOperation(tabId, params, signal, expectedFence);
+  const axSemantic = chromiumAxSemanticOperation(params);
+  let axFallback = false;
   const timeoutMs = boundedTimeout(params.timeoutMs, 5000, 30000);
   const deadline = Date.now() + timeoutMs;
   let lastError;
@@ -5370,6 +5627,16 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
     await assertTabFence(tabId, expectedFence, "access");
     const remaining = Math.max(1, deadline - Date.now());
     try {
+      if (axSemantic && !axFallback) {
+        try {
+          const value = await executeAxSemanticOperation(tabId, params, signal, expectedFence);
+          assertRequestActive(signal);
+          return value;
+        } catch (error) {
+          if (error?.code !== "BROWSER_AX_UNAVAILABLE") throw error;
+          axFallback = true;
+        }
+      }
       const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
       if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
       const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
@@ -5384,6 +5651,7 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
         throw abortError(signal, "Browser request aborted");
       }
       const retryable = (error && typeof error === "object" && error.code === "ELEMENT_TARGET_NOT_FOUND")
+        || (axSemantic && retryableAccessibilityObservationError(error))
         || (String(params.action || "") === "waitFor" && error instanceof Error && error.message === "Timed out waiting for locator");
       if (isLostExecutionContext(error)) {
         if (signal?.aborted) throw abortError(signal, "Browser request aborted");
@@ -5471,6 +5739,13 @@ async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence
   if (signal?.aborted) throw abortError(signal, "Browser request aborted");
   await assertTabFence(tabId, expectedFence, "access");
   if (accessibilityReference(params)) return executeAccessibilityPageOperation(tabId, params, signal, expectedFence);
+  if (chromiumAxSemanticOperation(params)) {
+    try {
+      return await executeAxSemanticOperation(tabId, params, signal, expectedFence);
+    } catch (error) {
+      if (error?.code !== "BROWSER_AX_UNAVAILABLE") throw error;
+    }
+  }
   try {
     const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
     const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);

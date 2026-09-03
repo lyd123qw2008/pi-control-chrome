@@ -53,6 +53,7 @@
 - Accessibility Snapshot；
 - 默认返回可见语义页面状态，snapshot 和 DOM CUA 使用 20,000 字符/200 节点预算，extract 使用共享 12,000 字符预算；Pi/DSH 模型结果不暴露重复 raw accessibility 和 frameTree；Bridge health 宣告 `capabilities.compactResponses=true`，页面读取协商 `responseMode=compact`，旧消费者省略 mode 时仍保留 raw 兼容，人工/开发者可显式使用 CLI `--raw`；当 Tab 已携带标题和 URL 时，snapshot、Accessibility 和 extract 不在内部重复这些字段；有交互元素或 Accessibility 节点时不再追加重复的页面全文，完整正文请使用 `browser_extract`；空的可选 `selector`、`snapshotId`、`incarnation` 和截图 `path` 会在发送前按省略处理；
 - Accessibility Snapshot 优先读取真实 Chromium AX，支持 full、增量 diff 和 unchanged；AX actionable/focusable 节点可带 document-scoped `aN` ref，操作前须携带匹配的 `snapshotId`；AX 和 locator 结果中的敏感值保持脱敏；Accessibility domain 不可用时安全回退 DOM semantic tree；需要完整树时显式传 `disableDiffing: true`；snapshot、Accessibility、extract 和 DOM CUA 支持可选 selector 与预算参数；
+- 普通 `role`/`name`、label 和 accessible-text 定位、等待、交互现在优先尝试 Chromium AX：使用浏览器计算后的 role/name/state，再在既有 document/frame fence 下映射当前 backend DOM；成功的映射动作会返回内部 provenance `resolvedBy: "chromium_ax"`。AX 树不完整、匹配歧义或 DOM 映射不安全时安全失败，只有 Accessibility domain 明确不可用才走 DOM semantic；selector、testId、placeholder 和 AX 不足以保留结果的文字读取继续走 DOM；
 - `browser_evaluate` 返回值限制为深度 8、数组 2,000 项、对象 200 个字段和字符串 200,000 字符；
 - DOM 和 Locator 操作；
 - click、fill、type、press、scroll；
@@ -68,7 +69,7 @@
 
 ## 语义页面交互
 
-常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。交互操作会在过滤可见元素后应用该索引，隐藏的重复控件不会占用索引。已有的快照 ref 需携带匹配的 `snapshotId`；运行时优先使用原 connected node，且只允许一次同 document 内唯一、强等价的 rebind。CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
+常用的 click 和表单工具支持嵌套 `target`，例如 `{ "role": "button", "name": "提交" }`、`{ "label": "邮箱" }`、`{ "placeholder": "搜索" }`、`{ "text": "下一步" }` 和 `{ "testId": "submit-button" }`。语义交互会等待一个可见匹配；目标不存在、隐藏、禁用或匹配多个元素时会安全失败，只有明确提供从零开始的 `index` 才会消除多匹配。交互操作会在过滤可见元素后应用该索引，隐藏的重复控件不会占用索引。`role`/`name`、label 和 accessible-text 目标优先使用 Chromium AX，并在成功映射的动作中返回 `resolvedBy: "chromium_ax"`；CSS selector、testId 和 placeholder 继续使用 DOM。已有的快照 ref 需携带匹配的 `snapshotId`；运行时优先使用原 connected node，且只允许一次同 document 内唯一、强等价的 rebind。CSS selector 仍然兼容。DSH 会把模型生成的空可选字段和 `index: -1` 当作省略，纠正重复的旧式 locator 字段，并确保 locator 不会混入 Tab Handle。
 
 文字 target 用于操作或元素状态定位时，会把文字叶节点投影到最近的可操作祖先，因此 `isEnabled` 和 `browser_wait` 报告的是实际接收操作的控件状态。`browser_wait` 支持 `load`、`url`、`text`、`text_gone`、`visible`、`hidden` 和 `enabled`。文字条件使用 `text`，元素条件使用与交互相同的 `target`；`url` 和 `urlIncludes` 可以作为所有等待条件的 URL 过滤器。`hidden` 在没有可见匹配时成功，包括目标不存在或存在多个隐藏匹配；`visible` 和 `enabled` 遇到多个可见匹配时会安全失败。对于 `visible` 和 `enabled`，会在过滤可见元素后应用明确提供的索引。若交互因导航丢失注入结果，会报告结果不确定，系统不会自动重放该副作用操作。
 

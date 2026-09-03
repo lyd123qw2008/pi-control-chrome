@@ -72,6 +72,9 @@ const site = `<!doctype html>
 <button id="disabled-action" disabled>Disabled action</button>
 <button id="disabled-nested" disabled data-probe="disabled-button"><span>Disabled nested</span></button>
 <div id="nested-editor" contenteditable><span>Nested editor</span></div>
+<div id="shadow-host"></div>
+<iframe id="semantic-frame" title="Semantic frame" srcdoc="<!doctype html><button aria-label='Frame action'>Frame action</button>"></iframe>
+<div id="custom-combobox" role="combobox" aria-label="Custom choice" aria-expanded="false" tabindex="0">Choose</div>
 <button id="ambiguous-a">Ambiguous</button><button id="ambiguous-b">Ambiguous</button>
 <button id="indexed-hidden">Indexed action</button><button id="indexed-visible">Indexed action</button>
 <div id="out"></div>
@@ -89,6 +92,7 @@ document.querySelector('#navigate-action').addEventListener('click', () => {
   // Let the injected click return before the real document navigation begins.
   setTimeout(() => { location.href = '/?marker=Navigate%20action'; }, 150);
 });
+document.querySelector('#shadow-host').attachShadow({ mode: 'open' }).innerHTML = '<button aria-label="Shadow action">Shadow action</button>';
 document.querySelector('#dialog').addEventListener('click', () => setTimeout(() => alert('e2e-dialog'), 0));
 document.querySelector('#indexed-visible').addEventListener('click', () => { out.textContent = 'Indexed visible'; });
 console.log('page-ready');
@@ -338,6 +342,7 @@ try {
     timeoutMs: 5000,
   });
   assert.equal(submitEnabled.matched, true);
+  assert.equal(submitEnabled.element?.resolvedBy, "chromium_ax");
   const absentHidden = await request("wait", {
     tabId: selected.tab.id,
     state: "hidden",
@@ -653,12 +658,13 @@ try {
   assert.equal(semanticFill.result?.element?.tag, "input");
   const semanticInput = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').value" });
   assert.equal(semanticInput.result?.result?.value, "Semantic");
-  await request("interaction", {
+  const semanticClick = await request("interaction", {
     tabId: selected.tab.id,
     operation: "click",
     target: { role: "button", name: "Submit", exact: true },
     timeoutMs: 5000,
   });
+  assert.equal(semanticClick.result?.resolvedBy, "chromium_ax");
   const semanticAfter = await request("snapshot", { tabId: selected.tab.id });
   assert.match(semanticAfter.snapshot.text, /Hello Semantic/);
   await assert.rejects(() => request("interaction", {
@@ -667,7 +673,7 @@ try {
     target: { role: "button", name: "Ambiguous", exact: true },
     timeoutMs: 1000,
   }), (error) => {
-    assert.equal(error.code, "ELEMENT_TARGET_AMBIGUOUS");
+    assert.ok(["ELEMENT_TARGET_AMBIGUOUS", "AX_NODE_AMBIGUOUS"].includes(error.code));
     assert.equal(error.details?.count, 2);
     return true;
   });
@@ -715,6 +721,7 @@ try {
     timeoutMs: 5000,
   });
   assert.equal(semanticEmailFill.result?.element?.tag, "input");
+  assert.equal(semanticEmailFill.result?.resolvedBy, "chromium_ax");
   const semanticEmail = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#email').value" });
   assert.equal(semanticEmail.result?.result?.value, "email@example.test");
   const semanticLabelCount = await request("locator", {
@@ -728,23 +735,52 @@ try {
   assert.equal(textLocatorCount.result, 1);
   const textLocatorClick = await request("locator", { tabId: selected.tab.id, target: textLocator, locator: textLocator, action: "click", timeoutMs: 5000 });
   assert.equal(textLocatorClick.result?.element?.tag, "button");
+  assert.equal(textLocatorClick.result?.resolvedBy, "chromium_ax");
   const ariaLocator = { role: "button", name: "Labelled action", exact: true };
   const ariaLocatorClick = await request("locator", { tabId: selected.tab.id, target: ariaLocator, locator: ariaLocator, action: "click", timeoutMs: 5000 });
   assert.equal(ariaLocatorClick.result?.element?.tag, "button");
+  assert.equal(ariaLocatorClick.result?.resolvedBy, "chromium_ax");
+  // The DOM semantic collector does not pierce a shadow tree; the
+  // AX-first path still resolves the real Chromium-computed button identity.
+  const shadowTarget = { role: "button", name: "Shadow action", exact: true };
+  const domShadowCount = await request("locator", { tabId: selected.tab.id, locator: { strategy: "css", value: "#shadow-host button" }, action: "count", timeoutMs: 1000 });
+  assert.equal(domShadowCount.result, 0);
+  const shadowCount = await request("locator", { tabId: selected.tab.id, target: shadowTarget, locator: shadowTarget, action: "count", timeoutMs: 5000 });
+  assert.equal(shadowCount.result, 1);
+  const shadowClick = await request("locator", { tabId: selected.tab.id, target: shadowTarget, locator: shadowTarget, action: "click", timeoutMs: 5000 });
+  assert.equal(shadowClick.result?.resolvedBy, "chromium_ax");
+  assert.equal(shadowClick.result?.element?.tag, "button");
+  const frameTarget = { role: "button", name: "Frame action", exact: true };
+  const domFrameCount = await request("locator", { tabId: selected.tab.id, locator: { strategy: "css", value: "#semantic-frame button" }, action: "count", timeoutMs: 1000 });
+  assert.equal(domFrameCount.result, 0);
+  const frameCount = await request("locator", { tabId: selected.tab.id, target: frameTarget, locator: frameTarget, action: "count", timeoutMs: 5000 });
+  assert.equal(frameCount.result, 1);
+  const frameClick = await request("locator", { tabId: selected.tab.id, target: frameTarget, locator: frameTarget, action: "click", timeoutMs: 5000 });
+  assert.equal(frameClick.result?.resolvedBy, "chromium_ax");
+  const comboTarget = { role: "combobox", name: "Custom choice", exact: true };
+  const combo = await request("locator", { tabId: selected.tab.id, target: comboTarget, locator: comboTarget, action: "click", timeoutMs: 5000 });
+  assert.equal(combo.result?.resolvedBy, "chromium_ax");
+  assert.equal(combo.result?.element?.expanded, false);
+  await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#shadow-host').shadowRoot.innerHTML = '<button>Shadow action</button>'" });
+  const shadowRedraw = await request("locator", { tabId: selected.tab.id, target: shadowTarget, locator: shadowTarget, action: "click", timeoutMs: 5000 });
+  assert.equal(shadowRedraw.result?.resolvedBy, "chromium_ax");
+  // Hidden/disabled semantics are read from AX first, then checked against the
+  // current DOM object before any side effect is dispatched.
   const hiddenLocator = { role: "button", name: "Hidden action", exact: true };
-  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: hiddenLocator, locator: hiddenLocator, action: "click", timeoutMs: 300 }), /Timed out waiting for visible element target/);
+  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: hiddenLocator, locator: hiddenLocator, action: "click", timeoutMs: 300 }), /(?:No matching Chromium accessibility node|No visible Chromium accessibility node|Timed out waiting for visible element target)/);
   const disabledLocator = { role: "button", name: "Disabled action", exact: true };
-  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: disabledLocator, locator: disabledLocator, action: "click", timeoutMs: 300 }), /Element target is disabled/);
+  await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: disabledLocator, locator: disabledLocator, action: "click", timeoutMs: 300 }), /(?:The accessibility node is disabled|Element target is disabled)/);
   const readonlyLocator = { selector: "#readonly" };
   await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: readonlyLocator, locator: readonlyLocator, action: "fill", value: "changed", timeoutMs: 5000 }), /Element target is not editable/);
   const ambiguousLocatorTarget = { role: "button", name: "Ambiguous", exact: true };
   await assert.rejects(() => request("locator", { tabId: selected.tab.id, target: ambiguousLocatorTarget, locator: ambiguousLocatorTarget, action: "click", timeoutMs: 1000 }), (error) => {
-    assert.equal(error.code, "ELEMENT_TARGET_AMBIGUOUS");
+    assert.ok(["ELEMENT_TARGET_AMBIGUOUS", "AX_NODE_AMBIGUOUS"].includes(error.code));
     assert.equal(error.details?.count, 2);
     return true;
   });
   const editorFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", target: { label: "Editor", exact: true }, value: "Editable", timeoutMs: 5000 });
   assert.equal(editorFill.result?.element?.tag, "div");
+  assert.equal(editorFill.result?.resolvedBy, "chromium_ax");
   const editorValue = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#editor').textContent" });
   assert.equal(editorValue.result?.result?.value, "Editable");
   assert.equal(semanticLabelCount.result, 1);
