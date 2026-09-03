@@ -979,6 +979,159 @@ test("AX refs map to backend DOM nodes, fence frames, and allow one semantic reb
   );
 });
 
+test("AX snapshots preserve checked, expanded, and readonly state and enforce readonly actionability", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-ax-state",
+        __piControlChromeSnapshotUrl: "https://example.test/ax-state",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "AX state",
+        url: "https://example.test/ax-state",
+        text: "Options Remember Read only",
+        elements: [],
+      },
+    },
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-state" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [
+          { nodeId: "options", backendDOMNodeId: 101, role: { type: "role", value: "button" }, name: { type: "string", value: "Options" }, ignored: false, properties: [{ name: "expanded", value: { type: "boolean", value: true } }] },
+          { nodeId: "remember", backendDOMNodeId: 102, role: { type: "role", value: "checkbox" }, name: { type: "string", value: "Remember" }, ignored: false, properties: [{ name: "checked", value: { type: "tristate", value: "mixed" } }] },
+          { nodeId: "readonly", backendDOMNodeId: 103, role: { type: "role", value: "textbox" }, name: { type: "string", value: "Read only" }, ignored: false, properties: [
+            { name: "readonly", value: { type: "boolean", value: true } },
+            { name: "editable", value: { type: "boolean", value: false } },
+          ] },
+        ],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: "ax-readonly" } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "isVisible") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "input", disabled: false, rect: { x: 0, y: 0, width: 120, height: 24 } } } };
+        if (operation === "fill") return { result: { type: "object", value: { __piControlError: true, error: { code: "AX_NODE_NOT_EDITABLE", message: "The accessibility node is not editable" } } } };
+        return { result: { type: "object", value: { ok: true, operation } } };
+      }
+      return {};
+    },
+  });
+  fixture.tabs.set(320, { id: 320, windowId: 1, title: "AX state", url: "https://example.test/ax-state", status: "complete" });
+
+  const result = await fixture.api.handleRequest("snapshot", { tabId: 320, accessibilityOnly: true, sessionId: "session-test" });
+  const accessibility = result.snapshot.accessibility;
+  const options = accessibility.children.find(node => node.name === "Options");
+  const remember = accessibility.children.find(node => node.name === "Remember");
+  const readonly = accessibility.children.find(node => node.name === "Read only");
+  assert.equal(options.expanded, true);
+  assert.equal(remember.checked, "mixed");
+  assert.equal(readonly.readonly, true);
+  assert.equal(readonly.editable, false);
+  assert.match(accessibility.state, /button \"Options\" expanded=true/);
+  assert.match(accessibility.state, /checkbox \"Remember\" checked=mixed/);
+  assert.match(accessibility.state, /textbox \"Read only\" readonly=true editable=false/);
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 320,
+      target: { role: "textbox", name: "Read only", exact: true },
+      operation: "fill",
+      value: "must-not-write",
+      sessionId: "session-test",
+    }),
+    error => error?.code === "AX_NODE_NOT_EDITABLE",
+  );
+  assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
+});
+
+test("AX semantic mapping failure fails closed without DOM fallback", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: { pageOperation: { ok: true, element: { tag: "button" } } },
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-map" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ nodeId: "save", backendDOMNodeId: 104, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false }],
+      };
+      if (method === "DOM.resolveNode") return {};
+      return {};
+    },
+  });
+  fixture.tabs.set(321, { id: 321, windowId: 1, title: "AX mapping", url: "https://example.test/ax-map", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 321,
+      target: { role: "button", name: "Save", exact: true },
+      operation: "click",
+      timeoutMs: 1,
+      sessionId: "session-test",
+    }),
+    error => error?.code === "AX_NODE_NOT_RESOLVABLE" && error?.details?.rebound === false,
+  );
+  assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
+});
+
+test("incomplete AX frames fail closed instead of falling back to DOM semantic resolution", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: { pageOperation: { ok: true } },
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: {
+        frame: { id: "frame-main", loaderId: "loader-main" },
+        childFrames: [{ frame: { id: "frame-child", loaderId: "loader-child" } }],
+      } };
+      if (method === "Accessibility.getFullAXTree" && params?.frameId === "frame-child") throw new Error("child AX target unavailable");
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ nodeId: "save", backendDOMNodeId: 105, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false }],
+      };
+      return {};
+    },
+  });
+  fixture.tabs.set(322, { id: 322, windowId: 1, title: "AX incomplete", url: "https://example.test/ax-incomplete", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 322,
+      target: { role: "button", name: "Save", exact: true },
+      operation: "click",
+      timeoutMs: 1,
+      sessionId: "session-test",
+    }),
+    error => error?.code === "AX_NODE_NOT_FOUND" && error?.details?.reason === "frame_incomplete",
+  );
+  assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
+});
+
+test("truncated AX semantic trees fail closed instead of falling back to DOM", async () => {
+  const nodes = Array.from({ length: 5_000 }, (_, index) => ({
+    nodeId: `button-${index}`,
+    backendDOMNodeId: 10_000 + index,
+    role: { type: "role", value: "button" },
+    name: { type: "string", value: "x".repeat(240) },
+    ignored: false,
+  }));
+  const fixture = loadExtension({
+    executeScriptResults: { pageOperation: { ok: true } },
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-truncated" } } };
+      if (method === "Accessibility.getFullAXTree") return { nodes };
+      return {};
+    },
+  });
+  fixture.tabs.set(323, { id: 323, windowId: 1, title: "AX truncated", url: "https://example.test/ax-truncated", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("locator", {
+      tabId: 323,
+      target: { role: "button", name: "missing", exact: true },
+      action: "count",
+      timeoutMs: 1,
+      sessionId: "session-test",
+    }),
+    error => error?.code === "AX_NODE_NOT_FOUND" && error?.details?.reason === "tree_truncated",
+  );
+  assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
+});
+
 test("ordinary role-name operations resolve through Chromium AX before DOM semantic fallback", async () => {
   const fixture = loadExtension({
     debuggerCommandResult: async (method, params) => {
@@ -1183,9 +1336,52 @@ test("AX semantic side effects preserve uncertainty after dispatch", async () =>
       operation: "click",
       sessionId: "session-test",
     }),
-    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN",
+    (error) => error?.code === "BROWSER_OPERATION_UNCERTAIN" && error?.details?.inspectFirst === true,
   );
   assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+  assert.equal(fixture.debuggerCommandCalls.some(({ method, params }) => method === "Runtime.releaseObject" && params?.objectId === "ax-save"), true);
+});
+
+test("closed tabs retain a structured tab error before semantic resolution starts", async () => {
+  const fixture = loadExtension({ executeScriptResults: { pageOperation: { ok: true } } });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("locator", {
+      tabId: 324,
+      target: { role: "button", name: "Save", exact: true },
+      action: "count",
+      sessionId: "session-test",
+    }),
+    error => error?.code === "BROWSER_TAB_CLOSED" && error?.details?.tabId === 324,
+  );
+  assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
+});
+
+test("AX semantic reads honor cancellation without dispatching a DOM fallback", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-cancel" } } };
+      if (method === "Accessibility.getFullAXTree") {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        return { nodes: [{ nodeId: "save", backendDOMNodeId: 106, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false }] };
+      }
+      return {};
+    },
+    executeScriptResults: { pageOperation: { ok: true } },
+  });
+  fixture.tabs.set(325, { id: 325, windowId: 1, title: "AX cancel", url: "https://example.test/ax-cancel", status: "complete" });
+  const controller = new AbortController();
+  const request = fixture.api.handleRequest("locator", {
+    tabId: 325,
+    target: { role: "button", name: "Save", exact: true },
+    action: "count",
+    timeoutMs: 1000,
+    sessionId: "session-test",
+  }, { signal: controller.signal });
+  setTimeout(() => controller.abort(new Error("Browser request canceled")), 5);
+
+  await assert.rejects(request, error => error?.message === "Browser request aborted");
+  assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
 });
 
 test("semantic operations use the DOM path only when the AX domain is unavailable", async () => {

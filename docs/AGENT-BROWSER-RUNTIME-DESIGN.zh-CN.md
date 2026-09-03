@@ -502,7 +502,7 @@ extension/page/redaction.js
 3. 目标属性或语义被改变，必须不误操作；
 4. React/Vue 风格替换唯一字段；
 5. 替换后出现两个同名字段；
-6. navigation/reload/back/forward/tab close；`navigate(wait:false)`、`reload`、`back` 和 `forward` 均返回标记为 `transitionPending` 且 handle 省略不稳定 URL/title 和 incarnation 的 Tab，loading 期间旧 ref 返回 `BROWSER_DOCUMENT_CHANGED`；
+6. navigation/reload/back/forward/tab close；`navigate(wait:false)`、`reload`、`back` 和 `forward` 均返回标记为 `transitionPending` 且 handle 省略不稳定 URL/title 和 incarnation 的 Tab，loading 期间旧 ref 返回 `BROWSER_DOCUMENT_CHANGED`，tab close 和 tab fence change 分别返回 `BROWSER_TAB_CLOSED` 和 `BROWSER_TAB_FENCE_CHANGED`；
 7. click/fill 已确认返回且 post-action document identity 可验证时保持成功（可带 `postActionDocumentChanged: true`）；只有注入结果或 post-action identity 无法验证时返回 `BROWSER_OPERATION_UNCERTAIN`，且不重放；
 8. Edge 隔离 profile smoke；Chrome for Testing 149.0.7827.55 的单 profile smoke 与双 profile 路由/重连 smoke；人工加载 Chrome 扩展的受控 Skill 集成流程。
 

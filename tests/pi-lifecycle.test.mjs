@@ -511,6 +511,40 @@ test("Pi refuses AX ref operations when the extension capability is missing", as
   }
 });
 
+test("Pi preserves structured AX and tab lifecycle errors from the Bridge", async () => {
+  const mock = await createMockBridge();
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    mock.enqueue("interaction", async (_message, respond) => respond(undefined, {
+      code: "AX_NODE_DISABLED",
+      message: "The accessibility node is disabled",
+      details: { snapshotId: "snapshot-ax", actionState: "not_completed" },
+    }));
+    const disabled = await harness.tools.get("browser_click").execute("ax-disabled", { tabId: 7, ref: "a1", snapshotId: "snapshot-ax" });
+    assert.equal(disabled.details.code, "AX_NODE_DISABLED");
+    assert.deepEqual(disabled.details.details, { snapshotId: "snapshot-ax", actionState: "not_completed" });
+
+    mock.enqueue("locator", async (_message, respond) => respond(undefined, {
+      code: "BROWSER_TAB_CLOSED",
+      message: "Tab 7 was closed",
+      details: { tabId: 7 },
+    }));
+    const closed = await harness.tools.get("browser_locator").execute("closed-tab", { tabId: 7, action: "count", target: { role: "button" } });
+    assert.equal(closed.details.code, "BROWSER_TAB_CLOSED");
+    assert.deepEqual(closed.details.details, { tabId: 7 });
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
+
 test("Pi refuses stale-runtime recovery when the extension capability is missing", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();

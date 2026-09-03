@@ -1162,6 +1162,8 @@ type BrowserOperationErrorCode =
   | 'BROWSER_TARGET_MISMATCH'
   | 'BROWSER_PAGE_UNAVAILABLE'
   | 'BROWSER_PAGE_CHANGING'
+  | 'BROWSER_TAB_CLOSED'
+  | 'BROWSER_TAB_FENCE_CHANGED'
   | 'BROWSER_WAIT_TIMEOUT'
   | 'BROWSER_SELECTOR_NOT_FOUND'
   | 'BROWSER_SELECTOR_INVALID'
@@ -1210,6 +1212,22 @@ async function operationDisconnectedResult(
         : code === 'BROWSER_SELECTOR_INVALID'
           ? 'The requested page selector is invalid. Use a valid CSS selector, then run browser_snapshot again.'
           : 'The page script failed before producing a result. Inspect the current page before retrying.',
+      ...(details === undefined ? {} : { details }),
+    },
+  })
+  if (code === 'BROWSER_TAB_CLOSED' || code === 'BROWSER_TAB_FENCE_CHANGED') return asJsonValue({
+    ok: false,
+    completed: false,
+    actionState: 'not_completed',
+    retryable: code === 'BROWSER_TAB_FENCE_CHANGED',
+    inspectFirst: true,
+    nextAction: 'browser_tabs',
+    recommendation: 'refresh_browser_tabs',
+    error: {
+      code,
+      message: code === 'BROWSER_TAB_CLOSED'
+        ? 'The requested browser tab is closed. Refresh browser_tabs and choose a current tab before retrying.'
+        : 'The browser tab incarnation changed. Refresh browser_tabs and use the current tab handle before retrying.',
       ...(details === undefined ? {} : { details }),
     },
   })
@@ -1392,7 +1410,7 @@ async function requestBrowserOperation(
     return { ok: true, value: await requestWithTarget(bridge, method, params, signal, target) }
   } catch (error) {
     const code = bridgeErrorCode(error)
-    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
+    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_TAB_CLOSED' || code === 'BROWSER_TAB_FENCE_CHANGED' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
       const details = error && typeof error === 'object' && 'details' in error ? (error as { readonly details?: unknown }).details : undefined
       return { ok: false, code: code as BrowserOperationErrorCode, ...(details === undefined ? {} : { details: asJsonValue(details) }) }
     }
