@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-09-03
 
 - Prefer the real Chromium Accessibility Tree for accessibility snapshots, retain bounded full/diff/unchanged output, safely fall back to the DOM semantic tree when the Accessibility domain is unavailable, and add document-scoped `aN` refs with fenced AX/DOM mapping and limited interactions.
 
