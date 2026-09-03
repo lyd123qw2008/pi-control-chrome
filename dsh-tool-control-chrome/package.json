@@ -1,6 +1,6 @@
 {
   "name": "@lyd123qw2008/dsh-tool-control-chrome",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "DeepSeek Harness browser-control tools backed by the pi-control-chrome local Bridge",
   "keywords": [
     "deepseek-harness",
@@ -40,6 +40,8 @@
     "lib/tools.js",
     "lib/types/**/*.d.ts",
     "skills/pi-control-chrome/SKILL.md",
+    "skills/pi-control-chrome/references/recovery.md",
+    "skills/pi-control-chrome/references/workflows.md",
     "README.md",
     "package.json"
   ],
@@ -68,7 +70,7 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
-    "pi-control-chrome": "^0.5.2",
+    "pi-control-chrome": "^0.5.3",
     "ws": "^8.18.0",
     "yaml": "2.9.0"
   },
