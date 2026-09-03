@@ -267,7 +267,9 @@ AX diff 只描述模型认知状态，不单独授予对旧节点的操作权。
 - `visible`、`enabled`、`disabled`、`checked`、`expanded` 等可由 AX 表达的状态随节点保留，动作前仍复核当前 DOM actionability；
 - backend identity 不能映射、AX tree 不完整或候选不唯一时 fail closed；只有 Accessibility domain 明确不可用才回退 DOM；
 - selector、testId、placeholder、combine 和 AX 无法保持结果形状的 text read 继续走 DOM；成功的 AX-first mapped action 返回 `resolvedBy: "chromium_ax"`；
-- 真实对比覆盖 shadow DOM、同源 iframe、custom ARIA combobox、动态 shadow redraw、复杂 accessible name、hidden/disabled 控件和 AX-only frame target。
+- 真实对比覆盖 shadow DOM、同源 iframe、custom ARIA combobox、动态 shadow redraw、复杂 accessible name、hidden/disabled 控件和跨域 frame。
+
+真实矩阵补充结论：不同端口的 `127.0.0.1` child frame 可以由当前 AX target 读取并完成 semantic action；使用 `127.0.0.2` 的 cross-site OOPIF 虽然实际加载，但不会出现在当前 target 的 `Page.getFrameTree` 中。当前实现不猜测或跨 target 映射它，locator 返回 `0`，副作用返回 `AX_NODE_NOT_FOUND`，且不回退到 DOM。完整 OOPIF 支持需要单独的 debugger child-target attach/lifecycle fence，暂不提前引入。
 
 ## 11. 测试与验收
 
