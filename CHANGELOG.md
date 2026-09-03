@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3 - 2026-09-03
+
+- Trim the shared Pi/DSH browser Skill entry to its activation, fencing, AX, uncertainty, ownership, and cleanup contract; move detailed recovery and special workflows into Skill-local references and ship the same files in both hosts with load-path parity coverage.
+
 ## 0.5.2 - 2026-09-03
 
 - Prefer the real Chromium Accessibility Tree for accessibility snapshots, retain bounded full/diff/unchanged output, safely fall back to the DOM semantic tree when the Accessibility domain is unavailable, and add document-scoped `aN` refs with fenced AX/DOM mapping and limited interactions.
