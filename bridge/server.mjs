@@ -54,7 +54,7 @@ function argValue(name, fallback) {
 const port = Number(argValue("--port", DEFAULT_PORT));
 const tokenFile = argValue("--token-file", DEFAULT_TOKEN_FILE);
 const startedByValue = argValue("--started-by", argValue("--managed-by", "unknown"));
-const startedBy = startedByValue === "dsh" || startedByValue === "pi" ? startedByValue : "unknown";
+const startedBy = ["dsh", "pi", "codex"].includes(startedByValue) ? startedByValue : "unknown";
 const startupMarkerValue = argValue("--startup-marker", "");
 const startupMarker = typeof startupMarkerValue === "string" && startupMarkerValue.length > 0 ? startupMarkerValue : undefined;
 

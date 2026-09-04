@@ -1,0 +1,7 @@
+{
+  "name": "pi-control-chrome",
+  "version": "0.5.4",
+  "description": "Codex browser control for the user's existing Chrome or Edge profile through the local pi-control-chrome Bridge.",
+  "skills": "./skills/pi-control-chrome/",
+  "mcpServers": "./.mcp.json"
+}

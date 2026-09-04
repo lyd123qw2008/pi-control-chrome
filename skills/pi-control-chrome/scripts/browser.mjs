@@ -8,6 +8,7 @@
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { compactBrowserResult } from "../../../pi-extension/output.js";
 
 const BRIDGE_HOST = process.env.PI_CONTROL_CHROME_BRIDGE_HOST || "127.0.0.1";
@@ -260,22 +261,36 @@ class BridgeClient {
       }
     }
     clearTimeout(entry.timer);
+    entry.removeAbort?.();
     this.pending.delete(id);
     if (error) entry.reject(cancelRemote ? localRequestError(entry.method, entry.params, error.message) : error);
     else entry.resolve(value);
   }
 
-  rawRequest(method, params = {}, timeoutMs = DEFAULT_TIMEOUT, target) {
+  rawRequest(method, params = {}, timeoutMs = DEFAULT_TIMEOUT, target, signal) {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("Bridge WebSocket is not connected"));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("Browser request aborted"));
     }
     const id = `skill-${process.pid}-${++this.sequence}`;
     return new Promise((resolveRequest, rejectRequest) => {
       const timer = setTimeout(() => {
         this.settlePending(id, new Error(`Browser request timed out: ${method}`), undefined, true);
       }, timeoutMs);
-      this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer, method, params, socket });
+      const entry = { resolve: resolveRequest, reject: rejectRequest, timer, method, params, socket, removeAbort: undefined };
+      this.pending.set(id, entry);
+      if (signal) {
+        const onAbort = () => this.settlePending(id, signal.reason instanceof Error ? signal.reason : new Error("Browser request aborted"), undefined, true);
+        entry.removeAbort = () => signal.removeEventListener("abort", onAbort);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+      }
       try {
         socket.send(JSON.stringify({ type: "request", id, method, params, ...(target === undefined ? {} : { target }) }));
       } catch (error) {
@@ -293,12 +308,12 @@ class BridgeClient {
     };
   }
 
-  async request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT) {
+  async request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT, signal) {
     if (method === "status") {
       const { acknowledgeBrowserId, browserId, ...statusParams } = params;
-      const selectedBrowserId = browserId || acknowledgeBrowserId || this.selectedBrowserId;
+      const selectedBrowserId = browserId || acknowledgeBrowserId || this.selectedBrowserId || this.acknowledgedTarget?.browserId;
       const route = selectedBrowserId === undefined ? undefined : { browserId: selectedBrowserId };
-      const result = await this.rawRequest("status", statusParams, timeoutMs, route);
+      const result = await this.rawRequest("status", statusParams, timeoutMs, route, signal);
       const target = browserTarget(result);
       const previous = this.acknowledgedTarget;
       const changed = previous !== undefined && previous.browserId !== target?.browserId;
@@ -323,7 +338,7 @@ class BridgeClient {
       };
     }
     const route = this.targetRoute();
-    const status = await this.rawRequest("status", {}, timeoutMs, route);
+    const status = await this.rawRequest("status", {}, timeoutMs, route, signal);
     const target = browserTarget(status);
     const extensionCapabilities = status?.capabilities && typeof status.capabilities === "object" ? status.capabilities : {};
     const required = [];
@@ -359,7 +374,7 @@ class BridgeClient {
     const { responseMode: _requestedMode, ...baseParams } = params;
     const negotiatedMode = this.bridgeCapabilities.compactResponses === true && requestedMode !== undefined ? requestedMode : undefined;
     const wireParams = negotiatedMode === undefined ? baseParams : { ...baseParams, responseMode: negotiatedMode };
-    const result = await this.rawRequest(method, { ...wireParams, expectedBrowserId: target.browserId }, timeoutMs, this.targetRoute(target));
+    const result = await this.rawRequest(method, { ...wireParams, expectedBrowserId: target.browserId }, timeoutMs, this.targetRoute(target), signal);
     return requestedMode === "compact" && responseTool !== undefined ? compactBrowserResult(responseTool, params, result) : result;
   }
 
@@ -656,8 +671,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const code = typeof error?.code === "string" ? `[${error.code}] ` : "";
-  console.error(`pi-control-chrome: ${code}${error.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    const code = typeof error?.code === "string" ? `[${error.code}] ` : "";
+    console.error(`pi-control-chrome: ${code}${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+export { BridgeClient, createClient };

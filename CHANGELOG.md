@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.4 - 2026-09-04
+
+- Add a Codex CLI/Desktop plugin manifest and local MCP stdio adapter backed by the existing Bridge and the initial eight browser tools; no additional MCP listening port is required.
+
 ## 0.5.3 - 2026-09-03
 
 - Trim the shared Pi/DSH browser Skill entry to its activation, fencing, AX, uncertainty, ownership, and cleanup contract; move detailed recovery and special workflows into Skill-local references and ship the same files in both hosts with load-path parity coverage.

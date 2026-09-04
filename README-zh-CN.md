@@ -2,7 +2,7 @@
 
 [English](./README.md) · 简体中文
 
-这是一个面向 Pi 的 Chrome/Edge 浏览器控制方案设计仓库，目标是尽可能对齐 Codex `control-chrome` 的体验和能力。
+这是一个面向 Pi、Codex 和 DSH 的 Chrome/Edge 浏览器控制仓库，目标是对齐 Codex `control-chrome` 的体验和能力。
 
 当前阶段包含：
 
@@ -132,6 +132,17 @@ pi install git:github.com/lyd123qw2008/pi-control-chrome
 仓库还包含独立的 [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) 包。默认 `lazyTools: true` 时，插件只注册 `pi-control-chrome` Skill 的名称和描述；Skill 成功加载后，把完整的 39 个 `browser_*` 工具注册到当前 Agent，并在该 Agent session 的连续 turn 中保持激活。按 Codex 默认生命周期，turn 结束时宿主关闭未标记的 Agent 临时 Tab、release claimed user Tab、detach debugger lease，但不停止 Bridge、移除工具或重新加载 Skill。模型需要保留页面时，应在当前 turn 调用 `browser_mark_handoff` 或 `browser_mark_deliverable`，下一 turn 仍需保留时重新标记。只有用户明确要求立即关闭临时 Tab、释放 claim 或清理浏览器任务时，才调用 `browser_cleanup`；它会保留工具和健康 Bridge。只有在用户明确决定恢复扩展运行时之后，才把 `recoverStale: true` 传给 `browser_cleanup`；该选项只忘记未知运行时的 ownership 记录，不关闭对应 Tab，并在 `recovered` 中返回 Tab id 供人工检查。`browser_context_reset` 是单独的显式用户请求操作，用于 finalize 资源并停用惰性工具。Agent disposal 和插件关闭会重试最终清理；清理恢复失败时，复用同一 session ID 的替代 Agent 会保持阻塞，直到清理成功。设置 `lazyTools: false` 可保留插件加载即显示工具的兼容行为。Pi 使用同一批原生工具定义和 active-tool 隐藏机制。DSH 还提供人工使用的 `/chrome status`、`/chrome targets`、`/chrome profile [browserId]`、`/chrome connect`、`/chrome disconnect`、`/chrome doctor`、`/chrome restart` 和 `/chrome tabs` 命令；这些命令不替代 Skill 激活。
 
 在 DSH Profile 中安装该包，把它的 `config/cordis.patch.yml.example` 中的 `insert` 条目合并到现有 `cordis.patch.yml`，不要覆盖其他 patch 条目，并把 Bridge 配置放到 `<DSH_HOME>/settings.yaml` 的 `control-chrome` 命名空间。DSH Profile 应包含标准的 `@deepseek-ai/dsh-skill` 服务，以便使用运行时 Skill 注册表和 `skill` 工具；浏览器插件本身不强制注入该可选服务。DSH 包复用本项目的 Bridge 和 Manifest V3 扩展，不会自动安装浏览器扩展，不读取 Chrome Profile 文件，也不会把 Bridge 暴露到 loopback 之外。
+
+## Codex CLI 和桌面端集成
+
+仓库包含 Codex Plugin 清单和本地 MCP `stdio` adapter，首版只暴露 8 个基础浏览器工具。使用包含该 adapter 的版本时，npm 安装后执行：
+
+```powershell
+npm install --global pi-control-chrome
+codex mcp add pi-control-chrome -- pi-control-chrome-codex
+```
+
+也可以直接指向 checkout 中的 `codex/mcp-server.mjs`。MCP adapter 不监听新的端口，只通过 stdin/stdout 与 Codex 通信，再连接已有的 `127.0.0.1:17318` Bridge；如果 Bridge 尚未运行，adapter 只会启动一个新的 Bridge，不会重载扩展。CLI 和桌面端共享 `~/.codex/config.toml` 中的 MCP 配置。第一次浏览器操作必须是 `browser_status`；多个 Chrome/Edge 或 Profile 同时连接时，必须显式选择并确认 `browserId`。完整安装说明见 [`codex/README.md`](./codex/README.md)。
 
 加载 Chrome/Edge 扩展：
 
