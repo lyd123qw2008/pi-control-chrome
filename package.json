@@ -1,10 +1,11 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.5.3",
-  "description": "Codex-aligned Chrome and Edge browser control for Pi",
+  "version": "0.5.4",
+  "description": "Codex-aligned Chrome and Edge browser control for Pi, Codex and DSH",
   "type": "module",
   "exports": {
     "./bridge/server.mjs": "./bridge/server.mjs",
+    "./codex/mcp-server.mjs": "./codex/mcp-server.mjs",
     "./pi-extension/output.js": {
       "types": "./pi-extension/output.d.ts",
       "default": "./pi-extension/output.js"
@@ -32,10 +33,14 @@
     "chromium",
     "browser-automation",
     "browser-control",
+    "codex",
+    "mcp",
     "manifest-v3",
     "cdp"
   ],
   "files": [
+    ".codex-plugin",
+    ".mcp.json",
     "ARCHITECTURE.md",
     "ARCHITECTURE.zh-CN.md",
     "CHANGELOG.md",
@@ -49,6 +54,7 @@
     "SECURITY.md",
     "docs/*.md",
     "bridge",
+    "codex",
     "extension",
     "pi-extension",
     "skills"
@@ -56,16 +62,20 @@
   "publishConfig": {
     "access": "public"
   },
+  "bin": {
+    "pi-control-chrome-codex": "./codex/mcp-server.mjs"
+  },
   "scripts": {
-    "check": "node --check bridge/server.mjs && node --check extension/background.js && node --check extension/page-agent.js && node --check pi-extension/index.ts && node --check pi-extension/activation.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
+    "check": "node --check bridge/server.mjs && node --check codex/mcp-server.mjs && node --check extension/background.js && node --check extension/page-agent.js && node --check pi-extension/index.ts && node --check pi-extension/activation.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json','.codex-plugin/plugin.json','.mcp.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
     "test": "node --test tests/bridge.test.mjs",
     "test:activation": "node --test tests/pi-activation.test.mjs",
     "test:extension": "node --test tests/extension-lifecycle.test.mjs",
     "test:pi:lifecycle": "node --test tests/pi-lifecycle.test.mjs",
     "test:skill:lifecycle": "node --test tests/skill-script-lifecycle.test.mjs",
     "test:skill": "node --test tests/skill-script.test.mjs",
+    "test:codex": "node --test tests/codex-mcp.test.mjs",
     "test:output": "node --test tests/output-projection.test.mjs",
-    "test:all": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:skill && npm run test:output",
+    "test:all": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:skill && npm run test:codex && npm run test:output",
     "bridge": "node bridge/server.mjs",
     "smoke:e2e": "node tests/e2e-browser.mjs",
     "smoke:e2e:multi-profile": "node tests/e2e-multi-profile.mjs",

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pi-control-chrome": {
+      "command": "node",
+      "args": ["codex/mcp-server.mjs"],
+      "cwd": "."
+    }
+  }
+}

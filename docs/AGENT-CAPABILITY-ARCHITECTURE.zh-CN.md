@@ -463,7 +463,7 @@ browser-mcp --profile=interactive
 
 优先使用启动时固定的工具集合，而不是每个请求动态增删大量工具，避免工具列表变化造成缓存失效、会话状态不一致和权限边界模糊。
 
-模型看到的 MCP 工具数量应明显少于内部能力数量。
+模型看到的 MCP 工具数量应明显少于内部能力数量。当前 Codex 兼容适配器只暴露首批 8 个基础 `browser_*` 工具；后续若有真实需求，再按 Read/Interactive/Privileged profiles 增加能力。
 
 ## 9. Codex、Claude Code、Gemini CLI 的接入策略
 
@@ -504,17 +504,17 @@ MCP Interactive Profile
 
 ### 9.4 Codex
 
-准备两种入口：
+当前已经提供：
 
 ```text
-MCP 兼容入口
-+
-Codex Skill / Node Client 入口
+Codex Plugin manifest
++ 共享 pi-control-chrome Skill
++ 本地 MCP stdio adapter
 ```
 
-`browser-client.mjs` 可以成为 Codex `node_repl` 的客户端，但它必须调用同一个 Capability Broker，不能重新实现浏览器连接、标签页 ownership 和页面围栏。
+CLI 和桌面端通过同一份 Codex MCP 配置启动 adapter。adapter 只调用现有 Bridge，保留浏览器 target、tab/document fence、ownership、取消、cleanup 和副作用 uncertainty，不重新实现扩展或浏览器控制逻辑。
 
-Codex App Server 主要解决“外部应用如何深度集成 Codex Agent”这一方向，不应直接当成我们浏览器能力的唯一传输协议。
+`browser-client.mjs` 仍可作为未来 `node_repl` 入口，但不是当前 CLI/桌面端接入的前置条件。Codex App Server 主要解决“外部应用如何深度集成 Codex Agent”这一方向，不应直接当成我们浏览器能力的唯一传输协议。
 
 ## 10. Workflow Runtime
 

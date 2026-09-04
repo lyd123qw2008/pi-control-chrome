@@ -2,7 +2,7 @@
 
 [English](./README.md) · [简体中文](./README-zh-CN.md)
 
-Codex-aligned Chrome and Edge browser control for Pi. It reuses the user's existing Chromium profile through a local WebSocket Bridge and a Manifest V3 extension.
+Codex-aligned Chrome and Edge browser control for Pi, Codex and DSH. It reuses the user's existing Chromium profile through a local WebSocket Bridge and a Manifest V3 extension.
 
 > The Stage 1/2 core implementation is complete. Later-stage capabilities remain tracked separately in [`FEATURES.md`](./FEATURES.md).
 
@@ -72,6 +72,10 @@ The package registers the Pi extension and the bundled Skill through its `packag
 This repository also contains the standalone [`@lyd123qw2008/dsh-tool-control-chrome`](./dsh-tool-control-chrome/README.md) package. It registers the same browser-control surface as model-facing DeepSeek Harness tools and routes calls through the local Bridge. Install the DSH package in the active DSH Profile, merge the `insert` entry from its `config/cordis.patch.yml.example` into the existing `cordis.patch.yml`, and keep Bridge settings in `<DSH_HOME>/settings.yaml`.
 
 The DSH package reuses this project's Bridge and Manifest V3 extension. Its default `lazyTools: true` mode exposes only the `pi-control-chrome` Skill metadata initially; after a successful Skill load, all 39 `browser_*` tools are registered in that Agent and remain active across turns in the current Agent session. At turn end, the host closes unmarked Agent temporary tabs, releases claimed user tabs without closing them, and detaches the session debugger lease. Bridge, browser tools, and Browser binding remain available for later turns. A model must call `browser_mark_handoff` or `browser_mark_deliverable` to preserve an Agent tab through the current turn cleanup, and repeat the mark in a later turn when needed. Only an explicit user request to close temporary tabs, release claims, or clean the browser task may trigger `browser_cleanup`; it performs immediate task cleanup while retaining the lazy tools and healthy Bridge. `browser_context_reset` is the separate explicit user-requested operation that finalizes resources and deactivates lazy tools. Agent and plugin disposal retry final cleanup; failed recovery blocks a replacement Agent that reuses the same session ID until cleanup succeeds. Set `lazyTools: false` for eager visibility. Pi registers the same native tools once but hides them with its active-tool set until the explicit `/skill:pi-control-chrome` expansion or another successful Skill activation. Ordinary web search does not activate browser control. The DSH package also provides human-only `/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` commands. It does not install browser extensions automatically, read Chrome Profile files, or expose the Bridge beyond loopback.
+
+### Codex CLI and Desktop
+
+The repository includes a Codex plugin manifest and a local MCP `stdio` adapter. After installing a package version containing this adapter, register it with `codex mcp add pi-control-chrome -- pi-control-chrome-codex`, or point `codex mcp add` at `codex/mcp-server.mjs` in this checkout. The adapter reuses the existing Bridge and exposes the initial eight browser tools; it does not open an additional MCP port. See [`codex/README.md`](./codex/README.md) for setup and safety rules.
 
 ## Load the browser extension
 
