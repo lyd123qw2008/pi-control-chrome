@@ -54,6 +54,13 @@ An idle Manifest V3 service worker is normal. Send a harmless `browser_status` r
 
 If browser controls report that they are paused, use `/chrome resume`, then call `browser_status`. Retry only after the requested browser and Bridge are healthy.
 
+## Embedded frames and prototype shells
+
+- Page readers are frame-aware by default: same-origin iframe text is included and `frames` metadata identifies readable, loading, and cross-origin frames. Prefer the returned frame content over `browser_evaluate` for routine inspection.
+- If `frameLoading` is present or a read returns `BROWSER_PAGE_CHANGING` with `frameChanged`, wait for `load` or the expected URL, then take a fresh snapshot/extract. Do not reuse refs from the interrupted observation.
+- Cross-origin frames are intentionally not scripted by the extension. A `frames[].reason` of `cross_origin` is a boundary, not a transient failure; use a user-provided URL/tab or a supported top-level control instead.
+- A same-origin embedded document can be read through the parent observation, but its controls still need fresh AX/DOM resolution; never assume a top-level `eN` ref points into the iframe.
+
 ## Stale tabs, handles, and elements
 
 1. Check the error code. `BROWSER_DOCUMENT_CHANGED`, stale-handle errors, `BROWSER_TAB_CLOSED`, and `BROWSER_TAB_FENCE_CHANGED` require `browser_tabs`, a current handle, and a fresh observation.
@@ -62,6 +69,8 @@ If browser controls report that they are paused, use `/chrome resume`, then call
 4. If a user tab changed unexpectedly, stop and ask before claiming or navigating it.
 
 For an isolated read on a changing page, the runtime may re-observe once. A persistent document change returns `BROWSER_PAGE_CHANGING`; refresh `browser_tabs` and retry the read. No page side effect was sent in that case.
+
+Read-only requests may also absorb one Bridge/target reconnect internally when the browser identity is unchanged. If that bounded recovery still fails, follow `nextAction` and do not keep replaying the operation. This automatic path is never used for clicks, typing, navigation, uploads, downloads, cleanup, or other side effects.
 
 ### Element recovery ladder
 

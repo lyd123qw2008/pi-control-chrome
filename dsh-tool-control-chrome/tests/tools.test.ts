@@ -168,6 +168,10 @@ describe('DSH browser tool catalog', () => {
     expect(wait?.parameters.state).toMatchObject({ enum: ['load', 'url', 'text', 'text_gone', 'visible', 'hidden', 'enabled'] })
     expect(click?.parameters).toHaveProperty('target')
     expect(click?.parameters).toHaveProperty('timeoutMs')
+    const snapshot = browserToolCatalog.core.find(tool => tool.name === 'browser_snapshot')
+    const extract = browserToolCatalog.core.find(tool => tool.name === 'browser_extract')
+    expect(snapshot?.parameters).toHaveProperty('includeFrames')
+    expect(extract?.parameters).toHaveProperty('includeFrames')
     const accessibility = browserToolCatalog.core.find(tool => tool.name === 'browser_accessibility_snapshot')
     const network = browserToolCatalog.advanced.find(tool => tool.name === 'browser_network')
     const download = browserToolCatalog.advanced.find(tool => tool.name === 'browser_download')
@@ -869,6 +873,89 @@ describe('DSH browser tool catalog', () => {
     expect(closed).toMatchObject({ ok: false, completed: false, actionState: 'not_completed', retryable: false, inspectFirst: true, nextAction: 'browser_tabs', recommendation: 'refresh_browser_tabs', error: { code: 'BROWSER_TAB_CLOSED', details: { tabId: 7 } } })
   })
 
+  it('preserves the browser error message and explicit AX retry policy', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return {
+        connected: true,
+        browser: 'edge',
+        browserId: 'edge:test',
+        profile: 'current',
+        extensionVersion: '0.5.4',
+        capabilities: { semanticTargets: true, tabIncarnationFence: true },
+      }
+      const error = new Error('Select value did not match any option') as Error & { code?: string; details?: unknown }
+      error.code = 'AX_NODE_NOT_FOUND'
+      error.details = { reason: 'invalid_option', actionState: 'not_completed', retryable: false, inspectFirst: false }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, target: { role: 'combobox', name: 'Choice' } }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'not_completed',
+      retryable: false,
+      inspectFirst: false,
+      error: {
+        code: 'AX_NODE_NOT_FOUND',
+        message: 'Select value did not match any option',
+        details: { reason: 'invalid_option', retryable: false },
+      },
+    })
+  })
+
+  it('keeps document-change recovery retryable after refreshing the observation', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.4', capabilities: { semanticTargets: true, tabIncarnationFence: true } }
+      const error = new Error('The accessibility reference belongs to an earlier document') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_DOCUMENT_CHANGED'
+      error.details = { snapshotId: 'old', actionState: 'not_completed', retryable: true, inspectFirst: true }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, target: { role: 'button', name: 'Save' } }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'not_completed',
+      retryable: true,
+      inspectFirst: true,
+      nextAction: 'browser_tabs',
+      error: {
+        code: 'BROWSER_DOCUMENT_CHANGED',
+        message: 'The accessibility reference belongs to an earlier document',
+      },
+    })
+  })
+
+  it('directs uncertain AX operations to a fresh accessibility observation', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.4', capabilities: { semanticTargets: true, tabIncarnationFence: true } }
+      const error = new Error('AX dispatch result was lost') as Error & { code?: string; details?: unknown }
+      error.code = 'AX_NODE_OPERATION_FAILED'
+      error.details = { actionState: 'unknown', retryable: false, inspectFirst: true }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, target: { role: 'button', name: 'Save' } }, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'unknown',
+      retryable: false,
+      inspectFirst: true,
+      nextAction: 'browser_accessibility_snapshot',
+      recommendation: 'inspect_before_retry',
+      error: { code: 'AX_NODE_OPERATION_FAILED', message: 'AX dispatch result was lost' },
+    })
+  })
+
   it('returns a compact actionable result for a browser wait timeout', async () => {
     const request = vi.fn(async (method: string) => {
       if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { pageWaitStates: true, semanticTargets: true, tabIncarnationFence: true } }
@@ -955,6 +1042,83 @@ describe('DSH browser tool catalog', () => {
       recommendation: 'retry_read_on_current_tab',
       error: { code: 'BROWSER_PAGE_CHANGING', details: { tabId: 7, attempts: 2 } },
     })
+  })
+
+  it('retries a read once after the Bridge target connection changes', async () => {
+    let snapshots = 0
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return {
+        connected: true,
+        browser: 'edge',
+        browserId: 'edge:test',
+        profile: 'current',
+        extensionVersion: '0.5.4',
+        capabilities: { tabIncarnationFence: true },
+      }
+      if (method === 'snapshot') {
+        snapshots += 1
+        if (snapshots === 1) {
+          const error = new Error('Browser target edge:test connection changed') as Error & { code?: string }
+          error.code = 'TARGET_CONNECTION_CHANGED'
+          throw error
+        }
+        return { tabId: 7, snapshot: { snapshotId: 'fresh', state: 'button "Save" [ref=e1]', nodeCount: 1, charCount: 25, truncated: false } }
+      }
+      return { method }
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { compactResponses: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_snapshot')?.execute({ tabId: 7 }, execution(harness.agent))
+    expect(result).toMatchObject({ snapshot: { snapshotId: 'fresh' } })
+    expect(snapshots).toBe(2)
+    expect(request.mock.calls.filter(([method]) => method === 'snapshot')).toHaveLength(2)
+  })
+
+  it('honors an explicit non-retryable target-change diagnosis for a read', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.4', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('The current read cannot be replayed') as Error & { code?: string; details?: unknown }
+      error.code = 'TARGET_CONNECTION_CHANGED'
+      error.details = { retryable: false, actionState: 'not_completed' }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_snapshot')?.execute({ tabId: 7 }, execution(harness.agent))
+    expect(result).toMatchObject({ ok: false, retryable: false, actionState: 'unknown', error: { code: 'TARGET_CONNECTION_CHANGED' } })
+    expect(request.mock.calls.filter(([method]) => method === 'snapshot')).toHaveLength(1)
+  })
+
+  it('does not replay a side effect after the Bridge target connection changes', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.4', capabilities: { semanticTargets: true, tabIncarnationFence: true } }
+      const error = new Error('Browser target edge:test connection changed') as Error & { code?: string }
+      error.code = 'TARGET_CONNECTION_CHANGED'
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_click')?.execute({ tabId: 7, target: { role: 'button', name: 'Save' } }, execution(harness.agent))
+    expect(result).toMatchObject({ ok: false, retryable: false, actionState: 'unknown', nextAction: 'browser_status', error: { code: 'TARGET_CONNECTION_CHANGED' } })
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
+  })
+
+  it('does not replay log-clearing reads after the Bridge target connection changes', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.4', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('Browser target edge:test connection changed') as Error & { code?: string }
+      error.code = 'TARGET_CONNECTION_CHANGED'
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_console')?.execute({ tabId: 7, action: 'read', clear: true }, execution(harness.agent))
+    expect(result).toMatchObject({ ok: false, retryable: false, actionState: 'unknown', error: { code: 'TARGET_CONNECTION_CHANGED' } })
+    expect(request.mock.calls.filter(([method]) => method === 'console_logs')).toHaveLength(1)
   })
 
   it('reports and blocks an old Bridge without atomic target routing', async () => {

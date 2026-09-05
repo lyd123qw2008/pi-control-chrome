@@ -100,7 +100,7 @@ function isHealthyResponse(response: { status: number; value: unknown }): boolea
 }
 
 function isSideEffectingBrowserRequest(method: string, params: Record<string, unknown>): boolean {
-  if (['navigate', 'back', 'forward', 'reload', 'select_tab', 'new_tab', 'close_tab', 'upload', 'cua', 'dom_cua', 'cleanup'].includes(method)) return method !== 'dom_cua' || params.action !== 'get_visible_dom'
+  if (['navigate', 'back', 'forward', 'reload', 'select_tab', 'new_tab', 'close_tab', 'upload', 'cua', 'keypress', 'scroll', 'dom_cua', 'cleanup'].includes(method)) return method !== 'dom_cua' || params.action !== 'get_visible_dom'
   if (method === 'interaction') return ['click', 'double_click', 'dblclick', 'fill', 'type', 'press', 'select', 'check', 'uncheck', 'set_checked', 'hover', 'focus', 'scroll'].includes(String(params.operation ?? params.action ?? ''))
   if (method === 'locator') return ['click', 'dblclick', 'double_click', 'fill', 'type', 'press', 'select', 'check', 'uncheck', 'set_checked', 'hover', 'focus', 'scroll'].includes(String(params.action ?? ''))
   if (method === 'download') return !['list', 'wait'].includes(String(params.action ?? ''))
@@ -122,6 +122,9 @@ function localBrowserRequestError(method: string, params: Record<string, unknown
   if (sideEffecting) {
     result.code = 'BROWSER_OPERATION_UNCERTAIN'
     result.details = { actionState: 'unknown', retryable: false, inspectFirst: true }
+  } else if (result.code === undefined && source.message === 'Browser Bridge disconnected') {
+    result.code = 'BROWSER_BRIDGE_DISCONNECTED'
+    result.details = { actionState: 'not_completed', retryable: true, inspectFirst: false }
   } else if (result.code === undefined) {
     result.code = 'BROWSER_REQUEST_CANCELED'
   }
@@ -535,8 +538,10 @@ export class BrowserBridgeClient {
   }
 
   private rejectPendingForSocket(socket: WebSocket, error: Error): void {
+    const disconnected = new Error('Browser Bridge disconnected')
+    disconnected.cause = error
     for (const [id, entry] of this.pending.entries()) {
-      if (entry.socket === socket) this.settlePending(id, error, undefined, true)
+      if (entry.socket === socket) this.settlePending(id, disconnected, undefined, true)
     }
   }
 }

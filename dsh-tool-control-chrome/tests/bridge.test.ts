@@ -87,6 +87,15 @@ it('BrowserBridgeClient pairs, routes requests, reads health, and observes abort
     const pending = client.request('wait_forever', {}, controller.signal)
     controller.abort()
     await expect(pending).rejects.toThrow(/aborted/)
+
+    const disconnectPending = client.request('wait_forever', {})
+    const socket = [...sockets][0]
+    if (socket === undefined) throw new Error('test Bridge socket was not registered')
+    socket.close()
+    await expect(disconnectPending).rejects.toMatchObject({
+      code: 'BROWSER_BRIDGE_DISCONNECTED',
+      details: { actionState: 'not_completed', retryable: true, inspectFirst: false },
+    })
   } finally {
     await client.stop()
     for (const socket of sockets) socket.close()
