@@ -51,11 +51,11 @@
 ### 页面和 CDP
 
 - Accessibility Snapshot；
-- 默认返回可见语义页面状态，snapshot 和 DOM CUA 使用 20,000 字符/200 节点预算，extract 使用共享 12,000 字符预算；Pi/DSH 模型结果不暴露重复 raw accessibility 和 frameTree；Bridge health 宣告 `capabilities.compactResponses=true`，页面读取协商 `responseMode=compact`，旧消费者省略 mode 时仍保留 raw 兼容，人工/开发者可显式使用 CLI `--raw`；当 Tab 已携带标题和 URL 时，snapshot、Accessibility 和 extract 不在内部重复这些字段；有交互元素或 Accessibility 节点时不再追加重复的页面全文，完整正文请使用 `browser_extract`；空的可选 `selector`、`snapshotId`、`incarnation` 和截图 `path` 会在发送前按省略处理；
+- 默认返回可见语义页面状态，snapshot 和 DOM CUA 使用 20,000 字符/200 节点预算，extract 使用共享 12,000 字符预算；Pi/DSH 模型结果不暴露重复 raw accessibility 和 frameTree；Bridge health 宣告 `capabilities.compactResponses=true`，页面读取协商 `responseMode=compact`，旧消费者省略 mode 时仍保留 raw 兼容，人工/开发者可显式使用 CLI `--raw`；当 Tab 已携带标题和 URL 时，snapshot、Accessibility 和 extract 不在内部重复这些字段；有交互元素或 Accessibility 节点时不再追加重复的页面全文，完整正文请使用 `browser_extract`；空的可选 `selector`、`snapshotId`、`incarnation` 和截图 `path` 会在发送前按省略处理；snapshot、extract 和 DOM CUA 默认读取同源 iframe 的可见文字，并返回受限的 `frames` 元数据；跨域或仍在加载的 iframe 会报告 `reason`/`frameLoading`，可用 `includeFrames: false` 明确关闭；
 - Accessibility Snapshot 优先读取真实 Chromium AX，支持 full、增量 diff 和 unchanged；AX actionable/focusable 节点可带 document-scoped `aN` ref，操作前须携带匹配的 `snapshotId`；AX 和 locator 结果中的敏感值保持脱敏；Accessibility domain 不可用时安全回退 DOM semantic tree；需要完整树时显式传 `disableDiffing: true`；snapshot、Accessibility、extract 和 DOM CUA 支持可选 selector 与预算参数；
-- 普通 `role`/`name`、label 和 accessible-text 定位、等待、交互现在优先尝试 Chromium AX：使用浏览器计算后的 role/name/state，再在既有 document/frame fence 下映射当前 backend DOM；成功的映射动作会返回内部 provenance `resolvedBy: "chromium_ax"`。AX 树不完整、匹配歧义或 DOM 映射不安全时安全失败，只有 Accessibility domain 明确不可用才走 DOM semantic；selector、testId、placeholder 和 AX 不足以保留结果的文字读取继续走 DOM；
+- 普通 `role`/`name`、label 和 accessible-text 定位、等待、交互现在优先尝试 Chromium AX：使用浏览器计算后的 role/name/state，再在既有 document/frame fence 下映射当前 backend DOM；成功的映射动作会返回内部 provenance `resolvedBy: "chromium_ax"`。AX 树不完整、匹配歧义或 DOM 映射不安全时安全失败；只有 Accessibility domain 明确不可用，或纯文字 target 对应的自定义可点击元素没有 AX actionable node 时，才走受限 DOM semantic fallback；selector、testId、placeholder 和 AX 不足以保留结果的文字读取继续走 DOM；
 - `browser_evaluate` 返回值限制为深度 8、数组 2,000 项、对象 200 个字段和字符串 200,000 字符；
-- DOM 和 Locator 操作；
+- DOM 和 Locator 操作；同源 iframe 的可读上下文默认由页面观察一并收集，frame 元数据标注 readable/loading/cross-origin 边界；
 - click、fill、type、press、scroll；
 - 截图和图片回传；
 - 普通当前标签页视口截图不打开 DevTools 调试会话；完整页面和后台标签页截图使用短时、会话归属的调试租约；

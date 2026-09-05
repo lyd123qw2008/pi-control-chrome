@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.5 - 2026-09-05
+
+- Add bounded same-origin embedded-frame traversal to snapshot, extract, Accessibility Snapshot, and DOM-CUA reads, including frame diagnostics, loading state, cross-origin boundaries, and the `includeFrames: false` opt-out.
+
+- Stabilize prototype-shell observations across dynamic iframe loading, document transitions, reconnects, and constrained browser crypto environments while preserving strict side-effect fencing and fail-closed behavior.
+
+- Extend Pi, DSH, and Skill CLI schemas/documentation and real-browser regression coverage for frame-aware reads, lifecycle recovery, semantic controls, and keyboard `press` interactions.
+
 ## 0.5.4 - 2026-09-04
 
 - Add a Codex CLI/Desktop plugin manifest and local MCP stdio adapter backed by the existing Bridge and the initial eight browser tools; no additional MCP listening port is required.

@@ -38,8 +38,8 @@ function usage() {
   node browser.mjs group --browser-id <id> [--json]
   node browser.mjs open <url> --session <id> --browser-id <id> [--active|--inactive] [--turn <n>] [--json]
   node browser.mjs view <url> --session <id> --browser-id <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--raw] [--json]
-  node browser.mjs snapshot <tabId> --browser-id <id> [--session <id>] [--raw] [--json]
-  node browser.mjs extract <tabId> --browser-id <id> [--session <id>] [--max-chars <n>] [--raw] [--json]
+  node browser.mjs snapshot <tabId> --browser-id <id> [--session <id>] [--no-frames] [--raw] [--json]
+  node browser.mjs extract <tabId> --browser-id <id> [--session <id>] [--no-frames] [--max-chars <n>] [--raw] [--json]
   node browser.mjs screenshot <tabId> <path> --browser-id <id> [--session <id>] [--full-page]
   node browser.mjs close <tabId> --browser-id <id> [--session <id>] [--json]
   node browser.mjs cleanup --session <id> --browser-id <id> [--recover-stale] [--json]
@@ -142,11 +142,39 @@ function isSideEffectingRequest(method, params = {}) {
   return false;
 }
 
+const READ_ONLY_BRIDGE_RETRY_METHODS = new Set([
+  "selected_tab",
+  "list_tabs",
+  "snapshot",
+  "extract",
+  "wait",
+  "screenshot",
+  "network_response_body",
+]);
+
+function readOnlyLocatorAction(value) {
+  return ["count", "all", "allTextContents", "textContent", "innerText", "getAttribute", "isVisible", "isEnabled", "waitFor", "first", "last", "nth", "filter", "and", "or"].includes(String(value ?? ""));
+}
+
+function isReadOnlyBridgeMethod(method, params = {}) {
+  if (READ_ONLY_BRIDGE_RETRY_METHODS.has(method)) return true;
+  if (method === "locator") return readOnlyLocatorAction(params.action);
+  if (method === "dom_cua") return params.action === "get_visible_dom";
+  if (method === "dialog") return params.action === "get";
+  if (method === "clipboard") return params.action === "read";
+  if (method === "download") return params.action === "list" || params.action === "wait";
+  if (method === "console_logs" || method === "network_requests") return params.clear !== true;
+  return false;
+}
+
 function localRequestError(method, params, message, details = {}) {
   const error = new Error(message);
   if (isSideEffectingRequest(method, params)) {
     error.code = "BROWSER_OPERATION_UNCERTAIN";
     error.details = { actionState: "unknown", retryable: false, inspectFirst: true, ...details };
+  } else if (message === "Pi browser Bridge disconnected") {
+    error.code = "BROWSER_BRIDGE_DISCONNECTED";
+    error.details = { actionState: "not_completed", retryable: true, inspectFirst: false, ...details };
   }
   return error;
 }
@@ -374,7 +402,21 @@ class BridgeClient {
     const { responseMode: _requestedMode, ...baseParams } = params;
     const negotiatedMode = this.bridgeCapabilities.compactResponses === true && requestedMode !== undefined ? requestedMode : undefined;
     const wireParams = negotiatedMode === undefined ? baseParams : { ...baseParams, responseMode: negotiatedMode };
-    const result = await this.rawRequest(method, { ...wireParams, expectedBrowserId: target.browserId }, timeoutMs, this.targetRoute(target), signal);
+    let result;
+    const routedParams = { ...wireParams, expectedBrowserId: target.browserId };
+    const routedTarget = this.targetRoute(target);
+    try {
+      result = await this.rawRequest(method, routedParams, timeoutMs, routedTarget, signal);
+    } catch (error) {
+      const code = typeof error?.code === "string" ? error.code : undefined;
+      const details = error && typeof error === "object" && error.details && typeof error.details === "object" && !Array.isArray(error.details) ? error.details : undefined;
+      if (!isReadOnlyBridgeMethod(method, params) || (code !== "BROWSER_BRIDGE_DISCONNECTED" && code !== "TARGET_CONNECTION_CHANGED") || details?.retryable === false) throw error;
+      try {
+        result = await this.rawRequest(method, routedParams, timeoutMs, { browserId: target.browserId }, signal);
+      } catch {
+        throw error;
+      }
+    }
     return requestedMode === "compact" && responseTool !== undefined ? compactBrowserResult(responseTool, params, result) : result;
   }
 
@@ -472,9 +514,10 @@ async function inspectTab(client, tabOrId, options, sessionId) {
   const tabId = sourceTab?.id ?? tabOrId;
   const target = { tabId, ...(sourceTab?.handle ? { handle: sourceTab.handle } : {}), ...(sessionId ? { sessionId } : {}) };
   const responseMode = boolOption(options, "raw", false) ? "raw" : "compact";
-  const snapshot = await client.request("snapshot", { ...target, responseMode });
+  const observationOptions = options.no_frames === true ? { includeFrames: false } : {};
+  const snapshot = await client.request("snapshot", { ...target, ...observationOptions, responseMode });
   const snapshotTarget = snapshot?.tab?.handle ? { ...target, handle: snapshot.tab.handle } : target;
-  const extracted = await client.request("extract", { ...snapshotTarget, responseMode });
+  const extracted = await client.request("extract", { ...snapshotTarget, ...observationOptions, responseMode });
   const extractedTarget = extracted?.tab?.handle ? { ...snapshotTarget, handle: extracted.tab.handle } : snapshotTarget;
   let timing;
   try {
@@ -502,7 +545,8 @@ async function inspectTab(client, tabOrId, options, sessionId) {
       available: Boolean(snapshot?.snapshot),
       elementCount: snapshot?.snapshot?.elements?.length ?? null,
       accessibilityAvailable: Boolean(snapshot?.snapshot?.accessibility),
-      frameCount: snapshot?.frameTree?.frameTree ? 1 + (snapshot.frameTree.frameTree.childFrames?.length || 0) : null,
+      frameCount: snapshot?.snapshot?.frameCount ?? (snapshot?.frameTree?.frameTree ? 1 + (snapshot.frameTree.frameTree.childFrames?.length || 0) : null),
+       frames: snapshot?.snapshot?.frameSummaries ?? [],
     }
     : {
       available: Boolean(snapshot?.snapshot),
@@ -510,6 +554,8 @@ async function inspectTab(client, tabOrId, options, sessionId) {
       nodeCount: snapshot?.snapshot?.nodeCount ?? null,
       charCount: snapshot?.snapshot?.charCount ?? null,
       truncated: snapshot?.snapshot?.truncated ?? null,
+      frameCount: snapshot?.snapshot?.frameCount ?? null,
+      frames: snapshot?.snapshot?.frames ?? [],
     };
   const finalTab = extracted?.tab || snapshot?.tab || sourceTab;
   return {
@@ -633,7 +679,12 @@ async function main() {
     if (command === "snapshot" || command === "extract") {
       if (!positionals[0]) throw new Error(`${command} requires a tab id`);
       const responseMode = boolOption(options, "raw", false) ? "raw" : "compact";
-      const result = await client.request(command, { tabId: Number(positionals[0]), responseMode, ...(options.session === undefined ? {} : { sessionId: String(options.session) }) });
+      const result = await client.request(command, {
+        tabId: Number(positionals[0]),
+        responseMode,
+        ...(options.no_frames === true ? { includeFrames: false } : {}),
+        ...(options.session === undefined ? {} : { sessionId: String(options.session) }),
+      });
       if (command === "extract") {
         result.content.text = truncate(result.content.text, numberOption(options, "max_chars", DEFAULT_MAX_CHARS));
         result.content.markdown = truncate(result.content.markdown, numberOption(options, "max_chars", DEFAULT_MAX_CHARS));
