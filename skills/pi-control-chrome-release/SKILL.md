@@ -84,8 +84,13 @@ After creating or editing the PR, read the remote body before merge:
 
 ```powershell
 gh pr view <number> --repo <owner>/<repo> --json title,body,state,mergeStateStatus,url
-$body = gh pr view <number> --repo <owner>/<repo> --json body --jq .body
-if ($body.Contains('\n') -or $body.Contains('\r') -or $body.Contains('\t')) { throw 'PR body contains literal escape sequences; fix it before merge' }
+$body = (gh pr view <number> --repo <owner>/<repo> --json body --jq '.body') -join "`n"
+$literalEscapeCount = [regex]::Matches($body, '\\[nrt]').Count
+$realLineBreakCount = [regex]::Matches($body, "`r?`n").Count
+[pscustomobject]@{ literalEscapeCount = $literalEscapeCount; realLineBreakCount = $realLineBreakCount }
+if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) {
+  throw 'PR body appears to contain encoded line breaks; fix it before merge'
+}
 ```
 
 The gate passes only when the title is correct, headings and bullet lists render on separate lines, code blocks are readable, validation commands are complete, and the PR state/merge condition is expected. If literal escape sequences or Markdown concatenation is found, fix the body with `--body-file` and verify it again; do not merge first.

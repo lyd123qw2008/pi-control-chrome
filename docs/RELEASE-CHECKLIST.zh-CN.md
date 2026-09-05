@@ -67,8 +67,13 @@ PR 创建或编辑后，必须读取远端正文进行渲染前检查：
 
 ```powershell
 gh pr view <number> --repo <owner>/<repo> --json title,body,state,mergeStateStatus,url
-$body = gh pr view <number> --repo <owner>/<repo> --json body --jq .body
-if ($body.Contains('\n') -or $body.Contains('\r') -or $body.Contains('\t')) { throw 'PR body contains literal escape sequences; fix it before merge' }
+$body = (gh pr view <number> --repo <owner>/<repo> --json body --jq '.body') -join "`n"
+$literalEscapeCount = [regex]::Matches($body, '\\[nrt]').Count
+$realLineBreakCount = [regex]::Matches($body, "`r?`n").Count
+[pscustomobject]@{ literalEscapeCount = $literalEscapeCount; realLineBreakCount = $realLineBreakCount }
+if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) {
+  throw 'PR body appears to contain encoded line breaks; fix it before merge'
+}
 ```
 
 检查结果必须同时满足：标题正确、`##` 标题和项目符号正常分行、代码块可读、验证命令完整、状态和合并条件符合预期。发现字面量转义符或 Markdown 粘连时，先用 `--body-file` 修复并再次读取确认，禁止直接合并。
