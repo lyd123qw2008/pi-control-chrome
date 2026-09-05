@@ -40,6 +40,44 @@ npm view @lyd123qw2008/dsh-tool-control-chrome version dist-tags --json
 
 如果目标包、目标版本或发布范围不明确，先确认再改文件；不要根据上一次发布的版本自行推断。
 
+## PR 描述格式门禁
+
+创建、编辑或合并 PR 前，必须确认 GitHub 上的正文是实际 Markdown 换行，而不是字面量的 `\n`、`\r` 或 `\t`。PowerShell、JSON 和 shell 命令中的转义方式不同；不要把包含 `\n` 的普通双引号字符串直接传给 `gh pr create --body` 或 `gh pr edit --body`。
+
+推荐使用真实换行的 here-string 或正文文件：
+
+```powershell
+@'
+## Summary
+
+- concise change summary
+
+## Validation
+
+- `npm run test:all`
+- `npm run check`
+'@ | Set-Content -Encoding utf8 pr-body.md
+
+gh pr create --title "<title>" --body-file pr-body.md
+# 修改已有 PR 时使用：
+gh pr edit <number> --body-file pr-body.md
+```
+
+PR 创建或编辑后，必须读取远端正文进行渲染前检查：
+
+```powershell
+gh pr view <number> --repo <owner>/<repo> --json title,body,state,mergeStateStatus,url
+$body = (gh pr view <number> --repo <owner>/<repo> --json body --jq '.body') -join "`n"
+$literalEscapeCount = [regex]::Matches($body, '\\[nrt]').Count
+$realLineBreakCount = [regex]::Matches($body, "`r?`n").Count
+[pscustomobject]@{ literalEscapeCount = $literalEscapeCount; realLineBreakCount = $realLineBreakCount }
+if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) {
+  throw 'PR body appears to contain encoded line breaks; fix it before merge'
+}
+```
+
+检查结果必须同时满足：标题正确、`##` 标题和项目符号正常分行、代码块可读、验证命令完整、状态和合并条件符合预期。发现字面量转义符或 Markdown 粘连时，先用 `--body-file` 修复并再次读取确认，禁止直接合并。
+
 ## 推荐发布顺序
 
 当 DSH 包依赖新的 Pi 根包时，按以下顺序执行：
@@ -96,11 +134,21 @@ corepack pnpm --dir dsh-tool-control-chrome run pack:check
 
 ## 发布后更新 active DSH Profile
 
-仓库中的 DSH 依赖更新不会自动修改 active Profile。根包和 DSH 包发布成功后，执行精确版本安装：
+仓库中的 DSH 依赖更新不会自动修改 active Profile。根包和 DSH 包发布成功后，执行精确版本安装。如果 Profile 链接了本地 DSH workspace 包，并由运行中的 DSH 安装提供 peer 依赖，先在 `pnpm-workspace.yaml` 顶层声明：
+
+```yaml
+# <DSH_HOME>/profiles/web/pnpm-workspace.yaml
+# pnpm 11 使用 workspace YAML 的 camelCase 配置，不要依赖 .npmrc 中的旧写法。
+autoInstallPeers: false
+```
+
+这样 lockfile 的 `settings.autoInstallPeers` 也必须为 `false`。pnpm 11 不可靠地读取 `.npmrc` 中的 `auto-install-peers=false`；如果存在该旧配置，应迁移到 workspace YAML。然后带显式的一次性参数执行更新：
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@<dsh-version>
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> --config.auto-install-peers=false
 ```
+
+如果命令因本地链接 DSH 包产生的 `>=0.1.1 <0.2.0-0` 等 peer 范围报 `ERR_PNPM_NO_MATCHING_VERSION`，不要发布新版本或回退包版本；这是把 workspace peer 当成 registry 依赖解析造成的。设置 `autoInstallPeers: false`、重新生成 lockfile 后重试。`pnpm peers check` 仍可能把由 DSH 安装提供的 peers 列为 missing，这属于预期警告，不作为失败条件；应以 `pnpm list`、`pnpm why`、实际 `node_modules` manifest 和重启后的运行验证为准。
 
 然后检查 Profile 是否存在旧的 root override：
 
