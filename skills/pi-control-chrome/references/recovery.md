@@ -9,6 +9,7 @@ Read this file before recovering a browser, Bridge, target, tab, handle, or clea
 - A target reconnect or connection-generation change is a recovery event, not permission to replay a side-effecting request. Refresh status, inspect the current page, and retry only a read when its result is known to be safe.
 - A changed URL, document incarnation, tab fence, reload, navigation, or closed tab invalidates document-bound observations. Take a new tab handle and snapshot.
 - `BROWSER_OPERATION_UNCERTAIN` means the side effect may have happened. Inspect before any retry; never replay it automatically.
+- DSH process lifecycle is maintainer-owned. Never invoke a DSH restart command or script, `taskkill`, or a replacement DSH server as automatic recovery; ask the maintainer to restart it manually and wait for confirmation before read-only verification.
 
 ## Wrong browser or competing targets
 
@@ -28,9 +29,9 @@ Do not keep retrying while two browser extensions are competing for one Bridge.
 
 Run `browser_doctor` once. Inspect `recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`.
 
-If the Bridge reports `capabilities.localUserRestart: true`, use the explicit host command (`/chrome restart` in Pi or DSH). The Bridge validates the instance, rejects pending browser work, serializes concurrent restarts, and leaves browser tabs untouched. Then run `browser_doctor` again and call `browser_status` before retrying.
+If the Bridge reports `capabilities.localUserRestart: true`, use the explicit host command (`/chrome restart` in Pi or DSH) only after the user explicitly authorizes a Bridge restart. The Bridge validates the instance, rejects pending browser work, serializes concurrent restarts, and leaves browser tabs untouched. This command restarts the Bridge, not the DSH process; never invoke it proactively during Profile updates or release verification. Then run `browser_doctor` again and call `browser_status` before retrying.
 
-Do not terminate a port owner from a port/PID lookup or command-line match, and do not start a second Bridge while the daily Bridge is healthy. Ask the user for host-level help only when cooperative restart is unavailable.
+Do not terminate a port owner from a port/PID lookup or command-line match, and do not start a second Bridge while the daily Bridge is healthy. Ask the user for host-level help only when cooperative restart is unavailable or the user has not authorized the Bridge restart.
 
 ### Bridge offline or extension disconnected
 

@@ -12,9 +12,13 @@
 | 浏览器扩展 | `extension/manifest.json` | `extension/background.js`、根包版本说明 | 随 Pi 根包发布；Manifest 版本号是否同步必须在发布矩阵中明确确认 |
 | DSH 包 `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `dsh-tool-control-chrome/pnpm-lock.yaml`、`dsh-tool-control-chrome/pnpm-workspace.yaml`、`dsh-tool-control-chrome/README.md` | `.github/workflows/publish-dsh-tool-control-chrome.yml` |
 | 私有 DSH Profile 配置仓库 | `dsh-profile-config/profiles/web/package.json`、`.agent-presets/` | `profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/*/preset.yml`、`.agent-presets/*/agent.cordis.yml`、`README.md`、bootstrap 脚本 | 只提交并合并独立 Profile 配置 PR，不发布 npm 包 |
-| active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile 的 `pnpm-lock.yaml`、`pnpm-workspace.yaml` | 不属于仓库发布；在 npm 发布成功后单独更新并重启 DSH |
+| active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile 的 `pnpm-lock.yaml`、`pnpm-workspace.yaml` | 不属于仓库发布；在 npm 发布成功后单独更新，由维护者手动重启 DSH |
 
 根包版本、扩展 Manifest 版本、DSH 包版本和 active Profile 版本不是同一个字段。不能因为其中一个版本已经 bump，就假设其他发布面已经更新。
+
+## DSH 重启约束
+
+发布 Agent **不得主动重启 DSH**，也不得调用 `/chrome restart`、重启脚本、`taskkill` 或另起一个 DSH 服务来代替重启。重启可能断开现有会话，也可能无法恢复到同一个运行时。Profile 依赖安装和 lockfile 校验完成后，必须停在“等待维护者手动重启”状态；只有维护者明确确认已经重启后，Agent 才能进行只读的 `/chrome status`、`browser_status` 和页面验证。维护者未确认重启时，不得宣称 active Profile 的运行时验证完成。
 
 ## 发布前必须建立版本矩阵
 

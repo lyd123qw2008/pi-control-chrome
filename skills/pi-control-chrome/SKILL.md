@@ -21,6 +21,7 @@ Use this Skill only when the user explicitly asks to use the existing Chrome or 
 - Browser target leases are scoped by target, tab fence, attach epoch, and CDP target. Never detach an untracked debugger target; stale-runtime recovery requires explicit user authorization.
 - Do not expose passwords, cookies, access tokens, private keys, pairing tokens, or unrelated page data. Do not inspect browser storage, cookies, passwords, or session stores as a discovery shortcut.
 - Do not upload files, download sensitive data, change account security, or submit irreversible actions without an explicit user request. Verify the target and intended value immediately before an externally visible side effect.
+- DSH process lifecycle is maintainer-owned: never invoke a DSH restart command or script, `taskkill`, or a replacement DSH server automatically. Treat `/chrome restart` as a human-only Bridge lifecycle command; use it only after explicit user confirmation for Bridge recovery, never as a way to restart DSH.
 
 ## Semantic and observation rules
 
