@@ -304,7 +304,7 @@ test("BridgeClient stops before open and reconnects without stale socket state",
       staleRequest,
       new Promise((_, reject) => setTimeout(() => reject(new Error("stale request was not rejected")), 100)),
     ]);
-    await assert.rejects(staleOutcome, /Pi browser bridge disconnected/);
+    await assert.rejects(staleOutcome, error => error?.message === "Pi browser bridge disconnected" && error?.code === "BROWSER_BRIDGE_DISCONNECTED" && error?.details?.retryable === true);
 
     const requestPromise = client.request("probe", { source: "reconnected" });
     await new Promise(resolve => setImmediate(resolve));
@@ -461,6 +461,31 @@ test("Pi forwards semantic wait and locator targets with session and connection 
   }
 });
 
+test("Pi retries a read once after a target connection change", async () => {
+  const mock = await createMockBridge();
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    await harness.tools.get("browser_status").execute("bind", {});
+    mock.enqueue("snapshot", async (_message, respond) => respond(undefined, { code: "TARGET_CONNECTION_CHANGED", message: "Browser target connection changed" }));
+    mock.enqueue("snapshot", async (_message, respond) => respond({ tabId: 7, snapshot: { snapshotId: "fresh", state: 'button "Save" [ref=e1]', nodeCount: 1, charCount: 25, truncated: false } }));
+
+    const result = await harness.tools.get("browser_snapshot").execute("read", { tabId: 7 });
+    const value = JSON.parse(result.content[0].text);
+    assert.equal(value.snapshot.snapshotId, "fresh");
+    assert.equal(mock.requests.filter(message => message.method === "snapshot").length, 2);
+  } finally {
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
+
 test("Pi omits blank browser fields before dispatch", async () => {
   const mock = await createMockBridge();
   const harness = createPiHarness();
@@ -525,6 +550,9 @@ test("Pi preserves structured AX and tab lifecycle errors from the Bridge", asyn
     }));
     const disabled = await harness.tools.get("browser_click").execute("ax-disabled", { tabId: 7, ref: "a1", snapshotId: "snapshot-ax" });
     assert.equal(disabled.details.code, "AX_NODE_DISABLED");
+    assert.equal(disabled.details.actionState, "not_completed");
+    assert.equal(disabled.details.retryable, false);
+    assert.equal(disabled.details.nextAction, "browser_accessibility_snapshot");
     assert.deepEqual(disabled.details.details, { snapshotId: "snapshot-ax", actionState: "not_completed" });
 
     mock.enqueue("locator", async (_message, respond) => respond(undefined, {
@@ -534,6 +562,9 @@ test("Pi preserves structured AX and tab lifecycle errors from the Bridge", asyn
     }));
     const closed = await harness.tools.get("browser_locator").execute("closed-tab", { tabId: 7, action: "count", target: { role: "button" } });
     assert.equal(closed.details.code, "BROWSER_TAB_CLOSED");
+    assert.equal(closed.details.actionState, "not_completed");
+    assert.equal(closed.details.inspectFirst, true);
+    assert.equal(closed.details.nextAction, "browser_tabs");
     assert.deepEqual(closed.details.details, { tabId: 7 });
   } finally {
     try {

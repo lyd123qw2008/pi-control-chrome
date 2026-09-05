@@ -89,6 +89,39 @@ test("Pi snapshot projection honors explicit budgets and preserves refs", () => 
   assert.equal(result.snapshot.truncated, true);
 });
 
+test("Pi snapshot projection includes bounded embedded-frame context", () => {
+  const result = compactBrowserResult("browser_snapshot", {}, {
+    snapshot: {
+      snapshotId: "snapshot-frame",
+      state: "Interactive elements:\n- link \\\"Pages\\\" [ref=e1]",
+      nodeCount: 1,
+      frameSummaries: [{ framePath: "mainFrame", name: "mainFrame", readable: true, title: "Business page", text: "Customer chatbot" }],
+      frameCount: 1,
+    },
+  });
+  assert.match(result.snapshot.state, /Embedded frames:/);
+  assert.match(result.snapshot.state, /Customer chatbot/);
+  assert.equal(result.snapshot.frames[0].name, "mainFrame");
+  assert.equal(result.snapshot.frames[0].text, undefined);
+  assert.equal(result.snapshot.frameCount, 1);
+});
+
+test("Pi extract projection preserves frame diagnostics without raw frame payloads", () => {
+  const result = compactBrowserResult("browser_extract", {}, {
+    content: {
+      title: "Prototype shell",
+      text: "Pages\\nCustomer chatbot",
+      markdown: "Pages",
+      frameSummaries: [{ framePath: "mainFrame", readable: false, reason: "cross_origin", url: "https://private.example/frame", text: "must not leak" }],
+      frameFailures: 1,
+    },
+  });
+  assert.equal(result.content.frames[0].reason, "cross_origin");
+  assert.equal(result.content.frames[0].text, undefined);
+  assert.equal(result.content.frameFailures, 1);
+  assert.doesNotMatch(JSON.stringify(result), /must not leak/);
+});
+
 test("Pi snapshot projection accepts an already compact Bridge response", () => {
   const result = compactSnapshotResult({
     browserId: "edge:test",

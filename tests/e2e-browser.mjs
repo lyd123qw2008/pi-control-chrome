@@ -54,6 +54,7 @@ const site = `<!doctype html>
 <h1>Pi Control Chrome E2E</h1>
 <div id="async-status">Loading...</div>
 <label>Name <input id="name" placeholder="Name"></label>
+<label for="press-target">Press target</label><input id="press-target" aria-label="Press target" placeholder="Press target">
 <label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label>
 <label><input id="agree" type="checkbox"> Agree</label>
 <label for="email">Email</label><input id="email" placeholder="Email">
@@ -93,6 +94,7 @@ const marker = new URLSearchParams(location.search).get('marker');
 if (marker) document.querySelector('h1').textContent = marker;
 const out = document.querySelector('#out');
 document.querySelector('#go').addEventListener('click', () => { out.textContent = 'Hello ' + document.querySelector('#name').value; });
+document.querySelector('#press-target').addEventListener('keydown', event => { out.textContent = 'Pressed ' + event.key; });
 document.querySelector('#history-action').addEventListener('click', () => {
   history.pushState({}, '', '?marker=History%20action');
   document.querySelector('h1').textContent = 'History action';
@@ -760,6 +762,16 @@ try {
   assert.equal(semanticFill.result?.element?.tag, "input");
   const semanticInput = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#name').value" });
   assert.equal(semanticInput.result?.result?.value, "Semantic");
+  const semanticPress = await request("interaction", {
+    tabId: selected.tab.id,
+    operation: "press",
+    target: { role: "textbox", name: "Press target", exact: true },
+    key: "Enter",
+    timeoutMs: 5000,
+  });
+  assert.equal(semanticPress.result?.resolvedBy, "chromium_ax");
+  const pressedValue = await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#out').textContent" });
+  assert.equal(pressedValue.result?.result?.value, "Pressed Enter");
   const semanticClick = await request("interaction", {
     tabId: selected.tab.id,
     operation: "click",

@@ -101,7 +101,7 @@ function loadExtension(options = {}) {
         const tab = { id, windowId: Number(details.windowId ?? 1), title: "", url: createdUrl, status: "loading", active: details.active === true };
         tabs.set(id, tab);
         await tabCreated.emit(tab);
-        tab.status = "complete";
+        if (options.createTabComplete !== false) tab.status = "complete";
         return tab;
       },
       async update(tabId, details = {}) {
@@ -153,6 +153,7 @@ function loadExtension(options = {}) {
         const tab = tabs.get(Number(target.tabId));
         if (options.restrictedPageError && tab?.url === "about:blank") throw new Error(options.restrictedPageError);
         if (Array.isArray(files) && files.length > 0) return [{ result: undefined }];
+        if (options.hangPageGeneration === true && func.name === "pageGeneration") return new Promise(() => {});
         if (options.executeScriptException && func.name === (options.executeScriptException.functionName || "collectSnapshot")) return [{ exceptionDetails: options.executeScriptException.details }];
         if (func.name === "pageGeneration") {
           const sequence = Array.isArray(options.pageGenerationSequence) ? options.pageGenerationSequence : [];
@@ -258,7 +259,7 @@ function loadExtension(options = {}) {
     }
     return originalExecuteScript(details);
   };
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
     chrome,
@@ -358,6 +359,51 @@ test("Page Agent injection is idempotent, upgrades in place, and resolves bounde
 
   vm.runInContext(source, context, { filename: pageAgentPath });
   assert.equal(vm.runInContext("globalThis.__piControlChromePageAgent", context), upgraded);
+});
+
+test("Page Agent summarizes readable and cross-origin embedded frames", () => {
+  const style = { display: "block", visibility: "visible", collapse: "visible", contentVisibility: "visible", opacity: "1" };
+  const ownerWindow = { getComputedStyle: () => style };
+  const embeddedDocument = {
+    title: "Embedded business page",
+    documentElement: {},
+    body: { innerText: "Customer chatbot", textContent: "Customer chatbot", querySelectorAll: () => [] },
+  };
+  const frame = {
+    nodeType: 1,
+    tagName: "IFRAME",
+    id: "mainFrame",
+    ownerDocument: { defaultView: ownerWindow },
+    parentElement: null,
+    hidden: false,
+    getAttribute(name) { return name === "name" ? "mainFrame" : null; },
+    getBoundingClientRect() { return { width: 640, height: 480 }; },
+    contentDocument: embeddedDocument,
+    contentWindow: { location: { href: "https://example.test/embedded" } },
+  };
+  const crossOriginFrame = {
+    ...frame,
+    id: "externalFrame",
+    getAttribute(name) { return name === "name" ? "externalFrame" : null; },
+    contentDocument: null,
+  };
+  Object.defineProperty(crossOriginFrame, "contentWindow", { get() { throw new Error("cross-origin frame"); } });
+  const root = { querySelectorAll: () => [frame, crossOriginFrame] };
+  const context = vm.createContext({
+    crypto: { randomUUID: () => "document-token" },
+    document: { body: root },
+    location: { href: "https://example.test/shell" },
+    performance: { timeOrigin: 123 },
+  });
+  const source = readFileSync(pageAgentPath, "utf8");
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  const result = vm.runInContext("globalThis.__piControlChromePageAgent.collectFrames({ root: document.body })", context);
+  assert.equal(result.frameCount, 2);
+  assert.equal(result.frameFailures, 1);
+  assert.equal(result.frames[0].name, "mainFrame");
+  assert.equal(result.frames[0].readable, true);
+  assert.equal(result.frames[0].text, "Customer chatbot");
+  assert.equal(result.frames[1].reason, "cross_origin");
 });
 
 test("page generation reads the Page Agent document identity", async () => {
@@ -518,6 +564,62 @@ test("new-tab can target an explicit browser window", async () => {
 });
 
 
+test("new-tab replaces stale runtime ownership for its fresh created tab", async () => {
+  const tabId = 329;
+  const otherTabId = 330;
+  const stale = { ...record(tabId, "temporary", "old owner", "https://example.test/old"), runtimeId: "old-extension-runtime" };
+  const unrelatedStale = { ...record(otherTabId, "temporary", "other old owner", "https://example.test/other"), runtimeId: "older-extension-runtime" };
+  const fixture = loadExtension({
+    createTabId: tabId,
+    storage: {
+      [ownedTabsKey]: {
+        version: 3,
+        records: {
+          [`${stale.browserId}::${tabId}`]: stale,
+          [`${unrelatedStale.browserId}::${otherTabId}`]: unrelatedStale,
+        },
+      },
+      [profileIdKey]: "profile-id",
+    },
+  });
+  fixture.tabs.set(otherTabId, { id: otherTabId, windowId: 1, title: unrelatedStale.title, url: unrelatedStale.url });
+  const result = await fixture.api.handleRequest("new_tab", { url: "https://example.test/new", wait: false, sessionId: "session-test" });
+  const current = storedRecord(fixture, tabId);
+  const preserved = storedRecord(fixture, otherTabId);
+  assert.equal(result.tab.id, tabId);
+  assert.equal(current?.sessionId, "session-test");
+  assert.notEqual(current?.runtimeId, stale.runtimeId);
+  assert.equal(current?.tabFence, result.tab.handle.tabFence);
+  assert.equal(preserved?.runtimeId, unrelatedStale.runtimeId);
+});
+
+
+test("new-tab ownership does not probe a loading document before load", async () => {
+  const fixture = loadExtension({ createTabComplete: false });
+  const created = await fixture.api.handleRequest("new_tab", { url: "https://example.test/loading", wait: false, sessionId: "session-test" });
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageGeneration"), false);
+  const tab = fixture.tabs.get(created.tab.id);
+  tab.status = "complete";
+  await fixture.emitTabUpdated(created.tab.id, { status: "complete" }, tab);
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  assert.equal(typeof listed.tabs.find((entry) => entry.id === created.tab.id)?.handle.incarnation, "string");
+});
+
+
+test("tab inventory bounds a hung document identity probe", async () => {
+  const fixture = loadExtension({ hangPageGeneration: true });
+  const tab = { id: 328, windowId: 1, title: "hung identity", url: "https://example.test/hung-identity", status: "complete" };
+  fixture.tabs.set(tab.id, tab);
+  const stored = record(tab.id, "temporary", tab.title, tab.url);
+  fixture.storage[ownedTabsKey] = { version: 3, records: { [`${stored.browserId}::${tab.id}`]: stored } };
+
+  const startedAt = Date.now();
+  const listed = await fixture.api.handleRequest("list_tabs", {});
+  assert.ok(Date.now() - startedAt < 2_000);
+  assert.equal(listed.tabs.find((entry) => entry.id === tab.id)?.handle.incarnation, undefined);
+});
+
+
 test("new-tab load wait accepts browser URL canonicalization without requiring redirects", async () => {
   const fixture = loadExtension({ createdTabUrl: "https://example.test/" });
   const result = await fixture.api.handleRequest("new_tab", { url: "https://example.test", wait: true, sessionId: "session-test" });
@@ -540,6 +642,20 @@ test("Bridge new-tab wait accepts canonical URL normalization", async () => {
   const response = fixture.heartbeatMessages.find((message) => message.type === "response" && message.id === requestId);
   assert.equal(response?.error, undefined, JSON.stringify(fixture.heartbeatMessages));
   assert.equal(response?.result?.tab?.url, "https://example.test/");
+});
+
+
+test("control-plane status and tab inventory stay responsive behind a stuck page operation", async () => {
+  const fixture = loadExtension();
+  fixture.api.enqueueBridgeRequest(() => new Promise(() => {}));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  fixture.emitSocketOpen();
+
+  await fixture.emitSocketMessage({ type: "request", id: "status-behind-stuck-operation", method: "status", params: {} });
+  await fixture.emitSocketMessage({ type: "request", id: "tabs-behind-stuck-operation", method: "list_tabs", params: {} });
+  const responses = fixture.heartbeatMessages.filter((message) => message.type === "response");
+  assert.equal(responses.find((message) => message.id === "status-behind-stuck-operation")?.result?.connected, true);
+  assert.equal(Array.isArray(responses.find((message) => message.id === "tabs-behind-stuck-operation")?.result?.tabs), true);
 });
 
 
@@ -1132,6 +1248,28 @@ test("truncated AX semantic trees fail closed instead of falling back to DOM", a
   assert.equal(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"), false);
 });
 
+test("text-only interactions fall back to DOM for custom clickable elements missing from AX", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: { pageOperation: { ok: true, element: { tag: "a" } } },
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-text-fallback" } } };
+      if (method === "Accessibility.getFullAXTree") return { nodes: [] };
+      return {};
+    },
+  });
+  fixture.tabs.set(324, { id: 324, windowId: 1, title: "AX text fallback", url: "https://example.test/ax-text-fallback", status: "complete" });
+
+  const result = await fixture.api.handleRequest("interaction", {
+    tabId: 324,
+    target: { text: "API", exact: true },
+    operation: "click",
+    sessionId: "session-test",
+  });
+  assert.equal(result.result.ok, true);
+  assert.equal(result.result.element.tag, "a");
+  assert.ok(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"));
+});
+
 test("ordinary role-name operations resolve through Chromium AX before DOM semantic fallback", async () => {
   const fixture = loadExtension({
     debuggerCommandResult: async (method, params) => {
@@ -1342,6 +1480,54 @@ test("AX semantic side effects preserve uncertainty after dispatch", async () =>
   assert.equal(fixture.debuggerCommandCalls.some(({ method, params }) => method === "Runtime.releaseObject" && params?.objectId === "ax-save"), true);
 });
 
+test("deterministic AX validation failures are not retried after a dispatch reservation", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-validation" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ nodeId: "choice", backendDOMNodeId: 93, role: { type: "role", value: "combobox" }, name: { type: "string", value: "Choice" }, ignored: false }],
+      };
+      if (method === "DOM.resolveNode") return { object: { objectId: "ax-choice" } };
+      if (method === "Runtime.callFunctionOn") {
+        const operation = params?.arguments?.[0]?.value;
+        if (operation === "isVisible") return { result: { type: "boolean", value: true } };
+        if (operation === "describe") return { result: { type: "object", value: { tag: "select", disabled: false, rect: { x: 0, y: 0, width: 80, height: 24 } } } };
+        if (operation === "select") return {
+          result: {
+            type: "object",
+            value: {
+              __piControlError: true,
+              error: {
+                code: "AX_NODE_NOT_FOUND",
+                message: "Select value did not match any option",
+                details: { actionState: "not_completed", retryable: false, inspectFirst: false },
+              },
+            },
+          },
+        };
+      }
+      return {};
+    },
+  });
+  fixture.tabs.set(327, { id: 327, windowId: 1, title: "AX validation", url: "https://example.test/ax-validation", status: "complete" });
+
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", {
+      tabId: 327,
+      target: { role: "combobox", name: "Choice", exact: true },
+      operation: "select",
+      value: "missing",
+      timeoutMs: 1000,
+      sessionId: "session-test",
+    }),
+    (error) => error?.code === "AX_NODE_NOT_FOUND"
+      && error?.details?.actionState === "not_completed"
+      && error?.details?.retryable === false,
+  );
+  assert.equal(fixture.debuggerCommandCalls.filter(({ method, params }) => method === "Runtime.callFunctionOn" && params?.arguments?.[0]?.value === "select").length, 1);
+  assert.equal(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"), false);
+});
+
 test("closed tabs retain a structured tab error before semantic resolution starts", async () => {
   const fixture = loadExtension({ executeScriptResults: { pageOperation: { ok: true } } });
 
@@ -1405,6 +1591,45 @@ test("semantic operations use the DOM path only when the AX domain is unavailabl
   });
   assert.equal(result.result.element.tag, "button");
   assert.ok(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"));
+});
+
+test("page observations forward iframe scope and preserve bounded frame metadata", async () => {
+  const fixture = loadExtension({
+    executeScriptResults: {
+      collectSnapshot: {
+        snapshotId: "snapshot-frame",
+        __piControlChromeSnapshotUrl: "https://example.test/frame-shell",
+        __piControlChromeSnapshotTimeOrigin: 1,
+        __piControlChromeSnapshotToken: "fixture-document-token",
+        title: "Frame shell",
+        url: "https://example.test/frame-shell",
+        text: "Shell",
+        elements: [],
+        frameSummaries: [{ framePath: "mainFrame", name: "mainFrame", readable: true, title: "Embedded", text: "Business content" }],
+        frameCount: 1,
+      },
+      extractPage: {
+        title: "Frame shell",
+        url: "https://example.test/frame-shell",
+        text: "Shell\\n\\n[Embedded frame: Embedded]\\nBusiness content",
+        markdown: "Shell",
+        truncated: false,
+        frameSummaries: [{ framePath: "mainFrame", name: "mainFrame", readable: true, title: "Embedded", text: "Business content" }],
+        frameCount: 1,
+      },
+    },
+  });
+  fixture.tabs.set(315, { id: 315, windowId: 1, title: "Frame shell", url: "https://example.test/frame-shell", status: "complete" });
+
+  const snapshot = await fixture.api.handleRequest("snapshot", { tabId: 315, includeFrames: false, sessionId: "session-test" });
+  const snapshotCall = fixture.executeScriptCalls.find((call) => call.functionName === "collectSnapshot");
+  assert.equal(snapshotCall.args[0].includeFrames, false);
+  assert.equal(snapshot.snapshot.frameSummaries[0].name, "mainFrame");
+
+  const extract = await fixture.api.handleRequest("extract", { tabId: 315, includeFrames: false, sessionId: "session-test" });
+  const extractCall = fixture.executeScriptCalls.find((call) => call.functionName === "extractPage");
+  assert.equal(extractCall.args[0].includeFrames, false);
+  assert.equal(extract.content.frameCount, 1);
 });
 
 test("extract accepts an unowned user tab without a returned document handle", async () => {

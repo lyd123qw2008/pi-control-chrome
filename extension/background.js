@@ -30,12 +30,15 @@ const EXTENSION_CAPABILITIES = Object.freeze({
   liveRefs: true,
   semanticRebind: true,
   axRefs: true,
+  frameAwareReads: true,
   tabIncarnationFence: true,
 });
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
 const DEBUGGER_LEASE_IDLE_MS = 15_000;
 const BRIDGE_HEARTBEAT_INTERVAL_MS = 20_000;
+const FRAME_TREE_STABILITY_TIMEOUT_MS = 500;
+const FRAME_TREE_STABILITY_INTERVAL_MS = 25;
 
 let socket;
 let connecting;
@@ -1310,7 +1313,14 @@ async function connect() {
         activeRequestDetails.set(requestKey, { method: message.method, sessionId: params.sessionId, params, socket: next });
         if (message.method === "cleanup") abortActiveWaits(params.sessionId);
         const priorBridgeRequests = bridgeRequestTail;
-        const waitOutsideQueue = message.method === "wait"
+        // Status is a control-plane read and must remain responsive even when a
+        // queued page operation is waiting on a browser API or a slow document.
+        // Waited page operations continue to use the serialized queue for their
+        // state-changing setup, but recovery can always observe target identity.
+        const waitOutsideQueue = message.method === "status"
+          || message.method === "list_tabs"
+          || message.method === "selected_tab"
+          || message.method === "wait"
           || (message.method === "download" && (params.action === "wait" || (params.action === "start" && params.wait !== false)))
           || (message.method === "new_tab" && params.wait === true)
           || (message.method === "navigate" && params.wait !== false)
@@ -1796,6 +1806,11 @@ async function assertOwnershipRecordsCurrent(records, keys, action, tolerateMiss
   for (const key of keys) {
     const record = records[key];
     if (!record || typeof record.tabFence !== "string") continue;
+    // Records from a previous extension runtime are intentionally unknown. If
+    // this mutation did not touch one, preserve it without requiring its old
+    // fence to remain observable; fresh Agent tabs may still be recorded while
+    // explicit stale-runtime recovery remains required for those old records.
+    if (record.runtimeId !== runtimeInstanceIdentity && tolerateMissing.has(key)) continue;
     let currentTab;
     try {
       currentTab = await chrome.tabs.get(Number(record.tabId));
@@ -1827,7 +1842,10 @@ function mutateOwnedTabs(mutator) {
   return run;
 }
 
-async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temporary", expectedFence) {
+async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temporary", expectedFence, options = {}) {
+  const allowUnknownDocument = options.allowUnknownDocument === true;
+  const replaceStaleRuntime = options.replaceStaleRuntime === true;
+  if (allowUnknownDocument && owner === "claimed") throw new Error("Claimed tabs require a verified document identity");
   return mutateOwnedTabs(async (owned) => {
     const fenceBeforeLookup = expectedFence ?? await tabFenceFor(tab.id, true);
     const currentTab = await chrome.tabs.get(Number(tab.id)).catch(() => undefined);
@@ -1837,20 +1855,24 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
     const key = targetStateKey(tab.id, browserId);
     const tabFence = await tabFenceFor(tab.id, true);
     if (tabFence !== fenceBeforeLookup) throw new Error(`Tab ${tab.id} changed during setup; inspect the current browser state before retrying`);
-    const incarnation = await readTabIncarnation(tab.id, tabFence);
-    if (owner === "claimed" && typeof incarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
+    const incarnation = allowUnknownDocument ? undefined : await readTabIncarnation(tab.id, tabFence);
+    if (!allowUnknownDocument && owner === "claimed" && typeof incarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
     if (tab.incarnation !== undefined && incarnation !== undefined && tab.incarnation !== incarnation) throw new Error(`Tab ${tab.id} incarnation changed during the claim`);
     const existing = owned[key];
     if (existing) {
-      if (existing.runtimeId !== runtimeInstanceIdentity) throw new Error(`Cannot ${owner === "claimed" ? "claim" : "record"} tab ${tab.id}; its tab incarnation is unknown after the extension runtime changed`);
-      throw new Error(`Tab ${tab.id} is already owned; release it before claiming or recording it again`);
+      if (existing.runtimeId !== runtimeInstanceIdentity) {
+        if (!replaceStaleRuntime || owner !== "agent") throw new Error(`Cannot ${owner === "claimed" ? "claim" : "record"} tab ${tab.id}; its tab incarnation is unknown after the extension runtime changed`);
+        delete owned[key];
+      } else {
+        throw new Error(`Tab ${tab.id} is already owned; release it before claiming or recording it again`);
+      }
     }
     const finalTab = await chrome.tabs.get(Number(tab.id)).catch(() => undefined);
     if (!finalTab) throw new Error(`Tab ${tab.id} was closed before ownership could be recorded`);
     await assertTabFence(tab.id, tabFence, "record");
     if (owner === "claimed" && !tabSnapshotMatches(tab, finalTab)) throw new Error(`Tab ${tab.id} changed during the claim; take a new browser_tabs snapshot`);
-    const finalIncarnation = await readTabIncarnation(tab.id, tabFence);
-    if (owner === "claimed" && (typeof incarnation !== "string" || typeof finalIncarnation !== "string" || incarnation !== finalIncarnation)) {
+    const finalIncarnation = allowUnknownDocument ? undefined : await readTabIncarnation(tab.id, tabFence);
+    if (!allowUnknownDocument && owner === "claimed" && (typeof incarnation !== "string" || typeof finalIncarnation !== "string" || incarnation !== finalIncarnation)) {
       if (typeof incarnation !== "string" || typeof finalIncarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
       throw new Error(`Tab ${tab.id} document incarnation changed during ownership recording`);
     }
@@ -1858,8 +1880,8 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
     if (!latestTab) throw new Error(`Tab ${tab.id} was closed before ownership could be recorded`);
     await assertTabFence(tab.id, tabFence, "record");
     if (owner === "claimed" && !tabSnapshotMatches(tab, latestTab)) throw new Error(`Tab ${tab.id} changed during the claim; take a new browser_tabs snapshot`);
-    const latestIncarnation = await readTabIncarnation(tab.id, tabFence);
-    if (owner === "claimed" && (typeof incarnation !== "string" || typeof latestIncarnation !== "string" || incarnation !== latestIncarnation)) {
+    const latestIncarnation = allowUnknownDocument ? undefined : await readTabIncarnation(tab.id, tabFence);
+    if (!allowUnknownDocument && owner === "claimed" && (typeof incarnation !== "string" || typeof latestIncarnation !== "string" || incarnation !== latestIncarnation)) {
       if (typeof incarnation !== "string" || typeof latestIncarnation !== "string") throw documentIdentityUnavailableError(tab.id, "claim");
       throw new Error(`Tab ${tab.id} document incarnation changed during ownership recording`);
     }
@@ -1985,8 +2007,14 @@ function creationFlightMatches(tab, flight) {
   if (flight.tabId !== undefined) return Number(flight.tabId) === Number(tab?.id)
     && (!Number.isFinite(flight.windowId) || Number(tab?.windowId) === Number(flight.windowId));
   if (Number.isFinite(flight.windowId) && Number(tab?.windowId) !== Number(flight.windowId)) return false;
-  const eventUrl = String(tab?.url || "");
-  return eventUrl === String(flight.url || "");
+  const eventUrl = canonicalTabUrl(String(tab?.url || ""));
+  const requestedUrl = canonicalTabUrl(String(flight.url || ""));
+  // Chromium may report the newly created tab as about:blank/newtab before
+  // the requested URL is attached. While a create flight is active, avoid
+  // rotating a stale ownership fence for that tab; the reservation below will
+  // bind the eventual returned tab identity.
+  return eventUrl === requestedUrl
+    || ["", "about:blank", "chrome://newtab/", "edge://newtab/"].includes(eventUrl);
 }
 
 function activeCreationFlightsFor(tab) {
@@ -1996,7 +2024,7 @@ function activeCreationFlightsFor(tab) {
 function creationMarkerMatches(tab, marker) {
   return marker && Number(marker.tabId) === Number(tab.id)
     && (marker.windowId === undefined || Number(marker.windowId) === Number(tab.windowId))
-    && (marker.url === undefined || String(marker.url) === String(tab.url || ""));
+    && (marker.url === undefined || canonicalTabUrl(String(marker.url)) === canonicalTabUrl(String(tab.url || "")));
 }
 
 function rememberCreatedTabEvent(tab, fence, completed = false) {
@@ -2270,6 +2298,21 @@ async function listGroups() {
   }));
 }
 
+const LIST_TAB_IDENTITY_TIMEOUT_MS = 750;
+
+async function readTabIncarnationForListing(tabId, expectedFence) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), LIST_TAB_IDENTITY_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([readTabIncarnation(tabId, expectedFence, true), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function listTabs() {
   const tabs = await chrome.tabs.query({});
   const owned = await ownedTabs();
@@ -2296,7 +2339,10 @@ async function listTabs() {
     const transition = pendingDocumentTransition(tab.id, currentFence);
     const transitionPending = transition !== undefined && transition.completed !== true;
     const checksDocument = record?.owner === "claimed";
-    const incarnation = record && !transitionPending ? await readTabIncarnation(tab.id, currentFence) : undefined;
+    // Do not inject the Page Agent into a freshly created loading tab while its
+    // navigation is still in flight. The next stable listing will acquire the
+    // document identity; the tab fence remains available immediately.
+    const incarnation = record && !transitionPending && tab.status === "complete" ? await readTabIncarnationForListing(tab.id, currentFence) : undefined;
     return {
       id: tab.id,
       browserId: identity.browserId,
@@ -2910,6 +2956,15 @@ function collectDomAccessibilitySnapshot(options = {}) {
       throw new Error(`Invalid snapshot selector: ${String(options.selector)}`);
     }
   })();
+  const pageAgent = globalThis["__piControlChromePageAgent"];
+  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  const frameInfo = typeof pageAgent?.collectFrames === "function"
+    ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
+    : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
+  const frameText = frameInfo.frames
+    .filter((frame) => frame.readable === true && typeof frame.text === "string" && frame.text.length > 0)
+    .map((frame) => `[Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}]\n${frame.text}`)
+    .join("\n\n");
   const candidates = [];
   const candidateSelector = "a,button,input,textarea,select,summary,[role],[contenteditable]";
   if (root.matches?.(candidateSelector) || implicitRole(root)) candidates.push(root);
@@ -2951,7 +3006,7 @@ function collectDomAccessibilitySnapshot(options = {}) {
     charCount += cost;
   }
   const publicNodes = nodes.map(({ key: _key, ...node }) => node);
-  const state = publicNodes.map((node) => {
+  const rawSemanticState = publicNodes.map((node) => {
     const name = node.name ? ` ${JSON.stringify(String(node.name))}` : "";
     const value = node.value === undefined ? "" : ` value=${JSON.stringify(String(node.value))}`;
     const disabled = node.disabled ? " disabled" : "";
@@ -2959,6 +3014,9 @@ function collectDomAccessibilitySnapshot(options = {}) {
     const level = node.level === undefined ? "" : ` level=${node.level}`;
     return `- ${node.role}${name}${value}${disabled}${checked}${level}`;
   }).join("\n");
+  const rawState = [rawSemanticState, frameText ? `Embedded frames:\n${frameText}` : ""].filter(Boolean).join("\n\n");
+  const state = bound(rawState, maxChars);
+  truncated = truncated || rawState.length > maxChars;
   return {
     role: "document",
     name: bound(document.title),
@@ -2969,6 +3027,11 @@ function collectDomAccessibilitySnapshot(options = {}) {
     truncated,
     maxChars,
     maxNodes,
+    ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
+    ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
+    ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
+    ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
+    ...(frameInfo.truncated ? { framesTruncated: true } : {}),
     __piControlChromeAccessibilityNodes: nodes,
   };
 }
@@ -3121,6 +3184,33 @@ function accessibilityFrameIdentity(frames) {
   })).sort((left, right) => left.frameId.localeCompare(right.frameId)));
 }
 
+async function waitForStableFrameTree(sendCommand, signal, action = "accessibility", includeFrames = true) {
+  const deadline = Date.now() + FRAME_TREE_STABILITY_TIMEOUT_MS;
+  let previousIdentity;
+  let latestTree;
+  let latestFrames = [];
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw abortError(signal, "Browser request aborted");
+    let currentTree;
+    try {
+      currentTree = await sendCommand("Page.getFrameTree");
+    } catch (error) {
+      throw accessibilityProtocolError(error, "Page.getFrameTree");
+    }
+    const currentFrames = frameRecords(currentTree);
+    const comparableFrames = includeFrames ? currentFrames : [currentFrames[0] || { id: undefined }];
+    const currentIdentity = accessibilityFrameIdentity(comparableFrames);
+    latestTree = currentTree;
+    latestFrames = comparableFrames;
+    if (previousIdentity !== undefined && previousIdentity === currentIdentity) return { tree: latestTree, frames: latestFrames };
+    previousIdentity = currentIdentity;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await waitWithSignal(Math.min(FRAME_TREE_STABILITY_INTERVAL_MS, remaining), signal);
+  }
+  throw pageChangingDuringReadError(action, { frameChanged: true, frameStabilityTimedOut: true });
+}
+
 function accessibilityProtocolError(error, method) {
   const message = error instanceof Error ? error.message : String(error);
   if (/-32601|method not found|unknown (?:command|method)|not implemented|not supported|cannot find context|wasn['’]?t found|does not exist/i.test(message)) {
@@ -3205,8 +3295,8 @@ async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
     }
   };
   if (selector) {
-    const frameTree = await readFrameTree();
-    const initialFrames = frameRecords(frameTree);
+    const stable = await waitForStableFrameTree(readFrameTree, options.signal, "accessibility", options.includeFrames !== false);
+    const initialFrames = stable.frames;
     const mainFrameId = initialFrames[0]?.id;
     let document;
     try {
@@ -3249,7 +3339,9 @@ async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
       throw accessibilityProtocolError(error, "Accessibility.getPartialAXTree");
     }
     const finalFrameTree = await readFrameTree();
-    if (accessibilityFrameIdentity(initialFrames) !== accessibilityFrameIdentity(frameRecords(finalFrameTree))) {
+    const finalFrames = frameRecords(finalFrameTree);
+    const comparableFinalFrames = options.includeFrames === false ? [finalFrames[0] || { id: undefined }] : finalFrames;
+    if (accessibilityFrameIdentity(initialFrames) !== accessibilityFrameIdentity(comparableFinalFrames)) {
       throw pageChangingDuringReadError("accessibility", { frameChanged: true });
     }
     const scopedNodes = axSubtreeNodes(partial?.nodes, selectedBackendNodeId);
@@ -3266,10 +3358,12 @@ async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
       selector,
     };
   }
-  const frameTree = await readFrameTree();
-  const frames = frameRecords(frameTree);
-  const initialFrameIdentity = accessibilityFrameIdentity(frames);
-  const targets = frames.length > 0 ? frames : [{ id: undefined }];
+  const stable = await waitForStableFrameTree(readFrameTree, options.signal, "accessibility", options.includeFrames !== false);
+  const frames = stable.frames;
+  const targets = options.includeFrames === false
+    ? [frames[0] || { id: undefined }]
+    : frames.length > 0 ? frames : [{ id: undefined }];
+  const initialFrameIdentity = accessibilityFrameIdentity(targets);
   const results = [];
   const failures = [];
   for (const frame of targets) {
@@ -3292,13 +3386,15 @@ async function captureChromiumAccessibilityNodes(sendCommand, options = {}) {
     }
   }
   const finalFrameTree = await readFrameTree();
-  if (initialFrameIdentity !== accessibilityFrameIdentity(frameRecords(finalFrameTree))) {
+  const finalFrames = frameRecords(finalFrameTree);
+  const comparableFinalFrames = options.includeFrames === false ? [finalFrames[0] || { id: undefined }] : finalFrames;
+  if (initialFrameIdentity !== accessibilityFrameIdentity(comparableFinalFrames)) {
     throw pageChangingDuringReadError("accessibility", { frameChanged: true });
   }
   return { frames: results, frameCount: targets.length, frameFailures: failures.length };
 }
 
-async function collectChromiumAccessibilitySnapshot(tabId, options = {}, sessionId, expectedFence, expectedGeneration, fallbackTitle) {
+async function collectChromiumAccessibilitySnapshot(tabId, options = {}, sessionId, expectedFence, expectedGeneration, fallbackTitle, signal) {
   const positiveLimit = (value, fallback, maximum) => {
     if (value === undefined) return fallback;
     const number = Number(value);
@@ -3308,9 +3404,12 @@ async function collectChromiumAccessibilitySnapshot(tabId, options = {}, session
   const maxChars = positiveLimit(options.maxChars, 20_000, 100_000);
   const maxNodes = positiveLimit(options.maxNodes, 200, 1_000);
   try {
-    await assertPageGenerationStable(tabId, expectedFence, expectedGeneration, "snapshot", true);
-    return await documentFencedDebuggerOperation(tabId, async (sendCommand) => {
-      const captured = await captureChromiumAccessibilityNodes(sendCommand, options);
+    // The caller fences the complete snapshot read with before/after document
+    // identities. A second page-agent fence inside the debugger lease can race
+    // dynamic prototype shells while Accessibility is enabled; use the same
+    // lease directly and let the outer read fence decide stability.
+    return await withDebugger(tabId, async (sendCommand) => {
+      const captured = await captureChromiumAccessibilityNodes(sendCommand, { ...options, signal });
       const nodes = [];
       let charCount = 0;
       let truncated = captured.frameFailures > 0;
@@ -3382,8 +3481,15 @@ function collectSnapshot(options = {}) {
   };
   const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
-  const documentIdentity = pageAgent.documentIdentity();
+  const documentIdentity = typeof pageAgent?.documentIdentity === "function" ? pageAgent.documentIdentity() : (() => {
+    const url = location.href;
+    const timeOrigin = typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined;
+    const token = `${url}\u0000${timeOrigin ?? ""}`;
+    return { url, timeOrigin, token };
+  })();
+  const retainElement = typeof pageAgent?.retain === "function" ? (element) => pageAgent.retain(element) : (element) => element;
+  const rememberObservation = typeof pageAgent?.remember === "function" ? (...args) => pageAgent.remember(...args) : () => undefined;
+  const refsAvailable = typeof pageAgent?.retain === "function" && typeof pageAgent?.remember === "function";
   const isContentEditableHost = (element) => {
     const attr = element.getAttribute("contenteditable");
     return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
@@ -3457,7 +3563,7 @@ function collectSnapshot(options = {}) {
     return true;
   };
   const disabled = (element) => Boolean(element.matches?.(":disabled") || element.disabled || String(element.getAttribute("aria-disabled") || "").toLowerCase() === "true");
-  const snapshotId = crypto.randomUUID();
+  const snapshotId = typeof globalThis?.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
   const root = (() => {
     if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
     try {
@@ -3469,6 +3575,9 @@ function collectSnapshot(options = {}) {
       throw new Error(`Invalid snapshot selector: ${String(options.selector)}`);
     }
   })();
+  const frameInfo = typeof pageAgent?.collectFrames === "function"
+    ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
+    : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
   const candidateSelector = "a,button,input,textarea,select,summary,[role],[contenteditable]";
   const candidates = [];
   if (root.matches?.(candidateSelector)) candidates.push(root);
@@ -3484,7 +3593,7 @@ function collectSnapshot(options = {}) {
     const role = roleOf(element);
     if (!role || ["generic", "group", "listitem"].includes(role)) continue;
     const rect = element.getBoundingClientRect();
-    const ref = `e${++counter}`;
+    const ref = refsAvailable ? `e${++counter}` : undefined;
     const entry = {
       ref,
       tag: element.tagName.toLowerCase(),
@@ -3503,7 +3612,7 @@ function collectSnapshot(options = {}) {
     }
     refRecords.set(ref, {
       // Keep the original node without retaining removed application subtrees forever.
-      element: pageAgent.retain(element),
+      element: retainElement(element),
       descriptor: {
         tag: entry.tag,
         role: entry.role,
@@ -3526,12 +3635,18 @@ function collectSnapshot(options = {}) {
   }
   // Do not publish a partially populated observation if a page getter throws
   // while we are walking a hostile or concurrently changing DOM.
-  pageAgent.remember("snapshot", snapshotId, {
+  rememberObservation("snapshot", snapshotId, {
     refs: refRecords,
     documentIdentity,
   });
-  const rawPageText = root.innerText || root.textContent || "";
-  const pageText = bound(rawPageText.replace(/\n{3,}/g, "\n\n"), pageTextLimit);
+  const rootText = String(root.innerText || root.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+  const frameText = frameInfo.frames
+    .filter((frame) => frame.readable === true && typeof frame.text === "string" && frame.text.length > 0)
+    .map((frame) => `[Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}]\n${frame.text}`)
+    .join("\n\n");
+  const rawPageText = [rootText, frameText].filter(Boolean).join("\n\n");
+  const pageText = bound(rawPageText, pageTextLimit);
+  const framesTruncated = frameInfo.truncated === true || frameInfo.frames.some((frame) => frame.truncated === true);
   return {
     snapshotId,
     __piControlChromeSnapshotUrl: documentIdentity.url,
@@ -3548,7 +3663,12 @@ function collectSnapshot(options = {}) {
     elementCharCount,
     maxChars,
     maxNodes,
-    truncated: elementsTruncated || rawPageText.length > pageTextLimit,
+    truncated: elementsTruncated || rawPageText.length > pageTextLimit || framesTruncated,
+    ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
+    ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
+    ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
+    ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
+    ...(framesTruncated ? { framesTruncated: true } : {}),
     accessibility: undefined,
   };
 }
@@ -3570,6 +3690,7 @@ function extractPage(options = {}) {
     if (maxChars <= 3) return text.slice(0, maxChars);
     return `${text.slice(0, maxChars - 3)}...`;
   };
+  const pageAgent = globalThis["__piControlChromePageAgent"];
   const root = (() => {
     if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
     try {
@@ -3581,6 +3702,9 @@ function extractPage(options = {}) {
       throw new Error(`Invalid extract selector: ${String(options.selector)}`);
     }
   })();
+  const frameInfo = typeof pageAgent?.collectFrames === "function"
+    ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
+    : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
   const markdown = [];
   const markdownSelector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,a";
   const markdownElements = [];
@@ -3597,12 +3721,35 @@ function extractPage(options = {}) {
     else if (tag === "a" && element.getAttribute("href")) markdown.push(`[${text}](<${element.href}>)`);
     else markdown.push(text);
   }
-  const sourceText = (root.innerText || root.textContent || "").replace(/\n{3,}/g, "\n\n");
+  const frameText = frameInfo.frames
+    .filter((frame) => frame.readable === true && typeof frame.text === "string" && frame.text.length > 0)
+    .map((frame) => `[Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}]\n${frame.text}`)
+    .join("\n\n");
+  const sourceText = [String(root.innerText || root.textContent || "").replace(/\n{3,}/g, "\n\n").trim(), frameText]
+    .filter(Boolean)
+    .join("\n\n");
+  for (const frame of frameInfo.frames) {
+    if (frame.readable !== true || !frame.text) continue;
+    markdown.push(`### Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}\n\n${frame.text}`);
+  }
   const text = bound(sourceText);
   const remainingChars = Math.max(0, maxChars - text.length);
   const rawMarkdown = [...new Set(markdown)].join("\n\n");
   const markdownText = remainingChars > 0 ? bound(rawMarkdown.slice(0, remainingChars)) : "";
-  return { title: clean(document.title).slice(0, 240), url: location.href, text, markdown: markdownText, maxChars, truncated: sourceText.length > maxChars || rawMarkdown.length > remainingChars };
+  const framesTruncated = frameInfo.truncated === true || frameInfo.frames.some((frame) => frame.truncated === true);
+  return {
+    title: clean(document.title).slice(0, 240),
+    url: location.href,
+    text,
+    markdown: markdownText,
+    maxChars,
+    truncated: sourceText.length > maxChars || rawMarkdown.length > remainingChars || framesTruncated,
+    ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
+    ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
+    ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
+    ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
+    ...(framesTruncated ? { framesTruncated: true } : {}),
+  };
 }
 
 async function pageOperation(params = {}) {
@@ -4242,9 +4389,16 @@ function collectVisibleDom(options = {}) {
     return `${text.slice(0, limit - 3)}...`;
   };
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
-  const documentIdentity = pageAgent.documentIdentity();
-  const snapshotId = crypto.randomUUID();
+  const documentIdentity = typeof pageAgent?.documentIdentity === "function" ? pageAgent.documentIdentity() : (() => {
+    const url = location.href;
+    const timeOrigin = typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined;
+    const token = `${url}\u0000${timeOrigin ?? ""}`;
+    return { url, timeOrigin, token };
+  })();
+  const retainElement = typeof pageAgent?.retain === "function" ? (element) => pageAgent.retain(element) : (element) => element;
+  const rememberObservation = typeof pageAgent?.remember === "function" ? (...args) => pageAgent.remember(...args) : () => undefined;
+  const refsAvailable = typeof pageAgent?.retain === "function" && typeof pageAgent?.remember === "function";
+  const snapshotId = typeof globalThis?.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
   const nodeRecords = new Map();
   let counter = 0;
   const nodes = [];
@@ -4261,6 +4415,9 @@ function collectVisibleDom(options = {}) {
       throw new Error(`Invalid DOM selector: ${String(options.selector)}`);
     }
   })();
+  const frameInfo = typeof pageAgent?.collectFrames === "function"
+    ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
+    : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
   const visible = (element) => {
     const rect = element.getBoundingClientRect();
     let current = element;
@@ -4299,7 +4456,7 @@ function collectVisibleDom(options = {}) {
       nodeRecords.set(id, {
         // A WeakRef lets a removed DOM subtree be collected; resolver then uses the
         // bounded semantic descriptor only when it has one unambiguous replacement.
-        element: pageAgent.retain(element),
+        element: retainElement(element),
         descriptor: {
           tag: node.tag,
           role: node.role,
@@ -4340,7 +4497,7 @@ function collectVisibleDom(options = {}) {
   if (root) walk(root);
   // Store only the completed observation. A selector failure or output budget
   // truncation must not leave a blank/partially populated registry entry.
-  pageAgent.remember("dom", snapshotId, {
+  rememberObservation("dom", snapshotId, {
     nodes: nodeRecords,
     documentIdentity,
   });
@@ -4355,7 +4512,12 @@ function collectVisibleDom(options = {}) {
     charCount,
     maxChars,
     maxNodes,
-    truncated,
+    truncated: truncated || frameInfo.truncated === true,
+    ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
+    ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
+    ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
+    ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
+    ...(frameInfo.truncated ? { framesTruncated: true } : {}),
   };
 }
 
@@ -4510,7 +4672,7 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
   }
 }
 
-const PAGE_AGENT_FUNCTIONS = new Set(["collectSnapshot", "pageOperation", "collectVisibleDom", "runDomCua", "pageGeneration"]);
+const PAGE_AGENT_FUNCTIONS = new Set(["collectSnapshot", "extractPage", "pageOperation", "collectVisibleDom", "runDomCua", "pageGeneration"]);
 
 async function ensurePageAgent(tabId, expectedFence) {
   const fence = expectedFence ?? await tabFenceFor(tabId, true);
@@ -4608,7 +4770,11 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
   const previous = accessibilitySnapshotStates.get(key);
   const source = typeof accessibility?.source === "string" ? accessibility.source : "dom_semantic";
   const frameIdentity = accessibilityFrameIdentity(accessibility?.__piControlChromeAccessibilityFrames);
-  const incomplete = accessibility?.truncated === true || Number(accessibility?.frameFailures || 0) > 0;
+  const frameFailures = Number(accessibility?.frameFailures || 0);
+  const frameLoading = Number(accessibility?.frameLoading || snapshot?.frameLoading || 0);
+  const incomplete = accessibility?.truncated === true
+    || frameLoading > 0
+    || (source === "chromium_ax" && frameFailures > 0);
   const stableAxIdentity = source !== "chromium_ax" || rawNodes.every(node => node.__stableKey === true);
   const previousStableAxIdentity = source !== "chromium_ax" || previous?.nodes?.every(node => node.__stableKey === true);
   const sameDocument = previous !== undefined
@@ -4617,6 +4783,7 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     && previous.invalidated !== true
     && previous.truncated !== true
     && previous.frameFailures === 0
+    && previous.frameLoading === 0
     && !incomplete
     && previous.source === source
     && previous.frameIdentity === frameIdentity
@@ -4662,7 +4829,8 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
       source,
       frameIdentity,
       truncated: incomplete,
-      frameFailures: Number(accessibility?.frameFailures || 0),
+      frameFailures: source === "chromium_ax" ? frameFailures : 0,
+      frameLoading,
       selector: typeof accessibility?.selector === "string" ? accessibility.selector : undefined,
       nodes: rawNodes.map(cloneAccessibilityNode),
     };
@@ -4685,6 +4853,8 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     ...(typeof accessibility?.source === "string" ? { source: accessibility.source } : {}),
     ...(typeof accessibility?.frameCount === "number" ? { frameCount: accessibility.frameCount } : {}),
     ...(typeof accessibility?.frameFailures === "number" && accessibility.frameFailures > 0 ? { frameFailures: accessibility.frameFailures } : {}),
+    ...(frameLoading > 0 ? { frameLoading } : {}),
+    ...(Array.isArray(snapshot?.frameSummaries) && snapshot.frameSummaries.length > 0 ? { frameSummaries: snapshot.frameSummaries } : {}),
   };
 }
 
@@ -4881,7 +5051,14 @@ async function resolveAccessibilityNode(tabId, params, sessionId, expectedFence,
 
 function accessibilityDomOperation(operation, value, attribute, sensitive) {
   const element = this;
-  const fail = (code, message) => ({ __piControlError: true, error: { code, message } });
+  const fail = (code, message, details = {}) => ({
+    __piControlError: true,
+    error: {
+      code,
+      message,
+      details: { actionState: "not_completed", retryable: false, inspectFirst: false, ...details },
+    },
+  });
   if (!(element instanceof Element) || !element.isConnected) return fail("AX_NODE_NOT_RESOLVABLE", "The accessibility node is no longer attached to the current document");
   const visible = () => {
     const rect = element.getBoundingClientRect();
@@ -4961,7 +5138,7 @@ function accessibilityDomOperation(operation, value, attribute, sensitive) {
     const values = (Array.isArray(value) ? value : [value]).map(String);
     if (!element.multiple && values.length > 1) return fail("AX_NODE_NOT_ACTIONABLE", "Cannot select multiple values in a single-select element");
     const options = Array.from(element.options);
-    if (values.some(selected => !options.some(option => option.value === selected || option.label === selected))) return fail("AX_NODE_NOT_FOUND", "Select value did not match any option");
+    if (values.some(selected => !options.some(option => option.value === selected || option.label === selected))) return fail("AX_NODE_NOT_FOUND", "Select value did not match any option", { reason: "invalid_option", recommendation: "inspect_select_options" });
     for (const option of options) option.selected = values.includes(option.value) || values.includes(option.label);
     element.dispatchEvent(new Event("input", { bubbles: true }));
     element.dispatchEvent(new Event("change", { bubbles: true }));
@@ -4969,7 +5146,7 @@ function accessibilityDomOperation(operation, value, attribute, sensitive) {
     if (!("checked" in element)) return fail("AX_NODE_NOT_ACTIONABLE", "check/uncheck/set_checked requires a checkbox or radio element");
     const checked = operation === "check" ? true : operation === "uncheck" ? false : Boolean(value);
     if (Boolean(element.checked) !== checked) element.click();
-    if (Boolean(element.checked) !== checked) return fail("AX_NODE_NOT_ACTIONABLE", `Could not set checked state to ${checked}`);
+    if (Boolean(element.checked) !== checked) return fail("AX_NODE_NOT_ACTIONABLE", `Could not set checked state to ${checked}`, { actionState: "unknown", retryable: false, inspectFirst: true });
   } else return fail("AX_NODE_OPERATION_FAILED", `Unsupported accessibility operation: ${operation}`);
   return { ok: true, operation };
 }
@@ -5005,10 +5182,20 @@ async function callAccessibilityDomOperation(sendCommand, objectId, operation, v
   }
   if (valueResult && valueResult.__piControlError === true && valueResult.error) {
     const sideEffecting = ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus"].includes(operation);
+    const code = typeof valueResult.error.code === "string" ? valueResult.error.code : "AX_NODE_OPERATION_FAILED";
+    const nestedDetails = valueResult.error.details && typeof valueResult.error.details === "object" && !Array.isArray(valueResult.error.details)
+      ? valueResult.error.details
+      : {};
+    const deterministicFailure = ["AX_NODE_NOT_FOUND", "AX_NODE_NOT_RESOLVABLE", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED"].includes(code);
+    const inferredDetails = nestedDetails.actionState === undefined && deterministicFailure
+      ? { actionState: "not_completed", retryable: false, inspectFirst: false }
+      : sideEffecting && code === "AX_NODE_OPERATION_FAILED" && nestedDetails.actionState === undefined
+        ? { actionState: "unknown", retryable: false, inspectFirst: true }
+        : {};
     const error = accessibilityReferenceError(
-      typeof valueResult.error.code === "string" ? valueResult.error.code : "AX_NODE_OPERATION_FAILED",
+      code,
       typeof valueResult.error.message === "string" ? valueResult.error.message : "The accessibility operation failed",
-      { snapshotId, ...(sideEffecting && valueResult.error.code === "AX_NODE_OPERATION_FAILED" ? { actionState: "unknown", retryable: false, inspectFirst: true } : {}) },
+      { snapshotId, ...nestedDetails, ...inferredDetails },
     );
     throw error;
   }
@@ -5075,7 +5262,7 @@ async function executeAccessibilityPageOperation(tabId, params, signal, expected
   } catch (error) {
     if (signal?.aborted) throw sideEffect || dispatched ? uncertainPageOperationError() : abortError(signal, "Browser request aborted");
     if (isLostExecutionContext(error)) throw sideEffect || dispatched ? uncertainPageOperationError() : error;
-    if (sideEffect && dispatched && (!isStructuredPageError(error) || error?.details?.actionState === "unknown")) {
+    if (sideEffect && dispatched && error?.details?.actionState !== "not_completed") {
       const uncertain = uncertainPageOperationError();
       uncertain.cause = error;
       throw uncertain;
@@ -5234,6 +5421,165 @@ function isPageChangingDuringRead(error) {
   }
   return isLostExecutionContext(error);
 }
+function collectEmbeddedFramesInPage(options = {}) {
+  const DEFAULT_MAX_DEPTH = 3;
+  const DEFAULT_MAX_COUNT = 32;
+  const DEFAULT_TEXT_LIMIT = 12_000;
+  const optionNumber = (value, fallback, maximum) => {
+    const number = Number(value);
+    return Number.isInteger(number) && number > 0 ? Math.min(number, maximum) : fallback;
+  };
+  const maxDepth = optionNumber(options.maxDepth, DEFAULT_MAX_DEPTH, 6);
+  const maxCount = optionNumber(options.maxCount, DEFAULT_MAX_COUNT, 128);
+  const textLimit = optionNumber(options.textLimit, DEFAULT_TEXT_LIMIT, 100_000);
+  if (options.includeFrames === false) return { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
+  let root = document.body || document.documentElement;
+  if (typeof options.selector === "string" && options.selector.trim().length > 0) {
+    try { root = document.querySelector(options.selector); } catch { root = undefined; }
+  }
+  if (!root) return { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
+  const normalize = (value) => String(value ?? "").replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  const visible = (element) => {
+    try {
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const ownerWindow = element.ownerDocument?.defaultView || globalThis;
+      let current = element;
+      while (current && current.nodeType === 1) {
+        const style = ownerWindow.getComputedStyle(current);
+        if (current.hidden || String(current.getAttribute("aria-hidden") || "").toLowerCase() === "true" || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || style.contentVisibility === "hidden" || Number.parseFloat(style.opacity || "1") <= 0) return false;
+        current = current.parentElement;
+      }
+      return true;
+    } catch { return false; }
+  };
+  const frameUrl = (element) => {
+    try {
+      const value = element.contentWindow?.location?.href;
+      return typeof value === "string" && value.length > 0 ? value : undefined;
+    } catch { return undefined; }
+  };
+  const frames = [];
+  const visited = new WeakSet();
+  let frameFailures = 0;
+  let frameLoading = 0;
+  let truncated = false;
+  const visit = (scope, depth, parentPath) => {
+    if (!scope || depth > maxDepth || frames.length >= maxCount) {
+      if (scope && frames.length >= maxCount) truncated = true;
+      return;
+    }
+    const elements = Array.from(scope.querySelectorAll("iframe,frame"));
+    for (let index = 0; index < elements.length; index += 1) {
+      if (frames.length >= maxCount) { truncated = true; break; }
+      const element = elements[index];
+      if (!visible(element)) continue;
+      const name = String(element.getAttribute("name") || "").trim();
+      const id = String(element.id || "").trim();
+      const label = name || id || `frame-${index}`;
+      const framePath = parentPath ? `${parentPath}/${label}` : label;
+      const summary = { framePath, ...(name ? { name } : {}), ...(id ? { id } : {}), tag: String(element.tagName || "iframe").toLowerCase() };
+      let childDocument;
+      try { childDocument = element.contentDocument; } catch {
+        frameFailures += 1;
+        frames.push({ ...summary, readable: false, reason: "cross_origin" });
+        continue;
+      }
+      if (!childDocument?.documentElement || !childDocument.body) {
+        frameFailures += 1;
+        const url = frameUrl(element);
+        if (url === undefined) frames.push({ ...summary, readable: false, reason: "cross_origin" });
+        else { frameLoading += 1; frames.push({ ...summary, readable: false, loading: true, reason: "loading" }); }
+        continue;
+      }
+      if (visited.has(childDocument)) continue;
+      visited.add(childDocument);
+      const rawText = normalize(childDocument.body.innerText || childDocument.body.textContent || "");
+      const url = frameUrl(element);
+      const child = {
+        ...summary,
+        readable: true,
+        ...(url ? { url } : {}),
+        ...(childDocument.title ? { title: String(childDocument.title).slice(0, 240) } : {}),
+        text: rawText.slice(0, textLimit),
+        ...(rawText.length > textLimit ? { truncated: true } : {}),
+      };
+      frames.push(child);
+      if (depth < maxDepth) visit(childDocument.body, depth + 1, framePath);
+    }
+  };
+  visit(root, 1, "");
+  return { frames, frameCount: frames.length, frameFailures, frameLoading, truncated };
+}
+
+function frameTextForObservation(frameInfo) {
+  return (Array.isArray(frameInfo?.frames) ? frameInfo.frames : [])
+    .filter((frame) => frame?.readable === true && typeof frame.text === "string" && frame.text.length > 0)
+    .map((frame) => `[Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}]\n${frame.text}`)
+    .join("\n\n");
+}
+
+function mergeFrameObservation(value, frameInfo, kind, options = {}) {
+  if (!value || typeof value !== "object" || !frameInfo || !Array.isArray(frameInfo.frames) || frameInfo.frames.length === 0) return value;
+  const maxChars = Number.isInteger(Number(options.maxChars)) && Number(options.maxChars) > 0 ? Math.min(Number(options.maxChars), 100_000) : kind === "extract" ? 12_000 : 20_000;
+  const bound = (input, limit) => {
+    const source = String(input ?? "");
+    if (source.length <= limit) return source;
+    if (limit <= 3) return source.slice(0, limit);
+    return `${source.slice(0, limit - 3)}...`;
+  };
+  const frameText = frameTextForObservation(frameInfo);
+  const withFrameFields = (target) => ({
+    ...target,
+    ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
+    ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
+    ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
+    ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
+    ...(frameInfo.truncated ? { framesTruncated: true } : {}),
+  });
+  if (kind === "extract") {
+    const rawText = [value.text, frameText].filter(Boolean).join("\n\n");
+    const text = bound(rawText, maxChars);
+    const remaining = Math.max(0, maxChars - text.length);
+    const rawMarkdown = [value.markdown, ...frameInfo.frames.filter((frame) => frame?.readable === true && frame.text).map((frame) => `### Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}\n\n${frame.text}`)].filter(Boolean).join("\n\n");
+    return withFrameFields({ ...value, text, markdown: bound(rawMarkdown, remaining), truncated: value.truncated === true || rawText.length > maxChars || rawMarkdown.length > remaining });
+  }
+  if (kind === "snapshot") {
+    const rawText = [value.text, frameText].filter(Boolean).join("\n\n");
+    return withFrameFields({ ...value, text: bound(rawText, Math.min(8_000, maxChars)), truncated: value.truncated === true || rawText.length > Math.min(8_000, maxChars) });
+  }
+  if (kind === "dom_cua") {
+    const rawState = [value.state, frameText ? `Embedded frames:\n${frameText}` : ""].filter(Boolean).join("\n\n");
+    return withFrameFields({ ...value, state: bound(rawState, maxChars), charCount: Math.min(rawState.length, maxChars), truncated: value.truncated === true || rawState.length > maxChars });
+  }
+  return withFrameFields(value);
+}
+
+async function readFrameObservation(tabId, options, expectedFence, signal, action) {
+  if (options?.includeFrames === false) return undefined;
+  return executeObservationWithFrameSettling(tabId, collectEmbeddedFramesInPage, [options || {}], expectedFence, signal, action);
+}
+
+async function executeObservationWithFrameSettling(tabId, func, args, expectedFence, signal, action) {
+  const deadline = Date.now() + FRAME_TREE_STABILITY_TIMEOUT_MS;
+  let last;
+  while (Date.now() < deadline) {
+    assertRequestActive(signal);
+    last = await executeInTab(tabId, func, args, expectedFence);
+    const frameLoading = Number(last?.frameLoading || 0);
+    if (frameLoading <= 0) return last;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await waitWithSignal(Math.min(FRAME_TREE_STABILITY_INTERVAL_MS * 2, remaining), signal);
+  }
+  throw pageChangingDuringReadError(action, {
+    tabId: Number(tabId),
+    frameChanged: true,
+    frameLoading: Number(last?.frameLoading || 0),
+    frameStabilityTimedOut: true,
+  });
+}
+
 async function readOnlyWithRetry(method, tabId, signal, operation) {
   let lastError;
   const attempts = 2;
@@ -5245,7 +5591,10 @@ async function readOnlyWithRetry(method, tabId, signal, operation) {
       if (!isPageChangingDuringRead(error)) throw error;
       lastError = error;
       if (attempt === attempts) break;
-      await waitWithSignal(25, signal);
+      const waitMs = Number(error?.details?.frameLoading || 0) > 0
+        ? Math.min(100, FRAME_TREE_STABILITY_INTERVAL_MS * 3)
+        : 25;
+      await waitWithSignal(waitMs, signal);
     }
   }
   const details = lastError && typeof lastError === "object" && lastError.details && typeof lastError.details === "object" ? lastError.details : {};
@@ -5350,8 +5699,24 @@ function isSemanticLocator(value) {
 }
 
 function retryableAccessibilityObservationError(error) {
-  return (["AX_NODE_NOT_FOUND", "AX_NODE_NOT_RESOLVABLE"].includes(error?.code) && error?.details?.rebound !== true)
-    || (error?.code === "BROWSER_PAGE_CHANGING" && error?.details?.frameChanged === true);
+  if (error?.code === "BROWSER_PAGE_CHANGING" && error?.details?.frameChanged === true) return true;
+  if (!["AX_NODE_NOT_FOUND", "AX_NODE_NOT_RESOLVABLE"].includes(error?.code)) return false;
+  if (error?.details?.retryable === false) return false;
+  return error?.details?.rebound !== true;
+}
+
+function canFallbackToDomAfterAccessibility(error, params = {}) {
+  if (error?.code === "BROWSER_AX_UNAVAILABLE") return true;
+  // Text targets may be rendered by custom clickable elements that Chromium
+  // does not expose as an actionable AX node (for example an anchor with only
+  // a client-side click handler). Keep role/name/label targets fail-closed:
+  // those rely on AX semantics and must not silently change meaning.
+  const target = accessibilityTarget(params);
+  if (!isRecordObject(target) || typeof target.text !== "string") return false;
+  if (error?.code !== "AX_NODE_NOT_FOUND") return false;
+  if (error?.details?.reason !== "target_not_found" && error?.details?.reason !== "target_not_visible") return false;
+  if (error?.details?.retryable === false || error?.details?.rebound === true) return false;
+  return error?.details?.actionState !== "unknown";
 }
 
 async function executeAccessibilityLocatorWait(tabId, params, signal, expectedFence) {
@@ -5548,7 +5913,7 @@ async function executeAxSemanticOperation(tabId, params, signal, expectedFence) 
           for (const node of chromiumAxSemanticIndex(matches, target)) selectedMappings.push(await mappingFor(node));
           return Promise.all(selectedMappings.map((mapping) => callAccessibilityDomOperation(sendCommand, mapping.objectId, "textContent", undefined, undefined, mapping.node.__sensitive, snapshotId)));
         }
-        if (matches.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No matching Chromium accessibility node was found", { count: 0, rebound: false });
+        if (matches.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No matching Chromium accessibility node was found", { count: 0, rebound: false, reason: "target_not_found", retryable: true });
         const action = params.pageOperation === "interaction" ? String(params.operation || "") : String(params.action || "");
         const actionableMatches = sideEffect ? matches.filter(chromiumAxSemanticActionable) : matches;
         if (sideEffect && actionableMatches.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_ACTIONABLE", "The semantic target does not resolve to an actionable Chromium accessibility node", { count: 0, rebound: false });
@@ -5558,7 +5923,7 @@ async function executeAxSemanticOperation(tabId, params, signal, expectedFence) 
           const visible = [];
           for (const mapping of candidateMappings) if (await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, mapping.node.__sensitive, snapshotId)) visible.push(mapping);
           const selected = target.index === undefined ? visible : visible[Number(target.index)] === undefined ? [] : [visible[Number(target.index)]];
-          if (selected.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No visible Chromium accessibility node matched the semantic target", { count: 0, rebound: false });
+          if (selected.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No visible Chromium accessibility node matched the semantic target", { count: 0, rebound: false, reason: "target_not_visible", retryable: true });
           return { ok: true, count: selected.length };
         }
         const candidates = sideEffect
@@ -5570,7 +5935,7 @@ async function executeAxSemanticOperation(tabId, params, signal, expectedFence) 
           const visible = [];
           for (const mapping of candidateMappings) if (await callAccessibilityDomOperation(sendCommand, mapping.objectId, "isVisible", undefined, undefined, mapping.node.__sensitive, snapshotId)) visible.push(mapping);
           const selected = target.index === undefined ? visible : visible[Number(target.index)] === undefined ? [] : [visible[Number(target.index)]];
-          if (selected.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No visible Chromium accessibility node matched the semantic target", { count: 0, rebound: false });
+          if (selected.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No visible Chromium accessibility node matched the semantic target", { count: 0, rebound: false, reason: "target_not_visible", retryable: true });
           if (selected.length > 1) throw chromiumAxSemanticError("AX_NODE_AMBIGUOUS", "The semantic target matched multiple visible Chromium accessibility nodes; narrow the target before retrying", { count: selected.length, rebound: false });
           const mapping = selected[0];
           const element = { ...await callAccessibilityDomOperation(sendCommand, mapping.objectId, "describe", undefined, undefined, mapping.node.__sensitive, snapshotId), ...publicNode(mapping.node), resolvedBy: "chromium_ax" };
@@ -5583,7 +5948,7 @@ async function executeAxSemanticOperation(tabId, params, signal, expectedFence) 
         }
         if (params.pageOperation === "locator" && ["textContent", "innerText", "getAttribute", "isVisible", "isEnabled"].includes(action)) {
           if (candidates.length > 1) throw chromiumAxSemanticError("AX_NODE_AMBIGUOUS", "The semantic target matched multiple Chromium accessibility nodes; narrow the target before reading it", { count: candidates.length, rebound: false });
-          if (candidates.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No matching Chromium accessibility node was found", { count: 0, rebound: false });
+          if (candidates.length === 0) throw chromiumAxSemanticError("AX_NODE_NOT_FOUND", "No matching Chromium accessibility node was found", { count: 0, rebound: false, reason: "target_not_found", retryable: true });
           const mapping = await mappingFor(candidates[0]);
           if (action === "isEnabled") return candidates[0].disabled !== true && await callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, undefined, candidates[0].__sensitive, snapshotId);
           return callAccessibilityDomOperation(sendCommand, mapping.objectId, action, undefined, params.attribute, candidates[0].__sensitive, snapshotId);
@@ -5604,7 +5969,7 @@ async function executeAxSemanticOperation(tabId, params, signal, expectedFence) 
   } catch (error) {
     if (signal?.aborted) throw sideEffect || dispatched ? uncertainPageOperationError() : abortError(signal, "Browser request aborted");
     if (isLostExecutionContext(error)) throw sideEffect || dispatched ? uncertainPageOperationError() : error;
-    if (sideEffect && dispatched && (!isStructuredPageError(error) || error?.details?.actionState === "unknown")) {
+    if (sideEffect && dispatched && error?.details?.actionState !== "not_completed") {
       const uncertain = uncertainPageOperationError();
       uncertain.cause = error;
       throw uncertain;
@@ -5633,7 +5998,7 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
           assertRequestActive(signal);
           return value;
         } catch (error) {
-          if (error?.code !== "BROWSER_AX_UNAVAILABLE") throw error;
+          if (!canFallbackToDomAfterAccessibility(error, params)) throw error;
           axFallback = true;
         }
       }
@@ -5764,8 +6129,10 @@ async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence
 
 function pageGeneration() {
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
-  return pageAgent.documentIdentity();
+  if (typeof pageAgent?.documentIdentity === "function") return pageAgent.documentIdentity();
+  const url = location.href;
+  const timeOrigin = typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined;
+  return { url, timeOrigin, token: `${url}\u0000${timeOrigin ?? ""}` };
 }
 
 function isRestrictedPageError(error) {
@@ -6512,25 +6879,25 @@ async function enableDevtools(tabId, domains = ["Runtime", "Log", "Network", "Pa
     const currentRecord = persistentDebuggers.get(runtimeStateKey(id));
       if (currentRecord !== lease.record || currentRecord.attachEpoch !== lease.attachEpoch || currentRecord.tabFence !== lease.tabFence) throw uncertainBrowserOperationError("devtools_enable", { tabId: id });
 
-      const state = stateForTab(id);
-      if (domains.includes("Page")) {
-        let frameTree;
-        try {
-          frameTree = await debuggerCommand(id, "Page.getFrameTree", {}, expectedFence, lease);
-        } catch (error) {
-          if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
-          const uncertain = uncertainBrowserOperationError("devtools_enable", { tabId: id, domain: "Page.getFrameTree", enabled: [...enabled], actionState: "unknown" });
-          uncertain.cause = error;
-          throw uncertain;
-        }
-        const frame = frameTree?.frameTree?.frame;
-        const frameId = typeof frame?.id === "string" ? frame.id : undefined;
-        const loaderId = debuggerLoaderId(frame?.loaderId);
-        if (frameId !== undefined) state.mainFrameId = frameId;
-        if (frameId !== undefined && loaderId !== undefined) setDebuggerFrameLoader(state, frameId, loaderId);
-      }
-      state.acceptUnqualifiedEvents = true;
-      return { tabId: id, enabled, failed, attached: true };
+     const state = stateForTab(id);
+     if (domains.includes("Page")) {
+       let frameTree;
+       try {
+         frameTree = await debuggerCommand(id, "Page.getFrameTree", {}, expectedFence, lease);
+       } catch (error) {
+         if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
+         const uncertain = uncertainBrowserOperationError("devtools_enable", { tabId: id, domain: "Page.getFrameTree", enabled: [...enabled], actionState: "unknown" });
+         uncertain.cause = error;
+         throw uncertain;
+       }
+       const frame = frameTree?.frameTree?.frame;
+       const frameId = typeof frame?.id === "string" ? frame.id : undefined;
+       const loaderId = debuggerLoaderId(frame?.loaderId);
+       if (frameId !== undefined) state.mainFrameId = frameId;
+       if (frameId !== undefined && loaderId !== undefined) setDebuggerFrameLoader(state, frameId, loaderId);
+     }
+     state.acceptUnqualifiedEvents = true;
+     return { tabId: id, enabled, failed, attached: true };
   } catch (error) {
     operationError = error;
     throw error;
@@ -6652,7 +7019,10 @@ async function createTab(params) {
   let recorded = false;
   try {
     if (!prepareCreatedTabRuntimeState(tab.id, createdFence)) throw uncertainBrowserOperationError("new_tab", { tabId: tab.id, debuggerCleanupPending: true });
-    await recordOwnedTab({ ...tab, groupId: tab.groupId }, params.sessionId, "agent", "temporary", createdFence);
+    // A newly created URL may still be loading. Do not block ownership setup on
+    // page-script document identity; the waited response re-observes it after
+    // load, while the tab fence still protects the creation transaction.
+    await recordOwnedTab({ ...tab, groupId: tab.groupId }, params.sessionId, "agent", "temporary", createdFence, { allowUnknownDocument: true, replaceStaleRuntime: true });
     recorded = true;
     const groupId = await putInPiGroup(tab, createdFence);
     await updateOwnedTab(tab.id, { groupId }, params.sessionId);
@@ -7590,15 +7960,21 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
     return readOnlyWithRetry("extract", tab.id, signal, async () => {
       const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
-      const content = await executeInTab(tab.id, extractPage, [{
+      const content = await executeObservationWithFrameSettling(tab.id, extractPage, [{
         ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
         ...(params.selector === undefined ? {} : { selector: params.selector }),
-      }], expectedFence);
+        ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
+      }], expectedFence, signal, "extract");
+      const frameInfo = Array.isArray(content?.frameSummaries) ? undefined : await readFrameObservation(tab.id, {
+        ...(params.selector === undefined ? {} : { selector: params.selector }),
+        ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
+      }, expectedFence, signal, "extract");
+      const observedContent = mergeFrameObservation(content, frameInfo, "extract", params);
       const afterIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
       if (typeof beforeIncarnation !== "string" || typeof afterIncarnation !== "string" || afterIncarnation !== beforeIncarnation) throw pageChangingDuringReadError("extract", { tabId: tab.id, pageChanged: true });
       const listed = await tabEntryFor(tab.id, expectedFence, "extract");
       if (listed.handle?.incarnation !== undefined && listed.handle.incarnation !== afterIncarnation) throw pageChangingDuringReadError("extract", { tabId: tab.id, pageChanged: true });
-      return { tabId: tab.id, tab: listed, content, incarnation: afterIncarnation };
+      return { tabId: tab.id, tab: listed, content: observedContent, incarnation: afterIncarnation };
     });
   }
   if (method === "snapshot") {
@@ -7608,26 +7984,42 @@ async function handleRequest(method, params, dispatchOptions = {}) {
       ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
       ...(params.maxNodes === undefined ? {} : { maxNodes: params.maxNodes }),
       ...(params.selector === undefined ? {} : { selector: params.selector }),
+      ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
       ...(params.accessibilityOnly === true ? { includeRefs: true } : {}),
     };
     return readOnlyWithRetry("snapshot", tab.id, signal, async () => {
-      const snapshot = await executeInTab(tab.id, collectSnapshot, [snapshotOptions], expectedFence);
-      const snapshotGeneration = snapshot && { url: snapshot.__piControlChromeSnapshotUrl, timeOrigin: snapshot.__piControlChromeSnapshotTimeOrigin, token: snapshot.__piControlChromeSnapshotToken };
-      const accessibility = snapshot
-        ? await collectChromiumAccessibilitySnapshot(tab.id, snapshotOptions, params.sessionId, expectedFence, snapshotGeneration, snapshot.title)
-        : undefined;
+      const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+      const snapshot = await executeObservationWithFrameSettling(tab.id, collectSnapshot, [snapshotOptions], expectedFence, signal, "snapshot");
+      const frameInfo = Array.isArray(snapshot?.frameSummaries) ? undefined : await readFrameObservation(tab.id, snapshotOptions, expectedFence, signal, "snapshot");
+      const observedSnapshot = mergeFrameObservation(snapshot, frameInfo, "snapshot", snapshotOptions);
+      const snapshotGeneration = observedSnapshot && { url: observedSnapshot.__piControlChromeSnapshotUrl, timeOrigin: observedSnapshot.__piControlChromeSnapshotTimeOrigin, token: observedSnapshot.__piControlChromeSnapshotToken };
+      let accessibility;
+     if (observedSnapshot) {
+       try {
+        accessibility = await collectChromiumAccessibilitySnapshot(tab.id, snapshotOptions, params.sessionId, expectedFence, snapshotGeneration, observedSnapshot.title, signal);
+        } catch (error) {
+          const generationUnavailable = error?.details?.pageGenerationUnavailable === true;
+          if (!generationUnavailable) throw error;
+          const fallback = await executeInTab(tab.id, collectDomAccessibilitySnapshot, [snapshotOptions], expectedFence);
+          accessibility = { ...fallback, source: "dom_semantic", axFallback: true };
+        }
+      }
+
       let frameTree;
       try { frameTree = await withDebugger(tab.id, (sendCommand) => sendCommand("Page.getFrameTree"), params.sessionId, expectedFence); } catch (error) {
         if (error && typeof error === "object" && ["BROWSER_OPERATION_UNCERTAIN", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED"].includes(error.code)) throw error;
       }
-      await assertPageGenerationStable(tab.id, expectedFence, snapshotGeneration, "snapshot", true);
-      if (snapshot) {
-        const accessibilityOnly = params.accessibilityOnly === true;
-        snapshot.accessibility = accessibilityRevision(tab.id, snapshot, accessibility, accessibilityOnly && params.disableDiffing !== true, accessibilityOnly);
+      const afterIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+      if (typeof beforeIncarnation !== "string" || typeof afterIncarnation !== "string" || afterIncarnation !== beforeIncarnation) {
+        throw pageChangingDuringReadError("snapshot", { tabId: tab.id, pageChanged: true });
       }
-      rememberPageSnapshot(tab.id, snapshot);
+      if (observedSnapshot) {
+        const accessibilityOnly = params.accessibilityOnly === true;
+        observedSnapshot.accessibility = accessibilityRevision(tab.id, observedSnapshot, accessibility, accessibilityOnly && params.disableDiffing !== true, accessibilityOnly);
+      }
+      rememberPageSnapshot(tab.id, observedSnapshot);
       const listed = await tabEntryFor(tab.id, expectedFence, "snapshot");
-      return { tabId: tab.id, tab: listed, snapshot, frameTree };
+      return { tabId: tab.id, tab: listed, snapshot: observedSnapshot, frameTree };
     });
   }
   if (method === "locator") {
@@ -7650,16 +8042,26 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
     if (params.action === "get_visible_dom") {
       return readOnlyWithRetry("dom_cua", tab.id, signal, async () => {
-        const dom = await executeInTab(tab.id, collectVisibleDom, [{
+        const beforeIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+        const dom = await executeObservationWithFrameSettling(tab.id, collectVisibleDom, [{
           ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
           ...(params.maxNodes === undefined ? {} : { maxNodes: params.maxNodes }),
           ...(params.selector === undefined ? {} : { selector: params.selector }),
-        }], expectedFence);
-        const domGeneration = dom && { url: dom.__piControlChromeDomUrl, timeOrigin: dom.__piControlChromeDomTimeOrigin, token: dom.__piControlChromeDomToken };
-        await assertPageGenerationStable(tab.id, expectedFence, domGeneration, "dom_cua", true);
-        rememberDomSnapshot(tab.id, dom);
+          ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
+        }], expectedFence, signal, "dom_cua");
+        const frameInfo = Array.isArray(dom?.frameSummaries) ? undefined : await readFrameObservation(tab.id, {
+          ...(params.selector === undefined ? {} : { selector: params.selector }),
+          ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
+        }, expectedFence, signal, "dom_cua");
+        const observedDom = mergeFrameObservation(dom, frameInfo, "dom_cua", params);
+        const domGeneration = observedDom && { url: observedDom.__piControlChromeDomUrl, timeOrigin: observedDom.__piControlChromeDomTimeOrigin, token: observedDom.__piControlChromeDomToken };
+        const afterIncarnation = await readTabIncarnation(tab.id, expectedFence, true);
+        if (typeof beforeIncarnation !== "string" || typeof afterIncarnation !== "string" || afterIncarnation !== beforeIncarnation) {
+          throw pageChangingDuringReadError("dom_cua", { tabId: tab.id, pageChanged: true });
+        }
+        rememberDomSnapshot(tab.id, observedDom);
         const listed = await tabEntryFor(tab.id, expectedFence, "snapshot");
-        return { tabId: tab.id, tab: listed, dom };
+        return { tabId: tab.id, tab: listed, dom: observedDom };
       });
     }
     const result = await executeDomCuaOperation(tab.id, params, signal, expectedFence);

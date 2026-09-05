@@ -171,6 +171,7 @@ const TAB_HANDLE = Type.Optional(Type.Object({
   sessionId: Type.Optional(Type.String()),
 }, { additionalProperties: false }));
 const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot." }));
+const INCLUDE_FRAMES = Type.Optional(Type.Boolean({ description: "Include same-origin iframe summaries and readable frame text; cross-origin frames are reported as unavailable." }));
 const OUTPUT_MAX_CHARS = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output character budget; the extension caps this at 100000." }));
 const OUTPUT_MAX_NODES = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output node budget; the extension caps this at 1000." }));
 const WAIT_STATE = Type.Optional(Type.Union([
@@ -451,6 +452,8 @@ export class BridgeClient {
   }
 
   private rejectPendingForSocket(socket: WebSocket, error: Error): void {
+    const disconnected = new Error("Pi browser bridge disconnected");
+    disconnected.cause = error;
     for (const [id, entry] of this.pending) {
       if (entry.socket !== socket) continue;
       try {
@@ -460,7 +463,7 @@ export class BridgeClient {
       }
       clearTimeout(entry.timer);
       entry.removeAbort?.();
-      entry.reject(localBrowserRequestError(entry.method, entry.params, error, true));
+      entry.reject(localBrowserRequestError(entry.method, entry.params, disconnected, true));
       this.pending.delete(id);
     }
   }
@@ -550,8 +553,47 @@ function routeForBrowserId(browserId: string): BrowserTargetRoute {
   return { browserId };
 }
 
-function bridgeRequest(method: string, params: Record<string, unknown>, route?: BrowserTargetRoute, signal?: AbortSignal): Promise<any> {
-  return route === undefined ? bridge.request(method, params, undefined, signal) : bridge.request(method, params, route, signal);
+const READ_ONLY_BRIDGE_RETRY_METHODS = new Set([
+  "selected_tab",
+  "list_tabs",
+  "snapshot",
+  "extract",
+  "wait",
+  "screenshot",
+  "network_response_body",
+]);
+
+function readOnlyLocatorAction(value: unknown): boolean {
+  return ["count", "all", "allTextContents", "textContent", "innerText", "getAttribute", "isVisible", "isEnabled", "waitFor", "first", "last", "nth", "filter", "and", "or"].includes(String(value ?? ""));
+}
+
+function isReadOnlyBridgeMethod(method: string, params: Record<string, unknown>): boolean {
+  if (READ_ONLY_BRIDGE_RETRY_METHODS.has(method)) return true;
+  if (method === "locator") return readOnlyLocatorAction(params.action);
+  if (method === "dom_cua") return params.action === "get_visible_dom";
+  if (method === "dialog") return params.action === "get";
+  if (method === "clipboard") return params.action === "read";
+  if (method === "download") return params.action === "list" || params.action === "wait";
+  if (method === "console_logs" || method === "network_requests") return params.clear !== true;
+  return false;
+}
+
+async function bridgeRequest(method: string, params: Record<string, unknown>, route?: BrowserTargetRoute, signal?: AbortSignal): Promise<any> {
+  const request = () => route === undefined ? bridge.request(method, params, undefined, signal) : bridge.request(method, params, route, signal);
+  try {
+    return await request();
+  } catch (error) {
+    const code = bridgeErrorCode(error);
+    const details = error && typeof error === "object" && "details" in error && error.details && typeof error.details === "object" && !Array.isArray(error.details)
+      ? error.details as Record<string, unknown>
+      : undefined;
+    if (!isReadOnlyBridgeMethod(method, params) || (code !== "BROWSER_BRIDGE_DISCONNECTED" && code !== "TARGET_CONNECTION_CHANGED") || details?.retryable === false || route?.browserId === undefined) throw error;
+    try {
+      return await bridge.request(method, params, { browserId: route.browserId }, signal);
+    } catch {
+      throw error;
+    }
+  }
 }
 
 function isTargetLocator(value: unknown): boolean {
@@ -592,6 +634,9 @@ function localBrowserRequestError(method: string, params: Record<string, unknown
   if (sideEffecting) {
     result.code = "BROWSER_OPERATION_UNCERTAIN";
     result.details = { actionState: "unknown", retryable: false, inspectFirst: true };
+  } else if (result.code === undefined && source.message === "Pi browser bridge disconnected") {
+    result.code = "BROWSER_BRIDGE_DISCONNECTED";
+    result.details = { actionState: "not_completed", retryable: true, inspectFirst: false };
   } else if (result.code === undefined) {
     result.code = "BROWSER_REQUEST_CANCELED";
   }
@@ -892,9 +937,51 @@ function errorResult(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   const record = error && typeof error === "object" ? error as { code?: unknown; details?: unknown } : {};
   const code = typeof record.code === "string" ? record.code : undefined;
+  const nestedDetails = record.details && typeof record.details === "object" && !Array.isArray(record.details) ? record.details as Record<string, unknown> : undefined;
+  const actionState = nestedDetails?.actionState === "unknown" ? "unknown" : "not_completed";
+  const uncertain = code === "BROWSER_OPERATION_UNCERTAIN" || nestedDetails?.actionState === "unknown";
+  const explicitRetryable = typeof nestedDetails?.retryable === "boolean" ? nestedDetails.retryable : undefined;
+  const safeBridgeReadRecovery = code === "BROWSER_BRIDGE_DISCONNECTED"
+    && nestedDetails?.actionState === "not_completed"
+    && nestedDetails?.retryable === true;
+  const retryable = uncertain ? false : explicitRetryable ?? (code === "BROWSER_BRIDGE_DISCONNECTED"
+    ? safeBridgeReadRecovery
+    : ["BROWSER_PAGE_CHANGING", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "AX_NODE_NOT_FOUND"].includes(code ?? ""));
+  const inspectFirst = uncertain || (code === "BROWSER_BRIDGE_DISCONNECTED" && !safeBridgeReadRecovery) || nestedDetails?.inspectFirst === true || code === "BROWSER_TAB_CLOSED" || code === "BROWSER_DOCUMENT_CHANGED";
+  const detailNextAction = typeof nestedDetails?.nextAction === "string" && nestedDetails.nextAction.length > 0 ? nestedDetails.nextAction : undefined;
+  const detailRecommendation = typeof nestedDetails?.recommendation === "string" && nestedDetails.recommendation.length > 0 ? nestedDetails.recommendation : undefined;
+  const nextAction = detailNextAction ?? (code === "BROWSER_BRIDGE_DISCONNECTED" || code === "TARGET_UNAVAILABLE" || code === "TARGET_CONNECTION_CHANGED" || code === "BROWSER_TARGET_MISMATCH"
+    ? "browser_status"
+    : code === "BROWSER_PAGE_UNAVAILABLE" || code === "BROWSER_TAB_CLOSED" || code === "BROWSER_TAB_FENCE_CHANGED" || code === "BROWSER_DOCUMENT_CHANGED"
+      ? "browser_tabs"
+      : code !== undefined && code.startsWith("AX_") || code === "STALE_AX_SNAPSHOT"
+        ? "browser_accessibility_snapshot"
+        : uncertain ? "browser_snapshot" : undefined);
+  const recommendation = detailRecommendation ?? (() => {
+    if (code === "BROWSER_BRIDGE_DISCONNECTED") return safeBridgeReadRecovery ? "retry_browser_status" : "inspect_before_retry";
+    if (code === "TARGET_UNAVAILABLE" || code === "TARGET_CONNECTION_CHANGED") return "refresh_browser_targets";
+    if (code === "BROWSER_TARGET_MISMATCH") return "refresh_browser_target_handle";
+    if (code === "BROWSER_PAGE_UNAVAILABLE") return "navigate_to_scriptable_page";
+    if (code === "BROWSER_TAB_CLOSED" || code === "BROWSER_TAB_FENCE_CHANGED" || code === "BROWSER_DOCUMENT_CHANGED") return "refresh_browser_tabs";
+    if (uncertain) return "inspect_before_retry";
+    if (code !== undefined && code.startsWith("AX_")) return "refresh_accessibility_snapshot";
+    return undefined;
+  })();
+  const userMessage = uncertain
+    ? "The browser operation may have taken effect or could not be confirmed. Inspect the current browser state before retrying; do not replay side effects automatically."
+    : message;
   return {
-    content: [{ type: "text", text: `Browser error: ${message}` }],
-    details: { error: message, ...(code === undefined ? {} : { code }), ...(record.details === undefined ? {} : { details: record.details }) },
+    content: [{ type: "text", text: `Browser error: ${userMessage}` }],
+    details: {
+      error: message,
+      ...(code === undefined ? {} : { code }),
+      actionState,
+      retryable,
+      inspectFirst,
+      ...(nextAction === undefined ? {} : { nextAction }),
+      ...(recommendation === undefined ? {} : { recommendation }),
+      ...(record.details === undefined ? {} : { details: record.details }),
+    },
   };
 }
 
@@ -1224,8 +1311,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_snapshot",
     label: "Browser Snapshot",
-    description: "Read the active page title and one bounded semantic page state with document-scoped live eN refs; ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, but navigation remains a hard boundary.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES }),
+    description: "Read the active page title and one bounded semantic page state with document-scoped live eN refs; same-origin iframe text and bounded frame metadata are included by default. Set includeFrames=false to exclude embedded documents. Ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, but navigation remains a hard boundary.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES }),
     async execute(_toolCallId, params) {
       try { return textResult(compactBrowserResult("browser_snapshot", params, await call("snapshot", params))); } catch (error) { return errorResult(error); }
     },
@@ -1235,8 +1322,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_extract",
     label: "Extract Browser Page",
-    description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS }),
+    description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper; same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames=false.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS }),
     async execute(_toolCallId, params) {
       try { return textResult(compactBrowserResult("browser_extract", params, await call("extract", params))); } catch (error) { return errorResult(error); }
     },
@@ -1246,8 +1333,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_accessibility_snapshot",
     label: "Browser Accessibility Snapshot",
-    description: "Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: Type.Optional(Type.Boolean()) }),
+    description: "Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. Same-origin iframe context is included by default and can be disabled with includeFrames=false. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
         const result = await call("snapshot", { ...params, accessibilityOnly: true });
@@ -1406,10 +1493,11 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_dom_cua",
     label: "Browser DOM CUA",
-    description: "Use visible DOM node ids from a matching browser_dom_cua observation; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations. Same-document unrelated UI changes do not stale a node, but navigation remains a hard boundary.",
+    description: "Use visible DOM node ids from a matching browser_dom_cua observation; same-origin iframe text and bounded frame metadata are included for get_visible_dom by default and can be disabled with includeFrames=false. Any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations. Same-document unrelated UI changes do not stale a node, but navigation remains a hard boundary.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
+      includeFrames: INCLUDE_FRAMES,
       action: Type.Union([Type.Literal("get_visible_dom"), Type.Literal("click"), Type.Literal("double_click"), Type.Literal("type"), Type.Literal("keypress"), Type.Literal("scroll")]),
       snapshotId: Type.Optional(Type.String()),
       nodeId: Type.Optional(Type.String()),

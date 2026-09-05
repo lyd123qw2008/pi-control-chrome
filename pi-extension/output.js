@@ -32,6 +32,42 @@ function bounded(value, limit) {
   return `${source.slice(0, limit - 3)}...`;
 }
 
+function compactFrameSummaries(value) {
+  if (!Array.isArray(value)) return undefined;
+  const frames = value.filter(isRecord).slice(0, 32).map((frame) => {
+    const result = {};
+    for (const key of ["framePath", "name", "id", "tag", "url", "title", "readable", "loading", "reason", "truncated"]) {
+      if (frame[key] === undefined) continue;
+      result[key] = typeof frame[key] === "string" ? bounded(frame[key], key === "url" ? 4_096 : FIELD_MAX_CHARS) : frame[key];
+    }
+    return result;
+  });
+  return frames.length > 0 ? frames : undefined;
+}
+
+function frameTextState(value, limit) {
+  if (!Array.isArray(value)) return "";
+  const source = value
+    .filter((frame) => isRecord(frame) && frame.readable === true && typeof frame.text === "string" && frame.text.length > 0)
+    .map((frame) => {
+      const label = frame.title || frame.name || frame.framePath || "frame";
+      return `[${label}]\n${frame.text}`;
+    })
+    .join("\n\n");
+  return bounded(source, limit);
+}
+
+function frameProjectionFields(value) {
+  if (!isRecord(value)) return {};
+  const frames = compactFrameSummaries(value.frameSummaries);
+  return {
+    ...(frames === undefined ? {} : { frames }),
+    ...(typeof value.frameCount === "number" ? { frameCount: value.frameCount } : {}),
+    ...(typeof value.frameFailures === "number" && value.frameFailures > 0 ? { frameFailures: value.frameFailures } : {}),
+    ...(typeof value.frameLoading === "number" && value.frameLoading > 0 ? { frameLoading: value.frameLoading } : {}),
+  };
+}
+
 function compactTab(value, currentSessionId) {
   if (!isRecord(value)) return value;
   const keys = [
@@ -149,7 +185,9 @@ function snapshotState(snapshot, maxChars, maxNodes) {
   }
   const pageTextLimit = Math.min(SNAPSHOT_TEXT_MAX_CHARS, maxChars);
   const pageText = bounded(snapshot.text, pageTextLimit);
+  const embeddedFrameText = frameTextState(snapshot.frameSummaries, Math.min(SNAPSHOT_TEXT_MAX_CHARS, maxChars));
   if (elements.length === 0 && allChildren.length === 0 && pageText) sections.push(`Page text:\n${pageText}`);
+  if ((elements.length > 0 || allChildren.length > 0) && embeddedFrameText) sections.push(`Embedded frames:\n${embeddedFrameText}`);
   const stateSource = sections.join("\n\n");
   const state = bounded(stateSource, maxChars);
   const rawText = text(snapshot.text);
@@ -173,17 +211,21 @@ export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxN
   if (!isRecord(value.snapshot)) return compactResultEnvelope(value);
   const snapshot = value.snapshot;
   const projected = compactStateSnapshot(snapshot, maxChars, maxNodes) ?? snapshotState(snapshot, maxChars, maxNodes);
+  const embeddedFrameText = frameTextState(snapshot.frameSummaries, maxChars);
+  const combinedState = [projected.state, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
+  const state = bounded(combinedState, maxChars);
   return {
     ...compactResultEnvelope(value),
     snapshot: {
       snapshotId: snapshot.snapshotId,
       ...(value.tab === undefined && snapshot.title !== undefined ? { title: bounded(snapshot.title, FIELD_MAX_CHARS) } : {}),
       ...(value.tab === undefined && snapshot.url !== undefined ? { url: bounded(snapshot.url, 4_096) } : {}),
-      state: projected.state,
+      state,
       nodeCount: projected.nodeCount,
-      charCount: projected.charCount ?? projected.state.length,
-      truncated: projected.truncated,
+      charCount: state.length,
+      truncated: projected.truncated || combinedState.length > maxChars,
       ...(snapshot.viewport === undefined ? {} : { viewport: snapshot.viewport }),
+      ...frameProjectionFields(snapshot),
     },
   };
 }
@@ -193,16 +235,20 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
   if (!isRecord(value)) return value;
   const precompact = compactAccessibilityState(value, maxChars, maxNodes);
   if (precompact) {
+    const embeddedFrameText = frameTextState(value.frameSummaries, maxChars);
+    const combinedState = [precompact.state, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
+    const state = bounded(combinedState, maxChars);
     return {
       ...compactResultEnvelope(value),
       snapshotId: value.snapshotId,
       ...(typeof value.baseSnapshotId === "string" ? { baseSnapshotId: value.baseSnapshotId } : {}),
       mode: typeof value.mode === "string" ? value.mode : "full",
-      state: precompact.state,
+      state,
       nodeCount: precompact.nodeCount,
       ...(typeof value.changedNodeCount === "number" ? { changedNodeCount: value.changedNodeCount } : {}),
-      charCount: precompact.charCount,
-      truncated: precompact.truncated,
+      charCount: state.length,
+      truncated: precompact.truncated || combinedState.length > maxChars,
+      ...frameProjectionFields(value),
     };
   }
   const snapshot = isRecord(value.snapshot) ? value.snapshot : undefined;
@@ -213,7 +259,9 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
   const sourceState = mode === "full" && children.length > 0
     ? children.map(node => accessibilityLine(node)).join("\n")
     : typeof accessibility.state === "string" ? accessibility.state : children.map(node => accessibilityLine(node)).join("\n");
-  const state = bounded(sourceState, maxChars);
+  const embeddedFrameText = frameTextState(accessibility.frameSummaries || snapshot?.frameSummaries, maxChars);
+  const combinedState = [sourceState, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
+  const state = bounded(combinedState, maxChars);
   return {
     ...compactResultEnvelope(value),
     snapshotId: typeof snapshot?.snapshotId === "string" ? snapshot.snapshotId : accessibility.snapshotId,
@@ -225,7 +273,8 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
     nodeCount: typeof accessibility.nodeCount === "number" ? Math.min(accessibility.nodeCount, maxNodes) : children.length,
     ...(typeof accessibility.changedNodeCount === "number" ? { changedNodeCount: accessibility.changedNodeCount } : {}),
     charCount: state.length,
-    truncated: accessibility.truncated === true || allChildren.length > maxNodes || sourceState.length > maxChars,
+    truncated: accessibility.truncated === true || allChildren.length > maxNodes || combinedState.length > maxChars,
+    ...frameProjectionFields(accessibility.frameSummaries ? accessibility : snapshot),
   };
 }
 
@@ -236,15 +285,20 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
   const dom = value.dom;
   const precompact = compactDomState(dom, maxChars, maxNodes);
   if (precompact) {
+    const embeddedFrameText = frameTextState(dom.frameSummaries, maxChars);
+    const frameSection = embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : "";
+    const combinedState = precompact.state.includes("Embedded frames:\n") ? precompact.state : [precompact.state, frameSection].filter(Boolean).join("\n\n");
+    const state = bounded(combinedState, maxChars);
     return {
       ...compactResultEnvelope(value),
       dom: {
         snapshotId: dom.snapshotId,
         ...(dom.viewport === undefined ? {} : { viewport: dom.viewport }),
-        state: precompact.state,
+        state,
         nodeCount: precompact.nodeCount,
-        charCount: precompact.charCount,
-        truncated: precompact.truncated,
+        charCount: state.length,
+        truncated: precompact.truncated || combinedState.length > maxChars,
+        ...frameProjectionFields(dom),
       },
     };
   }
@@ -257,7 +311,9 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
     const parent = node.parent_id === undefined ? "" : ` parent=${text(node.parent_id)}`;
     return `<${tag} node_id=${id}${parent}${role}>${bounded(node.text, 160)}</${tag}>`;
   }).join("\n");
-  const state = bounded(stateSource, maxChars);
+  const embeddedFrameText = frameTextState(dom.frameSummaries, maxChars);
+  const combinedState = [stateSource, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
+  const state = bounded(combinedState, maxChars);
   return {
     ...compactResultEnvelope(value),
     dom: {
@@ -266,7 +322,8 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
       state,
       nodeCount: typeof dom.nodeCount === "number" ? Math.min(dom.nodeCount, maxNodes) : nodes.length,
       charCount: state.length,
-      truncated: dom.truncated === true || allNodes.length > maxNodes || stateSource.length > maxChars,
+      truncated: dom.truncated === true || allNodes.length > maxNodes || combinedState.length > maxChars,
+      ...frameProjectionFields(dom),
     },
   };
 }
@@ -287,6 +344,7 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
       text: contentText,
       markdown: contentMarkdown,
       ...(content.truncated === true || text(content.text).length > maxChars || text(content.markdown).length > remainingChars ? { truncated: true } : {}),
+      ...frameProjectionFields(content),
     },
   };
 }
