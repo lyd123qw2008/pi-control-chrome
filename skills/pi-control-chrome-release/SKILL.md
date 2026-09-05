@@ -19,6 +19,7 @@ The full Chinese checklist is [`docs/RELEASE-CHECKLIST.zh-CN.md`](../../docs/REL
 - Do not publish from a local npm login. Use the existing GitHub Actions Trusted Publishing workflows.
 - Do not overwrite a published npm version. If a release is incomplete, use a new patch version.
 - Before a commit, push, merge, or publish, report the package/version matrix and stop for clarification if the scope is ambiguous.
+- Never proactively restart DSH as part of a release or Profile verification. Restarting can disconnect live sessions and may not restart successfully; wait for the maintainer to restart it manually, then perform read-only verification.
 
 ## Release surfaces
 
@@ -28,7 +29,7 @@ The full Chinese checklist is [`docs/RELEASE-CHECKLIST.zh-CN.md`](../../docs/REL
 | MV3 extension | `extension/manifest.json` | `extension/background.js`; confirm whether its version follows the root package | Ships with the Pi package; do not silently assume its version is identical |
 | `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `pnpm-lock.yaml`, `pnpm-workspace.yaml`, README install examples | `publish-dsh-tool-control-chrome.yml` |
 | Private `dsh-profile-config` source | `profiles/web/package.json`, `.agent-presets/` | `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, `.agent-presets/*/preset.yml`, `.agent-presets/*/agent.cordis.yml`, README, bootstrap scripts | Update in a separate private Profile configuration PR after npm publication; never publish it |
-| Active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile lockfile and `pnpm-workspace.yaml` overrides | Update only after npm publication, then restart DSH |
+| Active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile lockfile and `pnpm-workspace.yaml` overrides | Update only after npm publication; maintainer restarts DSH manually |
 
 ## Phase 1: inspect before editing
 
@@ -179,7 +180,7 @@ corepack pnpm --dir <DSH_HOME>/profiles/web why pi-control-chrome
 
 If the Profile contains `overrides.pi-control-chrome: <old-version>`, update it to the target root version and add the target to `minimumReleaseAgeExclude` when that policy is enabled. Confirm both the installed DSH package and the transitive Pi package from `node_modules` or `pnpm why`; the Profile `package.json` alone is insufficient.
 
-Restart DSH after the Profile install. Load the separate `pi-control-chrome` Skill before browser operations, then verify:
+After the Profile install, stop and wait for the maintainer to restart DSH manually. Do not invoke `/chrome restart`, a restart script, `taskkill`, or a new DSH server from the release agent; these can disconnect live sessions and can fail to restore the same runtime. Only after the maintainer confirms the restart, load the separate `pi-control-chrome` Skill before browser operations, then verify:
 
 - `/chrome status` or `browser_status` reports `connected: true` for the selected target; use `/chrome targets` and `/chrome profile <browserId>` when multiple targets are ready;
 - Bridge health reports the target root version;
