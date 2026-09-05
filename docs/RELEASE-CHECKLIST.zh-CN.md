@@ -40,6 +40,39 @@ npm view @lyd123qw2008/dsh-tool-control-chrome version dist-tags --json
 
 如果目标包、目标版本或发布范围不明确，先确认再改文件；不要根据上一次发布的版本自行推断。
 
+## PR 描述格式门禁
+
+创建、编辑或合并 PR 前，必须确认 GitHub 上的正文是实际 Markdown 换行，而不是字面量的 `\n`、`\r` 或 `\t`。PowerShell、JSON 和 shell 命令中的转义方式不同；不要把包含 `\n` 的普通双引号字符串直接传给 `gh pr create --body` 或 `gh pr edit --body`。
+
+推荐使用真实换行的 here-string 或正文文件：
+
+```powershell
+@'
+## Summary
+
+- concise change summary
+
+## Validation
+
+- `npm run test:all`
+- `npm run check`
+'@ | Set-Content -Encoding utf8 pr-body.md
+
+gh pr create --title "<title>" --body-file pr-body.md
+# 修改已有 PR 时使用：
+gh pr edit <number> --body-file pr-body.md
+```
+
+PR 创建或编辑后，必须读取远端正文进行渲染前检查：
+
+```powershell
+gh pr view <number> --repo <owner>/<repo> --json title,body,state,mergeStateStatus,url
+$body = gh pr view <number> --repo <owner>/<repo> --json body --jq .body
+if ($body.Contains('\n') -or $body.Contains('\r') -or $body.Contains('\t')) { throw 'PR body contains literal escape sequences; fix it before merge' }
+```
+
+检查结果必须同时满足：标题正确、`##` 标题和项目符号正常分行、代码块可读、验证命令完整、状态和合并条件符合预期。发现字面量转义符或 Markdown 粘连时，先用 `--body-file` 修复并再次读取确认，禁止直接合并。
+
 ## 推荐发布顺序
 
 当 DSH 包依赖新的 Pi 根包时，按以下顺序执行：

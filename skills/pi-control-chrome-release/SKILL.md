@@ -57,6 +57,39 @@ active DSH Profile                      <read>        <confirm>     pi-control-c
 
 A DSH release is not complete when only the root package has been bumped. A Pi release is not complete when only the extension Manifest has been reloaded. Ask the maintainer to choose the exact package set when the matrix has more than one plausible target.
 
+## PR body formatting gate
+
+Before creating, editing, or merging a PR, verify that GitHub stores actual Markdown line breaks, not literal `\n`, `\r`, or `\t` sequences. PowerShell, JSON, and shell escaping rules differ; never pass a normal double-quoted string containing `\n` directly to `gh pr create --body` or `gh pr edit --body`.
+
+Use a real-newline here-string or a body file instead:
+
+```powershell
+@'
+## Summary
+
+- concise change summary
+
+## Validation
+
+- `npm run test:all`
+- `npm run check`
+'@ | Set-Content -Encoding utf8 pr-body.md
+
+gh pr create --title "<title>" --body-file pr-body.md
+# For an existing PR:
+gh pr edit <number> --body-file pr-body.md
+```
+
+After creating or editing the PR, read the remote body before merge:
+
+```powershell
+gh pr view <number> --repo <owner>/<repo> --json title,body,state,mergeStateStatus,url
+$body = gh pr view <number> --repo <owner>/<repo> --json body --jq .body
+if ($body.Contains('\n') -or $body.Contains('\r') -or $body.Contains('\t')) { throw 'PR body contains literal escape sequences; fix it before merge' }
+```
+
+The gate passes only when the title is correct, headings and bullet lists render on separate lines, code blocks are readable, validation commands are complete, and the PR state/merge condition is expected. If literal escape sequences or Markdown concatenation is found, fix the body with `--body-file` and verify it again; do not merge first.
+
 ## Phase 2: prepare and test
 
 When DSH depends on a new Pi release, use this order:
