@@ -137,9 +137,10 @@ The workflow must pass its install, typecheck, test, build, pack, and publish st
 `dsh-profile-config` is a separate private repository and the source of truth for new-machine bootstrap. It is not an npm package and must not be published. After the public Pi and DSH packages are visible on npm:
 
 1. Update `profiles/web/package.json`, `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, `.agent-presets/*/preset.yml`, `.agent-presets/*/agent.cordis.yml`, README package examples, and bootstrap-related documentation in the private repository.
-2. Ensure both bootstrap scripts copy `.agent-presets/` into `DSH_HOME/.agent-presets` without deleting unrelated user presets.
-3. Inspect any `pi-control-chrome` override and update it to the target root version; add the target to `minimumReleaseAgeExclude` when that policy is enabled.
-4. Run the Profile checks from that repository:
+2. When the Profile links a local DSH workspace package (`link:`) and the running DSH installation supplies its peer graph, set top-level `autoInstallPeers: false` in `profiles/web/pnpm-workspace.yaml`. pnpm 11 reads this camelCase setting from workspace YAML; the old `.npmrc` key `auto-install-peers=false` is not a reliable replacement. Regenerate the lockfile so `settings.autoInstallPeers: false` matches. A `pnpm peers check` report listing host-provided DSH peers as missing is expected and is not a release failure; verify the installed package and runtime instead.
+3. Ensure both bootstrap scripts copy `.agent-presets/` into `DSH_HOME/.agent-presets` without deleting unrelated user presets.
+4. Inspect any `pi-control-chrome` override and update it to the target root version; add the target to `minimumReleaseAgeExclude` when that policy is enabled.
+5. Run the Profile checks from that repository:
 
    ```powershell
    corepack pnpm --dir profiles/web install --frozen-lockfile
@@ -147,15 +148,25 @@ The workflow must pass its install, typecheck, test, build, pack, and publish st
    corepack pnpm --dir profiles/web why pi-control-chrome
    ```
 
-5. Create and merge a separate private Profile configuration PR. Do not mix its files into the public `pi-control-chrome` release PR and do not trigger an npm publish for this repository.
+6. Create and merge a separate private Profile configuration PR. Do not mix its files into the public `pi-control-chrome` release PR and do not trigger an npm publish for this repository.
 
 ## Phase 4: update and verify active DSH Profile
 
-The active Profile is outside this repository. After both npm packages are available, install the exact DSH version:
+The active Profile is outside this repository. After both npm packages are available, install the exact DSH version. If it links local DSH workspace packages, configure host-provided peers before the first install:
+
+```yaml
+# <DSH_HOME>/profiles/web/pnpm-workspace.yaml
+# pnpm 11 uses this workspace setting; do not rely on .npmrc auto-install-peers=false.
+autoInstallPeers: false
+```
+
+Then run the update with the explicit one-shot flag as a safeguard:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@<dsh-version>
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> --config.auto-install-peers=false
 ```
+
+If the command reports `ERR_PNPM_NO_MATCHING_VERSION` for a range such as `>=0.1.1 <0.2.0-0` coming from a linked DSH package, do not publish or downgrade packages. That range is a peer-resolution artifact from the local workspace package; the DSH installation supplies those peers. Set `autoInstallPeers: false`, regenerate the lockfile, and retry. `pnpm peers check` may still list those host-provided peers as missing; use `pnpm list`, `pnpm why`, the actual `node_modules` manifests, and the runtime check below as the acceptance criteria.
 
 Then inspect and fix any root package override before installing again:
 

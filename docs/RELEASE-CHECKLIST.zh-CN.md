@@ -134,11 +134,21 @@ corepack pnpm --dir dsh-tool-control-chrome run pack:check
 
 ## 发布后更新 active DSH Profile
 
-仓库中的 DSH 依赖更新不会自动修改 active Profile。根包和 DSH 包发布成功后，执行精确版本安装：
+仓库中的 DSH 依赖更新不会自动修改 active Profile。根包和 DSH 包发布成功后，执行精确版本安装。如果 Profile 链接了本地 DSH workspace 包，并由运行中的 DSH 安装提供 peer 依赖，先在 `pnpm-workspace.yaml` 顶层声明：
+
+```yaml
+# <DSH_HOME>/profiles/web/pnpm-workspace.yaml
+# pnpm 11 使用 workspace YAML 的 camelCase 配置，不要依赖 .npmrc 中的旧写法。
+autoInstallPeers: false
+```
+
+这样 lockfile 的 `settings.autoInstallPeers` 也必须为 `false`。pnpm 11 不可靠地读取 `.npmrc` 中的 `auto-install-peers=false`；如果存在该旧配置，应迁移到 workspace YAML。然后带显式的一次性参数执行更新：
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@<dsh-version>
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> --config.auto-install-peers=false
 ```
+
+如果命令因本地链接 DSH 包产生的 `>=0.1.1 <0.2.0-0` 等 peer 范围报 `ERR_PNPM_NO_MATCHING_VERSION`，不要发布新版本或回退包版本；这是把 workspace peer 当成 registry 依赖解析造成的。设置 `autoInstallPeers: false`、重新生成 lockfile 后重试。`pnpm peers check` 仍可能把由 DSH 安装提供的 peers 列为 missing，这属于预期警告，不作为失败条件；应以 `pnpm list`、`pnpm why`、实际 `node_modules` manifest 和重启后的运行验证为准。
 
 然后检查 Profile 是否存在旧的 root override：
 
