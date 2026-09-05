@@ -31,6 +31,7 @@ const INDEX: ParameterPropertySpec = { type: 'integer', description: 'Optional z
 const OPTIONAL_BOOLEAN: ParameterPropertySpec = { type: 'boolean' }
 const WAIT_EXACT: ParameterPropertySpec = { type: 'boolean', description: 'For text/text_gone waits only. For visible/hidden/enabled waits, put exact inside target.' }
 const SELECTOR: ParameterPropertySpec = { type: 'string', description: 'Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot.' }
+const INCLUDE_FRAMES: ParameterPropertySpec = { type: 'boolean', description: 'Include same-origin iframe summaries and readable frame text; cross-origin frames are reported as unavailable.' }
 const OUTPUT_MAX_CHARS: ParameterPropertySpec = { type: 'integer', description: 'Optional output character budget. The extension caps this at 100000; the default is 20000 for snapshots and DOM CUA.' }
 const OUTPUT_MAX_NODES: ParameterPropertySpec = { type: 'integer', description: 'Optional output node budget. The extension caps this at 1000; the default is 200.' }
 const TAB_HANDLE_PROPERTIES: ParameterSchemaSpec = {
@@ -356,20 +357,20 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_snapshot',
-    description: 'Read the active page title and one bounded semantic page state with document-scoped live eN refs; ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, while navigation remains a hard boundary. Read-only observation may retry once if the tab document changes.',
-    parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES },
+    description: 'Read the active page title and one bounded semantic page state with document-scoped live eN refs; same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames: false. Ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, while navigation remains a hard boundary. Read-only observation may retry once if the tab document changes.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES },
     method: 'snapshot',
   },
   {
     name: 'browser_extract',
-    description: 'Extract the current page as bounded plain text and simple Markdown without using a separate web scraper. Read-only observation may retry once if the tab document changes.',
-    parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS },
+    description: 'Extract the current page as bounded plain text and simple Markdown without using a separate web scraper; same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames: false. Read-only observation may retry once if the tab document changes.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS },
     method: 'extract',
   },
   {
     name: 'browser_accessibility_snapshot',
-    description: 'Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.',
-    parameters: { tabId: TAB_ID, selector: SELECTOR, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: OPTIONAL_BOOLEAN },
+    description: 'Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. Same-origin iframe context is included by default and can be disabled with includeFrames: false. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: OPTIONAL_BOOLEAN },
     method: 'snapshot',
   },
   {
@@ -564,10 +565,11 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_dom_cua',
-    description: 'Use visible DOM node ids from a matching browser_dom_cua observation; any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations. Unrelated same-document UI changes do not stale a node, while navigation remains a hard boundary.',
+    description: 'Use visible DOM node ids from a matching browser_dom_cua observation; same-origin iframe text and bounded frame metadata are included for get_visible_dom by default and can be disabled with includeFrames: false. Any supplied nodeId requires its matching snapshotId for click, double-click, type, keypress and scroll operations. Unrelated same-document UI changes do not stale a node, while navigation remains a hard boundary.',
     parameters: {
       tabId: TAB_ID,
       action: DOM_CUA_ACTION,
+      includeFrames: INCLUDE_FRAMES,
       snapshotId: OPTIONAL_STRING,
       nodeId: OPTIONAL_STRING,
       selector: SELECTOR,
@@ -1156,6 +1158,7 @@ function connectionResult(connection: Exclude<BrowserConnection, { readonly stat
 
 type BrowserOperationErrorCode =
   | 'EXTENSION_OFFLINE'
+  | 'BROWSER_BRIDGE_DISCONNECTED'
   | 'TARGET_UNAVAILABLE'
   | 'TARGET_CONNECTION_CHANGED'
   | 'BROWSER_OPERATION_UNCERTAIN'
@@ -1196,7 +1199,10 @@ async function operationDisconnectedResult(
   bridge: BrowserBridgeClient,
   code: BrowserOperationErrorCode = 'EXTENSION_OFFLINE',
   details?: JsonValue,
+  operationMessage?: string,
 ): Promise<JsonValue> {
+  const providedMessage = typeof operationMessage === 'string' && operationMessage.length > 0 ? operationMessage : undefined
+  const messageOr = (fallback: string): string => providedMessage ?? fallback
   if (code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR') return asJsonValue({
     ok: false,
     completed: false,
@@ -1207,11 +1213,11 @@ async function operationDisconnectedResult(
     recommendation: code === 'BROWSER_SELECTOR_NOT_FOUND' ? 'refresh_selector_target' : code === 'BROWSER_SELECTOR_INVALID' ? 'fix_selector' : 'inspect_page_script_error',
     error: {
       code,
-      message: code === 'BROWSER_SELECTOR_NOT_FOUND'
+      message: messageOr(code === 'BROWSER_SELECTOR_NOT_FOUND'
         ? 'The requested page selector did not match an element. Run browser_snapshot without selector or choose a selector present on the current page.'
         : code === 'BROWSER_SELECTOR_INVALID'
           ? 'The requested page selector is invalid. Use a valid CSS selector, then run browser_snapshot again.'
-          : 'The page script failed before producing a result. Inspect the current page before retrying.',
+          : 'The page script failed before producing a result. Inspect the current page before retrying.'),
       ...(details === undefined ? {} : { details }),
     },
   })
@@ -1225,30 +1231,42 @@ async function operationDisconnectedResult(
     recommendation: 'refresh_browser_tabs',
     error: {
       code,
-      message: code === 'BROWSER_TAB_CLOSED'
+      message: messageOr(code === 'BROWSER_TAB_CLOSED'
         ? 'The requested browser tab is closed. Refresh browser_tabs and choose a current tab before retrying.'
-        : 'The browser tab incarnation changed. Refresh browser_tabs and use the current tab handle before retrying.',
+        : 'The browser tab incarnation changed. Refresh browser_tabs and use the current tab handle before retrying.'),
       ...(details === undefined ? {} : { details }),
     },
   })
   if (AX_OPERATION_ERROR_CODES.has(code)) {
-    const uncertain = code === 'AX_NODE_OPERATION_FAILED' || (isRecord(details) && details.actionState === 'unknown')
+    const detailRecord = isRecord(details) ? details : undefined
+    const actionState = detailRecord?.actionState === 'unknown'
+      ? 'unknown'
+      : detailRecord?.actionState === 'not_completed'
+        ? 'not_completed'
+        : undefined
+    const uncertain = actionState === 'unknown' || (code === 'AX_NODE_OPERATION_FAILED' && actionState !== 'not_completed')
     const documentChanged = code === 'BROWSER_DOCUMENT_CHANGED'
+    const explicitRetryable = typeof detailRecord?.retryable === 'boolean' ? detailRecord.retryable : undefined
+    const retryable = uncertain ? false : explicitRetryable ?? (code === 'AX_NODE_NOT_FOUND' || documentChanged)
+    const inspectFirst = uncertain || documentChanged || detailRecord?.inspectFirst === true
+    const detailNextAction = typeof detailRecord?.nextAction === 'string' && detailRecord.nextAction.length > 0 ? detailRecord.nextAction : undefined
+    const detailRecommendation = typeof detailRecord?.recommendation === 'string' && detailRecord.recommendation.length > 0 ? detailRecord.recommendation : undefined
+    const message = messageOr(documentChanged
+      ? 'The accessibility reference belongs to an earlier document. Refresh browser_tabs and browser_accessibility_snapshot before retrying.'
+      : uncertain
+        ? 'The accessibility operation may have taken effect or could not be confirmed. Inspect the current page before retrying; do not replay side effects automatically.'
+        : 'The accessibility target is not available in the current page. Refresh browser_accessibility_snapshot and use the current target.')
     return asJsonValue({
       ok: false,
       completed: false,
-      actionState: uncertain ? 'unknown' : 'not_completed',
-      retryable: code === 'AX_NODE_NOT_FOUND' || documentChanged,
-      inspectFirst: uncertain || documentChanged,
-      nextAction: documentChanged ? 'browser_tabs' : 'browser_accessibility_snapshot',
-      recommendation: documentChanged ? 'refresh_browser_document' : uncertain ? 'inspect_before_retry' : 'refresh_accessibility_snapshot',
+      actionState: uncertain ? 'unknown' : actionState ?? 'not_completed',
+      retryable,
+      inspectFirst,
+      nextAction: documentChanged ? 'browser_tabs' : detailNextAction ?? 'browser_accessibility_snapshot',
+      recommendation: documentChanged ? 'refresh_browser_document' : uncertain ? 'inspect_before_retry' : detailRecommendation ?? 'refresh_accessibility_snapshot',
       error: {
         code,
-        message: documentChanged
-          ? 'The accessibility reference belongs to an earlier document. Refresh browser_tabs and browser_accessibility_snapshot before retrying.'
-          : uncertain
-            ? 'The accessibility operation may have taken effect or could not be confirmed. Inspect the current page before retrying; do not replay side effects automatically.'
-            : 'The accessibility reference is no longer safely usable. Run browser_accessibility_snapshot again and use the new ref.',
+        message,
         ...(details === undefined ? {} : { details }),
       },
     })
@@ -1263,10 +1281,30 @@ async function operationDisconnectedResult(
     recommendation: 'retry_read_on_current_tab',
     error: {
       code,
-      message: 'The tab document changed during a read. Refresh browser_tabs and retry the read; no page side effect was sent.',
+      message: messageOr('The tab document changed during a read. Refresh browser_tabs and retry the read; no page side effect was sent.'),
       ...(details === undefined ? {} : { details }),
     },
   })
+  if (code === 'BROWSER_BRIDGE_DISCONNECTED') {
+    const detailRecord = isRecord(details) ? details : undefined
+    const safeReadRecovery = detailRecord?.actionState === 'not_completed' && detailRecord.retryable === true
+    return asJsonValue({
+      ok: false,
+      completed: false,
+      actionState: safeReadRecovery ? 'not_completed' : 'unknown',
+      retryable: safeReadRecovery,
+      inspectFirst: !safeReadRecovery,
+      nextAction: 'browser_status',
+      recommendation: safeReadRecovery ? 'retry_browser_status' : 'inspect_before_retry',
+      error: {
+        code,
+        message: messageOr(safeReadRecovery
+          ? 'The browser Bridge connection was interrupted during a read. Run browser_status before retrying.'
+          : 'The browser Bridge connection ended during an operation. Inspect the current browser state before retrying; do not replay side effects automatically.'),
+        ...(details === undefined ? {} : { details }),
+      },
+    })
+  }
   if (code === 'BROWSER_WAIT_TIMEOUT') return asJsonValue({
     ok: false,
     completed: false,
@@ -1277,7 +1315,7 @@ async function operationDisconnectedResult(
     recommendation: 'inspect_wait_target',
     error: {
       code,
-      message: 'The wait condition did not become true before the timeout. Inspect the current page or narrow the target before retrying.',
+      message: messageOr('The wait condition did not become true before the timeout. Inspect the current page or narrow the target before retrying.'),
       ...(details === undefined ? {} : { details }),
     },
   })
@@ -1300,7 +1338,7 @@ async function operationDisconnectedResult(
     ...(targetLoss || targetMismatch ? { nextAction: 'browser_status', recommendation: targetMismatch ? 'refresh_browser_target_handle' : 'refresh_browser_targets' } : pageUnavailable ? { nextAction: 'browser_tabs', recommendation: 'navigate_to_scriptable_page' } : uncertain ? { nextAction: 'browser_snapshot', recommendation: 'inspect_before_retry' } : {}),
     error: {
       code: uncertain || targetLoss || targetMismatch || pageUnavailable ? code : 'extension_disconnected_during_operation',
-      message: uncertain
+      message: messageOr(uncertain
         ? 'The browser operation may have taken effect before the Bridge request ended. Inspect the current browser state before retrying; do not replay side effects automatically.'
         : targetLoss
           ? 'The selected browser target is unavailable or its connection changed during the browser operation. Run browser_status, then refresh the tab state before retrying.'
@@ -1308,7 +1346,7 @@ async function operationDisconnectedResult(
             ? 'The tab handle belongs to a different browser target. Run browser_status, then browser_tabs and use a handle from the selected target; the request was not sent to that tab.'
             : pageUnavailable
               ? 'The selected tab is a browser error page or restricted page and cannot be scripted. Navigate it to a scriptable page, then run browser_tabs before retrying.'
-              : 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.',
+              : 'The browser extension disconnected during the browser operation. Inspect the current page before retrying.'),
       ...(details === undefined ? {} : { details }),
     },
     ...(bridgeHealth === undefined ? {} : { bridgeHealth: compactBridgeHealth(bridgeHealth), recovery: bridgeRecovery(bridgeHealth) }),
@@ -1317,7 +1355,7 @@ async function operationDisconnectedResult(
 
 type BrowserOperationResponse =
   | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false; readonly code: BrowserOperationErrorCode; readonly details?: JsonValue }
+  | { readonly ok: false; readonly code: BrowserOperationErrorCode; readonly details?: JsonValue; readonly message?: string }
 
 function isTargetLocator(value: unknown): boolean {
   if (!isRecord(value)) return false
@@ -1410,11 +1448,66 @@ async function requestBrowserOperation(
     return { ok: true, value: await requestWithTarget(bridge, method, params, signal, target) }
   } catch (error) {
     const code = bridgeErrorCode(error)
-    if (code === 'EXTENSION_OFFLINE' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_TAB_CLOSED' || code === 'BROWSER_TAB_FENCE_CHANGED' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
+    if (code === 'EXTENSION_OFFLINE' || code === 'BROWSER_BRIDGE_DISCONNECTED' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_TAB_CLOSED' || code === 'BROWSER_TAB_FENCE_CHANGED' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
       const details = error && typeof error === 'object' && 'details' in error ? (error as { readonly details?: unknown }).details : undefined
-      return { ok: false, code: code as BrowserOperationErrorCode, ...(details === undefined ? {} : { details: asJsonValue(details) }) }
+      const message = error instanceof Error && error.message.length > 0 ? error.message : undefined
+      return {
+        ok: false,
+        code: code as BrowserOperationErrorCode,
+        ...(details === undefined ? {} : { details: asJsonValue(details) }),
+        ...(message === undefined ? {} : { message }),
+      }
     }
     throw error
+  }
+}
+
+const READ_ONLY_BRIDGE_RETRY_METHODS = new Set([
+  'selected_tab',
+  'list_tabs',
+  'snapshot',
+  'extract',
+  'wait',
+  'screenshot',
+  'network_response_body',
+])
+
+function readOnlyLocatorAction(value: unknown): boolean {
+  return ['count', 'all', 'allTextContents', 'textContent', 'innerText', 'getAttribute', 'isVisible', 'isEnabled', 'waitFor', 'first', 'last', 'nth', 'filter', 'and', 'or'].includes(String(value ?? ''))
+}
+
+function isReadOnlyBrowserMethod(method: string, params: Record<string, JsonValue>): boolean {
+  if (READ_ONLY_BRIDGE_RETRY_METHODS.has(method)) return true
+  if (method === 'locator') return readOnlyLocatorAction(params.action)
+  if (method === 'dom_cua') return params.action === 'get_visible_dom'
+  if (method === 'dialog') return params.action === 'get'
+  if (method === 'clipboard') return params.action === 'read'
+  if (method === 'download') return params.action === 'list' || params.action === 'wait'
+  if (method === 'console_logs' || method === 'network_requests') return params.clear !== true
+  return false
+}
+
+async function requestBrowserOperationWithReadRecovery(
+  bridge: BrowserBridgeClient,
+  method: string,
+  params: Record<string, JsonValue>,
+  signal: AbortSignal,
+  target: BrowserTargetRoute | undefined,
+): Promise<BrowserOperationResponse> {
+  const result = await requestBrowserOperation(bridge, method, params, signal, target)
+  if (result.ok || !isReadOnlyBrowserMethod(method, params)) return result
+  if (result.code !== 'BROWSER_BRIDGE_DISCONNECTED' && result.code !== 'TARGET_CONNECTION_CHANGED') return result
+  if (isRecord(result.details) && result.details.retryable === false) return result
+  const browserId = target?.browserId
+  if (browserId === undefined) return result
+  // A read may be replayed after a transport/connection fence failure. Route by
+  // stable browser identity only; the target's current generation is reacquired
+  // by the Bridge, while side-effecting methods never enter this path.
+  try {
+    const retry = await requestBrowserOperation(bridge, method, params, signal, { browserId })
+    return retry.ok ? retry : result
+  } catch {
+    return result
   }
 }
 
@@ -2200,8 +2293,8 @@ export function registerBrowserTools(
         if (spec.name === 'browser_accessibility_snapshot') {
           const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
           assertBridgeRequestCapabilities('snapshot', wireParams, connection.bridgeHealth, connection.status)
-          const result = await requestBrowserOperation(bridge, 'snapshot', { ...wireParams, accessibilityOnly: true }, operationSignal, targetRoute)
-          if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
+          const result = await requestBrowserOperationWithReadRecovery(bridge, 'snapshot', { ...wireParams, accessibilityOnly: true }, operationSignal, targetRoute)
+          if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
           return prepareAccessibility(result.value, params)
         }
         if (spec.name === 'browser_console') {
@@ -2215,12 +2308,12 @@ export function registerBrowserTools(
         const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
         assertBridgeRequestCapabilities(method, wireParams, connection.bridgeHealth, connection.status)
         if (spec.name === 'browser_screenshot') {
-          const result = await requestBrowserOperation(bridge, method, wireParams, operationSignal, targetRoute)
-          if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
+          const result = await requestBrowserOperationWithReadRecovery(bridge, method, wireParams, operationSignal, targetRoute)
+          if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
           return prepareScreenshot(result.value, params, attachments)
         }
-        const result = await requestBrowserOperation(bridge, method, wireParams, operationSignal, targetRoute)
-        if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details)
+        const result = await requestBrowserOperationWithReadRecovery(bridge, method, wireParams, operationSignal, targetRoute)
+        if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
         return compactBrowserResult(spec.name, params, result.value)
       } finally {
         releaseOperation?.()
