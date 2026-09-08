@@ -108,7 +108,7 @@ test("Codex MCP adapter exposes the initial browser tool catalog over stdio", as
 
     mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listed = await mcp.nextMessage();
-    assert.equal(listed.result.tools.length, 8);
+    assert.equal(listed.result.tools.length, 9);
     assert.deepEqual(listed.result.tools.map((tool) => tool.name), [
       "browser_status",
       "browser_tabs",
@@ -116,6 +116,7 @@ test("Codex MCP adapter exposes the initial browser tool catalog over stdio", as
       "browser_accessibility_snapshot",
       "browser_extract",
       "browser_wait",
+      "browser_probe_interaction",
       "browser_click",
       "browser_fill",
     ]);

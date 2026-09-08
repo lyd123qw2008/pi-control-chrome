@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.6 - 2026-09-08
+
+- Add `browser_probe_interaction` as an explicit, single-dispatch interaction diagnostic that returns before/after document identity, action confirmation, bounded settle status, post-action Console/pageerror events, and target post-state without replaying uncertain side effects.
+
+- Add bounded incremental Console reads with `since`/`nextSince`, `only: "errors"` filtering, and `Runtime.exceptionThrown` to `pageerror` mapping; expose the capability through Pi, DSH, Codex, Bridge, and the MV3 extension.
+
+- Add isolated real-Edge regression fixtures for post-action Console errors, page errors, removed targets, asynchronous settling, stable state, and Console cursors; update the Skill, README, and release documentation.
+
 ## 0.5.5 - 2026-09-05
 
 - Add bounded same-origin embedded-frame traversal to snapshot, extract, Accessibility Snapshot, and DOM-CUA reads, including frame diagnostics, loading state, cross-origin boundaries, and the `includeFrames: false` opt-out.

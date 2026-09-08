@@ -606,14 +606,14 @@ function isTargetLocator(value: unknown): boolean {
 
 const TAB_INCARNATION_METHODS = new Set([
   "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
-  "close_tab", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
+  "close_tab", "locator", "interaction", "probe_interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
   "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard",
   "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable", "download", "cleanup",
 ]);
 
 function isSideEffectingBrowserRequest(method: string, params: Record<string, unknown>): boolean {
   if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "dom_cua", "keypress", "cleanup"].includes(method)) return method !== "dom_cua" || params.action !== "get_visible_dom";
-  if (method === "interaction") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.operation || params.action || ""));
+  if (method === "interaction" || method === "probe_interaction") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.operation || params.action || ""));
   if (method === "locator") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || ""));
   if (method === "download") return !["list", "wait"].includes(String(params.action || ""));
   if (method === "clipboard") return params.action === "write";
@@ -675,7 +675,15 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
     requiredBridge.push("semanticTargetRequests");
     requiredExtension.push("semanticTargets");
   };
-  if (method === "interaction" && params.target !== undefined) requireTargetSupport();
+  if ((method === "interaction" || method === "probe_interaction") && params.target !== undefined) requireTargetSupport();
+  if (method === "probe_interaction") {
+    requiredBridge.push("interactionDiagnostics", "incrementalConsole");
+    requiredExtension.push("interactionDiagnostics", "incrementalConsole");
+    const settle = params.settle && typeof params.settle === "object" && !Array.isArray(params.settle) ? params.settle as Record<string, unknown> : undefined;
+    const settleState = String(settle?.state || "");
+    if (settle !== undefined && ["text", "text_gone", "visible", "hidden", "enabled", "url", "load"].includes(settleState)) requiredBridge.push("pageWaitStates");
+    if (settle?.target !== undefined) requireTargetSupport();
+  }
   if (method === "locator" && (params.target !== undefined || isTargetLocator(params.locator))) requireTargetSupport();
   if (method === "wait") {
     const state = String(params.state || "load");
@@ -1012,9 +1020,21 @@ function validateLocatorRequest(params: Record<string, unknown>): void {
   if (["strategy", "selector", "exact", "name", "index", "hasText", "hasSelector"].some(key => params[key] !== undefined)) throw new Error("locator target cannot be combined with legacy locator fields");
 }
 
+function validateProbeInteractionRequest(params: Record<string, unknown>): void {
+  const operation = String(params.operation || "");
+  if (!["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(operation)) throw new Error(`Unsupported probe interaction operation: ${operation || "missing"}`);
+  const hasTarget = params.target !== undefined || params.selector !== undefined || /^e\\d+$/.test(String(params.ref || ""));
+  if (operation !== "scroll" && !hasTarget) throw new Error(`probe_interaction ${operation} requires target, ref or selector`);
+  if (["fill", "type", "select", "set_checked"].includes(operation) && params.value === undefined) throw new Error(`probe_interaction ${operation} requires value`);
+  if (operation === "press" && params.key === undefined) throw new Error("probe_interaction press requires key");
+  if (params.only !== undefined && !["all", "errors"].includes(String(params.only))) throw new Error("probe_interaction only must be all or errors");
+  if (params.settle !== undefined && (typeof params.settle !== "object" || params.settle === null || Array.isArray(params.settle))) throw new Error("probe_interaction settle must be an object");
+}
+
 async function call(method: string, params: Record<string, unknown> = {}, options: BrowserCallOptions = {}) {
   const lifecycleTracked = !["status", "doctor", "list_tabs", "selected_tab", "cleanup", "context_reset"].includes(method);
   const waitTracked = method === "wait"
+    || method === "probe_interaction"
     || (method === "navigate" && params.wait !== false)
     || (method === "download" && (params.action === "wait" || (params.action === "start" && params.wait !== false)))
     || (method === "locator" && params.action === "waitFor");
@@ -1058,6 +1078,7 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
   if (targetSelectionRequired && !["status", "doctor", "cleanup", "context_reset"].includes(method)) throw targetSelectionRequiredError();
   if (method === "wait") validateWaitRequest(params);
   if (method === "locator") validateLocatorRequest(params);
+  if (method === "probe_interaction") validateProbeInteractionRequest(params);
   if (method === "context_reset") return call("cleanup", params, options);
   if (method === "doctor") {
     if (targetSelectionRequired) return targetSelectionRequiredResult(requestSessionId);
@@ -1419,6 +1440,47 @@ function registerBrowserTools(pi: ExtensionAPI) {
 
   pi.registerTool({
     executionMode: "sequential",
+    name: "browser_probe_interaction",
+    label: "Probe Browser Interaction",
+    description: "Perform one explicit browser interaction and return a bounded diagnostic linking target resolution, action confirmation, document identity, post-action Console errors, settling and target state. Use this when a click, form action or UI update may fail; it never automatically retries the side effect.",
+    parameters: Type.Object({
+      tabId: TAB_ID,
+      handle: TAB_HANDLE,
+      operation: Type.Union([
+        Type.Literal("click"), Type.Literal("double_click"), Type.Literal("dblclick"), Type.Literal("fill"), Type.Literal("type"),
+        Type.Literal("press"), Type.Literal("select"), Type.Literal("check"), Type.Literal("uncheck"), Type.Literal("set_checked"),
+        Type.Literal("hover"), Type.Literal("focus"), Type.Literal("scroll"),
+      ]),
+      snapshotId: Type.Optional(Type.String()),
+      ref: Type.Optional(Type.String()),
+      selector: SELECTOR,
+      target: ELEMENT_TARGET,
+      value: Type.Optional(Type.Unknown()),
+      key: Type.Optional(Type.String()),
+      deltaX: Type.Optional(Type.Number()),
+      deltaY: Type.Optional(Type.Number()),
+      timeoutMs: TIMEOUT_MS,
+      settle: Type.Optional(Type.Object({
+        state: WAIT_STATE,
+        url: Type.Optional(Type.String()),
+        urlIncludes: Type.Optional(Type.String()),
+        text: Type.Optional(Type.String()),
+        target: ELEMENT_TARGET,
+        exact: Type.Optional(Type.Boolean()),
+        timeoutMs: TIMEOUT_MS,
+      }, { additionalProperties: false })),
+      settleMs: Type.Optional(Type.Number({ minimum: 0, maximum: 5000 })),
+      only: Type.Optional(Type.Union([Type.Literal("errors"), Type.Literal("all")])),
+      maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+      maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 100000 })),
+    }),
+    async execute(_toolCallId, params) {
+      try { return textResult(await call("probe_interaction", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    executionMode: "sequential",
     name: "browser_click",
     label: "Click Browser Element",
     description: "Click one visible element by semantic target, a document-scoped live eN/aN ref with matching snapshotId, or CSS selector.",
@@ -1574,9 +1636,9 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_console",
     label: "Browser Console",
-    description: "Enable and read Runtime console and Log entries captured from a browser tab.",
+    description: "Enable and read bounded Runtime console, pageerror and Log entries captured from a browser tab. Use since/nextSince for action-scoped incremental reads and only=errors to filter runtime failures.",
     parameters: Type.Object({ tabId: TAB_ID,
-      handle: TAB_HANDLE, action: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()) }),
+      handle: TAB_HANDLE, action: Type.Optional(Type.String()), clear: Type.Optional(Type.Boolean()), only: Type.Optional(Type.Union([Type.Literal("all"), Type.Literal("errors")])), since: Type.Optional(Type.String()), maxEvents: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })), maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 100000 })) }),
     async execute(_toolCallId, params) {
       try {
         if (params.action === "enable") return textResult(await call("devtools_enable", { ...params, domains: ["Runtime", "Log"] }));

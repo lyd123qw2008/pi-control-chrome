@@ -32,6 +32,8 @@ const EXTENSION_CAPABILITIES = Object.freeze({
   axRefs: true,
   frameAwareReads: true,
   tabIncarnationFence: true,
+  interactionDiagnostics: true,
+  incrementalConsole: true,
 });
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
@@ -188,6 +190,20 @@ function validateLocatorParams(params = {}) {
   if (["strategy", "selector", "exact", "name", "index", "hasText", "hasSelector"].some((key) => params[key] !== undefined)) throw new Error("locator target cannot be combined with legacy locator fields");
 }
 
+const PROBE_INTERACTION_OPERATIONS = new Set(["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"]);
+
+function validateProbeInteractionParams(params = {}) {
+  const operation = String(params.operation || params.action || "");
+  if (!PROBE_INTERACTION_OPERATIONS.has(operation)) throw new Error(`Unsupported probe interaction operation: ${operation || "missing"}`);
+  if (params.target !== undefined) validateLocatorParams(params);
+  const hasTarget = params.target !== undefined || params.selector !== undefined || /^e\\d+$/.test(String(params.ref || ""));
+  if (operation !== "scroll" && !hasTarget) throw new Error(`probe_interaction ${operation} requires target, ref or selector`);
+  if (["fill", "type", "select", "set_checked"].includes(operation) && params.value === undefined) throw new Error(`probe_interaction ${operation} requires value`);
+  if (operation === "press" && params.key === undefined) throw new Error("probe_interaction press requires key");
+  if (params.only !== undefined && !["all", "errors"].includes(String(params.only))) throw new Error("probe_interaction only must be all or errors");
+  if (params.settle !== undefined && (typeof params.settle !== "object" || params.settle === null || Array.isArray(params.settle))) throw new Error("probe_interaction settle must be an object");
+}
+
 function boundedPush(list, value) {
   list.push(value);
   if (list.length > MAX_EVENTS) list.splice(0, list.length - MAX_EVENTS);
@@ -208,6 +224,65 @@ function boundedEventCollection(entries, maxChars = 20_000, maxItems = 200) {
     charCount += cost;
   }
   return { items, charCount, truncated, maxChars, maxItems };
+}
+
+function appendConsoleEvent(state, event) {
+  const sequence = Number(state.consoleSequence || 0) + 1;
+  state.consoleSequence = sequence;
+  boundedPush(state.console, { ...event, sequence });
+  return sequence;
+}
+
+function consoleBaseline(state, tabFence) {
+  const documentEpoch = Number(state.documentEpoch || 0);
+  const sequence = Number(state.consoleSequence || 0);
+  return {
+    token: `${documentEpoch}:${sequence}`,
+    documentEpoch,
+    sequence,
+    tabFence: typeof tabFence === "string" ? tabFence : undefined,
+  };
+}
+
+function parseConsoleSince(value) {
+  if (Number.isFinite(Number(value))) return { documentEpoch: undefined, sequence: Number(value) };
+  if (typeof value === "string") {
+    const match = /^(\d+):(\d+)$/.exec(value.trim());
+    if (match) return { documentEpoch: Number(match[1]), sequence: Number(match[2]) };
+  }
+  if (value && typeof value === "object") {
+    const documentEpoch = Number(value.documentEpoch);
+    const sequence = Number(value.sequence);
+    if (Number.isInteger(documentEpoch) && documentEpoch >= 0 && Number.isInteger(sequence) && sequence >= 0) return { documentEpoch, sequence };
+  }
+  return undefined;
+}
+
+function consoleEventIsError(event) {
+  return event?.type === "pageerror" || ["error", "assert", "exception"].includes(String(event?.level || "").toLowerCase());
+}
+
+function consoleCollectionFor(state, params = {}, tabFence) {
+  const baseline = consoleBaseline(state, tabFence);
+  const since = parseConsoleSince(params.since);
+  const documentChanged = since?.documentEpoch !== undefined && since.documentEpoch !== baseline.documentEpoch;
+  const startSequence = documentChanged ? 0 : since?.sequence;
+  const only = params.only === "errors" ? "errors" : "all";
+  const maxChars = Number.isInteger(Number(params.maxChars)) && Number(params.maxChars) > 0 ? Math.min(Number(params.maxChars), 100_000) : 20_000;
+  const maxItems = Number.isInteger(Number(params.maxEvents)) && Number(params.maxEvents) > 0 ? Math.min(Number(params.maxEvents), 500) : 200;
+  const selected = state.console.filter((event) => {
+    if (startSequence !== undefined && Number(event?.sequence || 0) <= startSequence) return false;
+    return only === "all" || consoleEventIsError(event);
+  });
+  const collection = boundedEventCollection(selected, maxChars, maxItems);
+  return {
+    ...collection,
+    only,
+    baseline,
+    nextSince: baseline.token,
+    ...(since === undefined && params.since !== undefined ? { sinceInvalid: true } : {}),
+    ...(documentChanged ? { documentChanged: true } : {}),
+  };
 }
 
 function runtimeStateKey(tabId) {
@@ -235,6 +310,7 @@ function stateForTab(tabId) {
   if (!state) {
     state = {
       console: [],
+      consoleSequence: 0,
       network: [],
       lifecycle: [],
       requestLoaders: new Map(),
@@ -403,7 +479,35 @@ function formatConsoleEvent(method, params) {
       args: boundedEventArgs(params.args),
       url: redactEventText(params.stackTrace?.callFrames?.[0]?.url, 2048),
       line: params.stackTrace?.callFrames?.[0]?.lineNumber,
+      column: params.stackTrace?.callFrames?.[0]?.columnNumber,
       timestamp: params.timestamp,
+    };
+  }
+  if (method === "Runtime.exceptionThrown") {
+    const details = params.exceptionDetails || {};
+    const exception = details.exception || {};
+    const stack = Array.isArray(details.stackTrace?.callFrames)
+      ? details.stackTrace.callFrames.slice(0, 20).map((frame) => ({
+        functionName: boundedEventText(frame.functionName, 256),
+        url: redactEventText(frame.url, 2048),
+        line: frame.lineNumber,
+        column: frame.columnNumber,
+      }))
+      : undefined;
+    const detailText = details.text ? String(details.text) : "";
+    const exceptionText = exception.description || exception.value || "";
+    const text = [detailText, exceptionText]
+      .filter((value, index, values) => value && values.indexOf(value) === index)
+      .join(detailText && exceptionText && detailText !== exceptionText ? ": " : "") || "Uncaught exception";
+    return {
+      type: "pageerror",
+      level: "error",
+      text: redactEventText(text, 4096),
+      url: redactEventText(details.url || stack?.[0]?.url, 2048),
+      line: details.lineNumber ?? stack?.[0]?.line,
+      column: details.columnNumber ?? stack?.[0]?.column,
+      ...(stack && stack.length > 0 ? { stack } : {}),
+      timestamp: details.timestamp ?? Date.now(),
     };
   }
   if (method === "Log.entryAdded") {
@@ -414,6 +518,7 @@ function formatConsoleEvent(method, params) {
       text: redactEventText(entry.text, 4096),
       url: redactEventText(entry.url, 2048),
       line: entry.lineNumber,
+      column: entry.columnNumber,
       source: entry.source,
       timestamp: entry.timestamp,
     };
@@ -583,7 +688,7 @@ chrome.debugger?.onEvent?.addListener((source, method, params = {}) => {
     return;
   }
   const consoleEvent = formatConsoleEvent(method, params);
-  if (consoleEvent && state.acceptUnqualifiedEvents) boundedPush(state.console, consoleEvent);
+  if (consoleEvent && state.acceptUnqualifiedEvents) appendConsoleEvent(state, consoleEvent);
   if (method === "Page.javascriptDialogClosed") {
     if (state.acceptUnqualifiedEvents) {
       state.dialog = undefined;
@@ -1521,8 +1626,8 @@ function enqueueBridgeRequest(task) {
   return run;
 }
 
-const TAB_REQUEST_METHODS = new Set(["selected_tab", "select_tab", "wait", "navigate", "back", "forward", "reload", "close_tab", "extract", "snapshot", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable", "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard", "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable"]);
-const STABLE_DOCUMENT_TAB_REQUESTS = new Set(["claim_tab", "extract", "snapshot", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard", "keypress", "scroll"]);
+const TAB_REQUEST_METHODS = new Set(["selected_tab", "select_tab", "wait", "navigate", "back", "forward", "reload", "close_tab", "extract", "snapshot", "locator", "interaction", "probe_interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable", "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard", "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable"]);
+const STABLE_DOCUMENT_TAB_REQUESTS = new Set(["claim_tab", "extract", "snapshot", "locator", "interaction", "probe_interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard", "keypress", "scroll"]);
 
 function sessionBarrierKey(key, sessionId) {
   return JSON.stringify([sessionKey(sessionId), String(key)]);
@@ -5643,7 +5748,7 @@ async function waitAfterEffect(method, wait, details = {}) {
 
 function isSideEffectingRequest(method, params = {}) {
   if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "dom_cua", "cleanup"].includes(method)) return method !== "dom_cua" || params.action !== "get_visible_dom";
-  if (method === "interaction") return isSideEffectingPageOperation(params);
+  if (method === "interaction" || method === "probe_interaction") return isSideEffectingPageOperation(params);
   if (method === "locator") return SIDE_EFFECTING_PAGE_ACTIONS.has(String(params.action || ""));
   if (method === "download") return !["list", "wait"].includes(String(params.action || ""));
   if (method === "clipboard") return params.action === "write";
@@ -6035,6 +6140,145 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
 
 async function executeLocatorOperation(tabId, params, signal, expectedFence) {
   return executeWithLocatorWait(tabId, { ...params, pageOperation: "locator" }, signal, expectedFence);
+}
+
+function probeErrorDetails(error) {
+  if (!error || typeof error !== "object") return { message: String(error || "Unknown error") };
+  return {
+    ...(typeof error.code === "string" ? { code: error.code } : {}),
+    message: error instanceof Error ? error.message : String(error.message || error),
+    ...(error.details && typeof error.details === "object" ? { details: error.details } : {}),
+  };
+}
+
+async function probePostState(tabId, params, signal, expectedFence) {
+  const hasTarget = params.target !== undefined || params.selector !== undefined || /^e\\d+$/.test(String(params.ref || ""));
+  if (!hasTarget) return { known: false, reason: "target_not_provided" };
+  const base = { ...params, pageOperation: "locator", action: "count" };
+  delete base.operation;
+  if (base.target === undefined && base.selector !== undefined) {
+    base.target = { selector: base.selector };
+    delete base.selector;
+  } else if (base.target === undefined && base.ref !== undefined) {
+    base.target = { ref: base.ref };
+    delete base.ref;
+  }
+  delete base.settle;
+  delete base.only;
+  delete base.maxEvents;
+  delete base.maxChars;
+  delete base.settleMs;
+  try {
+    const countValue = await executeLocatorOperation(tabId, base, signal, expectedFence);
+    const count = typeof countValue === "number" ? countValue : Number(countValue?.count);
+    if (!Number.isFinite(count)) return { known: false, reason: "count_unavailable" };
+    const result = { known: true, exists: count > 0, count };
+    if (count !== 1 && params.target?.index === undefined) return result;
+    const state = { ...result };
+    for (const action of ["isVisible", "isEnabled", "textContent"]) {
+      try {
+        const value = await executeLocatorOperation(tabId, { ...base, action }, signal, expectedFence);
+        if (action === "isVisible") state.visible = value === true;
+        else if (action === "isEnabled") state.enabled = value === true;
+        else state.text = boundedEventText(value, 2_048);
+      } catch (error) {
+        if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
+        state[`${action}Error`] = probeErrorDetails(error);
+      }
+    }
+    return state;
+  } catch (error) {
+    if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
+    return { known: false, reason: "target_observation_failed", error: probeErrorDetails(error) };
+  }
+}
+
+async function waitForProbeSettle(tabId, params, signal, expectedFence) {
+  const settle = params.settle && typeof params.settle === "object" ? params.settle : undefined;
+  if (!settle) {
+    const delayMs = Number.isFinite(Number(params.settleMs)) ? Math.min(Math.max(0, Number(params.settleMs)), 5_000) : 100;
+    await waitWithSignal(delayMs, signal);
+    return { mode: "delay", delayMs, completed: true };
+  }
+  const state = String(settle.state || "load");
+  if (["load", "url"].includes(state)) {
+    const tab = await waitForTabState(tabId, { ...settle, state }, signal, expectedFence);
+    return { mode: "wait", state, matched: true, completed: true, tab: await tabEntryFor(tabId, expectedFence, "probe settle") };
+  }
+  const page = await waitForPageCondition(tabId, { ...settle, state, pageOperation: "wait" }, signal, expectedFence);
+  return { mode: "wait", state, completed: true, matched: true, ...page.result };
+}
+
+function probeConsoleResult(collection, baseline) {
+  return {
+    events: collection.items,
+    eventCount: collection.items.length,
+    charCount: collection.charCount,
+    truncated: collection.truncated,
+    maxChars: collection.maxChars,
+    maxEvents: collection.maxItems,
+    only: collection.only,
+    baseline: baseline ?? collection.baseline,
+    nextSince: collection.nextSince,
+    ...(collection.documentChanged ? { documentChanged: true } : {}),
+    ...(collection.sinceInvalid ? { sinceInvalid: true } : {}),
+  };
+}
+
+async function executeProbeInteraction(tabId, params, signal, expectedFence) {
+  const state = stateForTab(tabId);
+  await enableDevtools(tabId, ["Runtime", "Log"], params.sessionId, expectedFence);
+  await assertTabFence(tabId, expectedFence, "probe baseline");
+  const baseline = consoleBaseline(state, expectedFence);
+  const beforeTab = await tabEntryFor(tabId, expectedFence, "probe before");
+  const beforeIncarnation = await readTabIncarnation(tabId, expectedFence, true);
+  const operation = String(params.operation || params.action || "");
+  const actionParams = { ...params, pageOperation: "interaction", operation };
+  delete actionParams.settle;
+  delete actionParams.only;
+  delete actionParams.maxEvents;
+  delete actionParams.maxChars;
+  delete actionParams.settleMs;
+  delete actionParams.action;
+  let actionResult;
+  try {
+    actionResult = await executePageOperation(tabId, actionParams, signal, expectedFence);
+  } catch (error) {
+    if (error?.code === "BROWSER_OPERATION_UNCERTAIN" || isTabFenceError(error)) throw error;
+    return {
+      tabId: Number(tabId),
+      action: { operation, dispatched: false, confirmed: false, error: probeErrorDetails(error) },
+      identity: { before: { url: beforeTab.url, incarnation: beforeIncarnation }, current: { url: beforeTab.url, incarnation: beforeIncarnation } },
+      console: probeConsoleResult(consoleCollectionFor(state, { ...params, only: params.only ?? "errors", since: baseline.token }, expectedFence), baseline),
+      postState: { known: false, reason: "action_failed" },
+      settling: { completed: false, skipped: true },
+    };
+  }
+  let settling;
+  try {
+    settling = await waitForProbeSettle(tabId, params, signal, expectedFence);
+  } catch (error) {
+    if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
+    settling = { completed: false, matched: false, error: probeErrorDetails(error) };
+  }
+  await assertTabFence(tabId, expectedFence, "probe after");
+  const afterTab = await tabEntryFor(tabId, expectedFence, "probe after");
+  const afterIncarnation = await readTabIncarnation(tabId, expectedFence, true);
+  const postState = await probePostState(tabId, params, signal, expectedFence);
+  const collection = consoleCollectionFor(state, { ...params, only: params.only ?? "errors", since: baseline.token }, expectedFence);
+  return {
+    tabId: Number(tabId),
+    target: params.target ?? (params.selector !== undefined ? { selector: params.selector } : params.ref !== undefined ? { ref: params.ref } : undefined),
+    action: { operation, dispatched: true, confirmed: actionResult?.ok === true, result: actionResult },
+    identity: {
+      before: { url: beforeTab.url, incarnation: beforeIncarnation },
+      after: { url: afterTab.url, incarnation: afterIncarnation },
+      documentChanged: beforeIncarnation !== undefined && afterIncarnation !== undefined && beforeIncarnation !== afterIncarnation,
+    },
+    console: probeConsoleResult(collection, baseline),
+    postState,
+    settling,
+  };
 }
 
 async function executeDomCuaOperation(tabId, params, signal, expectedFence) {
@@ -7738,6 +7982,7 @@ async function handleRequest(method, params, dispatchOptions = {}) {
   assertRequestActive(signal);
   if (method === "wait") validateWaitParams(params);
   if (method === "locator") validateLocatorParams(params);
+  if (method === "probe_interaction") validateProbeInteractionParams(params);
   if (method === "clipboard" && params.action !== "read" && params.action !== "write") throw new Error("clipboard action must be read or write");
   let requestTab;
   let requestTabFence;
@@ -8036,6 +8281,13 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     if (isSideEffectingPageOperation(params)) await refreshOwnedTabDocument(tab.id, expectedFence, params.sessionId);
     return { tabId: tab.id, result };
   }
+  if (method === "probe_interaction") {
+    const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
+    const expectedFence = requestTabFence ?? authorizedTabFence(tab);
+    const result = await executeProbeInteraction(tab.id, params, signal, expectedFence);
+    if (isSideEffectingPageOperation(params)) await refreshOwnedTabDocument(tab.id, expectedFence, params.sessionId);
+    return result;
+  }
   if (method === "dom_cua") {
     if (!["get_visible_dom", "click", "double_click", "type", "keypress", "scroll"].includes(params.action)) throw new Error("DOM CUA action must be get_visible_dom, click, double_click, type, keypress or scroll");
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
@@ -8122,9 +8374,9 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     await enableDevtools(tab.id, ["Runtime", "Log"], params.sessionId, expectedFence);
     await assertTabFence(tab.id, expectedFence, "read console logs");
     const state = stateForTab(tab.id);
-    const logs = boundedEventCollection(state.console);
+    const logs = consoleCollectionFor(state, params, expectedFence);
     if (params.clear === true) state.console.length = 0;
-    return { tabId: tab.id, logs: logs.items, logCount: logs.items.length, logCharCount: logs.charCount, logTruncated: logs.truncated, maxLogChars: logs.maxChars, maxLogs: logs.maxItems };
+    return { tabId: tab.id, logs: logs.items, logCount: logs.items.length, logCharCount: logs.charCount, logTruncated: logs.truncated, maxLogChars: logs.maxChars, maxLogs: logs.maxItems, only: logs.only, baseline: logs.baseline, nextSince: logs.nextSince, ...(logs.documentChanged ? { documentChanged: true } : {}), ...(logs.sinceInvalid ? { sinceInvalid: true } : {}) };
   }
   if (method === "network_requests") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));

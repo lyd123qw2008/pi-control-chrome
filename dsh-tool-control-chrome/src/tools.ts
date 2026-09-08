@@ -107,14 +107,14 @@ const LOCATOR_TAB_HANDLE: ParameterPropertySpec = {
 const EMPTY_PARAMETERS: ParameterSchemaSpec = {}
 const TAB_INCARNATION_METHODS = new Set([
   'list_tabs', 'selected_tab', 'select_tab', 'new_tab', 'navigate', 'snapshot', 'extract', 'wait', 'back', 'forward', 'reload',
-  'close_tab', 'locator', 'interaction', 'dom_cua', 'cua', 'screenshot', 'evaluate', 'cdp', 'devtools_enable',
+  'close_tab', 'locator', 'interaction', 'probe_interaction', 'dom_cua', 'cua', 'screenshot', 'evaluate', 'cdp', 'devtools_enable',
   'devtools_disable', 'console_logs', 'network_requests', 'network_response_body', 'dialog', 'upload', 'clipboard',
   'keypress', 'scroll', 'claim_tab', 'release', 'mark_handoff', 'mark_deliverable', 'download', 'cleanup',
 ])
 const TURN_CLEANUP_CAPABILITIES = ['turnCleanup', 'turnScopedMarks', 'retainedCleanup', 'debuggerLeaseRecovery', 'tabIncarnationFence']
 const TAB_HANDLE_METHODS = new Set([
   'selected_tab', 'select_tab', 'navigate', 'snapshot', 'extract', 'wait', 'back', 'forward', 'reload', 'close_tab', 'locator',
-  'interaction', 'dom_cua', 'cua', 'screenshot', 'evaluate', 'cdp', 'devtools_enable', 'devtools_disable',
+  'interaction', 'probe_interaction', 'dom_cua', 'cua', 'screenshot', 'evaluate', 'cdp', 'devtools_enable', 'devtools_disable',
   'console_logs', 'network_requests', 'network_response_body', 'dialog', 'upload', 'clipboard', 'keypress', 'scroll',
   'claim_tab', 'release', 'mark_handoff', 'mark_deliverable',
 ])
@@ -402,6 +402,41 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     method: 'wait',
   },
   {
+    name: 'browser_probe_interaction',
+    description: 'Perform one explicit browser interaction and return target resolution, action confirmation, document identity, incremental Console errors and post-action target state. The side effect is never automatically replayed; use this for click-after-failure and UI regression diagnosis.',
+    parameters: {
+      tabId: TAB_ID,
+      operation: { type: 'string', required: true, enum: ['click', 'double_click', 'dblclick', 'fill', 'type', 'press', 'select', 'check', 'uncheck', 'set_checked', 'hover', 'focus', 'scroll'] },
+      snapshotId: OPTIONAL_STRING,
+      ref: OPTIONAL_STRING,
+      selector: SELECTOR,
+      target: ELEMENT_TARGET,
+      value: JSON_VALUE,
+      key: OPTIONAL_STRING,
+      deltaX: OPTIONAL_NUMBER,
+      deltaY: OPTIONAL_NUMBER,
+      timeoutMs: TIMEOUT_MS,
+      settle: {
+        type: 'object',
+        properties: {
+          state: WAIT_STATE,
+          url: OPTIONAL_STRING,
+          urlIncludes: OPTIONAL_STRING,
+          text: OPTIONAL_STRING,
+          target: ELEMENT_TARGET,
+          exact: OPTIONAL_BOOLEAN,
+          timeoutMs: TIMEOUT_MS,
+        },
+        additionalProperties: false,
+      },
+      settleMs: { type: 'number', description: 'Optional bounded settle delay in milliseconds.' },
+      only: { type: 'string', enum: ['errors', 'all'] },
+      maxEvents: { type: 'integer', description: 'Maximum post-action Console events.' },
+      maxChars: { type: 'integer', description: 'Maximum post-action Console characters.' },
+    },
+    method: 'probe_interaction',
+  },
+  {
     name: 'browser_back',
     description: 'Navigate the selected browser tab back in history. The returned tab is transitionPending and its handle omits unstable URL/title and document-incarnation fields; wait and re-observe before document-bound work.',
     parameters: { tabId: TAB_ID, bypassCache: OPTIONAL_BOOLEAN },
@@ -603,8 +638,8 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_console',
-    description: 'Enable and read Runtime console and Log entries captured from a browser tab.',
-    parameters: { tabId: TAB_ID, action: OPTIONAL_STRING, clear: OPTIONAL_BOOLEAN },
+    description: 'Enable and read bounded Runtime console, pageerror and Log entries captured from a browser tab. Use since/nextSince for incremental reads and only=errors to filter runtime failures.',
+    parameters: { tabId: TAB_ID, action: OPTIONAL_STRING, clear: OPTIONAL_BOOLEAN, only: { type: 'string', enum: ['all', 'errors'] }, since: OPTIONAL_STRING, maxEvents: { type: 'integer' }, maxChars: { type: 'integer' } },
     method: 'console_logs',
     prepare: args => args.action === 'enable'
       ? { ...args, domains: ['Runtime', 'Log'] }
@@ -1417,7 +1452,15 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
     requiredBridge.push('semanticTargetRequests')
     requiredExtension.push('semanticTargets')
   }
-  if (method === 'interaction' && params.target !== undefined) requireTargetSupport()
+  if ((method === 'interaction' || method === 'probe_interaction') && params.target !== undefined) requireTargetSupport()
+  if (method === 'probe_interaction') {
+    requiredBridge.push('interactionDiagnostics', 'incrementalConsole')
+    requiredExtension.push('interactionDiagnostics', 'incrementalConsole')
+    const settle = isRecord(params.settle) ? params.settle : undefined
+    const settleState = String(settle?.state ?? '')
+    if (settle !== undefined && ['text', 'text_gone', 'visible', 'hidden', 'enabled', 'url', 'load'].includes(settleState)) requiredBridge.push('pageWaitStates')
+    if (settle?.target !== undefined) requireTargetSupport()
+  }
   if (method === 'locator' && (params.target !== undefined || isTargetLocator(params.locator))) requireTargetSupport()
   if (method === 'wait') {
     const state = String(params.state ?? 'load')
@@ -2236,6 +2279,7 @@ export function registerBrowserTools(
       const session = requireAgent(exec).session
       if (closed) throw inactiveBrowserError()
       const isWaitTool = spec.name === 'browser_wait'
+        || spec.name === 'browser_probe_interaction'
         || (spec.name === 'browser_navigate' && args.wait !== false)
         || (spec.name === 'browser_download' && (args.action === 'wait' || (args.action === 'start' && args.wait !== false)))
         || (spec.name === 'browser_locator' && args.action === 'waitFor')
