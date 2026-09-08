@@ -30,11 +30,13 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   pageWaitStates: true,
   requestCancellation: true,
   compactResponses: true,
+  interactionDiagnostics: true,
+  incrementalConsole: true,
 });
 const RESPONSE_MODES = new Set(["compact", "raw"]);
 const TAB_INCARNATION_METHODS = new Set([
   "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
-  "close_tab", "locator", "interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
+  "close_tab", "locator", "interaction", "probe_interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
   "devtools_disable", "console_logs", "network_requests", "network_response_body", "dialog", "upload", "clipboard",
   "keypress", "scroll", "claim_tab", "release", "mark_handoff", "mark_deliverable", "download", "cleanup",
 ]);
@@ -370,7 +372,7 @@ function responseForClient(entry, value) {
 }
 
 function isSideEffectingRequest(method, params = {}) {
-  if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable"].includes(method)) return true;
+  if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable", "probe_interaction"].includes(method)) return true;
   if (method === "interaction") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || params.operation || ""));
   if (method === "locator") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || ""));
   if (method === "dom_cua") return params.action !== "get_visible_dom";

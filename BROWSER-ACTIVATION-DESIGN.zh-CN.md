@@ -4,7 +4,7 @@
 
 ## 1. 背景
 
-`pi-control-chrome` 和 `dsh-tool-control-chrome` 使用惰性 Bridge 连接。Pi 扩展静态注册浏览器工具但默认从 active set 隐藏，DSH 默认 `lazyTools: true` 时只暴露 Skill 元数据；Skill 成功加载后才向当前 Agent 提供 39 个 `browser_*` 工具。Bridge 不一定立即连接，模型也不应在用户没有明确要求浏览器时主动使用当前浏览器。
+`pi-control-chrome` 和 `dsh-tool-control-chrome` 使用惰性 Bridge 连接。Pi 扩展静态注册浏览器工具但默认从 active set 隐藏，DSH 默认 `lazyTools: true` 时只暴露 Skill 元数据；Skill 成功加载后才向当前 Agent 提供 40 个 `browser_*` 工具。Bridge 不一定立即连接，模型也不应在用户没有明确要求浏览器时主动使用当前浏览器。
 
 浏览器控制应当与普通搜索和普通推理区分开。它会访问用户当前 Chrome/Edge Profile、登录态、标签页和页面数据，也会带来较高的上下文和运行时成本。
 

@@ -25,7 +25,8 @@ Use these only when the task requires them and confirm the current target/tab fi
 - `browser_upload`: confirm the intended file input, then set only the requested local files. Do not reveal unrelated local paths.
 - `browser_download`: inspect status before retrying; do not start another externally visible download while completion is unclear.
 - `browser_clipboard`: read or write the selected tab's clipboard only for the requested operation.
-- `browser_console`: enable/read Runtime Console and Log entries; report only information needed for the task.
+- `browser_console`: enable/read bounded Runtime Console, `pageerror` and Log entries; use `only: "errors"` and `since`/`nextSince` for action-scoped incremental reads.
+- `browser_probe_interaction`: perform exactly one explicit click, form or keyboard action and return target resolution, action confirmation, before/after document identity, post-action Console errors and post-state. Prefer it for click-after-failure, disappearing UI, slot crashes, white screens and screenshot/state mismatches; it never automatically replays an uncertain side effect.
 - `browser_network`: enable/read Network events. For a response body, use the matching `requestId` and `loaderId` from the current listing; reacquire both after navigation.
 - `browser_evaluate`: use narrowly scoped, page-visible JavaScript only when native tools are insufficient. Returned values are bounded; do not use evaluation to bypass browser security or inspect hidden storage.
 - `browser_cdp`: use a specific CDP method only when a higher-level tool does not expose the required capability.

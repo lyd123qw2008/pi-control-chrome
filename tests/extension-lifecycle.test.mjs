@@ -441,6 +441,8 @@ test("advertises live-ref and semantic-rebind capabilities", async () => {
   assert.equal(status.capabilities.liveRefs, true);
   assert.equal(status.capabilities.semanticRebind, true);
   assert.equal(status.capabilities.axRefs, true);
+  assert.equal(status.capabilities.interactionDiagnostics, true);
+  assert.equal(status.capabilities.incrementalConsole, true);
 });
 
 test("keeps the extension Bridge socket alive with application heartbeats", async () => {
@@ -2090,6 +2092,38 @@ test("console and network reads apply aggregate output limits", async () => {
   assert.ok(requests.requests.length <= 200);
   assert.ok(requests.requestCharCount <= 20_000);
   assert.equal(requests.requestTruncated, true);
+});
+
+test("console reads support incremental cursors and pageerror filtering", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(314, { id: 314, windowId: 1, title: "events", url: "https://example.test/events" });
+  await fixture.api.handleRequest("devtools_enable", { tabId: 314, sessionId: "session-test", domains: ["Runtime", "Log"] });
+  const baseline = await fixture.api.handleRequest("console_logs", { tabId: 314, sessionId: "session-test", only: "all" });
+  const source = { tabId: 314, targetId: "target-314" };
+  await fixture.emitDebuggerEvent(source, "Runtime.consoleAPICalled", { type: "log", args: [{ type: "string", value: "incremental-log" }] });
+  await fixture.emitDebuggerEvent(source, "Runtime.exceptionThrown", { exceptionDetails: { text: "Uncaught Error: incremental-pageerror", url: "https://example.test/events", lineNumber: 4, columnNumber: 2, exception: { description: "Error: incremental-pageerror" } } });
+  const errors = await fixture.api.handleRequest("console_logs", { tabId: 314, sessionId: "session-test", since: baseline.nextSince, only: "errors" });
+  assert.equal(errors.documentChanged, undefined);
+  assert.equal(errors.logs.length, 1);
+  assert.equal(errors.logs[0].type, "pageerror");
+  assert.match(errors.logs[0].text, /incremental-pageerror/);
+  const all = await fixture.api.handleRequest("console_logs", { tabId: 314, sessionId: "session-test", since: baseline.nextSince, only: "all" });
+  assert.equal(all.logs.length, 2);
+  assert.equal(typeof all.nextSince, "string");
+});
+
+test("probe_interaction returns one confirmed action and bounded post-action diagnostics", async () => {
+  const fixture = loadExtension({ executeScriptResults: { pageOperation: { ok: true, operation: "scroll" } } });
+  fixture.tabs.set(315, { id: 315, windowId: 1, title: "probe", url: "https://example.test/probe", status: "complete" });
+  const result = await fixture.api.handleRequest("probe_interaction", { tabId: 315, operation: "scroll", deltaY: 120, settleMs: 0, sessionId: "session-test" });
+  assert.equal(result.action.operation, "scroll");
+  assert.equal(result.action.confirmed, true);
+  assert.equal(result.console.only, "errors");
+  assert.equal(result.console.events.length, 0);
+  assert.equal(result.postState.known, false);
+  assert.equal(result.postState.reason, "target_not_provided");
+  assert.equal(result.identity.documentChanged, false);
+  assert.ok(fixture.executeScriptCalls.some(call => call.functionName === "pageOperation"));
 });
 
 test("list_tabs suppresses data-url favicon payloads", async () => {

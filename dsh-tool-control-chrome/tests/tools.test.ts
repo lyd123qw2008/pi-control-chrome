@@ -152,11 +152,12 @@ function execution(agent: Agent): ToolRunContext {
 
 describe('DSH browser tool catalog', () => {
   it('exposes the complete Pi browser tool surface', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(39)
+    expect(BROWSER_TOOL_NAMES).toHaveLength(40)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_screenshot')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_context_reset')
+    expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_probe_interaction')
     const cleanup = browserToolCatalog.core.find(tool => tool.name === 'browser_cleanup')
     const contextReset = browserToolCatalog.core.find(tool => tool.name === 'browser_context_reset')
     expect(cleanup?.description).toContain('explicitly asks')
@@ -1089,6 +1090,28 @@ describe('DSH browser tool catalog', () => {
     const result = await harness.tools.get('browser_snapshot')?.execute({ tabId: 7 }, execution(harness.agent))
     expect(result).toMatchObject({ ok: false, retryable: false, actionState: 'unknown', error: { code: 'TARGET_CONNECTION_CHANGED' } })
     expect(request.mock.calls.filter(([method]) => method === 'snapshot')).toHaveLength(1)
+  })
+
+  it('sends one atomic interaction probe without replaying the side effect', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'status') return {
+        connected: true,
+        browser: 'edge',
+        browserId: 'edge:test',
+        profile: 'current',
+        extensionVersion: '0.5.5',
+        capabilities: { semanticTargets: true, pageWaitStates: true, tabIncarnationFence: true, interactionDiagnostics: true, incrementalConsole: true },
+      }
+      if (method === 'probe_interaction') return { tabId: 7, action: { operation: params.operation, confirmed: true }, console: { events: [] }, postState: { known: true, exists: true, count: 1 } }
+      return { method }
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { semanticTargetRequests: true, pageWaitStates: true, tabIncarnationFence: true, interactionDiagnostics: true, incrementalConsole: true } }))
+    const harness = setup({ request, health })
+
+    const result = await harness.tools.get('browser_probe_interaction')?.execute({ tabId: 7, operation: 'click', target: { role: 'button', name: 'Edit', exact: true }, only: 'errors' }, execution(harness.agent))
+    expect(result).toMatchObject({ action: { operation: 'click', confirmed: true }, postState: { exists: true } })
+    expect(request).toHaveBeenCalledWith('probe_interaction', expect.objectContaining({ operation: 'click', target: { role: 'button', name: 'Edit', exact: true }, sessionId: 'session-test', expectedBrowserId: 'edge:test' }), expect.any(AbortSignal), { browserId: 'edge:test' })
+    expect(request.mock.calls.filter(([method]) => method === 'probe_interaction')).toHaveLength(1)
   })
 
   it('does not replay a side effect after the Bridge target connection changes', async () => {

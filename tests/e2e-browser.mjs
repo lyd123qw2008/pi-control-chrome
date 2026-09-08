@@ -70,6 +70,11 @@ const site = `<!doctype html>
 <button id="hidden-action">Hidden action</button>
 <main><button id="text-action">Text <span>target</span><br>now</button></main>
 <button id="delayed-action" data-testid="delayed-button">Ready action</button>
+<button id="probe-error" type="button">Probe console error</button>
+<button id="probe-pageerror" type="button">Probe page error</button>
+<button id="probe-remove" type="button">Probe remove</button>
+<button id="probe-async" type="button">Probe async</button><span id="probe-status">Idle</span>
+<button id="probe-stable" type="button">Probe stable</button>
 <button id="disabled-action" disabled>Disabled action</button>
 <button id="disabled-nested" disabled data-probe="disabled-button"><span>Disabled nested</span></button>
 <div id="nested-editor" contenteditable><span>Nested editor</span></div>
@@ -115,6 +120,11 @@ document.querySelector('#virtual-next').addEventListener('click', () => { virtua
 document.querySelector('#custom-switch').addEventListener('click', (event) => event.currentTarget.setAttribute('aria-checked', String(event.currentTarget.getAttribute('aria-checked') !== 'true')));
 document.querySelector('#custom-combobox').addEventListener('click', (event) => event.currentTarget.setAttribute('aria-expanded', String(event.currentTarget.getAttribute('aria-expanded') !== 'true')));
 document.querySelector('#dialog').addEventListener('click', () => setTimeout(() => alert('e2e-dialog'), 0));
+document.querySelector('#probe-error').addEventListener('click', () => { console.error('probe-console-error'); });
+document.querySelector('#probe-pageerror').addEventListener('click', () => setTimeout(() => { throw new Error('probe-page-error'); }, 0));
+document.querySelector('#probe-remove').addEventListener('click', event => event.currentTarget.remove());
+document.querySelector('#probe-async').addEventListener('click', () => setTimeout(() => { document.querySelector('#probe-status').textContent = 'Probe async ready'; }, 120));
+document.querySelector('#probe-stable').addEventListener('click', () => { document.querySelector('#probe-status').textContent = 'Probe stable ready'; });
 document.querySelector('#indexed-visible').addEventListener('click', () => { out.textContent = 'Indexed visible'; });
 console.log('page-ready');
 setTimeout(() => {
@@ -993,6 +1003,60 @@ try {
   await sleep(1200);
   const consoleLogs = await request("console_logs", { tabId: selected.tab.id });
   assert.ok(consoleLogs.logs.some((entry) => String(entry.text).includes("e2e-console")));
+
+  const probeConsoleError = await request("probe_interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    selector: "#probe-error",
+    only: "errors",
+    settleMs: 250,
+  });
+  assert.equal(probeConsoleError.action?.confirmed, true);
+  assert.equal(probeConsoleError.console?.only, "errors");
+  assert.ok(probeConsoleError.console?.events?.some((entry) => String(entry.text).includes("probe-console-error")));
+  assert.equal(probeConsoleError.postState?.exists, true);
+  assert.equal(probeConsoleError.postState?.visible, true);
+
+  const probePageError = await request("probe_interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    target: { selector: "#probe-pageerror" },
+    only: "errors",
+    settleMs: 300,
+  });
+  assert.equal(probePageError.action?.confirmed, true);
+  assert.ok(probePageError.console?.events?.some((entry) => entry.type === "pageerror" && String(entry.text).includes("probe-page-error")));
+
+  const probeRemoved = await request("probe_interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    selector: "#probe-remove",
+    only: "errors",
+    settleMs: 100,
+  });
+  assert.equal(probeRemoved.action?.confirmed, true);
+  assert.equal(probeRemoved.postState?.exists, false);
+  assert.equal(probeRemoved.postState?.count, 0);
+
+  const probeAsync = await request("probe_interaction", {
+    tabId: selected.tab.id,
+    operation: "click",
+    selector: "#probe-async",
+    settle: { state: "text", text: "Probe async ready", exact: true, timeoutMs: 5000 },
+    only: "errors",
+  });
+  assert.equal(probeAsync.action?.confirmed, true);
+  assert.equal(probeAsync.settling?.completed, true);
+  assert.equal(probeAsync.postState?.exists, true);
+  assert.equal(probeAsync.console?.eventCount, 0);
+
+  const consoleBaseline = await request("console_logs", { tabId: selected.tab.id, only: "all" });
+  await request("evaluate", { tabId: selected.tab.id, expression: "console.log('incremental-console-marker')" });
+  await sleep(250);
+  const consoleDelta = await request("console_logs", { tabId: selected.tab.id, only: "all", since: consoleBaseline.nextSince });
+  assert.ok(consoleDelta.logs.some((entry) => String(entry.text).includes("incremental-console-marker")));
+  assert.equal(consoleDelta.documentChanged, undefined);
+
   const network = await request("network_requests", { tabId: selected.tab.id });
   const apiResponse = network.requests.find((entry) => entry.event === "response" && entry.url.endsWith("/api/data") && entry.status === 200);
   assert.ok(apiResponse?.requestId);

@@ -132,7 +132,7 @@ function hasAccessibilityReference(value) {
 }
 
 function isSideEffectingRequest(method, params = {}) {
-  if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable"].includes(method)) return true;
+  if (["navigate", "back", "forward", "reload", "select_tab", "new_tab", "close_tab", "upload", "cua", "keypress", "scroll", "cleanup", "claim_tab", "release", "mark_handoff", "mark_deliverable", "evaluate", "cdp", "devtools_enable", "devtools_disable", "probe_interaction"].includes(method)) return true;
   if (method === "interaction" || method === "locator") return ["click", "double_click", "dblclick", "fill", "type", "press", "select", "check", "uncheck", "set_checked", "hover", "focus", "scroll"].includes(String(params.action || params.operation || ""));
   if (method === "dom_cua") return params.action !== "get_visible_dom";
   if (method === "download") return !["list", "wait"].includes(String(params.action || ""));
