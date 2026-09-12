@@ -291,6 +291,7 @@ try {
     `--load-extension=${extension}`,
     "--no-first-run",
     "--no-default-browser-check",
+    "--new-window",
     `http://127.0.0.1:${pagePort}/`,
   ]);
 
