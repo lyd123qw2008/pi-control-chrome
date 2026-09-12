@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -36,17 +37,31 @@ jobs:
       - name: Install dependencies
         run: corepack pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: corepack pnpm run check
+      - name: Verify CI and Compatibility gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for workflow in ci.yml compatibility.yml; do
+            success_count=$(gh run list \
+              --workflow "$workflow" \
+              --commit "$GITHUB_SHA" \
+              --event push \
+              --limit 20 \
+              --json status,conclusion \
+              --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')
+            if [ "$success_count" -lt 1 ]; then
+              echo "No successful $workflow gate found for commit $GITHUB_SHA; wait for the push workflows before publishing." >&2
+              exit 1
+            fi
+          done
 
       - name: Verify requested version
         if: inputs.expected_version != ''
         run: node -e "if (require('./package.json').version !== process.env.EXPECTED_VERSION) throw new Error('package version mismatch')"
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
-
-      - name: Test
-        run: corepack pnpm test
 
       - name: Build
         run: corepack pnpm run build
@@ -55,4 +70,4 @@ jobs:
         run: npm pack --dry-run --ignore-scripts
 
       - name: Publish
-        run: npm publish --access public
+        run: npm publish --access public --ignore-scripts
