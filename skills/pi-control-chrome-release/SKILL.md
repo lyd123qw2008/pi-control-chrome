@@ -19,6 +19,7 @@ The full Chinese checklist is [`docs/RELEASE-CHECKLIST.zh-CN.md`](../../docs/REL
 - Do not publish from a local npm login. Use the existing GitHub Actions Trusted Publishing workflows.
 - Do not overwrite a published npm version. If a release is incomplete, use a new patch version.
 - Before a commit, push, merge, or publish, report the package/version matrix and stop for clarification if the scope is ambiguous.
+- Every public npm release must have a matching GitHub Release maintained at the same time; use the Pi root version as the `v<pi-version>` tag and record DSH as a companion package when its version differs.
 - Never proactively restart DSH as part of a release or Profile verification. Restarting can disconnect live sessions and may not restart successfully; wait for the maintainer to restart it manually, then perform read-only verification.
 
 ## Release surfaces
@@ -30,6 +31,7 @@ The full Chinese checklist is [`docs/RELEASE-CHECKLIST.zh-CN.md`](../../docs/REL
 | `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `pnpm-lock.yaml`, `pnpm-workspace.yaml`, README install examples | `publish-dsh-tool-control-chrome.yml` |
 | Private `dsh-profile-config` source | `profiles/web/package.json`, `.agent-presets/` | `profiles/web/pnpm-lock.yaml`, `profiles/web/pnpm-workspace.yaml`, `.agent-presets/*/preset.yml`, `.agent-presets/*/agent.cordis.yml`, README, bootstrap scripts | Update in a separate private Profile configuration PR after npm publication; never publish it |
 | Active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile lockfile and `pnpm-workspace.yaml` overrides | Update only after npm publication; maintainer restarts DSH manually |
+| GitHub Release | Root package `package.json` version as `v<pi-version>` | Release notes, target commit, gate links, npm metadata | Create or edit with `gh release create/edit` after npm publication |
 
 ## Phase 1: inspect before editing
 
@@ -54,6 +56,7 @@ extension/manifest.json                 <read>        <confirm>     n/a         
 @lyd123qw2008/dsh-tool-control-chrome   <read>        <confirm>     pi-control-chrome       publish-dsh-tool-control-chrome.yml
 dsh-profile-config Profile              <read>        <confirm>     DSH <target>            separate Profile PR
 active DSH Profile                      <read>        <confirm>     pi-control-chrome       local install
+GitHub Release                          n/a           v<pi-target>   root/DSH links          gh release create/edit
 ```
 
 A DSH release is not complete when only the root package has been bumped. A Pi release is not complete when only the extension Manifest has been reloaded. Ask the maintainer to choose the exact package set when the matrix has more than one plausible target.
@@ -96,6 +99,27 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
 
 The gate passes only when the title is correct, headings and bullet lists render on separate lines, code blocks are readable, validation commands are complete, and the PR state/merge condition is expected. If literal escape sequences or Markdown concatenation is found, fix the body with `--body-file` and verify it again; do not merge first.
 
+## GitHub Release maintenance gate
+
+For every public npm release, maintain the matching GitHub Release as part of the same release procedure:
+
+1. Use `v<pi-version>` as the GitHub tag. The Pi root package version is authoritative; a different DSH version is listed inside the same release notes as a companion package.
+2. Before creating or editing, inspect `gh release view v<pi-version>` and confirm that an existing release is not already attached to a different commit.
+3. Write release notes to a real Markdown file. Include the feature summary, Pi/Manifest/DSH versions, links to the successful CI and Compatibility runs, npm package links, and any Profile status.
+4. Create the release after the root npm metadata is verified, then edit the same release after the DSH package/Profile work adds companion metadata. Do not republish npm or create a duplicate root tag.
+5. Re-read the remote release after every create/edit and verify the tag, target commit, `isDraft: false`, `isPrerelease: false`, title, and rendered notes.
+
+```powershell
+gh release view v<pi-version> --json tagName,targetCommitish,isDraft,isPrerelease,url
+# missing release:
+gh release create v<pi-version> --target <commit-sha> --title "v<pi-version> — <title>" --notes-file <notes-file>
+# existing release needing companion updates:
+gh release edit v<pi-version> --target <commit-sha> --title "v<pi-version> — <title>" --notes-file <notes-file>
+gh release view v<pi-version> --json tagName,targetCommitish,isDraft,isPrerelease,body,url
+```
+
+A GitHub Release is a public release record, not a substitute for npm Trusted Publishing, workflow success, or `npm view` metadata verification.
+
 ## Phase 2: prepare and test
 
 When DSH depends on a new Pi release, use this order:
@@ -119,19 +143,22 @@ When DSH depends on a new Pi release, use this order:
    npm view pi-control-chrome@<pi-version> version dist-tags dependencies --json
    ```
 
-7. Update the DSH package dependency specifier, `dsh-tool-control-chrome/pnpm-lock.yaml`, `dsh-tool-control-chrome/pnpm-workspace.yaml`, and README examples. Inspect `overrides.pi-control-chrome`; it can keep an old Bridge package even when the DSH dependency says otherwise.
-8. Bump the DSH package's own version. Run:
+7. Create or update GitHub Release `v<pi-version>` at the exact verified commit. Include the Pi/Manifest versions, feature summary, CI/Compatibility links, and npm metadata; update this same release later with DSH companion and Profile verification details.
+8. Update the DSH package dependency specifier, `dsh-tool-control-chrome/pnpm-lock.yaml`, `dsh-tool-control-chrome/pnpm-workspace.yaml`, and README examples. Inspect `overrides.pi-control-chrome`; it can keep an old Bridge package even when the DSH dependency says otherwise.
+9. Bump the DSH package's own version. Run:
 
    ```powershell
    corepack pnpm --dir dsh-tool-control-chrome run pack:check
    ```
 
-9. Create and merge the DSH release PR, wait for the post-merge exact-commit `CI` and `Compatibility and Profile Validation` gates, then publish with `publish-dsh-tool-control-chrome.yml`, providing `expected_version`. The workflow verifies both gates, installs dependencies, builds the generated `lib/`, and publishes with scripts disabled so the already-passed tests are not repeated.
-10. Verify the published DSH metadata:
+10. Create and merge the DSH release PR, wait for the post-merge exact-commit `CI` and `Compatibility and Profile Validation` gates, then publish with `publish-dsh-tool-control-chrome.yml`, providing `expected_version`. The workflow verifies both gates, installs dependencies, builds the generated `lib/`, and publishes with scripts disabled so the already-passed tests are not repeated.
+11. Verify the published DSH metadata:
 
    ```powershell
    npm view @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> version dist-tags dependencies --json
    ```
+
+12. Edit the same GitHub Release `v<pi-version>` notes to add the DSH package version, DSH publish workflow, npm metadata, and Profile verification links. Do not create a separate root tag from the DSH version.
 
 The matching GitHub gate and publish workflow must pass. A local `npm pack --dry-run` is not evidence that npm publication succeeded.
 
@@ -211,6 +238,7 @@ A release is complete only when all of these are true:
 - relevant lockfiles and Profile overrides resolve the target dependency;
 - the correct PR was merged with passing CI;
 - the matching Trusted Publishing workflow passed;
+- the matching GitHub Release exists as a non-draft, non-prerelease release, points at the verified commit, and contains the final rendered notes;
 - the private `dsh-profile-config` PR updated the bootstrap source without publishing that repository;
 - `npm view` confirms the published version and dependencies;
 - active Profile installation and `pnpm why` show the target versions when a local update was requested;

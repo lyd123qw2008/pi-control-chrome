@@ -2,7 +2,7 @@
 
 配套执行 Skill：[`skills/pi-control-chrome-release/SKILL.md`](../skills/pi-control-chrome-release/SKILL.md)。执行发布任务时先加载该 Skill，再按本清单核对。
 
-这份清单适用于同时维护 Pi 根包、Manifest V3 浏览器扩展、DSH 集成包和私有 `dsh-profile-config` Profile 配置仓库的发布流程。发布前必须逐项核对包名、目标版本、依赖版本、lockfile、发布 workflow 和 active DSH Profile，不能只修改或发布其中一个包。`dsh-profile-config` 是新机器 bootstrap 使用的私有配置源，不是 npm 发布面；`<DSH_HOME>/profiles/web` 是安装后的运行副本，两者都要检查。
+这份清单适用于同时维护 Pi 根包、Manifest V3 浏览器扩展、DSH 集成包、GitHub Release 和私有 `dsh-profile-config` Profile 配置仓库的发布流程。发布前必须逐项核对包名、目标版本、依赖版本、lockfile、发布 workflow、GitHub Release 和 active DSH Profile，不能只修改或发布其中一个发布面。`dsh-profile-config` 是新机器 bootstrap 使用的私有配置源，不是 npm 发布面；`<DSH_HOME>/profiles/web` 是安装后的运行副本，两者都要检查。
 
 ## 发布面清单
 
@@ -13,8 +13,9 @@
 | DSH 包 `@lyd123qw2008/dsh-tool-control-chrome` | `dsh-tool-control-chrome/package.json` | `dsh-tool-control-chrome/pnpm-lock.yaml`、`dsh-tool-control-chrome/pnpm-workspace.yaml`、`dsh-tool-control-chrome/README.md` | `.github/workflows/publish-dsh-tool-control-chrome.yml` |
 | 私有 DSH Profile 配置仓库 | `dsh-profile-config/profiles/web/package.json`、`.agent-presets/` | `profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/*/preset.yml`、`.agent-presets/*/agent.cordis.yml`、`README.md`、bootstrap 脚本 | 只提交并合并独立 Profile 配置 PR，不发布 npm 包 |
 | active DSH Profile | `<DSH_HOME>/profiles/web/package.json` | Profile 的 `pnpm-lock.yaml`、`pnpm-workspace.yaml` | 不属于仓库发布；在 npm 发布成功后单独更新，由维护者手动重启 DSH |
+| GitHub Release | 根包 `package.json` 版本对应的 `v<pi-version>` tag | release notes、目标 commit、CI/Compatibility 和 npm 链接 | npm 包发布成功后创建或更新；DSH 版本作为同一 Release 的 companion package 记录 |
 
-根包版本、扩展 Manifest 版本、DSH 包版本和 active Profile 版本不是同一个字段。不能因为其中一个版本已经 bump，就假设其他发布面已经更新。
+根包版本、扩展 Manifest 版本、DSH 包版本和 active Profile 版本不是同一个字段。不能因为其中一个版本已经 bump，就假设其他发布面已经更新。GitHub Release 的 tag 以 Pi 根包版本为准；不能为同一个根包版本重复创建 tag，也不能把 DSH 版本误当成根包 tag。
 
 ## DSH 重启约束
 
@@ -25,12 +26,13 @@
 在修改文件、commit、push 或触发发布 workflow 之前，先记录以下矩阵并核对实际文件内容：
 
 ```text
-包名/发布面                         当前版本       目标版本       依赖目标       发布 workflow
+包名/发布面                         当前版本       目标版本       依赖目标       发布 workflow / 路径
 pi-control-chrome                   <read>         <confirm>       <read>         publish-pi-control-chrome.yml
 extension/manifest.json             <read>         <confirm>       n/a            随根包或单独确认
 @lyd123qw2008/dsh-tool-control-chrome <read>       <confirm>       pi-control-chrome <target> publish-dsh-tool-control-chrome.yml
 私有 dsh-profile-config Profile      <read>         <confirm>       DSH <target>  独立 Profile PR（不发布 npm）
 active DSH Profile                  <read>         <confirm>       pi-control-chrome <target> 本地安装
+GitHub Release                      n/a            v<pi-target>   根包/DSH links gh release create/edit
 ```
 
 至少检查：
@@ -95,6 +97,28 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
 
 如果本地已经完成全量测试，可以直接 push；不需要为了触发发布再次本地重复测试。正式发布前仍必须等待 GitHub 上同一 commit 的两个 Gate 成功。
 
+## GitHub Release 维护规则
+
+每次公开 npm 发布都必须同步维护 GitHub Release：
+
+- Pi 根包目标版本 `<pi-version>` 对应 tag `v<pi-version>`；该 tag 必须指向本次发布所验证的精确 commit；
+- Release notes 使用真实 Markdown 文件，至少包含功能摘要、Pi/扩展/DSH 版本、CI/Compatibility run 链接和 npm 链接；
+- 根包首次发布时使用 `gh release create`；同一根包版本的 DSH companion 发布或 Profile 更新完成后，使用 `gh release edit` 补充 notes，不重复创建 tag；
+- 创建或编辑前先执行 `gh release view v<pi-version>`，发现已有 release 时不得覆盖成另一个 commit；
+- 创建或编辑后必须重新读取 `gh release view`，确认 `isDraft: false`、`isPrerelease: false`、tag、目标 commit 和正文均正确；
+- GitHub Release 是发布记录，不替代 npm Trusted Publishing，也不允许用 Release 页面状态代替 workflow 和 `npm view` 验证。
+
+推荐命令（`<notes-file>` 必须包含真实换行）：
+
+```powershell
+gh release view v<pi-version> --json tagName,targetCommitish,isDraft,isPrerelease,url
+# 不存在时：
+gh release create v<pi-version> --target <commit-sha> --title "v<pi-version> — <title>" --notes-file <notes-file>
+# 已存在且需要补充 companion package 或验证链接时：
+gh release edit v<pi-version> --target <commit-sha> --title "v<pi-version> — <title>" --notes-file <notes-file>
+gh release view v<pi-version> --json tagName,targetCommitish,isDraft,isPrerelease,body,url
+```
+
 ## 推荐发布顺序
 
 当 DSH 包依赖新的 Pi 根包时，按以下顺序执行：
@@ -108,18 +132,20 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
    npm view pi-control-chrome@<pi-version> version dist-tags dependencies --json
    ```
 
-5. 更新 DSH 仓库包的依赖 specifier、`pnpm-lock.yaml` 和 `pnpm-workspace.yaml`；重点检查 `overrides.pi-control-chrome`，它可能把 DSH 依赖强制固定到旧版本。
-6. 将 DSH 包自己的 `package.json` 版本 bump，并同步 README 中的安装示例。
-7. 运行 DSH 检查，创建并合并 DSH release PR。
-8. 触发 `publish-dsh-tool-control-chrome.yml`，填写 `expected_version`；workflow 会校验当前 commit 的两个 Gate，执行必要的 install/build、pack 和 publish。
-9. 用 npm 查询 DSH 包，确认 DSH 版本和它实际声明的 `pi-control-chrome` 依赖：
+5. 创建或更新 GitHub Release `v<pi-version>`，以本次 Gate 验证的精确 commit 为目标；notes 先记录 Pi 和扩展版本、功能摘要、CI/Compatibility 链接，后续再补充 DSH companion 信息。
+6. 更新 DSH 仓库包的依赖 specifier、`pnpm-lock.yaml` 和 `pnpm-workspace.yaml`；重点检查 `overrides.pi-control-chrome`，它可能把 DSH 依赖强制固定到旧版本。
+7. 将 DSH 包自己的 `package.json` 版本 bump，并同步 README 中的安装示例。
+8. 运行 DSH 检查，创建并合并 DSH release PR。
+9. 触发 `publish-dsh-tool-control-chrome.yml`，填写 `expected_version`；workflow 会校验当前 commit 的两个 Gate，执行必要的 install/build、pack 和 publish。
+10. 用 npm 查询 DSH 包，确认 DSH 版本和它实际声明的 `pi-control-chrome` 依赖：
 
    ```powershell
    npm view @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> version dist-tags dependencies --json
    ```
 
-10. 在私有 `dsh-profile-config` 仓库中更新 `profiles/web/package.json`、`profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/` 下的自定义 preset composition 和 `preset.yml` 元数据，以及 README 和 bootstrap 相关说明。该仓库的 bootstrap 脚本会从 npm 安装发布包并复制自定义 presets；只更新 active Profile 不会更新新机器的配置源，也不能把这个仓库当作 npm 发布包。
-11. 从 `dsh-profile-config` 的 `profiles/web` 运行安装和依赖解析检查，创建并合并独立的私有 Profile 配置 PR；不要为该仓库触发 npm 发布：
+11. 更新同一个 `v<pi-version>` GitHub Release notes，补充 DSH 版本、DSH publish workflow、npm 元数据和 Profile 验证链接；不要为 DSH companion 单独创建一个与根包版本混淆的 `v<dsh-version>` tag。
+12. 在私有 `dsh-profile-config` 仓库中更新 `profiles/web/package.json`、`profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/` 下的自定义 preset composition 和 `preset.yml` 元数据，以及 README 和 bootstrap 相关说明。该仓库的 bootstrap 脚本会从 npm 安装发布包并复制自定义 presets；只更新 active Profile 不会更新新机器的配置源，也不能把这个仓库当作 npm 发布包。
+13. 从 `dsh-profile-config` 的 `profiles/web` 运行安装和依赖解析检查，创建并合并独立的私有 Profile 配置 PR；不要为该仓库触发 npm 发布：
 
     ```powershell
     corepack pnpm --dir profiles/web install --frozen-lockfile
@@ -127,7 +153,7 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
     corepack pnpm --dir profiles/web why pi-control-chrome
     ```
 
-12. 配置 PR 合并后，重新 bootstrap 或把配置同步到 `<DSH_HOME>`，再重启 DSH 做运行验证。
+14. 配置 PR 合并后，重新 bootstrap 或把配置同步到 `<DSH_HOME>`，再重启 DSH 做运行验证。
 
 已发布的 npm 版本不可覆盖。如果发现包内容或依赖遗漏，使用新的修订版本修复，不要尝试重新发布同一个版本号。
 
@@ -225,6 +251,7 @@ corepack pnpm --dir <DSH_HOME>/profiles/web why pi-control-chrome
 - 将要发布的包名和版本；
 - 依赖更新涉及的 package.json、lockfile、override 和 README；
 - 对应的 GitHub Actions workflow；
+- 对应的 GitHub Release tag、notes 和目标 commit；
 - 发布后 active Profile 是否需要更新。
 
 没有完成这份核对时，不应直接 commit、merge 或 publish。
