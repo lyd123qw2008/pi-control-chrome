@@ -84,7 +84,7 @@ jobs:
         uses: browser-actions/setup-chrome@v2
         with:
           # A four-part version selects Chrome for Testing instead of the runner's regular Chrome.
-          chrome-version: 152.0.7977.83
+          chrome-version: 153.0.8010.36
       - name: Run isolated browser matrix
         run: npm run smoke:e2e:matrix
         env:

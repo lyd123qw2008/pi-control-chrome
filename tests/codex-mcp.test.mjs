@@ -15,6 +15,31 @@ const bridgePath = join(root, "bridge", "server.mjs");
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+async function findFreePort() {
+  const server = createServer();
+  return new Promise((resolve, reject) => {
+    const fail = (error) => {
+      server.close(() => reject(error));
+    };
+    server.once("error", fail);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : undefined;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (!Number.isInteger(port) || port <= 0) {
+          reject(new Error("failed to allocate a free test port"));
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
 function getJson(port, path) {
   return new Promise((resolve, reject) => {
     const request = httpGet({ hostname: "127.0.0.1", port, path }, (response) => {
@@ -100,7 +125,7 @@ test("Codex plugin manifest points at the shared Skill and stdio MCP server", ()
 });
 
 test("Codex MCP adapter exposes the initial browser tool catalog over stdio", async () => {
-  const mcp = startMcp(17980 + Math.floor(Math.random() * 100));
+  const mcp = startMcp(await findFreePort());
   try {
     mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
     const initialized = await mcp.nextMessage();
@@ -131,7 +156,7 @@ test("Codex MCP adapter exposes the initial browser tool catalog over stdio", as
 });
 
 test("Codex browser_restart requires explicit user confirmation", async () => {
-  const mcp = startMcp(17980 + Math.floor(Math.random() * 100));
+  const mcp = startMcp(await findFreePort());
   try {
     mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
     await mcp.nextMessage();
@@ -151,7 +176,7 @@ test("Codex browser_restart requires explicit user confirmation", async () => {
 });
 
 test("Codex browser_restart cooperatively replaces the Bridge after confirmation", async () => {
-  const bridgePort = 17980 + Math.floor(Math.random() * 100);
+  const bridgePort = await findFreePort();
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-codex-mcp-restart-test-"));
   const tokenFile = join(temp, "token");
   const bridge = spawn(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
@@ -228,7 +253,7 @@ test("Codex browser_restart cooperatively replaces the Bridge after confirmation
 });
 
 test("Codex MCP adapter routes a selected target through the existing Bridge", async () => {
-  const bridgePort = 17980 + Math.floor(Math.random() * 100);
+  const bridgePort = await findFreePort();
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-codex-mcp-test-"));
   const tokenFile = join(temp, "token");
   const bridge = spawn(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
@@ -307,7 +332,7 @@ test("Codex MCP adapter routes a selected target through the existing Bridge", a
 });
 
 test("Codex MCP cancellation reaches the Bridge without replaying the browser wait", async () => {
-  const bridgePort = 17980 + Math.floor(Math.random() * 100);
+  const bridgePort = await findFreePort();
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-codex-mcp-cancel-test-"));
   const tokenFile = join(temp, "token");
   const bridge = spawn(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
