@@ -336,13 +336,20 @@ try {
     });
   };
 
-  const initial = await request("list_tabs");
+  const pageOrigin = `http://127.0.0.1:${pagePort}`;
+  let initial;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    initial = await request("list_tabs");
+    if (initial.tabs.some(tab => typeof tab.url === "string" && tab.url.startsWith(pageOrigin))) break;
+    await sleep(250);
+  }
   assert.ok(initial.tabs.length >= 1);
   const initialCompact = await request("list_tabs", { responseMode: "compact" });
   assert.ok(initialCompact.tabs.length >= 1);
   assert.equal(initialCompact.tabs[0].favicon, undefined);
-  const selected = await request("selected_tab");
+  const selected = { tab: initial.tabs.find(tab => typeof tab.url === "string" && tab.url.startsWith(pageOrigin)) ?? (await request("selected_tab")).tab };
   assert.ok(selected.tab?.id !== undefined);
+  assert.ok(selected.tab.url?.startsWith(pageOrigin), `browser did not select the E2E page: ${JSON.stringify(selected.tab)}`);
   const claimed = await request("claim_tab", {
     tabId: selected.tab.id,
     title: selected.tab.title,

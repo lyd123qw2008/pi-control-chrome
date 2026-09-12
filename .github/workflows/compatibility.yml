@@ -104,7 +104,14 @@ jobs:
         with:
           node-version: 24
       - name: Fetch reusable Profile history
-        run: git clone --depth 2 https://github.com/lyd123qw2008/dsh-profile-config.git .profile-config
+        uses: actions/checkout@v4
+        with:
+          repository: lyd123qw2008/dsh-profile-config
+          # Use a cross-repository read token when configured; GITHUB_TOKEN works if repository access is granted.
+          token: ${{ secrets.PROFILE_CONFIG_TOKEN || github.token }}
+          path: .profile-config
+          fetch-depth: 2
+          persist-credentials: false
       - name: Validate current Profile lockfile
         run: |
           plugin_version=$(node -p "require('./dsh-tool-control-chrome/package.json').version")
