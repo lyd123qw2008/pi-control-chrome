@@ -534,6 +534,7 @@ type CleanupIntent = {
 const pendingCleanupSessionIds = new Map<string, CleanupIntent>();
 const cleanupFlights = new Map<string, Promise<unknown>>();
 const cleanupTargetRoutes = new Map<string, BrowserTargetRoute>();
+const sessionTargetLeases = new Set<string>();
 let resumeBlockedSession: ((ctx?: ExtensionContext) => boolean) | undefined;
 
 function abortActiveBrowserWaits(): void {
@@ -594,6 +595,13 @@ async function bridgeRequest(method: string, params: Record<string, unknown>, ro
       throw error;
     }
   }
+}
+
+async function releaseSessionTargetLeases(session: string, signal?: AbortSignal): Promise<void> {
+  if (sessionTargetLeases.size === 0) return;
+  const result = await bridgeRequest("target_lease", { action: "release_session", sessionId: session }, undefined, signal);
+  if (result?.ok !== true) throw new Error("Bridge did not confirm target lease release for the browser session");
+  sessionTargetLeases.clear();
 }
 
 function isTargetLocator(value: unknown): boolean {
@@ -956,6 +964,7 @@ async function requestCleanup(session: string, params: Record<string, unknown> =
       const value = await bridgeRequest("cleanup", cleanupParams, route);
       const failure = cleanupFailure(value);
       if (failure !== undefined) throw failure;
+       if (inheritedParams.mode !== "turn") await releaseSessionTargetLeases(session);
       const currentIntent = pendingCleanupSessionIds.get(session);
       if (currentIntent === undefined || retryPriority >= currentIntent.priority) pendingCleanupSessionIds.delete(session);
       return value;
@@ -1175,7 +1184,7 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
     }
   }
   if (method === "cleanup") {
-    if (!bridgeUsed && !browserActivation.cleanupRequired && !turnCleanupArmed && params.recoverStale !== true) return { removed: [], released: [], retained: [], failed: [], recovered: [] };
+    if (!bridgeUsed && !browserActivation.cleanupRequired && !turnCleanupArmed && sessionTargetLeases.size === 0 && params.recoverStale !== true) return { removed: [], released: [], retained: [], failed: [], recovered: [] };
     bridgeUsed = true;
     browserTargetUsed = true;
     turnCleanupArmed = true;
@@ -1383,12 +1392,16 @@ function registerBrowserTools(pi: ExtensionAPI) {
     label: "Browser Target Lease",
     description: "Explicitly acquire, release, or inspect a session-scoped lease for a browser target before advanced multi-target control. Ordinary single-target browser operations do not require a lease.",
     parameters: Type.Object({
-      action: Type.Union([Type.Literal("acquire"), Type.Literal("release"), Type.Literal("status")]),
-      browserId: Type.Optional(Type.String({ description: "Browser target id. Required for acquire and release." })),
+      action: Type.Union([Type.Literal("acquire"), Type.Literal("release"), Type.Literal("release_session"), Type.Literal("status")]),
+      browserId: Type.Optional(Type.String({ description: "Browser target id. Required for acquire and release; omit for release_session and status." })),
     }),
     async execute(_toolCallId, params) {
       try {
-        return textResult(await bridgeRequest("target_lease", { action: params.action, ...(params.browserId === undefined ? {} : { browserId: params.browserId }), sessionId }));
+        const result = await bridgeRequest("target_lease", { action: params.action, ...(params.browserId === undefined ? {} : { browserId: params.browserId }), sessionId });
+        if (params.action === "acquire" && result?.acquired === true && typeof params.browserId === "string") sessionTargetLeases.add(params.browserId);
+        else if (params.action === "release" && result?.released === true && typeof params.browserId === "string") sessionTargetLeases.delete(params.browserId);
+        else if (params.action === "release_session" && result?.ok === true) sessionTargetLeases.clear();
+        return textResult(result);
       } catch (error) {
         return errorResult(error);
       }
@@ -1993,7 +2006,7 @@ export default function piControlChrome(pi: ExtensionAPI): void {
     const resetGeneration = ++lifecycleGeneration;
     sessionTransitionInFlight = true;
     abortActiveBrowserWaits();
-    const needsCleanup = bridgeUsed || turnCleanupArmed || browserActivation.cleanupRequired;
+    const needsCleanup = bridgeUsed || turnCleanupArmed || browserActivation.cleanupRequired || sessionTargetLeases.size > 0;
     let cleanupSucceeded = !needsCleanup;
     if (needsCleanup) {
       try {

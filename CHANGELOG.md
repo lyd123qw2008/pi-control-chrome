@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.9 - 2026-09-12
+
+- Harden target lease lifecycle with proactive expiry sweeps, session-scoped release, and automatic release on Pi, DSH, and Codex cleanup/disposal while retaining fail-closed behavior after uncertain cleanup.
+
+- Add Profile compatibility and rollback metadata validation, release workflow concurrency/version guards, and a Node 22/24 CI matrix.
+
+- Add isolated Chrome/Edge browser E2E matrix coverage plus repeated Bridge reconnect/lease invalidation stability coverage.
+
 ## 0.5.8 - 2026-09-12
 
 - Add explicit session-scoped `browser_target_lease` acquisition, release, and status operations for opt-in multi-target control; leased target operations fail closed on conflicts, ownership mismatch, disconnect, reconnect, replacement, expiry, or Bridge restart.

@@ -2,6 +2,15 @@ name: Publish Pi Control Chrome
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_version:
+        description: "Optional exact package version to verify before publishing"
+        required: false
+        type: string
+
+concurrency:
+  group: publish-pi-control-chrome
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -27,8 +36,14 @@ jobs:
       - name: Check
         run: npm run check
 
-      - name: Test
-        run: npm test
+      - name: Verify requested version
+        if: inputs.expected_version != ''
+        run: node -e "if (require('./package.json').version !== process.env.EXPECTED_VERSION) throw new Error('package version mismatch')"
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+
+      - name: Full test suite
+        run: npm run test:all
 
       - name: Pack check
         run: npm pack --dry-run

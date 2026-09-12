@@ -1,0 +1,123 @@
+name: Compatibility and Profile Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  root:
+    name: Root checks (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Static checks
+        run: npm run check
+      - name: Full test suite
+        run: npm run test:all
+      - name: Package dry run
+        run: npm run pack:check
+
+  dsh:
+    name: DSH plugin checks (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    defaults:
+      run:
+        working-directory: dsh-tool-control-chrome
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - name: Install dependencies
+        run: corepack pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: corepack pnpm run check
+      - name: Test
+        run: corepack pnpm test
+      - name: Build
+        run: corepack pnpm run build
+      - name: Package dry run
+        run: corepack pnpm run pack:check
+
+  browsers:
+    name: Isolated Chrome and Edge E2E matrix
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Run isolated browser matrix
+        run: npm run smoke:e2e:matrix
+        env:
+          PI_CONTROL_CHROME_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+      - name: Run isolated multi-profile E2E
+        run: npm run smoke:e2e:multi-profile
+
+  profiles:
+    name: Reusable Profile compatibility and rollback
+    runs-on: ubuntu-latest
+    needs: [root, dsh]
+    steps:
+      - name: Check out current repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Fetch reusable Profile history
+        run: git clone --depth 2 https://github.com/lyd123qw2008/dsh-profile-config.git .profile-config
+      - name: Validate current Profile lockfile
+        run: |
+          plugin_version=$(node -p "require('./dsh-tool-control-chrome/package.json').version")
+          pi_version=$(node -p "require('./dsh-tool-control-chrome/package.json').dependencies['pi-control-chrome'].replace(/^[^0-9]*/, '')")
+          node profile-compatibility.mjs \
+            --profile .profile-config/profiles/web \
+            --plugin-version "$plugin_version" \
+            --pi-version "$pi_version"
+      - name: Prepare previous Profile snapshot
+        run: |
+          mkdir -p .profile-rollback
+          git -C .profile-config archive HEAD~1 profiles/web | tar -x -C .profile-rollback
+      - name: Validate rollback Profile metadata
+        run: |
+          node profile-compatibility.mjs \
+            --profile .profile-config/profiles/web \
+            --rollback-profile .profile-rollback/profiles/web

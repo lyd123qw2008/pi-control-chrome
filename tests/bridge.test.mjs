@@ -660,6 +660,9 @@ test("bridge enforces session-scoped target leases and invalidates them on targe
     assert.equal(releasedA.result.released, true);
     const reacquiredA = await request("lease-reacquire", "target_lease", { action: "acquire", browserId: targetA.browserId, sessionId: "session-b" });
     assert.equal(reacquiredA.result.acquired, true);
+    const releasedSession = await request("lease-release-session", "target_lease", { action: "release_session", sessionId: "session-b" });
+    assert.deepEqual(new Set(releasedSession.result.released), new Set([targetA.browserId, targetB.browserId]));
+    assert.equal(releasedSession.result.releasedCount, 2);
 
     first.close();
     await waitHealth(port);
@@ -670,10 +673,13 @@ test("bridge enforces session-scoped target leases and invalidates them on targe
     assert.notEqual(reconnectedA.connectionId, targetA.connectionId);
     const reacquiredAfterReconnect = await request("lease-after-reconnect", "target_lease", { action: "acquire", browserId: reconnectedA.browserId, sessionId: "session-c" });
     assert.equal(reacquiredAfterReconnect.result.acquired, true);
+    const reacquiredB = await request("lease-after-reconnect-b", "target_lease", { action: "acquire", browserId: targetB.browserId, sessionId: "session-c" });
+    assert.equal(reacquiredB.result.acquired, true);
     const observedHealth = (await getJson(port, "/health")).body;
     assert.ok(observedHealth.observability.metrics.targetLeaseAcquisitions >= 3);
     assert.ok(observedHealth.observability.metrics.targetLeaseConflicts >= 2);
-    assert.ok(observedHealth.observability.metrics.targetLeaseReleases >= 1);
+    assert.ok(observedHealth.observability.metrics.targetLeaseReleases >= 3);
+    assert.ok(observedHealth.observability.metrics.targetLeaseSessionReleases >= 1);
     assert.ok(observedHealth.observability.metrics.targetDisconnects >= 1);
     assert.equal(observedHealth.observability.targetLeases.activeCount, 2);
     assert.ok(observedHealth.observability.targetRecovery.lastTargetReconnectAt > 0);
@@ -686,6 +692,60 @@ test("bridge enforces session-scoped target leases and invalidates them on targe
     first?.close();
     second?.close();
     replacement?.close();
+    await stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test("bridge proactively expires target leases and records the expiry", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-lease-expiry-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], {
+    stdio: "ignore",
+    windowsHide: true,
+    env: { ...process.env, PI_CONTROL_CHROME_TARGET_LEASE_TTL_MS: "100" },
+  });
+  let extension;
+  let pi;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = (role) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    const responseFor = (socket, id) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`response timeout for ${id}`)), 2000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== id) return;
+        clearTimeout(timer);
+        socket.off("message", onMessage);
+        resolve(message);
+      };
+      socket.on("message", onMessage);
+    });
+    const request = (id, method, params = {}) => {
+      pi.send(JSON.stringify({ type: "request", id, method, params }));
+      return responseFor(pi, id);
+    };
+    extension = await connect("extension");
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:lease-expiry", profile: "lease-expiry", extensionVersion: "0.5.8" }));
+    await waitHealthTarget(port, "edge:lease-expiry");
+    pi = await connect("pi");
+    const acquired = await request("expiry-acquire", "target_lease", { action: "acquire", browserId: "edge:lease-expiry", sessionId: "expiry-session" });
+    assert.equal(acquired.result.acquired, true);
+    await sleep(250);
+    const health = (await getJson(port, "/health")).body;
+    assert.equal(health.observability.targetLeases.activeCount, 0);
+    assert.ok(health.observability.metrics.targetLeaseExpirations >= 1);
+    assert.ok(health.observability.recentEvents.some((event) => event.event === "target_lease_released" && event.reason === "lease_expired"));
+  } finally {
+    pi?.close();
+    extension?.close();
     await stopProcess(child);
     await sleep(100);
     rmSync(temp, { recursive: true, force: true });

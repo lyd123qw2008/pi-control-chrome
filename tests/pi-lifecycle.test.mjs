@@ -352,7 +352,7 @@ test("Pi exposes a lightweight user-confirmed browser_restart and invalidates th
           instanceId: "new-instance",
           targets: [{ browser: "edge", browserId: "edge:test", profile: "profile-test", state: "ready", connectionId: "new-connection", connectionGeneration: 2 }],
           observability: {
-            metrics: { targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 0, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+            metrics: { targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 0, targetLeaseConflicts: 0, targetLeaseReleases: 0, targetLeaseSessionReleases: 0, targetLeaseExpirations: 0 },
             targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
             targetLeases: { activeCount: 0, heldTargets: [] },
             recentEvents: [],
@@ -411,7 +411,7 @@ test("Pi exposes explicit session-scoped target lease operations", async () => {
       acquired: true,
       browserId: "edge:test",
       observability: {
-        metrics: { targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+        metrics: { targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0, targetLeaseSessionReleases: 0, targetLeaseExpirations: 0 },
         targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
         targetLeases: { activeCount: 1, heldTargets: [{ browserId: "edge:test", state: "held" }] },
         recentEvents: [{ event: "target_lease_acquired" }],
@@ -424,6 +424,10 @@ test("Pi exposes explicit session-scoped target lease operations", async () => {
     assert.deepEqual(leaseRequest.params.action, "acquire");
     assert.deepEqual(leaseRequest.params.browserId, "edge:test");
     assert.equal(typeof leaseRequest.params.sessionId, "string");
+     mock.enqueue("target_lease", async (_message, respond) => respond({ ok: true, action: "release_session", released: ["edge:test"], releasedCount: 1 }));
+     await harness.tools.get("browser_cleanup").execute("cleanup", {});
+     const releaseRequest = mock.requests.find(message => message.method === "target_lease" && message.params.action === "release_session");
+     assert.equal(releaseRequest.params.sessionId, leaseRequest.params.sessionId);
   } finally {
     try { await harness.commands.get("chrome").handler("disconnect", context); } catch { /* release mock below */ }
     await mock.close();

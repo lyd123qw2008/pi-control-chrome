@@ -338,8 +338,8 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     name: 'browser_target_lease',
     description: 'Explicitly acquire, release, or inspect a session-scoped lease for a browser target before advanced multi-target control. Ordinary single-target browser operations do not require a lease.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['acquire', 'release', 'status'] },
-      browserId: { type: 'string', description: 'Browser target id. Required for acquire and release.' },
+      action: { type: 'string', required: true, enum: ['acquire', 'release', 'release_session', 'status'] },
+      browserId: { type: 'string', description: 'Browser target id. Required for acquire and release; omit for release_session and status.' },
     },
     method: 'target_lease',
   },
@@ -1938,6 +1938,7 @@ export function registerBrowserTools(
   }
   const recoveryRecords = new Map<string, RecoveryRecord>()
   const recoveryRequiredSessions = new Set<AgentSession>()
+  const sessionTargetLeases = new Map<AgentSession, Set<string>>()
   const operationLeases = new Set<Promise<void>>()
   const activeWaitControllers = new Map<AgentSession, Set<AbortController>>()
   const wireBarriers = new Map<string, Promise<void>>()
@@ -1964,6 +1965,13 @@ export function registerBrowserTools(
     if (controllers.size === 0) activeWaitControllers.delete(session)
   }
   const sessionId = (session: AgentSession): string => String(session.id)
+  const releaseSessionTargetLeases = async (session: AgentSession, signal?: AbortSignal): Promise<void> => {
+    const leases = sessionTargetLeases.get(session)
+    if (leases === undefined || leases.size === 0) return
+    const result = await bridge.request('target_lease', { action: 'release_session', sessionId: sessionId(session) }, signal)
+    if (!isRecord(result) || result.ok !== true) throw new Error('Bridge did not confirm target lease release for the browser session')
+    sessionTargetLeases.delete(session)
+  }
   const turnNumberFor = (session: AgentSession): number => turnNumbers.get(session) ?? 0
   const trackerFor = (session: AgentSession): BrowserTargetTracker => {
     const existing = trackers.get(session)
@@ -2215,7 +2223,7 @@ export function registerBrowserTools(
         }
         recoveryRequested = options.recoverStale === true || recoveryRequiredSessions.has(session)
         if (tracker.requiresExplicitSelection()) throw targetSelectionRequiredError()
-        const needsCleanup = hasBrowserUsage(session) || recoveryRequested
+        const needsCleanup = hasBrowserUsage(session) || recoveryRequested || (sessionTargetLeases.get(session)?.size ?? 0) > 0
         if (!needsCleanup) {
           if (mode === 'turn') {
             resetSessionUsage(session)
@@ -2244,6 +2252,7 @@ export function registerBrowserTools(
         const value = await requestCleanup(session, cleanupParams, signal, cleanupRoute)
         const failure = cleanupFailure(value)
         if (failure !== undefined) throw failure
+        if (mode !== 'turn') await releaseSessionTargetLeases(session, signal)
         if (mode === 'turn') {
           resetSessionUsage(session, !cleanupRetainsTabs(value))
           clearRecovery(session, recoveryRequested)
@@ -2349,6 +2358,7 @@ export function registerBrowserTools(
         ...cleanupFailures,
         ...cleanupFlights.keys(),
         ...cleanupTails.keys(),
+        ...sessionTargetLeases.keys(),
         ...retiredSessions,
         ...[...recoveryRecords.values()].map(record => record.owner),
       ])
@@ -2436,7 +2446,19 @@ export function registerBrowserTools(
           })
         }
         if (spec.name === 'browser_target_lease') {
-          return asJsonValue(await bridge.request('target_lease', params, operationSignal))
+          const result = await bridge.request('target_lease', params, operationSignal)
+          if (params.action === 'acquire' && isRecord(result) && result.acquired === true && typeof params.browserId === 'string') {
+            const leases = sessionTargetLeases.get(session) ?? new Set<string>()
+            leases.add(params.browserId)
+            sessionTargetLeases.set(session, leases)
+          } else if (params.action === 'release' && isRecord(result) && result.released === true && typeof params.browserId === 'string') {
+            const leases = sessionTargetLeases.get(session)
+            leases?.delete(params.browserId)
+            if (leases?.size === 0) sessionTargetLeases.delete(session)
+          } else if (params.action === 'release_session' && isRecord(result) && result.ok === true) {
+            sessionTargetLeases.delete(session)
+          }
+          return asJsonValue(result)
         }
         if (spec.name === 'browser_cleanup' || spec.name === 'browser_context_reset') {
           const mode = spec.name === 'browser_context_reset' ? 'context' : 'task'

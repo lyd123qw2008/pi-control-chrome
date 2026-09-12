@@ -32,7 +32,7 @@
   "targetObservability": {
     "requiredHealthFields": ["observability"],
     "requiredFields": ["metrics", "targetRecovery", "targetLeases", "recentEvents"],
-    "metricFields": ["targetConnections", "targetDisconnects", "targetReconnects", "targetLeaseAcquisitions", "targetLeaseConflicts", "targetLeaseReleases"],
+    "metricFields": ["targetConnections", "targetDisconnects", "targetReconnects", "targetLeaseAcquisitions", "targetLeaseConflicts", "targetLeaseReleases", "targetLeaseSessionReleases", "targetLeaseExpirations"],
     "leaseFields": ["activeCount", "heldTargets"]
   }
 }

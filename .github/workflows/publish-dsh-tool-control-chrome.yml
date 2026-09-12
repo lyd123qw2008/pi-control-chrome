@@ -2,6 +2,15 @@ name: Publish DSH Chrome Control Package
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_version:
+        description: "Optional exact package version to verify before publishing"
+        required: false
+        type: string
+
+concurrency:
+  group: publish-dsh-tool-control-chrome
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,6 +38,12 @@ jobs:
 
       - name: Typecheck
         run: corepack pnpm run check
+
+      - name: Verify requested version
+        if: inputs.expected_version != ''
+        run: node -e "if (require('./package.json').version !== process.env.EXPECTED_VERSION) throw new Error('package version mismatch')"
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
 
       - name: Test
         run: corepack pnpm test

@@ -89,8 +89,8 @@ const ALL_TOOLS = [
   })),
   tool("browser_targets", "List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available.", "list_targets", schema()),
   tool("browser_target_lease", "Explicitly acquire, release, or inspect a session-scoped lease for a browser target before advanced multi-target control. Ordinary single-target browser operations do not require a lease.", "target_lease", schema({
-    action: { type: "string", enum: ["acquire", "release", "status"], description: "Lease action." },
-    browserId: string("Browser target id. Required for acquire and release."),
+    action: { type: "string", enum: ["acquire", "release", "release_session", "status"], description: "Lease action." },
+    browserId: string("Browser target id. Required for acquire and release; omit for release_session and status."),
   }, ["action"])),
   tool("browser_restart", "After the user explicitly confirms a Bridge restart, restart the shared Bridge cooperatively without asking the user to type a command. Pass confirmed=true only after that confirmation; this does not restart DSH or Edge and does not close tabs.", "bridge_restart", schema({
     confirmed: boolean("Must be true only after the user explicitly confirms the Bridge restart."),
@@ -490,6 +490,11 @@ async function invokeTool(spec, args, signal) {
     }
   }
   if (spec.name === "browser_context_reset") params.mode = "context";
+  if (spec.name === "browser_cleanup" || spec.name === "browser_context_reset") {
+    const cleanupResult = await client.request("cleanup", params, requestTimeout(args), signal);
+    await client.request("target_lease", withSession({ action: "release_session" }), requestTimeout(args), signal);
+    return cleanupResult;
+  }
   if (spec.name === "browser_console" && params.action !== "enable") spec = { ...spec, method: "console_logs" };
   if (spec.name === "browser_network" && params.action !== "enable" && params.action !== "response_body") spec = { ...spec, method: "network_requests" };
   return client.request(spec.method, params, requestTimeout(args), signal);
@@ -555,6 +560,7 @@ async function shutdown() {
   try {
     if (bridgeClient?.socket?.readyState === 1) {
       await bridgeClient.request("cleanup", withSession({ mode: "context" }), 5_000);
+      await bridgeClient.request("target_lease", withSession({ action: "release_session" }), 5_000);
     }
   } catch {
     // Process shutdown must not turn cleanup uncertainty into an automatic retry.

@@ -287,7 +287,7 @@ describe('DSH browser tool catalog', () => {
         browserId: params.browserId,
         sessionId: params.sessionId,
         observability: {
-          metrics: { targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+          metrics: { targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0, targetLeaseSessionReleases: 0, targetLeaseExpirations: 0 },
           targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
           targetLeases: { activeCount: params.action === 'release' ? 0 : 1, heldTargets: [] },
           recentEvents: [{ event: 'target_lease_acquired' }],
@@ -304,6 +304,21 @@ describe('DSH browser tool catalog', () => {
     expect(released).toMatchObject({ ok: true, action: 'release', released: true, browserId: 'edge:test', sessionId: 'session-test' })
     expect(request).toHaveBeenNthCalledWith(1, 'target_lease', { action: 'acquire', browserId: 'edge:test', sessionId: 'session-test' }, expect.any(AbortSignal))
     expect(request).toHaveBeenNthCalledWith(2, 'target_lease', { action: 'release', browserId: 'edge:test', sessionId: 'session-test' }, expect.any(AbortSignal))
+  })
+
+  it('releases all tracked target leases during explicit browser cleanup', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'target_lease' && params.action === 'acquire') return { ok: true, action: 'acquire', acquired: true, browserId: 'edge:test' }
+      if (method === 'target_lease' && params.action === 'release_session') return { ok: true, action: 'release_session', released: ['edge:test'], releasedCount: 1 }
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', connectionId: 'edge-connection', connectionGeneration: 1, capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true } }
+      if (method === 'cleanup') return { removed: [], released: [], retained: [], failed: [] }
+      return { method }
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    await harness.tools.get('browser_target_lease')?.execute({ action: 'acquire', browserId: 'edge:test' }, execution(harness.agent))
+    await harness.tools.get('browser_cleanup')?.execute({}, execution(harness.agent))
+    expect(request).toHaveBeenCalledWith('target_lease', { action: 'release_session', sessionId: 'session-test' }, expect.any(AbortSignal))
   })
 
   it('treats blank browserId values as omitted during single-target status lookup', async () => {
@@ -528,7 +543,7 @@ describe('DSH browser tool catalog', () => {
       connectionId: 'connection-1',
       connectionGeneration: 2,
       observability: {
-         metrics: { requests: 4, targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+         metrics: { requests: 4, targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0, targetLeaseSessionReleases: 0, targetLeaseExpirations: 0 },
          targetRecovery: { trackedTargets: 2, readyTargets: 1, disconnectedTargets: 1 },
          targetLeases: { activeCount: 1, heldTargets: [{ browserId: 'edge:test', state: 'held', expiresAt: 123 }] },
          recentEvents: Array.from({ length: 100 }, () => ({ event: 'internal' })),

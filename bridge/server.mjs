@@ -81,7 +81,10 @@ const draining = new Map();
 const extensionTargets = new Map();
 const targetGenerations = new Map();
 const targetLeases = new Map();
-const TARGET_LEASE_TTL_MS = 10 * 60 * 1000;
+const configuredTargetLeaseTtlMs = Number(process.env.PI_CONTROL_CHROME_TARGET_LEASE_TTL_MS);
+const TARGET_LEASE_TTL_MS = Number.isFinite(configuredTargetLeaseTtlMs) && configuredTargetLeaseTtlMs >= 100
+  ? configuredTargetLeaseTtlMs
+  : 10 * 60 * 1000;
 const TARGET_LEASE_CONTROL_METHODS = new Set(["list_targets", "doctor", "status", "target_lease"]);
 const diagnostics = [];
 const MAX_DIAGNOSTICS = 100;
@@ -98,6 +101,7 @@ const metrics = {
   targetLeaseAcquisitions: 0,
   targetLeaseRenewals: 0,
   targetLeaseReleases: 0,
+  targetLeaseSessionReleases: 0,
   targetLeaseConflicts: 0,
   targetLeaseNotOwned: 0,
   targetLeaseExpirations: 0,
@@ -319,7 +323,7 @@ function clearTargetLease(browserId, reason = "target_unavailable") {
   targetLeases.delete(browserId);
   metrics.targetLeaseReleases += 1;
   if (reason === "lease_expired") metrics.targetLeaseExpirations += 1;
-  else if (reason !== "explicit_release") metrics.targetLeaseInvalidations += 1;
+  else if (reason !== "explicit_release" && reason !== "session_release") metrics.targetLeaseInvalidations += 1;
   recordDiagnostic("target_lease_released", {
     browserId,
     reason,
@@ -384,6 +388,15 @@ function activeTargetLease(browserId) {
   return lease;
 }
 
+function sweepExpiredTargetLeases() {
+  for (const [browserId, lease] of targetLeases) {
+    if (lease.expiresAt <= Date.now()) clearTargetLease(browserId, "lease_expired");
+  }
+}
+
+const targetLeaseExpiryTimer = setInterval(sweepExpiredTargetLeases, Math.min(TARGET_LEASE_TTL_MS, 30_000));
+targetLeaseExpiryTimer.unref?.();
+
 function leaseView(lease, sessionId) {
   if (lease === undefined) return { state: "available", owner: "none" };
   return {
@@ -413,8 +426,8 @@ function handleTargetLease(client, id, message) {
   const action = nonEmptyString(params.action);
   const sessionId = nonEmptyString(params.sessionId);
   const browserId = nonEmptyString(params.browserId);
-  if (!action || !["acquire", "release", "status"].includes(action) || !sessionId || (action !== "status" && !browserId)) {
-    sendError(client, id, "INVALID_TARGET_LEASE", "target_lease requires action acquire, release or status, sessionId, and browserId for acquire/release.");
+  if (!action || !["acquire", "release", "release_session", "status"].includes(action) || !sessionId || (["acquire", "release"].includes(action) && !browserId)) {
+    sendError(client, id, "INVALID_TARGET_LEASE", "target_lease requires action acquire, release, release_session or status, sessionId, and browserId for acquire/release.");
     return;
   }
   if (action === "status") {
@@ -426,6 +439,28 @@ function handleTargetLease(client, id, message) {
         ok: true,
         action,
         leases: entries.map(currentBrowserId => ({ browserId: currentBrowserId, lease: leaseView(activeTargetLease(currentBrowserId), sessionId) })),
+        observability: targetLeaseResponseObservability(),
+      },
+    });
+    return;
+  }
+  if (action === "release_session") {
+    const released = [];
+    for (const [currentBrowserId, lease] of targetLeases) {
+      if (lease.client === client && lease.sessionId === sessionId && clearTargetLease(currentBrowserId, "session_release")) {
+        released.push(currentBrowserId);
+      }
+    }
+    metrics.targetLeaseSessionReleases += released.length > 0 ? 1 : 0;
+    if (released.length > 0) recordDiagnostic("target_lease_session_released", { sessionId, browserIds: released });
+    send(client, {
+      type: "response",
+      id,
+      result: {
+        ok: true,
+        action,
+        released,
+        releasedCount: released.length,
         observability: targetLeaseResponseObservability(),
       },
     });
@@ -506,7 +541,12 @@ function enforceTargetLease(client, message, target) {
     clearTargetLease(target.browserId, "connection_changed");
     return targetLeaseError("TARGET_LEASE_STALE", `Browser target ${target.browserId} was reconnected; reacquire its target lease.`, { browserId: target.browserId, nextAction: "browser_target_lease", recommendation: "reacquire_target_lease", targetLease: previousLease });
   }
-  lease.expiresAt = Date.now() + TARGET_LEASE_TTL_MS;
+  const now = Date.now();
+  if (lease.expiresAt - now <= TARGET_LEASE_TTL_MS / 2) {
+    metrics.targetLeaseRenewals += 1;
+    recordDiagnostic("target_lease_renewed", { browserId: target.browserId, sessionId, connectionId: target.connectionId, connectionGeneration: target.connectionGeneration, reason: "operation" });
+  }
+  lease.expiresAt = now + TARGET_LEASE_TTL_MS;
   return undefined;
 }
 
@@ -1283,6 +1323,7 @@ server.listen(port, "127.0.0.1", () => {
 });
 
 function shutdown() {
+  clearInterval(targetLeaseExpiryTimer);
   for (const entry of pending.values()) clearTimeout(entry.timer);
   pending.clear();
   for (const entry of draining.values()) clearTimeout(entry.timer);
