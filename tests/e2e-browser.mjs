@@ -1264,9 +1264,11 @@ try {
   }));
 } finally {
   await closeSocket(socket);
-  await new Promise((resolve) => siteServer.close(resolve));
-  await new Promise((resolve) => crossOriginServer.close(resolve));
+  // Stop the browser before closing the HTTP servers so keep-alive page
+  // connections cannot hold server.close() open on the Windows runner.
   await stopProcess(edgeProcess);
   await stopProcess(bridgeProcess);
+  await new Promise((resolve) => siteServer.close(resolve));
+  await new Promise((resolve) => crossOriginServer.close(resolve));
   try { rmSync(temp, { recursive: true, force: true }); } catch {}
 }
