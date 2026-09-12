@@ -82,13 +82,26 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
 
 检查结果必须同时满足：标题正确、`##` 标题和项目符号正常分行、代码块可读、验证命令完整、状态和合并条件符合预期。发现字面量转义符或 Markdown 粘连时，先用 `--body-file` 修复并再次读取确认，禁止直接合并。
 
+## 发布前置 Gate 与发布 workflow
+
+推送到 `main` 后，`CI` 与 `Compatibility and Profile Validation` 会针对同一个 commit 并行运行。它们是发布的正式验证 Gate：
+
+- `CI`：静态检查、Bridge tests、包内容 dry-run，以及真实安装 npm tarball 的 `test:package-install` smoke test；
+- `Compatibility`：Root Node 22/24、DSH Node 22/24、Chrome/Edge 隔离浏览器 E2E、Profile 当前/回滚校验；
+- 同一个 workflow/ref 的旧 push run 会被新 push 自动取消，避免过期 commit 占用浏览器 runner；
+- `checkout`、`setup-node` 和 `pnpm/action-setup` 使用 Node 24 运行时版本，避免 Actions Node 20 弃用告警。
+
+发布 workflow 不再重复执行全量测试。它们会先用 `gh run list` 校验当前 commit 已有成功的 `CI` 和 `Compatibility` run，然后只执行发布所需的轻量步骤：版本校验、必要的 DSH 构建、pack 和 npm publish。发布 workflow 保留 `cancel-in-progress: false`，避免发布过程中被后续 push 中断。
+
+如果本地已经完成全量测试，可以直接 push；不需要为了触发发布再次本地重复测试。正式发布前仍必须等待 GitHub 上同一 commit 的两个 Gate 成功。
+
 ## 推荐发布顺序
 
 当 DSH 包依赖新的 Pi 根包时，按以下顺序执行：
 
 1. 在 PR 中提交 Pi 根包、扩展代码和对应测试；确认根包 `package.json`、`package-lock.json` 与 Changelog 已同步。
-2. 等待 PR CI 通过并合并。
-3. 触发 `publish-pi-control-chrome.yml`，确认 workflow 的 check、test、pack 和 publish 全部成功。
+2. 等待 PR CI 通过并合并，并等待合并后同一个 commit 的 `CI` 与 `Compatibility` Gate 全部成功。
+3. 触发 `publish-pi-control-chrome.yml`，填写 `expected_version`；workflow 会校验当前 commit 的两个 Gate，然后执行版本校验、pack 和 publish。
 4. 用 npm 查询刚发布的根包，确认版本、`latest` 和依赖元数据：
 
    ```powershell
@@ -98,7 +111,7 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
 5. 更新 DSH 仓库包的依赖 specifier、`pnpm-lock.yaml` 和 `pnpm-workspace.yaml`；重点检查 `overrides.pi-control-chrome`，它可能把 DSH 依赖强制固定到旧版本。
 6. 将 DSH 包自己的 `package.json` 版本 bump，并同步 README 中的安装示例。
 7. 运行 DSH 检查，创建并合并 DSH release PR。
-8. 触发 `publish-dsh-tool-control-chrome.yml`，确认发布成功。
+8. 触发 `publish-dsh-tool-control-chrome.yml`，填写 `expected_version`；workflow 会校验当前 commit 的两个 Gate，执行必要的 install/build、pack 和 publish。
 9. 用 npm 查询 DSH 包，确认 DSH 版本和它实际声明的 `pi-control-chrome` 依赖：
 
    ```powershell
@@ -126,6 +139,7 @@ Pi 根包：
 npm run check
 npm run test:all
 npm run pack:check
+npm run test:package-install
 ```
 
 DSH 包：

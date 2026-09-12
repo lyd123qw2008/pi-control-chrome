@@ -77,6 +77,7 @@
     "test:output": "node --test tests/output-projection.test.mjs",
     "test:profile": "node --test tests/profile-compatibility.test.mjs",
     "test:stability": "node tests/bridge-stability.mjs",
+    "test:package-install": "node tests/package-install-smoke.mjs",
     "test:ci": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:codex && npm run test:output && npm run test:profile && npm run test:stability",
     "test:all": "npm run test:ci && npm run test:skill",
     "bridge": "node bridge/server.mjs",

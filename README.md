@@ -134,6 +134,7 @@ npm test
 npm run test:pi:lifecycle
 npm run test:skill
 npm run pack:check
+npm run test:package-install
 ```
 
 `npm run test:skill` requires a connected Chrome or Edge profile and the local Bridge. It creates temporary Agent tabs, so when multiple ready targets exist it skips rather than choosing one; set `PI_CONTROL_CHROME_TEST_BROWSER_ID` only for an explicitly authorized target. The high-coverage browser smoke test is:

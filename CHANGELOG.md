@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Harden release publishing with exact-commit CI/Compatibility gates, a real installed-package smoke test, Node 24-compatible Actions, and cancellation of stale push runs.
+
+- Reduce isolated Chrome/Edge E2E runtime by running browser candidates concurrently and bounding Windows browser/server cleanup.
+
 ## 0.5.9 - 2026-09-12
 
 - Harden target lease lifecycle with proactive expiry sweeps, session-scoped release, and automatic release on Pi, DSH, and Codex cleanup/disposal while retaining fail-closed behavior after uncertain cleanup.

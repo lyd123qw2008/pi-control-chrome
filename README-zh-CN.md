@@ -173,6 +173,7 @@ npm run test:pi:lifecycle
 npm run test:skill
 npm run test:all
 npm run pack:check
+npm run test:package-install
 npm run smoke:e2e
 npm run smoke:e2e:multi-profile
 ```

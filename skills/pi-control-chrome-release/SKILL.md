@@ -107,31 +107,33 @@ When DSH depends on a new Pi release, use this order:
    npm run check
    npm run test:all
    npm run pack:check
+   npm run test:package-install
    ```
 
 3. Merge the Pi PR only after CI passes.
-4. Publish the root package with `publish-pi-control-chrome.yml`.
-5. Verify the published metadata before touching DSH:
+4. Wait for the post-merge `CI` and `Compatibility and Profile Validation` runs for the exact release commit to pass. The CI gate includes `npm run test:package-install`, which installs the packed npm tarball and imports its exported projection.
+5. Publish the root package with `publish-pi-control-chrome.yml`, providing `expected_version`. The publish workflow verifies both exact-commit gates, then runs version verification, pack, and npm publish without repeating the full test suite.
+6. Verify the published metadata before touching DSH:
 
    ```powershell
    npm view pi-control-chrome@<pi-version> version dist-tags dependencies --json
    ```
 
-6. Update the DSH package dependency specifier, `dsh-tool-control-chrome/pnpm-lock.yaml`, `dsh-tool-control-chrome/pnpm-workspace.yaml`, and README examples. Inspect `overrides.pi-control-chrome`; it can keep an old Bridge package even when the DSH dependency says otherwise.
-7. Bump the DSH package's own version. Run:
+7. Update the DSH package dependency specifier, `dsh-tool-control-chrome/pnpm-lock.yaml`, `dsh-tool-control-chrome/pnpm-workspace.yaml`, and README examples. Inspect `overrides.pi-control-chrome`; it can keep an old Bridge package even when the DSH dependency says otherwise.
+8. Bump the DSH package's own version. Run:
 
    ```powershell
    corepack pnpm --dir dsh-tool-control-chrome run pack:check
    ```
 
-8. Create and merge the DSH release PR, then publish with `publish-dsh-tool-control-chrome.yml`.
-9. Verify the published DSH metadata:
+9. Create and merge the DSH release PR, wait for the post-merge exact-commit `CI` and `Compatibility and Profile Validation` gates, then publish with `publish-dsh-tool-control-chrome.yml`, providing `expected_version`. The workflow verifies both gates, installs dependencies, builds the generated `lib/`, and publishes with scripts disabled so the already-passed tests are not repeated.
+10. Verify the published DSH metadata:
 
    ```powershell
    npm view @lyd123qw2008/dsh-tool-control-chrome@<dsh-version> version dist-tags dependencies --json
    ```
 
-The workflow must pass its install, typecheck, test, build, pack, and publish steps. A local `npm pack --dry-run` is not evidence that npm publication succeeded.
+The matching GitHub gate and publish workflow must pass. A local `npm pack --dry-run` is not evidence that npm publication succeeded.
 
 ## Phase 3: update private `dsh-profile-config` source
 

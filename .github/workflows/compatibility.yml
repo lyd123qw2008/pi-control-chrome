@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -19,9 +23,9 @@ jobs:
         node: [22, 24]
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -46,13 +50,13 @@ jobs:
         working-directory: dsh-tool-control-chrome
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 11.22.0
       - name: Install dependencies
@@ -71,9 +75,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -98,13 +102,13 @@ jobs:
     needs: [root, dsh]
     steps:
       - name: Check out current repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Fetch reusable Profile history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: lyd123qw2008/dsh-profile-config
           # Use a cross-repository read token when configured; GITHUB_TOKEN works if repository access is granted.
