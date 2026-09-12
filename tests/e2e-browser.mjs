@@ -182,11 +182,24 @@ function waitForExit(child, timeoutMs = 5000) {
 async function stopProcess(child) {
   if (!child?.pid) return;
   await new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
     const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-    killer.once("close", resolve);
-    killer.once("error", resolve);
+    killer.once("close", finish);
+    killer.once("error", finish);
+    timer = setTimeout(() => {
+      try { killer.kill(); } catch {}
+      try { child.kill(); } catch {}
+      finish();
+    }, 5_000);
   });
-  await waitForExit(child);
+  await waitForExit(child, 5_000);
 }
 
 async function closeSocket(client) {
