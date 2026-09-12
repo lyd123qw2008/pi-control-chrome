@@ -348,7 +348,14 @@ try {
   const initialCompact = await request("list_tabs", { responseMode: "compact" });
   assert.ok(initialCompact.tabs.length >= 1);
   assert.equal(initialCompact.tabs[0].favicon, undefined);
-  const selected = { tab: initial.tabs.find(tab => typeof tab.url === "string" && tab.url.startsWith(pageOrigin)) ?? (await request("selected_tab")).tab };
+  let selectedTab = initial.tabs.find(tab => typeof tab.url === "string" && tab.url.startsWith(pageOrigin));
+  if (selectedTab === undefined) {
+    const created = await request("new_tab", { url: `${pageOrigin}/`, wait: true, timeoutMs: 10_000, active: true });
+    await request("release", { tabId: created.tab.id });
+    selectedTab = created.tab;
+    initial = { ...initial, tabs: [...initial.tabs, selectedTab] };
+  }
+  const selected = { tab: selectedTab };
   assert.ok(selected.tab?.id !== undefined);
   assert.ok(selected.tab.url?.startsWith(pageOrigin), `browser did not select the E2E page: ${JSON.stringify(selected.tab)}`);
   const claimed = await request("claim_tab", {
