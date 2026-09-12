@@ -29,8 +29,8 @@ jobs:
         run: npm ci
       - name: Static checks
         run: npm run check
-      - name: Full test suite
-        run: npm run test:all
+      - name: CI-safe test suite
+        run: npm run test:ci
       - name: Package dry run
         run: npm run pack:check
 

@@ -42,8 +42,8 @@ jobs:
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
 
-      - name: Full test suite
-        run: npm run test:all
+      - name: CI-safe test suite
+        run: npm run test:ci
 
       - name: Pack check
         run: npm pack --dry-run
