@@ -162,6 +162,37 @@ function lifecycleError(code: string, message: string): Error & { readonly code:
   return error
 }
 
+function restartCanceledError(): Error & { readonly code: string } {
+  return lifecycleError('BRIDGE_RESTART_CANCELED', 'Browser Bridge restart was cancelled; inspect Bridge health before retrying.')
+}
+
+function normalizeRestartError(error: unknown): Error & { readonly code?: string } {
+  const source = error instanceof Error ? error : new Error(String(error))
+  const code = (source as Error & { readonly code?: unknown }).code
+  if (code === 'BRIDGE_IN_USE') return lifecycleError('BRIDGE_RESTART_BUSY', source.message)
+  if (code === 'BRIDGE_INSTANCE_CHANGED') return lifecycleError('BRIDGE_RESTART_INSTANCE_MISMATCH', source.message)
+  if (code === 'BRIDGE_OFFLINE' || code === 'BROWSER_BRIDGE_DISCONNECTED' || source.message.includes('Timed out')) {
+    return lifecycleError('BRIDGE_RESTART_TIMEOUT', source.message)
+  }
+  return source as Error & { readonly code?: string }
+}
+
+function raceRestartAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return promise
+  if (signal.aborted) {
+    promise.catch(() => {})
+    return Promise.reject(restartCanceledError())
+  }
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(restartCanceledError())
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  return Promise.race([promise, aborted]).finally(() => {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  })
+}
+
 /**
  * Connect to, and when configured start, one loopback pi-control-chrome Bridge.
  * The Bridge process is deliberately left alive when this client stops so Pi
@@ -189,14 +220,18 @@ export class BrowserBridgeClient {
 
   /** Stop this client connection without stopping the reusable Bridge process. */
   async stop(): Promise<void> {
+    // Do not close the socket while bridge_restart is in flight: the Bridge may
+    // already have accepted the request and scheduled its own shutdown. Wait
+    // for the replacement to finish so stopping this DSH client never leaves
+    // the shared Bridge offline.
+    const restarting = this.restarting
+    if (restarting !== undefined) await restarting.catch(() => {})
     this.lifecycle += 1
     this.rejectPending(new Error('DSH browser Bridge client stopped'), true)
     const socket = this.socket
     this.socket = undefined
     this.socketKey = undefined
     socket?.close()
-    const restarting = this.restarting
-    if (restarting !== undefined) await restarting.catch(() => {})
     const connecting = this.connecting
     const starting = [...this.starting.values()]
     if (connecting !== undefined) await connecting.catch(() => {})
@@ -213,13 +248,18 @@ export class BrowserBridgeClient {
    * protocol, or start it when the configured port is offline.
    * @returns the new Bridge health document and lifecycle result.
    */
-  async restart(): Promise<Record<string, unknown>> {
-    if (this.restarting !== undefined) return this.restarting
-    const lifecycle = this.lifecycle
-    this.restarting = this.restartBridge(lifecycle).finally(() => {
-      this.restarting = undefined
-    })
-    return this.restarting
+  async restart(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    if (signal?.aborted) throw restartCanceledError()
+    if (this.restarting === undefined) {
+      const lifecycle = this.lifecycle
+      const operation = this.restartBridge(lifecycle)
+        .catch(error => { throw normalizeRestartError(error) })
+        .finally(() => {
+          if (this.restarting === operation) this.restarting = undefined
+        })
+      this.restarting = operation
+    }
+    return raceRestartAbort(this.restarting, signal)
   }
 
   /** Send one browser method request and preserve caller cancellation locally. */
@@ -347,7 +387,7 @@ export class BrowserBridgeClient {
   private async restartBridge(lifecycle: number): Promise<Record<string, unknown>> {
     const config = this.resolveConfig()
     const assertActive = () => {
-      if (lifecycle !== this.lifecycle) throw new Error('DSH browser Bridge client stopped')
+      if (lifecycle !== this.lifecycle) throw restartCanceledError()
     }
     let health: Record<string, unknown>
     try {
@@ -368,13 +408,12 @@ export class BrowserBridgeClient {
       expectedInstanceId: instanceId,
       requester: 'dsh',
     })
-    assertActive()
+    // Once bridge_restart is accepted, finish the replacement even if the DSH
+    // client is stopped or the caller cancels. Returning early here would leave
+    // the shared Bridge offline after it has already scheduled its shutdown.
     await this.waitForBridgeOffline(config)
-    assertActive()
     await this.startBridgeProcess(config)
-    assertActive()
     const next = await this.waitForHealth(config)
-    assertActive()
     if (healthInstanceId(next) === instanceId) {
       throw lifecycleError('BRIDGE_INSTANCE_CHANGED', 'The restarted Bridge reused the previous instance id')
     }

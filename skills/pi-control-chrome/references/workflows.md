@@ -6,6 +6,7 @@ Use this reference for a special capability or a human/developer workflow. The n
 
 - `browser_doctor`: diagnose Bridge reachability, extension connection, browser-target selection, Chrome/Edge competition, and cooperative recovery metadata without changing tabs.
 - `browser_status`: verify the selected browser, profile, Bridge, extension, and target stability.
+- `browser_targets`: list connected browser targets without changing the active target selection.
 - `browser_tabs` / `browser_selected`: inspect windows, tabs, ownership, lifecycle, and current handles.
 - `browser_snapshot`: read one bounded semantic DOM state and obtain document-scoped `eN` refs.
 - `browser_accessibility_snapshot`: read bounded Chromium AX state and obtain `aN` refs with a matching `snapshotId`.
@@ -58,6 +59,8 @@ These commands are diagnostics or lifecycle operations, not a substitute for loa
 /chrome cleanup
 /chrome release <tabId>
 ```
+
+For an explicitly user-authorized Bridge recovery, the agent may invoke the active Harness restart entry point described in `recovery.md`—DSH `BrowserBridgeClient.restart()`, Pi `bridge.restart()`, or Codex `browser_restart` with `confirmed: true`; do not ask the user to enter `/chrome restart`.
 
 The bundled `scripts/browser.mjs` is for explicit human/developer workflows and automated tests. Managed `open`, `view`, and `cleanup` require an explicit `--session <id>`; `view` retention marks also require `--turn <n>`. Read-only `tabs`, `view`, `snapshot`, and `extract` negotiate compact responses by default; use `--raw` only for human/developer diagnostics that need compatibility fields such as `frameTree`. Do not invoke the script through a model shell as an alternative to the native Skill-gated tools.
 

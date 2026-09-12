@@ -1,7 +1,7 @@
 /** Browser tool names and the session-local active-tool gate used by Pi. */
 
 export const BROWSER_TOOL_NAMES = Object.freeze([
-  'browser_doctor', 'browser_status', 'browser_tabs', 'browser_selected', 'browser_claim_tab', 'browser_select_tab', 'browser_new_tab',
+  'browser_doctor', 'browser_status', 'browser_restart', 'browser_targets', 'browser_tabs', 'browser_selected', 'browser_claim_tab', 'browser_select_tab', 'browser_new_tab',
   'browser_snapshot', 'browser_extract', 'browser_accessibility_snapshot', 'browser_navigate', 'browser_wait', 'browser_back',
   'browser_forward', 'browser_reload', 'browser_click', 'browser_double_click', 'browser_fill', 'browser_type', 'browser_press_key',
   'browser_scroll', 'browser_screenshot', 'browser_close_tab', 'browser_release', 'browser_mark_handoff', 'browser_mark_deliverable',

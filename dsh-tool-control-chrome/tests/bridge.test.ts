@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { once } from 'node:events'
 import WebSocket, { WebSocketServer } from 'ws'
@@ -49,6 +49,43 @@ it('rejects the old launcher-owner restart protocol', async () => {
     await client.stop()
     server.close()
     await once(server, 'close')
+  }
+})
+
+it('maps cooperative restart failures to stable DSH lifecycle codes', async () => {
+  const client = new BrowserBridgeClient(() => resolveConfig({ autoStartBridge: false }))
+  const restartBridge = vi.spyOn(client as unknown as { restartBridge: (lifecycle: number) => Promise<Record<string, unknown>> }, 'restartBridge')
+  try {
+    restartBridge.mockRejectedValueOnce(Object.assign(new Error('Bridge is busy'), { code: 'BRIDGE_IN_USE' }))
+    await expect(client.restart()).rejects.toMatchObject({ code: 'BRIDGE_RESTART_BUSY' })
+    restartBridge.mockRejectedValueOnce(Object.assign(new Error('Bridge identity changed'), { code: 'BRIDGE_INSTANCE_CHANGED' }))
+    await expect(client.restart()).rejects.toMatchObject({ code: 'BRIDGE_RESTART_INSTANCE_MISMATCH' })
+    restartBridge.mockRejectedValueOnce(Object.assign(new Error('Timed out waiting for Bridge'), { code: 'BRIDGE_OFFLINE' }))
+    await expect(client.restart()).rejects.toMatchObject({ code: 'BRIDGE_RESTART_TIMEOUT' })
+  } finally {
+    restartBridge.mockRestore()
+    await client.stop()
+  }
+})
+
+it('deduplicates concurrent cooperative restarts and rejects an already-cancelled caller', async () => {
+  const client = new BrowserBridgeClient(() => resolveConfig({ autoStartBridge: false }))
+  let resolveRestart: ((value: Record<string, unknown>) => void) | undefined
+  const restartPromise = new Promise<Record<string, unknown>>(resolve => { resolveRestart = resolve })
+  const restartBridge = vi.spyOn(client as unknown as { restartBridge: (lifecycle: number) => Promise<Record<string, unknown>> }, 'restartBridge').mockReturnValue(restartPromise)
+  try {
+    const first = client.restart()
+    const second = client.restart()
+    expect(restartBridge).toHaveBeenCalledTimes(1)
+    const controller = new AbortController()
+    controller.abort()
+    await expect(client.restart(controller.signal)).rejects.toMatchObject({ code: 'BRIDGE_RESTART_CANCELED' })
+    resolveRestart?.({ ok: true, restarted: true })
+    await expect(first).resolves.toEqual({ ok: true, restarted: true })
+    await expect(second).resolves.toEqual({ ok: true, restarted: true })
+  } finally {
+    restartBridge.mockRestore()
+    await client.stop()
   }
 })
 

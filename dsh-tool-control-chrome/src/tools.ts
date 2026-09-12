@@ -228,6 +228,13 @@ class BrowserTargetTracker {
     this.selectionRequired = true
   }
 
+  /** Invalidate the selected target route after a Bridge restart without transferring ownership. */
+  invalidateAfterRestart(): void {
+    if (this.acknowledged === undefined) return
+    this.acknowledged = undefined
+    this.selectionRequired = true
+  }
+
   route(): BrowserTargetRoute | undefined {
     const target = this.acknowledged
     if (target === undefined) return undefined
@@ -312,6 +319,20 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
       acknowledgeBrowserId: { type: 'string', description: 'Explicitly acknowledge this browserId after the user confirms a browser switch.' },
     },
     method: 'status',
+  },
+  {
+    name: 'browser_targets',
+    description: 'List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available.',
+    parameters: EMPTY_PARAMETERS,
+    method: 'list_targets',
+  },
+  {
+    name: 'browser_restart',
+    description: 'After the user explicitly confirms a Bridge restart, restart only the shared local Bridge. Pass confirmed=true only after that confirmation; this does not restart DSH or Chrome/Edge and does not close tabs. Refresh browser_status and all tab/snapshot handles after it completes.',
+    parameters: {
+      confirmed: { type: 'boolean', required: true, description: 'Must be true only after the user explicitly confirms the Bridge restart.' },
+    },
+    method: 'bridge_restart',
   },
   {
     name: 'browser_tabs',
@@ -1068,6 +1089,77 @@ async function waitForExtension(
     health = await bridge.health()
   }
   return health
+}
+
+function bridgeRestartConfirmationError(): Error & { readonly code: string; readonly details: JsonValue } {
+  const error = new Error('Bridge restart requires explicit user confirmation; ask the user before retrying with confirmed=true') as Error & { code: string; details: JsonValue }
+  error.code = 'BRIDGE_RESTART_CONFIRMATION_REQUIRED'
+  error.details = asJsonValue({ requiresUserConfirmation: true })
+  return error
+}
+
+function bridgeRestartCancellationError(): Error & { readonly code: string; readonly details: JsonValue } {
+  const error = new Error('Browser Bridge restart was cancelled; inspect Bridge health before retrying.') as Error & { code: string; details: JsonValue }
+  error.code = 'BRIDGE_RESTART_CANCELED'
+  error.details = asJsonValue({ actionState: 'not_completed', retryable: true, inspectFirst: true, nextAction: 'browser_doctor' })
+  return error
+}
+
+async function restartBrowser(
+  bridge: BrowserBridgeClient,
+  tracker: BrowserTargetTracker,
+  signal: AbortSignal,
+  extensionReadyTimeoutMs: number,
+): Promise<JsonValue> {
+  const result = await bridge.restart(signal)
+  // A successful restart changes the Bridge connection fence even when the
+  // extension reconnects to the same logical browser target. Never reuse the
+  // previously acknowledged route or document-bound handles.
+  const previousBrowserId = tracker.expectedBrowserId()
+  tracker.invalidateAfterRestart()
+  const initialHealth = isRecord(result.bridgeHealth) ? result.bridgeHealth : await bridge.health()
+  let bridgeHealth: Record<string, unknown>
+  try {
+    bridgeHealth = await waitForExtension(bridge, initialHealth, signal, extensionReadyTimeoutMs)
+  } catch (error) {
+    if (signal.aborted) throw bridgeRestartCancellationError()
+    throw error
+  }
+  const listedTargets = readyTargetRecords(bridgeHealth)
+  const reportedTarget = readBrowserTarget(bridgeHealth)
+  const targets = listedTargets.length > 0 ? listedTargets : reportedTarget === undefined ? [] : [reportedTarget]
+  const currentTarget = previousBrowserId === undefined
+    ? targets.length === 1 ? targets[0] : undefined
+    : targets.find(target => target.browserId === previousBrowserId)
+  const targetRequired = previousBrowserId !== undefined || targets.length !== 1
+  const common = {
+    ...result,
+    ok: true,
+    restarted: true,
+    bridgeHealth: compactBridgeHealth(bridgeHealth),
+    targets,
+    handleRefreshRequired: true,
+    snapshotRefreshRequired: true,
+    documentIncarnationRefreshRequired: true,
+    targetRequired,
+    nextAction: 'browser_status',
+    recommendation: targetRequired ? 'refresh_browser_target' : 'refresh_browser_status',
+    recoveryDetails: bridgeRecovery(bridgeHealth),
+    ...(previousBrowserId === undefined ? {} : { previousBrowserId }),
+    ...(currentTarget === undefined ? {} : { target: currentTarget }),
+  }
+  if (bridgeHealth.extensionConnected !== true) {
+    return asJsonValue({
+      ...common,
+      ok: false,
+      connected: false,
+      state: 'bridge_only',
+      completed: false,
+      retryable: true,
+      recommendation: 'retry_browser_status',
+    })
+  }
+  return asJsonValue({ ...common, connected: true, state: targetRequired ? 'target_required' : 'connected' })
 }
 
 type BrowserConnection =
@@ -2310,6 +2402,20 @@ export function registerBrowserTools(
         if (spec.name === 'browser_wait') validateWaitRequest(params)
         if (spec.name === 'browser_locator') validateLocatorRequest(params)
         if (spec.prepare !== undefined) params = spec.prepare(params)
+
+        const tracker = trackerFor(session)
+        if (spec.name === 'browser_restart') {
+          if (params.confirmed !== true) throw bridgeRestartConfirmationError()
+          return restartBrowser(bridge, tracker, operationSignal, resolveSettings().extensionReadyTimeoutMs)
+        }
+        if (spec.name === 'browser_targets') {
+          const bridgeHealth = await bridge.health()
+          return asJsonValue({
+            state: bridgeHealth.extensionConnected === true ? 'connected' : 'bridge_only',
+            targets: targetRecords(bridgeHealth),
+            bridgeHealth: compactBridgeHealth(bridgeHealth),
+          })
+        }
         if (spec.name === 'browser_cleanup' || spec.name === 'browser_context_reset') {
           const mode = spec.name === 'browser_context_reset' ? 'context' : 'task'
           const result = await cleanupSession(session, mode, exec.signal, undefined, false, { recoverStale: spec.name === 'browser_cleanup' && args.recoverStale === true })
@@ -2317,7 +2423,7 @@ export function registerBrowserTools(
           pendingCleanups.set(exec, { session, mode, activation, generation: generationFor(session), clearTurnCleanup: mode === 'context' || !cleanupRetainsTabs(result.value) })
           return compactBrowserResult(spec.name, params, result.value)
         }
-        const tracker = trackerFor(session)
+
         if (tracker.requiresExplicitSelection() && spec.name !== 'browser_status') throw targetSelectionRequiredError()
         if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, operationSignal)
         if (spec.name === 'browser_status') {

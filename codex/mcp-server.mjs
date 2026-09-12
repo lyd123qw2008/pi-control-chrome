@@ -24,7 +24,7 @@ const configuredBridgePort = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT ||
 const BRIDGE_PORT = Number.isInteger(configuredBridgePort) && configuredBridgePort > 0 && configuredBridgePort < 65_536 ? configuredBridgePort : 17318;
 const BRIDGE_ORIGIN = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const BRIDGE_PATH = fileURLToPath(new URL("../bridge/server.mjs", import.meta.url));
-const TOKEN_FILE = join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.token");
+const TOKEN_FILE = process.env.PI_CONTROL_CHROME_TOKEN_FILE || join(process.env.USERPROFILE || process.env.HOME || process.cwd(), ".pi", "agent", "pi-control-chrome.token");
 
 const string = (description) => ({ type: "string", ...(description ? { description } : {}) });
 const number = (description) => ({ type: "number", ...(description ? { description } : {}) });
@@ -87,6 +87,10 @@ const ALL_TOOLS = [
     browserId: string("Select a connected browser target by browserId."),
     acknowledgeBrowserId: string("Explicitly acknowledge this browserId after confirming a browser switch."),
   })),
+  tool("browser_targets", "List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available.", "list_targets", schema()),
+  tool("browser_restart", "After the user explicitly confirms a Bridge restart, restart the shared Bridge cooperatively without asking the user to type a command. Pass confirmed=true only after that confirmation; this does not restart DSH or Edge and does not close tabs.", "bridge_restart", schema({
+    confirmed: boolean("Must be true only after the user explicitly confirms the Bridge restart."),
+  }, ["confirmed"])),
   tool("browser_tabs", "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. Choose tabs using owner, sessionId and sessionScope, never groupId alone.", "list_tabs", schema()),
   tool("browser_selected", "Return the currently selected Chrome/Edge tab.", "selected_tab", schema()),
   tool("browser_claim_tab", "Claim an existing user tab using its id and optional snapshot checks. Fails if supplied tab identity changed.", "claim_tab", schema({ ...TAB_FIELDS, windowId: number(), title: string(), url: string() }, ["tabId", "handle"])),
@@ -224,6 +228,8 @@ const ALL_TOOLS = [
 ];
 const EXPOSED_TOOL_NAMES = new Set([
   "browser_status",
+  "browser_targets",
+  "browser_restart",
   "browser_tabs",
   "browser_snapshot",
   "browser_accessibility_snapshot",
@@ -241,6 +247,7 @@ let bridgeClientPromise;
 let shuttingDown = false;
 let operationTail = Promise.resolve();
 const activeRequests = new Map();
+let targetSelectionRequired = false;
 
 function requestKey(id) {
   return `${typeof id}:${String(id)}`;
@@ -256,13 +263,39 @@ function assertRequestActive(signal) {
   if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Browser request aborted");
 }
 
+async function readBridgeHealth() {
+  const response = await fetch(`${BRIDGE_ORIGIN}/health`, { signal: AbortSignal.timeout(1_500) });
+  const value = await response.json();
+  if (!response.ok || value?.ok !== true) throw new Error(`Bridge health failed: HTTP ${response.status}`);
+  return value;
+}
+
 async function bridgeHealthy() {
   try {
-    const response = await fetch(`${BRIDGE_ORIGIN}/health`, { signal: AbortSignal.timeout(700) });
-    return response.ok && (await response.json())?.ok === true;
+    await readBridgeHealth();
+    return true;
   } catch {
     return false;
   }
+}
+
+async function waitForBridgeOffline() {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (!(await bridgeHealthy())) return;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  throw new Error(`Timed out stopping the pi-control-chrome Bridge at ${BRIDGE_ORIGIN}`);
+}
+
+async function waitForNewBridge(previousInstanceId) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const health = await readBridgeHealth();
+      if (typeof health.instanceId === "string" && health.instanceId !== previousInstanceId) return health;
+    } catch {}
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  throw new Error(`Timed out waiting for a new pi-control-chrome Bridge instance at ${BRIDGE_ORIGIN}`);
 }
 
 async function ensureBridgeProcess() {
@@ -297,6 +330,72 @@ async function ensureBridgeClient() {
   return bridgeClientPromise;
 }
 
+let bridgeRestartPromise;
+
+async function restartBridgeNow() {
+  const client = await ensureBridgeClient();
+  const previousTarget = client.getAcknowledgedTarget();
+  const health = await readBridgeHealth();
+  const previousInstanceId = typeof health.instanceId === "string" ? health.instanceId : undefined;
+  if (previousInstanceId === undefined || health.capabilities?.localUserRestart !== true) {
+    const error = new Error("The active Bridge does not expose local-user cooperative restart capabilities");
+    error.code = "BRIDGE_RESTART_UNSUPPORTED";
+    throw error;
+  }
+  const control = await client.rawRequest("bridge_restart", {
+    expectedInstanceId: previousInstanceId,
+    requester: "codex",
+  }, DEFAULT_REQUEST_TIMEOUT_MS);
+  client.close();
+  if (bridgeClient === client) bridgeClient = undefined;
+  await waitForBridgeOffline();
+  await ensureBridgeProcess();
+  const nextHealth = await waitForNewBridge(previousInstanceId);
+  const targets = Array.isArray(nextHealth.targets) ? nextHealth.targets : [];
+  const readyTargets = targets.filter(target => target?.state === undefined || target?.state === "ready");
+  const currentTarget = previousTarget === undefined
+    ? readyTargets.length === 1 ? readyTargets[0] : undefined
+    : readyTargets.find(target => target?.browserId === previousTarget.browserId);
+  const requiresTargetSelection = previousTarget !== undefined || readyTargets.length !== 1;
+  targetSelectionRequired = requiresTargetSelection;
+  const common = {
+    ok: true,
+    restarted: true,
+    recovery: "cooperative_restart",
+    previousInstanceId,
+    control,
+    bridgeHealth: nextHealth,
+    targets,
+    handleRefreshRequired: true,
+    snapshotRefreshRequired: true,
+    documentIncarnationRefreshRequired: true,
+    targetRequired: requiresTargetSelection,
+    nextAction: "browser_status",
+    recommendation: requiresTargetSelection ? "refresh_browser_target" : "refresh_browser_status",
+    ...(previousTarget === undefined ? {} : { previousBrowserId: previousTarget.browserId }),
+    ...(currentTarget === undefined ? {} : { target: currentTarget }),
+  };
+  if (nextHealth.extensionConnected !== true) {
+    return { ...common, ok: false, connected: false, state: "bridge_only", completed: false, retryable: true, recommendation: "retry_browser_status" };
+  }
+  return { ...common, connected: true, state: requiresTargetSelection ? "target_required" : "connected" };
+}
+
+async function restartBridge(args) {
+  if (args?.confirmed !== true) {
+    const error = new Error("Bridge restart requires explicit user confirmation; ask the user before retrying with confirmed=true");
+    error.code = "BRIDGE_RESTART_CONFIRMATION_REQUIRED";
+    error.details = { requiresUserConfirmation: true };
+    throw error;
+  }
+  if (bridgeRestartPromise !== undefined) return bridgeRestartPromise;
+  const operation = restartBridgeNow().finally(() => {
+    if (bridgeRestartPromise === operation) bridgeRestartPromise = undefined;
+  });
+  bridgeRestartPromise = operation;
+  return operation;
+}
+
 function withSession(params) {
   return { ...params, sessionId: SESSION_ID };
 }
@@ -307,6 +406,7 @@ async function listTargets(client, signal) {
 
 async function invokeTool(spec, args, signal) {
   assertRequestActive(signal);
+  if (spec.name === "browser_restart") return restartBridge(args);
   const client = await ensureBridgeClient();
   let params = { ...args };
   if (spec.transform) params = spec.transform(params);
@@ -329,9 +429,34 @@ async function invokeTool(spec, args, signal) {
   assertRequestActive(signal);
 
   if (spec.name === "browser_doctor") return client.rawRequest("doctor", params, requestTimeout(args), undefined, signal);
+  if (spec.name === "browser_targets") {
+    const inventory = await listTargets(client, signal);
+    const health = await readBridgeHealth().catch(() => undefined);
+    return {
+      state: health?.extensionConnected === false ? "bridge_only" : "connected",
+      targets: Array.isArray(inventory?.targets) ? inventory.targets : [],
+      ...(health === undefined ? {} : { bridgeHealth: health }),
+    };
+  }
   if (spec.name === "browser_status") {
+    if (targetSelectionRequired && args.browserId === undefined && args.acknowledgeBrowserId === undefined) {
+      const inventory = await listTargets(client, signal).catch(() => ({ targets: [] }));
+      return {
+        connected: false,
+        state: "target_required",
+        targetRequired: true,
+        completed: false,
+        retryable: true,
+        nextAction: "browser_status",
+        recommendation: "select_browser_target",
+        error: { code: "TARGET_REQUIRED", message: "The browser connection changed; provide browserId to acknowledge the current target before retrying browser operations." },
+        targets: Array.isArray(inventory?.targets) ? inventory.targets : [],
+      };
+    }
     try {
-      return await client.request("status", { ...params, browserId: args.browserId, acknowledgeBrowserId: args.acknowledgeBrowserId }, requestTimeout(args), signal);
+      const result = await client.request("status", { ...params, browserId: args.browserId, acknowledgeBrowserId: args.acknowledgeBrowserId }, requestTimeout(args), signal);
+      if (targetSelectionRequired && result?.targetStability?.acknowledged === true) targetSelectionRequired = false;
+      return result;
     } catch (error) {
       if (["TARGET_REQUIRED", "TARGET_UNAVAILABLE", "TARGET_CONNECTION_CHANGED"].includes(error?.code)) {
         const inventory = await listTargets(client, signal).catch(() => ({ targets: [] }));
@@ -446,7 +571,7 @@ async function handleMessage(message) {
       protocolVersion: typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : PROTOCOL_VERSION,
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-      instructions: "Use browser_status before browser actions. Preserve browserId, tabFence, incarnation and snapshotId; inspect before retrying BROWSER_OPERATION_UNCERTAIN.",
+      instructions: "Use browser_status before browser actions. Preserve browserId, tabFence, incarnation and snapshotId; inspect before retrying BROWSER_OPERATION_UNCERTAIN. For Bridge recovery, ask the user for explicit confirmation before calling browser_restart with confirmed=true; acknowledge the new browser connection and refresh handles afterward.",
     });
     return;
   }

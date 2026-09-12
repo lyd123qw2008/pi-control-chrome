@@ -36,7 +36,7 @@ function agentContext(tools: Map<string, ToolDefinition>): Context {
 }
 
 function setup(
-  bridge: Pick<BrowserBridgeClient, 'request' | 'health'> & Partial<Pick<BrowserBridgeClient, 'start'>>,
+  bridge: Pick<BrowserBridgeClient, 'request' | 'health'> & Partial<Pick<BrowserBridgeClient, 'start' | 'restart'>>,
   attachments?: AttachmentStore,
   options: { lazyTools?: boolean; activate?: boolean; extensionReadyTimeoutMs?: number } = {},
 ): Harness {
@@ -152,9 +152,10 @@ function execution(agent: Agent): ToolRunContext {
 
 describe('DSH browser tool catalog', () => {
   it('exposes the complete Pi browser tool surface', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(40)
+    expect(BROWSER_TOOL_NAMES).toHaveLength(42)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
+    expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_targets')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_screenshot')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_context_reset')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_probe_interaction')
@@ -233,6 +234,29 @@ describe('DSH browser tool catalog', () => {
     expect(harness.globalTools.size).toBe(BROWSER_TOOL_NAMES.length)
     await harness.dispose(harness.agent)
     expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(1)
+  })
+
+  it('lists connected targets without changing the active target binding', async () => {
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      targets: [
+        { browser: 'edge', browserId: 'edge:profile-a', profile: 'profile-a', state: 'ready', connectionId: 'edge-connection', connectionGeneration: 3 },
+        { browser: 'chrome', browserId: 'chrome:profile-b', profile: 'profile-b', state: 'ready', connectionId: 'chrome-connection', connectionGeneration: 7 },
+      ],
+    }))
+    const request = vi.fn()
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_targets')?.execute({}, execution(harness.agent))
+    expect(result).toEqual({
+      state: 'connected',
+      targets: [
+        { browser: 'edge', browserId: 'edge:profile-a', profile: 'profile-a', state: 'ready', connectionId: 'edge-connection', connectionGeneration: 3 },
+        { browser: 'chrome', browserId: 'chrome:profile-b', profile: 'profile-b', state: 'ready', connectionId: 'chrome-connection', connectionGeneration: 7 },
+      ],
+      bridgeHealth: expect.objectContaining({ ok: true, extensionConnected: true }),
+    })
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('treats blank browserId values as omitted during single-target status lookup', async () => {
@@ -497,6 +521,84 @@ describe('DSH browser tool catalog', () => {
       bridgeHealth: { extensionConnected: false },
     })
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('requires explicit confirmation before exposing browser_restart', async () => {
+    const restart = vi.fn(async () => ({ ok: true }))
+    const request = vi.fn(async () => ({ connected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ restart, request, health })
+    await expect(harness.tools.get('browser_restart')?.execute({ confirmed: false }, execution(harness.agent))).rejects.toMatchObject({
+      code: 'BRIDGE_RESTART_CONFIRMATION_REQUIRED',
+      details: { requiresUserConfirmation: true },
+    })
+    expect(restart).not.toHaveBeenCalled()
+  })
+
+  it('restarts the Bridge, invalidates the selected target, and requires fresh handles', async () => {
+    const target = { browser: 'edge', browserId: 'edge:test', profile: 'current', state: 'ready', connectionId: 'edge-new', connectionGeneration: 2 }
+    const restart = vi.fn(async () => ({
+      ok: true,
+      restarted: true,
+      previousInstanceId: 'bridge-old',
+      bridgeHealth: { ok: true, extensionConnected: true, browserId: target.browserId, profile: target.profile, targets: [target] },
+    }))
+    const request = vi.fn(async (method: string, _params: Record<string, unknown>) => method === 'status'
+      ? { connected: true, browser: target.browser, browserId: target.browserId, profile: target.profile, connectionId: target.connectionId, connectionGeneration: target.connectionGeneration, capabilities: { tabIncarnationFence: true } }
+      : { method })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: target.browserId, profile: target.profile, targets: [target] }))
+    const harness = setup({ restart, request, health })
+
+    await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
+    const restarted = await harness.tools.get('browser_restart')?.execute({ confirmed: true }, execution(harness.agent))
+    expect(restart).toHaveBeenCalledWith(expect.any(AbortSignal))
+    expect(restarted).toMatchObject({
+      ok: true,
+      connected: true,
+      state: 'target_required',
+      targetRequired: true,
+      nextAction: 'browser_status',
+      recommendation: 'refresh_browser_target',
+      handleRefreshRequired: true,
+      snapshotRefreshRequired: true,
+      documentIncarnationRefreshRequired: true,
+      previousBrowserId: 'edge:test',
+      target: { browserId: 'edge:test', connectionGeneration: 2 },
+    })
+    await expect(harness.tools.get('browser_click')?.execute({ tabId: 7, handle: { tabId: 7, browserId: 'edge:test', tabFence: 'old', incarnation: 'old' }, selector: '#button' }, execution(harness.agent))).rejects.toMatchObject({ code: 'TARGET_REQUIRED' })
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
+
+    const status = await harness.tools.get('browser_status')?.execute({ browserId: 'edge:test', acknowledgeBrowserId: 'edge:test' }, execution(harness.agent))
+    expect(status).toMatchObject({ state: 'connected', targetStability: { acknowledged: true, connectionGeneration: 2 } })
+    await harness.tools.get('browser_click')?.execute({ tabId: 8, handle: { tabId: 8, browserId: 'edge:test', tabFence: 'new', incarnation: 'new' }, selector: '#button' }, execution(harness.agent))
+    expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
+  })
+
+  it('waits for extension reconnect after restart and reports Bridge-only when it remains offline', async () => {
+    const target = { browser: 'edge', browserId: 'edge:test', profile: 'current', state: 'ready', connectionId: 'edge-new', connectionGeneration: 2 }
+    let healthReads = 0
+    const restart = vi.fn(async () => ({
+      ok: true,
+      restarted: true,
+      bridgeHealth: { ok: true, extensionConnected: false },
+    }))
+    const request = vi.fn(async () => ({ connected: true, browser: target.browser, browserId: target.browserId, profile: target.profile }))
+    const health = vi.fn(async () => {
+      healthReads += 1
+      return healthReads === 1
+        ? { ok: true, extensionConnected: false }
+        : { ok: true, extensionConnected: true, browserId: target.browserId, profile: target.profile, targets: [target] }
+    })
+    const harness = setup({ restart, request, health }, undefined, { extensionReadyTimeoutMs: 300 })
+    const recovered = await harness.tools.get('browser_restart')?.execute({ confirmed: true }, execution(harness.agent))
+    expect(recovered).toMatchObject({ ok: true, connected: true, state: 'connected' })
+    expect(health).toHaveBeenCalledTimes(2)
+
+    healthReads = 0
+    const offlineRestart = vi.fn(async () => ({ ok: true, restarted: true, bridgeHealth: { ok: true, extensionConnected: false } }))
+    const offlineHarness = setup({ restart: offlineRestart, request, health: vi.fn(async () => ({ ok: true, extensionConnected: false })) })
+    const offline = await offlineHarness.tools.get('browser_restart')?.execute({ confirmed: true }, execution(offlineHarness.agent))
+    expect(offline).toMatchObject({ ok: false, connected: false, state: 'bridge_only', completed: false, retryable: true, nextAction: 'browser_status', recommendation: 'retry_browser_status', bridgeHealth: { extensionConnected: false } })
   })
 
   it('converts a status-handshake extension disconnect into Bridge-only state', async () => {

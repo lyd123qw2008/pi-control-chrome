@@ -29,7 +29,34 @@ Do not keep retrying while two browser extensions are competing for one Bridge.
 
 Run `browser_doctor` once. Inspect `recovery.available`, `recovery.authority`, `recovery.controlDomain`, `recovery.method`, and `recovery.requiresUserConfirmation`.
 
-If the Bridge reports `capabilities.localUserRestart: true`, use the explicit host command (`/chrome restart` in Pi or DSH) only after the user explicitly authorizes a Bridge restart. The Bridge validates the instance, rejects pending browser work, serializes concurrent restarts, and leaves browser tabs untouched. This command restarts the Bridge, not the DSH process; never invoke it proactively during Profile updates or release verification. Then run `browser_doctor` again and call `browser_status` before retrying.
+If the Bridge reports `capabilities.localUserRestart: true`, after the user explicitly authorizes a Bridge restart, prefer the active Harness's agent-managed Bridge restart entry point; do not ask the user to type a command. Use `/chrome restart` only as a manual fallback when the Harness client entry point is unavailable. The Bridge validates the instance, rejects pending browser work, serializes concurrent restarts, and leaves browser tabs untouched. This restarts the Bridge, not DSH or Edge; never invoke it proactively during Profile updates or release verification. Then run `browser_doctor` when available and call `browser_status` before retrying.
+
+### Quick agent-managed cooperative Bridge restart
+
+Use this sequence when a healthy but stale or incompatible Bridge is serving old capabilities. After the user explicitly authorizes the restart, the agent performs it; do not ask the user to type `/chrome restart`:
+
+```text
+browser_doctor (or browser_status in Codex)
+→ ask the user to authorize a Bridge restart
+→ invoke the current Harness restart entry point
+→ browser_doctor (or browser_status in Codex)
+→ acknowledge the current browser target
+```
+
+Use the entry point that belongs to the active Harness:
+
+- **DSH**: invoke `BrowserBridgeClient.restart()` from the active installed DSH package's `lib/bridge.js`.
+- **Pi**: invoke Pi's existing `bridge.restart()` implementation.
+- **Codex**: call the exposed `browser_restart` tool with `confirmed: true`; this flag is valid only after the user explicitly confirmed the restart.
+
+The entry point sends a guarded `bridge_restart` request with the current Bridge `instanceId`, waits for the old process to go offline, starts one Bridge on `127.0.0.1:17318`, waits for a new `instanceId`, and lets the extension reconnect. For DSH and Pi, resolve the client from the active installed Harness package rather than an unrelated or stale repository build. It does not restart DSH or Edge, close browser tabs, or clear login state. The Bridge rejects the request while browser work is pending or draining; never replace this with `taskkill` or a second Bridge.
+
+After the restart:
+
+1. Continue only when `extensionConnected: true` and the intended target is ready.
+2. If `connectionGeneration` or target stability changed, acknowledge the reported `browserId` with a fresh `browser_status` before any page action.
+3. Discard old tab handles and snapshot refs; take a new `browser_tabs` and snapshot observation.
+4. Retry the original side effect only after inspecting the current page; never replay an uncertain side effect automatically.
 
 Do not terminate a port owner from a port/PID lookup or command-line match, and do not start a second Bridge while the daily Bridge is healthy. Ask the user for host-level help only when cooperative restart is unavailable or the user has not authorized the Bridge restart.
 

@@ -8006,13 +8006,13 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const allowReadOnlyDocumentChange = allowsReadOnlyDocumentChange(method, params);
     if (method === "devtools_disable") {
       try {
-        requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || allowReadOnlyDocumentChange);
+        requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || method === "close_tab" || allowReadOnlyDocumentChange);
         requestTabFence = authorizedTabFence(requestTab);
       } catch (error) {
         if (!isMissingTabError(error)) throw error;
       }
     } else {
-      requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || allowReadOnlyDocumentChange);
+      requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || method === "close_tab" || allowReadOnlyDocumentChange);
       requestTabFence = authorizedTabFence(requestTab);
       const suppliedHandle = isRecordObject(params.handle) ? params.handle : undefined;
       requestTabIncarnation = typeof suppliedHandle?.incarnation === "string" ? suppliedHandle.incarnation : undefined;

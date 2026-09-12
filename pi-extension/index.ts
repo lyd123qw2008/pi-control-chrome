@@ -784,6 +784,56 @@ function forgetStaleTargetBinding(session: string, browserId: string): void {
   targetSelectionRequired = true;
 }
 
+function requireCleanupTargetSelection(session: string): void {
+  const existing = pendingCleanupSessionIds.get(session);
+  pendingCleanupSessionIds.set(session, {
+    params: existing?.params ?? { sessionId: session },
+    priority: Math.max(existing?.priority ?? 0, 1),
+    ...(existing?.inspectFirst === true ? { inspectFirst: true } : {}),
+    requiresTargetSelection: true,
+  });
+}
+
+async function completeRestartResult(value: unknown, previousBrowserId?: string): Promise<Record<string, unknown>> {
+  const base = value && typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
+  const initialHealth = base.bridgeHealth && typeof base.bridgeHealth === "object" && !Array.isArray(base.bridgeHealth)
+    ? base.bridgeHealth as Record<string, unknown>
+    : await bridge.health();
+  const targets = targetRecords(initialHealth);
+  const readyTargets = targets.filter(target => target.state === undefined || target.state === "ready");
+  const currentTarget = previousBrowserId === undefined
+    ? readyTargets.length === 1 ? readyTargets[0] : undefined
+    : readyTargets.find(target => target.browserId === previousBrowserId);
+  const targetRequired = previousBrowserId !== undefined || readyTargets.length !== 1;
+  const common = {
+    ...base,
+    ok: true,
+    restarted: true,
+    bridgeHealth: initialHealth,
+    targets,
+    handleRefreshRequired: true,
+    snapshotRefreshRequired: true,
+    documentIncarnationRefreshRequired: true,
+    targetRequired,
+    nextAction: "browser_status",
+    recommendation: targetRequired ? "refresh_browser_target" : "refresh_browser_status",
+    ...(previousBrowserId === undefined ? {} : { previousBrowserId }),
+    ...(currentTarget === undefined ? {} : { target: currentTarget }),
+  };
+  if (initialHealth.extensionConnected !== true) {
+    return {
+      ...common,
+      ok: false,
+      connected: false,
+      state: "bridge_only",
+      completed: false,
+      retryable: true,
+      recommendation: "retry_browser_status",
+    };
+  }
+  return { ...common, connected: true, state: targetRequired ? "target_required" : "connected" };
+}
+
 function isTargetLoss(error: unknown): boolean {
   return bridgeErrorCode(error) === "TARGET_UNAVAILABLE" || bridgeErrorCode(error) === "TARGET_CONNECTION_CHANGED";
 }
@@ -991,6 +1041,13 @@ function errorResult(error: unknown) {
       ...(record.details === undefined ? {} : { details: record.details }),
     },
   };
+}
+
+function bridgeRestartConfirmationError(): Error & { code: string; details: Record<string, unknown> } {
+  const error = new Error("Bridge restart requires explicit user confirmation; ask the user before retrying with confirmed=true") as Error & { code: string; details: Record<string, unknown> };
+  error.code = "BRIDGE_RESTART_CONFIRMATION_REQUIRED";
+  error.details = { requiresUserConfirmation: true };
+  return error;
 }
 
 type BrowserCallOptions = { allowInactive?: boolean };
@@ -1248,6 +1305,36 @@ function registerBrowserTools(pi: ExtensionAPI) {
 
   pi.registerTool({
     executionMode: "sequential",
+    name: "browser_restart",
+    label: "Browser Bridge Restart",
+    description: "After the user explicitly confirms a Bridge restart, restart only the shared local Bridge. This does not restart Pi or Chrome/Edge and does not close tabs; refresh browser_status and all tab/snapshot handles afterward.",
+    parameters: Type.Object({
+      confirmed: Type.Boolean({ description: "Must be true only after the user explicitly confirms the Bridge restart." }),
+    }),
+    async execute(_toolCallId, params) {
+      if (!browserToolsActive) return errorResult(new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control"));
+      if (params.confirmed !== true) return errorResult(bridgeRestartConfirmationError());
+      const generation = lifecycleGeneration;
+      const previousBrowserId = acknowledgedTarget?.browserId;
+      try {
+        const result = await bridge.restart();
+        if (generation !== lifecycleGeneration) throw new Error("Pi browser session changed while the Bridge was restarting");
+        if (previousBrowserId !== undefined) {
+          forgetStaleTargetBinding(sessionId, previousBrowserId);
+          if (browserTargetUsed || bridgeUsed || turnCleanupArmed) requireCleanupTargetSelection(sessionId);
+        }
+        bridgeUsed = true;
+        turnCleanupArmed = true;
+        browserActivation.markUsed();
+        return textResult(await completeRestartResult(result, previousBrowserId));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  });
+
+  pi.registerTool({
+    executionMode: "sequential",
     name: "browser_status",
     label: "Browser Status",
     description: "Return the connected Chrome/Edge browser, target stability and Pi bridge status.",
@@ -1257,6 +1344,27 @@ function registerBrowserTools(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params) {
       try { return textResult(await call("status", params)); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    executionMode: "sequential",
+    name: "browser_targets",
+    label: "Browser Targets",
+    description: "List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available.",
+    parameters: Type.Object({}),
+    async execute() {
+      try {
+        const inventory = await bridgeRequest("list_targets", { sessionId });
+        const health = await bridge.health().catch(() => undefined);
+        return textResult({
+          state: health?.extensionConnected === false ? "bridge_only" : "connected",
+          targets: targetRecords(inventory),
+          ...(health === undefined ? {} : { bridgeHealth: health }),
+        });
+      } catch (error) {
+        return errorResult(error);
+      }
     },
   });
 
@@ -1951,13 +2059,22 @@ export default function piControlChrome(pi: ExtensionAPI): void {
         }
         if (action === "restart") {
           const generation = lifecycleGeneration;
+          const previousBrowserId = acknowledgedTarget?.browserId;
           const result = await bridge.restart();
           if (generation !== lifecycleGeneration) return;
+          if (previousBrowserId !== undefined) {
+            forgetStaleTargetBinding(sessionId, previousBrowserId);
+            if (browserTargetUsed || bridgeUsed || turnCleanupArmed) requireCleanupTargetSelection(sessionId);
+          }
           bridgeUsed = true;
           turnCleanupArmed = true;
           browserActivation.markUsed();
-          updateStatus(ctx, result.bridgeHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
-          ctx.ui.notify(JSON.stringify(result), "info");
+          const completed = await completeRestartResult(result, previousBrowserId);
+          const completedHealth = completed.bridgeHealth && typeof completed.bridgeHealth === "object" && !Array.isArray(completed.bridgeHealth)
+            ? completed.bridgeHealth as Record<string, unknown>
+            : undefined;
+          updateStatus(completedHealth?.extensionConnected === true ? "chrome: connected" : "chrome: bridge only");
+          ctx.ui.notify(JSON.stringify(completed), "info");
           return;
         }
         if (action === "disconnect") {

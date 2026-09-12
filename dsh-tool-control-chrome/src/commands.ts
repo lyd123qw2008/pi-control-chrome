@@ -130,7 +130,7 @@ async function restartBrowser(
   bridge: BrowserBridgeClient,
   invocation: CommandInvocation,
 ): Promise<CommandResult> {
-  const result = await bridge.restart()
+  const result = await bridge.restart(invocation.signal)
   const bridgeHealth = await waitForExtension(bridge, invocation.signal)
   if (!extensionConnected(bridgeHealth)) return extensionOffline({ ...bridgeHealth, restart: result })
   const status = await bridge.request('status', { sessionId: sessionId(invocation) }, invocation.signal)

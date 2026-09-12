@@ -336,6 +336,10 @@ class BridgeClient {
     };
   }
 
+  getAcknowledgedTarget() {
+    return this.acknowledgedTarget;
+  }
+
   async request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT, signal) {
     if (method === "status") {
       const { acknowledgeBrowserId, browserId, ...statusParams } = params;

@@ -53,10 +53,10 @@ function stopProcess(child) {
   });
 }
 
-function startMcp(port) {
+function startMcp(port, extraEnv = {}) {
   const child = spawn(process.execPath, [serverPath], {
     cwd: root,
-    env: { ...process.env, PI_CONTROL_CHROME_BRIDGE_PORT: String(port) },
+    env: { ...process.env, ...extraEnv, PI_CONTROL_CHROME_BRIDGE_PORT: String(port) },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -108,9 +108,11 @@ test("Codex MCP adapter exposes the initial browser tool catalog over stdio", as
 
     mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listed = await mcp.nextMessage();
-    assert.equal(listed.result.tools.length, 9);
+    assert.equal(listed.result.tools.length, 11);
     assert.deepEqual(listed.result.tools.map((tool) => tool.name), [
       "browser_status",
+      "browser_targets",
+      "browser_restart",
       "browser_tabs",
       "browser_snapshot",
       "browser_accessibility_snapshot",
@@ -123,6 +125,94 @@ test("Codex MCP adapter exposes the initial browser tool catalog over stdio", as
   } finally {
     mcp.child.stdin.end();
     await stopProcess(mcp.child);
+  }
+});
+
+test("Codex browser_restart requires explicit user confirmation", async () => {
+  const mcp = startMcp(17980 + Math.floor(Math.random() * 100));
+  try {
+    mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+    await mcp.nextMessage();
+    mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "browser_restart",
+      arguments: { confirmed: false },
+    } });
+    const result = await mcp.nextMessage();
+    assert.equal(result.result.isError, true);
+    assert.match(result.result.content[0].text, /BRIDGE_RESTART_CONFIRMATION_REQUIRED/);
+  } finally {
+    mcp.child.stdin.end();
+    await stopProcess(mcp.child);
+  }
+});
+
+test("Codex browser_restart cooperatively replaces the Bridge after confirmation", async () => {
+  const bridgePort = 17980 + Math.floor(Math.random() * 100);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-codex-mcp-restart-test-"));
+  const tokenFile = join(temp, "token");
+  const bridge = spawn(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let extension;
+  const mcp = startMcp(bridgePort, { PI_CONTROL_CHROME_TOKEN_FILE: tokenFile });
+  const identity = {
+    browser: "edge",
+    browserId: "edge:codex-restart-test",
+    profile: "codex-restart-test",
+    capabilities: { pageWaitStates: true, tabIncarnationFence: true },
+  };
+  try {
+    await waitHealth(bridgePort);
+    const token = readFileSync(tokenFile, "utf8").trim();
+    extension = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=extension&token=${encodeURIComponent(token)}`);
+    await new Promise((resolve, reject) => { extension.once("open", resolve); extension.once("error", reject); });
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, ...identity }));
+    await sleep(30);
+    extension.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "request" && message.method === "status") extension.send(JSON.stringify({ type: "response", id: message.id, result: identity }));
+    });
+
+    mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+    await mcp.nextMessage();
+    mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "browser_status",
+      arguments: { browserId: identity.browserId, acknowledgeBrowserId: identity.browserId },
+    } });
+    const status = await mcp.nextMessage();
+    assert.equal(status.result.isError, undefined);
+    mcp.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
+      name: "browser_restart",
+      arguments: { confirmed: true },
+    } });
+    const restarted = await mcp.nextMessage();
+    assert.equal(restarted.result.isError, undefined);
+    const value = JSON.parse(restarted.result.content[0].text);
+    assert.equal(value.restarted, true);
+    assert.notEqual(value.previousInstanceId, value.bridgeHealth.instanceId);
+    assert.equal(value.bridgeHealth.startedBy, "codex");
+    assert.equal(value.previousBrowserId, identity.browserId);
+    assert.equal(value.handleRefreshRequired, true);
+    assert.equal(value.targetRequired, true);
+    assert.equal(value.nextAction, "browser_status");
+
+    const replacement = await waitHealth(bridgePort);
+    assert.equal(replacement.instanceId, value.bridgeHealth.instanceId);
+  } finally {
+    mcp.child.stdin.end();
+    await stopProcess(mcp.child);
+    extension?.close();
+    await stopProcess(bridge);
+    try {
+      const current = await getJson(bridgePort, "/health");
+      if (current?.ok) {
+        const replacementToken = readFileSync(tokenFile, "utf8").trim();
+        const replacementSocket = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=pi&token=${encodeURIComponent(replacementToken)}`);
+        await new Promise((resolve, reject) => { replacementSocket.once("open", resolve); replacementSocket.once("error", reject); });
+        replacementSocket.send(JSON.stringify({ type: "request", id: "cleanup-restart", method: "bridge_restart", params: { expectedInstanceId: current.instanceId, requester: "codex-test" } }));
+        await new Promise((resolve) => { replacementSocket.once("message", resolve); replacementSocket.once("close", resolve); setTimeout(resolve, 1000).unref(); });
+        replacementSocket.close();
+      }
+    } catch {}
+    rmSync(temp, { recursive: true, force: true });
   }
 });
 
@@ -158,13 +248,22 @@ test("Codex MCP adapter routes a selected target through the existing Bridge", a
       if (message.type !== "request") return;
       const result = message.method === "list_tabs"
         ? { ...identity, tabs: [], windows: [], groups: [] }
-        : identity;
+        : message.method === "list_targets"
+          ? { targets: [identity] }
+          : identity;
       extension.send(JSON.stringify({ type: "response", id: message.id, result }));
     });
 
     mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
     await mcp.nextMessage();
     mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "browser_targets",
+      arguments: {},
+    } });
+    const inventory = await mcp.nextMessage();
+    assert.equal(inventory.result.isError, undefined);
+    assert.deepEqual(JSON.parse(inventory.result.content[0].text).targets.map(target => target.browserId), [identity.browserId]);
+    mcp.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
       name: "browser_status",
       arguments: { browserId: identity.browserId, acknowledgeBrowserId: identity.browserId },
     } });

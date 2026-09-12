@@ -159,6 +159,7 @@ async function createMockBridge({ targets = [] } = {}) {
         browserId: "edge:test",
         profile: "profile-test",
         instanceId: "mock-instance",
+        targets,
         capabilities: { localUserRestart: true, semanticTargetRequests: true, pageWaitStates: true },
       }));
       return;
@@ -323,6 +324,63 @@ test("BridgeClient stops before open and reconnects without stale socket state",
   }
 });
 
+test("Pi exposes a lightweight user-confirmed browser_restart and invalidates the selected target", async () => {
+  const mock = await createMockBridge();
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  const originalRestart = BridgeClient.prototype.restart;
+  try {
+    await harness.emit("session_start", {}, context);
+    await harness.tools.get("browser_status").execute("bind", {});
+    const rejected = await harness.tools.get("browser_restart").execute("unconfirmed", { confirmed: false });
+    assert.equal(rejected.details.code, "BRIDGE_RESTART_CONFIRMATION_REQUIRED");
+
+    let restartCalls = 0;
+    BridgeClient.prototype.restart = async function () {
+      restartCalls += 1;
+      return {
+        ok: true,
+        restarted: true,
+        previousInstanceId: "old-instance",
+        bridgeHealth: {
+          ok: true,
+          extensionConnected: true,
+          instanceId: "new-instance",
+          targets: [{ browser: "edge", browserId: "edge:test", profile: "profile-test", state: "ready", connectionId: "new-connection", connectionGeneration: 2 }],
+        },
+      };
+    };
+    const restarted = await harness.tools.get("browser_restart").execute("confirmed", { confirmed: true });
+    const value = JSON.parse(restarted.content[0].text);
+    assert.equal(restartCalls, 1);
+    assert.equal(value.restarted, true);
+    assert.equal(value.handleRefreshRequired, true);
+    assert.equal(value.targetRequired, true);
+    assert.equal(value.nextAction, "browser_status");
+
+    const status = JSON.parse((await harness.tools.get("browser_status").execute("refresh", {})).content[0].text);
+    assert.equal(status.error.code, "TARGET_REQUIRED");
+
+    mock.enqueue("status", async (_message, respond) => respond({
+      ...statusValue(),
+      connectionId: "new-connection",
+      connectionGeneration: 2,
+    }));
+    await harness.tools.get("browser_status").execute("acknowledge", { browserId: "edge:test", acknowledgeBrowserId: "edge:test" });
+    mock.enqueue("cleanup", async (_message, respond) => respond(cleanupValue()));
+    await harness.tools.get("browser_cleanup").execute("cleanup", {});
+  } finally {
+    BridgeClient.prototype.restart = originalRestart;
+    try {
+      await harness.commands.get("chrome").handler("disconnect", context);
+    } catch {
+      // The test must still release the mock Bridge when disconnect itself fails.
+    }
+    await mock.close();
+  }
+});
+
 test("Pi requires explicit target selection and routes later operations with the selected connection fence", async () => {
   const mock = await createMockBridge({
     targets: [
@@ -345,6 +403,9 @@ test("Pi requires explicit target selection and routes later operations with the
   mock.enqueue("status", selectedStatus);
   try {
     await harness.emit("session_start", {}, context);
+    const inventoryResult = await harness.tools.get("browser_targets").execute("targets", {});
+    const inventory = JSON.parse(inventoryResult.content[0].text);
+    assert.deepEqual(inventory.targets.map(target => target.browserId), ["edge:profile-a", "chrome:profile-b"]);
     const ambiguousResult = await harness.tools.get("browser_status").execute("ambiguous", { browserId: "   " });
     const ambiguous = JSON.parse(ambiguousResult.content[0].text);
     assert.equal(ambiguous.error.code, "TARGET_REQUIRED");

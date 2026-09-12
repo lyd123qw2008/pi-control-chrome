@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.7 - 2026-09-12
+
+- Add lightweight, explicitly confirmed Bridge restart handling for Pi and align restart recovery metadata across Pi, DSH, and Codex without restarting the browser or closing tabs.
+
+- Add non-selecting `browser_targets` inventory across the browser-control surfaces; explicit `browser_status` acknowledgement remains required before controlling a selected target.
+
+- Add an isolated real-browser Bridge restart E2E that verifies instance replacement, extension reconnect, stale target-route rejection, refreshed handles, continued page operations, and cleanup using a temporary Edge profile.
+
 ## 0.5.6 - 2026-09-08
 
 - Add `browser_probe_interaction` as an explicit, single-dispatch interaction diagnostic that returns before/after document identity, action confirmation, bounded settle status, post-action Console/pageerror events, and target post-state without replaying uncertain side effects.
@@ -7,6 +15,8 @@
 - Add bounded incremental Console reads with `since`/`nextSince`, `only: "errors"` filtering, and `Runtime.exceptionThrown` to `pageerror` mapping; expose the capability through Pi, DSH, Codex, Bridge, and the MV3 extension.
 
 - Add isolated real-Edge regression fixtures for post-action Console errors, page errors, removed targets, asynchronous settling, stable state, and Console cursors; update the Skill, README, and release documentation.
+
+- Add the DSH model-facing `browser_restart` tool with explicit confirmation, cooperative Bridge restart, extension reconnect waiting, and target/handle invalidation after the connection fence changes; bump the DSH package to `@lyd123qw2008/dsh-tool-control-chrome@0.5.6`.
 
 ## 0.5.5 - 2026-09-05
 

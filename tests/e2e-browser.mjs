@@ -261,9 +261,14 @@ await new Promise((resolve, reject) => {
     resolve();
   });
 });
-const bridgeProcess = spawnProcess(process.execPath, [bridge, "--port", String(bridgePort), "--token-file", tokenFile, "--started-by", "pi", "--startup-marker", bridgeStartupMarker]);
+let bridgeProcess = spawnProcess(process.execPath, [bridge, "--port", String(bridgePort), "--token-file", tokenFile, "--started-by", "pi", "--startup-marker", bridgeStartupMarker]);
 let edgeProcess;
 let socket;
+const openSocket = async () => {
+  const client = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=pi&token=${encodeURIComponent(readFileSync(tokenFile, "utf8").trim())}`);
+  await new Promise((resolve, reject) => { client.once("open", resolve); client.once("error", reject); });
+  return client;
+};
 try {
   let bridgeHealth;
   for (let i = 0; i < 50; i++) {
@@ -306,13 +311,11 @@ try {
   assert.equal(health.port, bridgePort);
   await sleep(1500);
 
-  const token = readFileSync(tokenFile, "utf8").trim();
-  socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=pi&token=${encodeURIComponent(token)}`);
-  await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  socket = await openSocket();
   let sequence = 0;
-  const request = (method, params = {}) => {
+  const request = (method, params = {}, target) => {
     const requestParams = params.sessionId === undefined ? { ...params, sessionId: "e2e-session" } : params;
-     const id = `e2e-${++sequence}`;
+    const id = `e2e-${++sequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`request timeout: ${method} ${JSON.stringify(params)}`)), 15000);
       const onMessage = (raw) => {
@@ -329,7 +332,7 @@ try {
         else resolve(message.result);
       };
       socket.on("message", onMessage);
-      socket.send(JSON.stringify({ type: "request", id, method, params: requestParams }));
+      socket.send(JSON.stringify({ type: "request", id, method, params: requestParams, ...(target === undefined ? {} : { target }) }));
     });
   };
 
@@ -1091,6 +1094,92 @@ try {
   const screenshot = await request("screenshot", { tabId: selected.tab.id });
   assert.ok(typeof screenshot.data === "string" && screenshot.data.length > 100);
 
+  // Restart the isolated Bridge while keeping the isolated browser and its tab alive.
+  // The old target route is intentionally retained so the next request proves it is stale.
+  const beforeRestartHealth = (await localGet("/health")).body;
+  const beforeRestartTabs = await request("list_tabs");
+  const beforeRestartTab = beforeRestartTabs.tabs.find((tab) => tab.id === selected.tab.id);
+  assert.ok(beforeRestartTab?.handle?.tabId !== undefined);
+  assert.equal(beforeRestartTabs.browserId, beforeRestartHealth.browserId);
+  const beforeRestartTarget = {
+    browserId: beforeRestartHealth.browserId,
+    connectionId: beforeRestartHealth.connectionId,
+    connectionGeneration: beforeRestartHealth.connectionGeneration,
+  };
+  const staleHandle = beforeRestartTab.handle;
+  const preRestartInstanceId = beforeRestartHealth.instanceId;
+  const preRestartConnectionId = beforeRestartHealth.connectionId;
+  const restartControl = await request("bridge_restart", { expectedInstanceId: preRestartInstanceId, requester: "e2e" });
+  assert.equal(restartControl.ok, true);
+  assert.equal(restartControl.restarting, true);
+  await closeSocket(socket);
+  socket = undefined;
+  await waitForExit(bridgeProcess, 5000);
+  assert.notEqual(bridgeProcess.exitCode, null, "isolated Bridge did not exit after cooperative restart");
+
+  const replacementMarker = `${bridgeStartupMarker}-restart-${randomUUID()}`;
+  bridgeProcess = spawnProcess(process.execPath, [bridge, "--port", String(bridgePort), "--token-file", tokenFile, "--started-by", "pi", "--startup-marker", replacementMarker]);
+  let restartedHealth;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (bridgeProcess.exitCode !== null) throw new Error(`replacement Bridge exited before binding to port ${bridgePort}; exit=${bridgeProcess.exitCode}`);
+    try {
+      restartedHealth = (await localGet("/health")).body;
+      if (restartedHealth.ok === true && restartedHealth.startupMarker === replacementMarker && restartedHealth.instanceId !== preRestartInstanceId) break;
+    } catch {}
+    await sleep(100);
+  }
+  assert.equal(restartedHealth?.ok, true, `replacement Bridge did not become healthy: ${JSON.stringify(restartedHealth)}`);
+  assert.equal(restartedHealth.startupMarker, replacementMarker);
+  assert.notEqual(restartedHealth.instanceId, preRestartInstanceId);
+
+  let reconnectedHealth = restartedHealth;
+  for (let attempt = 0; attempt < 120 && reconnectedHealth?.extensionConnected !== true; attempt += 1) {
+    await sleep(250);
+    reconnectedHealth = (await localGet("/health")).body;
+  }
+  assert.equal(reconnectedHealth?.extensionConnected, true, `extension did not reconnect after isolated Bridge restart: ${JSON.stringify(reconnectedHealth)}`);
+  assert.equal(reconnectedHealth.browserId, beforeRestartHealth.browserId);
+  assert.equal(reconnectedHealth.targetCount, 1);
+  assert.equal(reconnectedHealth.readyTargetCount, 1);
+  assert.notEqual(reconnectedHealth.connectionId, preRestartConnectionId);
+
+  socket = await openSocket();
+  const restartedTarget = {
+    browserId: reconnectedHealth.browserId,
+    connectionId: reconnectedHealth.connectionId,
+    connectionGeneration: reconnectedHealth.connectionGeneration,
+  };
+  const restartedStatus = await request("status", {}, restartedTarget);
+  assert.equal(restartedStatus.browserId, beforeRestartHealth.browserId);
+  const refreshedTabs = await request("list_tabs", {}, restartedTarget);
+  const refreshedTab = refreshedTabs.tabs.find((tab) => tab.id === selected.tab.id);
+  assert.ok(refreshedTab?.handle?.tabId !== undefined, "selected tab did not survive the isolated Bridge restart");
+  await assert.rejects(
+    () => request("snapshot", { tabId: selected.tab.id, handle: staleHandle }, beforeRestartTarget),
+    (error) => error.code === "TARGET_CONNECTION_CHANGED" || error.code === "TARGET_UNAVAILABLE",
+  );
+  const restartedSnapshot = await request("snapshot", { tabId: selected.tab.id, handle: refreshedTab.handle }, restartedTarget);
+  assert.equal(restartedSnapshot.tab?.id ?? restartedSnapshot.id, selected.tab.id);
+  const restartedProbe = await request("probe_interaction", {
+    tabId: selected.tab.id,
+    operation: "hover",
+    selector: "#go",
+    only: "errors",
+    settleMs: 50,
+  }, restartedTarget);
+  assert.equal(restartedProbe.action?.confirmed, true);
+  const restartEvidence = {
+    previousInstanceId: preRestartInstanceId,
+    currentInstanceId: reconnectedHealth.instanceId,
+    browserId: reconnectedHealth.browserId,
+    previousConnectionId: preRestartConnectionId,
+    currentConnectionId: reconnectedHealth.connectionId,
+    connectionGeneration: reconnectedHealth.connectionGeneration,
+    staleHandleRejected: true,
+    refreshedHandleWorked: true,
+    extensionConnected: reconnectedHealth.extensionConnected,
+  };
+
   const created = await request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-session" });
   const concurrent = await Promise.all(Array.from({ length: 4 }, () => request("new_tab", { url: `http://127.0.0.1:${pagePort}/`, active: false, sessionId: "e2e-concurrent" })));
   const concurrentIds = concurrent.map((entry) => entry.tab.id);
@@ -1143,6 +1232,7 @@ try {
     group,
     cleanup,
     staleMarkCleanup,
+    restartEvidence,
   }));
 } finally {
   await closeSocket(socket);

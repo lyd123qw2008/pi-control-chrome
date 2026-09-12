@@ -1682,6 +1682,29 @@ test("side-effecting requests keep strict document fencing after read-only re-ob
   );
 });
 
+test("close_tab uses tab identity and ownership after the document changes", async () => {
+  const oldDocument = { url: "https://example.test/close", timeOrigin: 1, token: "old-document" };
+  const newDocument = { url: "https://example.test/close", timeOrigin: 2, token: "new-document" };
+  const fixture = loadExtension({ pageGenerationSequence: [newDocument] });
+  fixture.tabs.set(326, { id: 326, windowId: 1, title: "close me", url: newDocument.url, status: "complete" });
+  fixture.storage[ownedTabsKey] = { version: 3, records: { "edge:test-extension:profile-id::326": record(326, "temporary", "close me", newDocument.url) } };
+  const handle = {
+    tabId: 326,
+    browserId: "edge:test-extension:profile-id",
+    windowId: 1,
+    title: "close me",
+    url: oldDocument.url,
+    tabFence: "tab:326",
+    incarnation: `${oldDocument.url}\u0000${oldDocument.timeOrigin}\u0000${oldDocument.token}`,
+  };
+
+  const result = await fixture.api.handleRequest("close_tab", { tabId: 326, handle, sessionId: "session-test" });
+
+  assert.equal(result.closed, 326);
+  assert.equal(fixture.tabs.has(326), false);
+  assert.equal(storedRecord(fixture, 326), undefined);
+});
+
 test("a known-dispatched page action succeeds when its post-action document identity is verified", async () => {
   const oldDocument = { url: "https://example.test/action", timeOrigin: 1, token: "old-document" };
   const newDocument = { url: "https://example.test/action", timeOrigin: 2, token: "new-document" };

@@ -23,7 +23,8 @@ Use this Skill only when the user explicitly asks to use the existing Chrome or 
 - Browser target leases are scoped by target, tab fence, attach epoch, and CDP target. Never detach an untracked debugger target; stale-runtime recovery requires explicit user authorization.
 - Do not expose passwords, cookies, access tokens, private keys, pairing tokens, or unrelated page data. Do not inspect browser storage, cookies, passwords, or session stores as a discovery shortcut.
 - Do not upload files, download sensitive data, change account security, or submit irreversible actions without an explicit user request. Verify the target and intended value immediately before an externally visible side effect.
-- DSH process lifecycle is maintainer-owned: never invoke a DSH restart command or script, `taskkill`, or a replacement DSH server automatically. Treat `/chrome restart` as a human-only Bridge lifecycle command; use it only after explicit user confirmation for Bridge recovery, never as a way to restart DSH.
+- DSH process lifecycle is maintainer-owned: never invoke a DSH restart command or script, `taskkill`, or a replacement DSH server automatically. For an explicitly authorized Bridge recovery, the agent should invoke the active Harness restart entry point—DSH `BrowserBridgeClient.restart()`, Pi `bridge.restart()`, or Codex `browser_restart` with `confirmed: true`; `/chrome restart` is only a manual fallback, and never a way to restart DSH.
+- Quick agent-managed Bridge recovery after explicit user authorization: `browser_doctor` (or `browser_status` in Codex) → invoke the current Harness restart entry point → `browser_doctor`/`browser_status` → acknowledge the current target. This restarts only the Bridge, not DSH or Edge. Follow `references/recovery.md` to refresh target and tab handles.
 
 ## Semantic and observation rules
 
@@ -55,7 +56,7 @@ For a missing element, stale observation, changing page, offline Bridge, target 
 
 ## Human diagnostics and Skill-local references
 
-`/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are human diagnostics or lifecycle commands. They do not replace loading this Skill or authorize browser actions. When this distribution includes `scripts/browser.mjs`, that CLI is for explicit human/developer workflows and automated tests, not a model-facing alternative to the Skill-gated native tools.
+`/chrome status`, `/chrome targets`, `/chrome profile [browserId]`, `/chrome connect`, `/chrome disconnect`, `/chrome doctor`, `/chrome restart`, and `/chrome tabs` are human diagnostics or lifecycle commands. They do not replace loading this Skill or authorize browser actions. `/chrome restart` is a manual fallback; after explicit user authorization, agent-managed recovery uses the active Harness restart entry point described in `references/recovery.md` (`browser_restart` in Pi, DSH and Codex). When this distribution includes `scripts/browser.mjs`, that CLI is for explicit human/developer workflows and automated tests, not a model-facing alternative to the Skill-gated native tools.
 
 All Skill references and scripts are resolved from this Skill directory. Read only the linked files here when the workflow requires more detail; do not depend on repository files outside this directory for Skill activation.
 
