@@ -2409,7 +2409,6 @@ async function readTabIncarnationForListing(tabId, expectedFence) {
   let timer;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(() => resolve(undefined), LIST_TAB_IDENTITY_TIMEOUT_MS);
-    timer.unref?.();
   });
   try {
     return await Promise.race([readTabIncarnation(tabId, expectedFence, true), timeout]);

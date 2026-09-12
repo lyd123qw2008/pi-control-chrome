@@ -147,11 +147,15 @@ function cleanupValue() {
   return { removed: [], released: [], retained: [], failed: [] };
 }
 
-async function createMockBridge({ targets = [] } = {}) {
-  const requests = [];
-  const scripts = new Map();
-  const waiters = [];
-  const server = createServer((request, response) => {
+let activeMockBridge;
+let sharedMockBridgeServer;
+let sharedMockBridgeWebSocket;
+
+async function ensureSharedMockBridge() {
+  if (sharedMockBridgeServer !== undefined) return;
+  sharedMockBridgeServer = createServer((request, response) => {
+    const mock = activeMockBridge;
+    const targets = mock?.targets ?? [];
     response.setHeader("Content-Type", "application/json");
     if (request.url === "/health") {
       response.end(JSON.stringify({
@@ -173,38 +177,52 @@ async function createMockBridge({ targets = [] } = {}) {
     response.statusCode = 404;
     response.end(JSON.stringify({ error: "not found" }));
   });
-  const websocket = new WebSocketServer({ server });
-  websocket.on("connection", (socket) => {
+  sharedMockBridgeWebSocket = new WebSocketServer({ server: sharedMockBridgeServer });
+  sharedMockBridgeWebSocket.on("connection", (socket) => {
+    const mock = activeMockBridge;
+    if (mock === undefined) {
+      socket.close();
+      return;
+    }
     socket.on("message", raw => {
       const message = JSON.parse(raw.toString());
       if (message.type !== "request") return;
-      requests.push(message);
-      for (let index = waiters.length - 1; index >= 0; index -= 1) {
-        if (!waiters[index].predicate(message)) continue;
-        const waiter = waiters.splice(index, 1)[0];
+      mock.requests.push(message);
+      for (let index = mock.waiters.length - 1; index >= 0; index -= 1) {
+        if (!mock.waiters[index].predicate(message)) continue;
+        const waiter = mock.waiters.splice(index, 1)[0];
         waiter.resolve(message);
       }
-      const queue = scripts.get(message.method) ?? [];
+      const queue = mock.scripts.get(message.method) ?? [];
       const script = queue.shift();
-      scripts.set(message.method, queue);
+      mock.scripts.set(message.method, queue);
       const respond = (result, error) => {
         if (socket.readyState !== 1) return;
         socket.send(JSON.stringify({ type: "response", id: message.id, ...(error ? { error } : { result }) }));
       };
-      const defaultResult = message.method === "status" ? statusValue() : message.method === "list_targets" ? { targets } : message.method === "cleanup" ? cleanupValue() : {};
+      const defaultResult = message.method === "status" ? statusValue() : message.method === "list_targets" ? { targets: mock.targets } : message.method === "cleanup" ? cleanupValue() : {};
       Promise.resolve(script ? script(message, respond) : respond(defaultResult)).catch(error => respond(undefined, { message: String(error) }));
     });
   });
-  await listen(server, bridgePort);
+  await listen(sharedMockBridgeServer, bridgePort);
+  sharedMockBridgeServer.unref?.();
+}
+
+async function createMockBridge({ targets = [] } = {}) {
+  const mock = { targets, requests: [], scripts: new Map(), waiters: [] };
+  await ensureSharedMockBridge();
+  if (activeMockBridge !== undefined) throw new Error("mock Bridge is still active");
+  activeMockBridge = mock;
+  let closed = false;
   return {
-    requests,
+    requests: mock.requests,
     enqueue(method, script) {
-      const queue = scripts.get(method) ?? [];
+      const queue = mock.scripts.get(method) ?? [];
       queue.push(script);
-      scripts.set(method, queue);
+      mock.scripts.set(method, queue);
     },
     waitForRequest(predicate) {
-      const existing = requests.find(predicate);
+      const existing = mock.requests.find(predicate);
       if (existing) return Promise.resolve(existing);
       return new Promise((resolve, reject) => {
         const waiter = {
@@ -215,17 +233,26 @@ async function createMockBridge({ targets = [] } = {}) {
           },
         };
         const timer = setTimeout(() => {
-          const index = waiters.indexOf(waiter);
-          if (index >= 0) waiters.splice(index, 1);
+          const index = mock.waiters.indexOf(waiter);
+          if (index >= 0) mock.waiters.splice(index, 1);
           reject(new Error("timed out waiting for mock Bridge request"));
         }, 3000);
-        waiters.push(waiter);
+        mock.waiters.push(waiter);
       });
     },
     async close() {
-      for (const socket of websocket.clients) socket.close();
-      await new Promise(resolve => websocket.close(resolve));
-      await closeServer(server);
+      if (closed) return;
+      closed = true;
+      const clients = [...sharedMockBridgeWebSocket.clients];
+      await Promise.all(clients.map(socket => new Promise(resolve => {
+        if (socket.readyState === WebSocket.CLOSED) {
+          resolve();
+          return;
+        }
+        socket.once("close", resolve);
+        socket.close();
+      })));
+      if (activeMockBridge === mock) activeMockBridge = undefined;
     },
   };
 }
