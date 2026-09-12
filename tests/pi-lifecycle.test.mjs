@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { WebSocketServer } from "ws";
 
+const lifecycleContract = JSON.parse(readFileSync(new URL("./fixtures/browser-lifecycle-contract.json", import.meta.url), "utf8"));
 const bridgePort = 18_700 + Math.floor(Math.random() * 300);
 process.env.PI_CONTROL_CHROME_BRIDGE_PORT = String(bridgePort);
 process.env.PI_CONTROL_CHROME_LAZY_TOOLS = "false";
@@ -334,7 +336,8 @@ test("Pi exposes a lightweight user-confirmed browser_restart and invalidates th
     await harness.emit("session_start", {}, context);
     await harness.tools.get("browser_status").execute("bind", {});
     const rejected = await harness.tools.get("browser_restart").execute("unconfirmed", { confirmed: false });
-    assert.equal(rejected.details.code, "BRIDGE_RESTART_CONFIRMATION_REQUIRED");
+    assert.equal(rejected.details.code, lifecycleContract.restart.confirmationErrorCode);
+    assert.deepEqual(rejected.details.details, lifecycleContract.restart.confirmationDetails);
 
     let restartCalls = 0;
     BridgeClient.prototype.restart = async function () {
@@ -354,13 +357,17 @@ test("Pi exposes a lightweight user-confirmed browser_restart and invalidates th
     const restarted = await harness.tools.get("browser_restart").execute("confirmed", { confirmed: true });
     const value = JSON.parse(restarted.content[0].text);
     assert.equal(restartCalls, 1);
+    for (const field of lifecycleContract.restart.requiredFields) assert.notEqual(value[field], undefined, `missing restart field: ${field}`);
     assert.equal(value.restarted, true);
-    assert.equal(value.handleRefreshRequired, true);
+    assert.equal(value.nextAction, lifecycleContract.restart.nextAction);
+    for (const field of ["handleRefreshRequired", "snapshotRefreshRequired", "documentIncarnationRefreshRequired"]) {
+      assert.equal(value[field], lifecycleContract.restart.refreshFlags, `restart refresh contract: ${field}`);
+    }
     assert.equal(value.targetRequired, true);
-    assert.equal(value.nextAction, "browser_status");
 
     const status = JSON.parse((await harness.tools.get("browser_status").execute("refresh", {})).content[0].text);
-    assert.equal(status.error.code, "TARGET_REQUIRED");
+    assert.equal(status.error.code, lifecycleContract.targetSelection.errorCode);
+    assert.equal(status.nextAction, lifecycleContract.targetSelection.nextAction);
 
     mock.enqueue("status", async (_message, respond) => respond({
       ...statusValue(),
@@ -405,7 +412,11 @@ test("Pi requires explicit target selection and routes later operations with the
     await harness.emit("session_start", {}, context);
     const inventoryResult = await harness.tools.get("browser_targets").execute("targets", {});
     const inventory = JSON.parse(inventoryResult.content[0].text);
+    for (const field of lifecycleContract.targetInventory.requiredFields) assert.notEqual(inventory[field], undefined, `missing target inventory field: ${field}`);
+    assert.equal(lifecycleContract.targetInventory.mustNotSelect, true);
+    assert.ok(lifecycleContract.targetInventory.states.includes(inventory.state));
     assert.deepEqual(inventory.targets.map(target => target.browserId), ["edge:profile-a", "chrome:profile-b"]);
+    assert.equal(mock.requests.filter(message => message.method === "status").length, 0);
     const ambiguousResult = await harness.tools.get("browser_status").execute("ambiguous", { browserId: "   " });
     const ambiguous = JSON.parse(ambiguousResult.content[0].text);
     assert.equal(ambiguous.error.code, "TARGET_REQUIRED");
@@ -442,7 +453,7 @@ test("Pi clears a stale target binding only after explicit recovery and target s
   try {
     await harness.emit("session_start", {}, context);
     await harness.tools.get("browser_status").execute("bind", {});
-    mock.enqueue("status", async (_message, respond) => respond(undefined, { code: "TARGET_UNAVAILABLE", message: "old target disconnected" }));
+    mock.enqueue("status", async (_message, respond) => respond(undefined, { code: lifecycleContract.staleTarget.errorCodes[0], message: "old target disconnected" }));
     await assert.rejects(
       () => harness.tools.get("browser_cleanup").execute("recover-stale", { recoverStale: true }),
       error => error?.code === "TARGET_REQUIRED"
@@ -454,7 +465,8 @@ test("Pi clears a stale target binding only after explicit recovery and target s
     const statusCount = mock.requests.filter(message => message.method === "status").length;
     const unselected = JSON.parse((await harness.tools.get("browser_status").execute("unselected", {})).content[0].text);
     assert.equal(unselected.targetRequired, true);
-    assert.equal(unselected.error.code, "TARGET_REQUIRED");
+    assert.equal(unselected.error.code, lifecycleContract.targetSelection.errorCode);
+    assert.equal(unselected.nextAction, lifecycleContract.targetSelection.nextAction);
     assert.deepEqual(unselected.targets.map(target => target.browserId), ["edge:replacement", "chrome:other"]);
     assert.equal(mock.requests.filter(message => message.method === "status").length, statusCount);
 

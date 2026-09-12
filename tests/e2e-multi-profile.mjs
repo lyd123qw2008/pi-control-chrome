@@ -244,6 +244,22 @@ try {
   assert.equal(new Set(listedA.tabs.map((tab) => tab.id)).size, listedA.tabs.length);
   assert.equal(new Set(listedB.tabs.map((tab) => tab.id)).size, listedB.tabs.length);
 
+  const agentTabA = await pi.request("new_tab", { url: pageUrlA, active: false, sessionId: "session-a" }, route(targetA));
+  const agentTabB = await pi.request("new_tab", { url: pageUrlB, active: false, sessionId: "session-b" }, route(targetB));
+  assert.ok(agentTabA.tab?.id !== undefined);
+  assert.ok(agentTabB.tab?.id !== undefined);
+  const crossTargetCleanup = await pi.request("cleanup", { sessionId: "session-b", mode: "task" }, route(targetA));
+  assert.equal(crossTargetCleanup.removed?.includes(agentTabA.tab.id), false);
+  assert.equal(crossTargetCleanup.removed?.includes(agentTabB.tab.id), false);
+  const cleanupA = await pi.request("cleanup", { sessionId: "session-a", mode: "task" }, route(targetA));
+  assert.equal(cleanupA.removed?.includes(agentTabA.tab.id), true);
+  const listedBAfterCleanupA = await pi.request("list_tabs", {}, route(targetB));
+  assert.ok(listedBAfterCleanupA.tabs.some((tab) => tab.id === agentTabB.tab.id));
+  const crossSessionCleanupB = await pi.request("cleanup", { sessionId: "session-a", mode: "task" }, route(targetB));
+  assert.equal(crossSessionCleanupB.removed?.includes(agentTabB.tab.id), false);
+  const cleanupB = await pi.request("cleanup", { sessionId: "session-b", mode: "task" }, route(targetB));
+  assert.equal(cleanupB.removed?.includes(agentTabB.tab.id), true);
+
   const oldGenerationA = targetA.connectionGeneration;
   await stopProcess(browserA);
   browserA = undefined;
@@ -278,6 +294,7 @@ try {
     oldGenerationA,
     newGenerationA: reconnectedA.connectionGeneration,
     targetBUnaffected: unaffectedB.browserId === targetB.browserId,
+    cleanupIsolation: true,
   }));
 } finally {
   await closeSocket(pi?.socket);

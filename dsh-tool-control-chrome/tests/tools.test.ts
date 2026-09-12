@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -6,6 +7,19 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { BrowserBridgeClient } from '../src/bridge.js'
 import { BROWSER_SKILL_NAME } from '../src/skill.js'
 import { BROWSER_TOOL_NAMES, browserToolCatalog, registerBrowserTools } from '../src/tools.js'
+
+const lifecycleContract = JSON.parse(readFileSync(new URL('../../tests/fixtures/browser-lifecycle-contract.json', import.meta.url), 'utf8')) as {
+  readonly restart: {
+    readonly requiredFields: readonly string[]
+    readonly nextAction: string
+    readonly refreshFlags: boolean
+    readonly confirmationErrorCode: string
+    readonly confirmationDetails: { readonly requiresUserConfirmation: boolean }
+  }
+  readonly targetInventory: { readonly requiredFields: readonly string[]; readonly states: readonly string[]; readonly mustNotSelect: boolean }
+  readonly targetSelection: { readonly errorCode: string; readonly nextAction: string }
+  readonly staleTarget: { readonly errorCodes: readonly string[]; readonly recommendation: string }
+}
 
 type EventHandler = (...args: unknown[]) => unknown
 
@@ -248,6 +262,9 @@ describe('DSH browser tool catalog', () => {
     const request = vi.fn()
     const harness = setup({ request, health })
     const result = await harness.tools.get('browser_targets')?.execute({}, execution(harness.agent))
+    for (const field of lifecycleContract.targetInventory.requiredFields) expect(result).toHaveProperty(field)
+    expect(lifecycleContract.targetInventory.mustNotSelect).toBe(true)
+    expect(lifecycleContract.targetInventory.states).toContain((result as { state?: string }).state)
     expect(result).toEqual({
       state: 'connected',
       targets: [
@@ -529,8 +546,8 @@ describe('DSH browser tool catalog', () => {
     const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
     const harness = setup({ restart, request, health })
     await expect(harness.tools.get('browser_restart')?.execute({ confirmed: false }, execution(harness.agent))).rejects.toMatchObject({
-      code: 'BRIDGE_RESTART_CONFIRMATION_REQUIRED',
-      details: { requiresUserConfirmation: true },
+      code: lifecycleContract.restart.confirmationErrorCode,
+      details: lifecycleContract.restart.confirmationDetails,
     })
     expect(restart).not.toHaveBeenCalled()
   })
@@ -552,16 +569,17 @@ describe('DSH browser tool catalog', () => {
     await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
     const restarted = await harness.tools.get('browser_restart')?.execute({ confirmed: true }, execution(harness.agent))
     expect(restart).toHaveBeenCalledWith(expect.any(AbortSignal))
+    for (const field of lifecycleContract.restart.requiredFields) expect(restarted).toHaveProperty(field)
     expect(restarted).toMatchObject({
       ok: true,
       connected: true,
       state: 'target_required',
       targetRequired: true,
-      nextAction: 'browser_status',
+      nextAction: lifecycleContract.restart.nextAction,
       recommendation: 'refresh_browser_target',
-      handleRefreshRequired: true,
-      snapshotRefreshRequired: true,
-      documentIncarnationRefreshRequired: true,
+      handleRefreshRequired: lifecycleContract.restart.refreshFlags,
+      snapshotRefreshRequired: lifecycleContract.restart.refreshFlags,
+      documentIncarnationRefreshRequired: lifecycleContract.restart.refreshFlags,
       previousBrowserId: 'edge:test',
       target: { browserId: 'edge:test', connectionGeneration: 2 },
     })
@@ -837,7 +855,7 @@ describe('DSH browser tool catalog', () => {
     }))
     const harness = setup({ request, health })
     const result = await harness.tools.get('browser_status')?.execute({ browserId: 'edge:profile-a' }, execution(harness.agent))
-    expect(result).toMatchObject({ state: 'target_unavailable', recommendation: 'refresh_browser_targets', error: { code: 'TARGET_UNAVAILABLE' }, target: { browserId: 'edge:profile-a' } })
+    expect(result).toMatchObject({ state: 'target_unavailable', recommendation: lifecycleContract.staleTarget.recommendation, error: { code: lifecycleContract.staleTarget.errorCodes[0] }, target: { browserId: 'edge:profile-a' } })
   })
   it('blocks browser operations when the active browser target changes until explicitly acknowledged', async () => {
     let browser = 'edge'
@@ -916,8 +934,8 @@ describe('DSH browser tool catalog', () => {
       actionState: 'unknown',
       retryable: false,
       nextAction: 'browser_status',
-      recommendation: 'refresh_browser_targets',
-      error: { code: 'TARGET_CONNECTION_CHANGED' },
+      recommendation: lifecycleContract.staleTarget.recommendation,
+      error: { code: lifecycleContract.staleTarget.errorCodes[1] },
     })
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })

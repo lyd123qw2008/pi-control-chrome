@@ -9,6 +9,7 @@ import { test } from "node:test";
 import WebSocket from "ws";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+const lifecycleContract = JSON.parse(readFileSync(new URL("./fixtures/browser-lifecycle-contract.json", import.meta.url), "utf8"));
 const serverPath = join(root, "codex", "mcp-server.mjs");
 const bridgePath = join(root, "bridge", "server.mjs");
 
@@ -139,7 +140,9 @@ test("Codex browser_restart requires explicit user confirmation", async () => {
     } });
     const result = await mcp.nextMessage();
     assert.equal(result.result.isError, true);
-    assert.match(result.result.content[0].text, /BRIDGE_RESTART_CONFIRMATION_REQUIRED/);
+    const errorText = result.result.content[0].text;
+    assert.match(errorText, new RegExp(lifecycleContract.restart.confirmationErrorCode));
+    assert.match(errorText, /requiresUserConfirmation/);
   } finally {
     mcp.child.stdin.end();
     await stopProcess(mcp.child);
@@ -186,13 +189,16 @@ test("Codex browser_restart cooperatively replaces the Bridge after confirmation
     const restarted = await mcp.nextMessage();
     assert.equal(restarted.result.isError, undefined);
     const value = JSON.parse(restarted.result.content[0].text);
+    for (const field of lifecycleContract.restart.requiredFields) assert.notEqual(value[field], undefined, `missing restart field: ${field}`);
     assert.equal(value.restarted, true);
     assert.notEqual(value.previousInstanceId, value.bridgeHealth.instanceId);
     assert.equal(value.bridgeHealth.startedBy, "codex");
     assert.equal(value.previousBrowserId, identity.browserId);
-    assert.equal(value.handleRefreshRequired, true);
+    assert.equal(value.nextAction, lifecycleContract.restart.nextAction);
+    for (const field of ["handleRefreshRequired", "snapshotRefreshRequired", "documentIncarnationRefreshRequired"]) {
+      assert.equal(value[field], lifecycleContract.restart.refreshFlags, `restart refresh contract: ${field}`);
+    }
     assert.equal(value.targetRequired, true);
-    assert.equal(value.nextAction, "browser_status");
 
     const replacement = await waitHealth(bridgePort);
     assert.equal(replacement.instanceId, value.bridgeHealth.instanceId);
@@ -262,7 +268,11 @@ test("Codex MCP adapter routes a selected target through the existing Bridge", a
     } });
     const inventory = await mcp.nextMessage();
     assert.equal(inventory.result.isError, undefined);
-    assert.deepEqual(JSON.parse(inventory.result.content[0].text).targets.map(target => target.browserId), [identity.browserId]);
+    const inventoryValue = JSON.parse(inventory.result.content[0].text);
+    for (const field of lifecycleContract.targetInventory.requiredFields) assert.notEqual(inventoryValue[field], undefined, `missing target inventory field: ${field}`);
+    assert.equal(lifecycleContract.targetInventory.mustNotSelect, true);
+    assert.ok(lifecycleContract.targetInventory.states.includes(inventoryValue.state));
+    assert.deepEqual(inventoryValue.targets.map(target => target.browserId), [identity.browserId]);
     mcp.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
       name: "browser_status",
       arguments: { browserId: identity.browserId, acknowledgeBrowserId: identity.browserId },

@@ -1,0 +1,32 @@
+{
+  "restart": {
+    "requiredFields": [
+      "ok",
+      "restarted",
+      "handleRefreshRequired",
+      "snapshotRefreshRequired",
+      "documentIncarnationRefreshRequired",
+      "targetRequired",
+      "nextAction"
+    ],
+    "nextAction": "browser_status",
+    "refreshFlags": true,
+    "confirmationErrorCode": "BRIDGE_RESTART_CONFIRMATION_REQUIRED",
+    "confirmationDetails": {
+      "requiresUserConfirmation": true
+    }
+  },
+  "targetInventory": {
+    "requiredFields": ["targets"],
+    "states": ["connected", "bridge_only"],
+    "mustNotSelect": true
+  },
+  "targetSelection": {
+    "errorCode": "TARGET_REQUIRED",
+    "nextAction": "browser_status"
+  },
+  "staleTarget": {
+    "errorCodes": ["TARGET_UNAVAILABLE", "TARGET_CONNECTION_CHANGED"],
+    "recommendation": "refresh_browser_targets"
+  }
+}
