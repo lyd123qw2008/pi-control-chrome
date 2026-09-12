@@ -23,7 +23,7 @@ if (candidates.length === 0) {
   process.exit(0);
 }
 
-for (const candidate of candidates) {
+const results = await Promise.all(candidates.map(async candidate => {
   console.log(`RUN: isolated ${candidate.name} profile (${candidate.path})`);
   const result = await new Promise(resolve => {
     const child = spawn(process.execPath, [testFile], {
@@ -35,8 +35,10 @@ for (const candidate of candidates) {
     child.once("close", (code, signal) => resolve({ code: code ?? 1, signal }));
     child.once("error", error => resolve({ code: 1, error }));
   });
-  if (result.code !== 0) {
-    throw new Error(`${candidate.name} isolated E2E failed${result.signal ? ` (${result.signal})` : ""}`);
-  }
+  return { candidate, result };
+}));
+const failure = results.find(({ result }) => result.code !== 0);
+if (failure !== undefined) {
+  throw new Error(`${failure.candidate.name} isolated E2E failed${failure.result.signal ? ` (${failure.result.signal})` : ""}`);
 }
 console.log(JSON.stringify({ passed: true, browsers: candidates.map(candidate => candidate.name) }));
