@@ -24,6 +24,7 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   localUserRestart: true,
   multiTargetRouting: true,
   targetList: true,
+  targetLeases: true,
   connectionGeneration: true,
   targetScopedEvents: true,
   semanticTargetRequests: true,
@@ -79,6 +80,9 @@ const pending = new Map();
 const draining = new Map();
 const extensionTargets = new Map();
 const targetGenerations = new Map();
+const targetLeases = new Map();
+const TARGET_LEASE_TTL_MS = 10 * 60 * 1000;
+const TARGET_LEASE_CONTROL_METHODS = new Set(["list_targets", "doctor", "status", "target_lease"]);
 const diagnostics = [];
 const MAX_DIAGNOSTICS = 100;
 const startedAt = Date.now();
@@ -88,9 +92,20 @@ const metrics = {
   requestTimeouts: 0,
   requestErrors: 0,
   targetConnections: 0,
+  targetDisconnects: 0,
   targetReconnects: 0,
   targetReplacements: 0,
+  targetLeaseAcquisitions: 0,
+  targetLeaseRenewals: 0,
+  targetLeaseReleases: 0,
+  targetLeaseConflicts: 0,
+  targetLeaseNotOwned: 0,
+  targetLeaseExpirations: 0,
+  targetLeaseInvalidations: 0,
 };
+let lastTargetDisconnectAt;
+let lastTargetReconnectAt;
+let lastTargetReplacementAt;
 let requestCounter = 0;
 let connectionSequence = 0;
 let restarting = false;
@@ -180,6 +195,7 @@ function setExtensionIdentity(client, value, excludeBridgeRequestId) {
   if (previousIdentity && previousIdentity.browserId !== identity.browserId) {
     rejectPendingForExtension(client, "TARGET_CONNECTION_CHANGED", "The extension identified a different browser target; pending requests were canceled.", excludeBridgeRequestId);
     const previous = extensionTargets.get(previousIdentity.browserId);
+    clearTargetLease(previousIdentity.browserId, "target_replaced");
     if (previous?.client === client) {
       previous.client = undefined;
       previous.state = "replaced";
@@ -190,6 +206,7 @@ function setExtensionIdentity(client, value, excludeBridgeRequestId) {
   }
 
   const previousConnection = existing?.client;
+  if (previousConnection && previousConnection !== client) clearTargetLease(identity.browserId, "target_replaced");
   const generation = (targetGenerations.get(identity.browserId) ?? 0) + 1;
   targetGenerations.set(identity.browserId, generation);
   const record = {
@@ -203,6 +220,7 @@ function setExtensionIdentity(client, value, excludeBridgeRequestId) {
   };
   if (previousConnection && previousConnection !== client) {
     metrics.targetReplacements += 1;
+    lastTargetReplacementAt = Date.now();
     const previousRecord = existing;
     if (previousRecord) {
       previousRecord.client = undefined;
@@ -215,6 +233,7 @@ function setExtensionIdentity(client, value, excludeBridgeRequestId) {
     if (previousConnection.readyState === 1) previousConnection.close(1012, "replaced");
   } else if (targetGenerations.get(identity.browserId) > 1) {
     metrics.targetReconnects += 1;
+    lastTargetReconnectAt = Date.now();
   } else {
     metrics.targetConnections += 1;
   }
@@ -222,10 +241,12 @@ function setExtensionIdentity(client, value, excludeBridgeRequestId) {
   client.connectionId = record.connectionId;
   client.connectionGeneration = record.connectionGeneration;
   extensionTargets.set(identity.browserId, record);
-  recordDiagnostic("target_connected", {
+  recordDiagnostic(generation > 1 ? "target_reconnected" : "target_connected", {
     browserId: record.browserId,
     connectionId: record.connectionId,
     connectionGeneration: record.connectionGeneration,
+    ...(existing?.connectionId === undefined ? {} : { previousConnectionId: existing.connectionId }),
+    ...(existing?.connectionGeneration === undefined ? {} : { previousConnectionGeneration: existing.connectionGeneration }),
     browser: record.browser,
   });
   broadcastTargetEvent(record, generation > 1 ? "target_reconnected" : "target_connected");
@@ -290,6 +311,203 @@ function readyTargets() {
 
 function listTargets() {
   return [...extensionTargets.values()].map(publicTarget);
+}
+
+function clearTargetLease(browserId, reason = "target_unavailable") {
+  const lease = targetLeases.get(browserId);
+  if (lease === undefined) return false;
+  targetLeases.delete(browserId);
+  metrics.targetLeaseReleases += 1;
+  if (reason === "lease_expired") metrics.targetLeaseExpirations += 1;
+  else if (reason !== "explicit_release") metrics.targetLeaseInvalidations += 1;
+  recordDiagnostic("target_lease_released", {
+    browserId,
+    reason,
+    sessionId: lease.sessionId,
+    connectionId: lease.connectionId,
+    connectionGeneration: lease.connectionGeneration,
+  });
+  return true;
+}
+
+function leaseObservability() {
+  const heldTargets = [];
+  for (const [browserId] of targetLeases) {
+    const lease = activeTargetLease(browserId);
+    if (lease === undefined) continue;
+    heldTargets.push({
+      browserId,
+      state: "held",
+      connectionId: lease.connectionId,
+      connectionGeneration: lease.connectionGeneration,
+      expiresAt: lease.expiresAt,
+    });
+  }
+  return { activeCount: heldTargets.length, heldTargets };
+}
+
+function targetRecoveryObservability(targets = listTargets(), ready = readyTargets()) {
+  return {
+    trackedTargets: targets.length,
+    readyTargets: ready.length,
+    disconnectedTargets: targets.filter(target => target.state !== "ready").length,
+    lastTargetDisconnectAt,
+    lastTargetReconnectAt,
+    lastTargetReplacementAt,
+  };
+}
+
+function observabilityDocument(targets = listTargets(), ready = readyTargets()) {
+  return {
+    pendingRequests: pending.size,
+    drainingRequests: draining.size,
+    metrics: { ...metrics },
+    targetRecovery: targetRecoveryObservability(targets, ready),
+    targetLeases: leaseObservability(),
+    recentEvents: diagnostics.slice(-20),
+  };
+}
+
+function clearTargetLeasesForClient(client, reason = "client_disconnected") {
+  for (const [browserId, lease] of targetLeases) {
+    if (lease.client === client) clearTargetLease(browserId, reason);
+  }
+}
+
+function activeTargetLease(browserId) {
+  const lease = targetLeases.get(browserId);
+  if (lease === undefined) return undefined;
+  if (lease.expiresAt <= Date.now()) {
+    clearTargetLease(browserId, "lease_expired");
+    return undefined;
+  }
+  return lease;
+}
+
+function leaseView(lease, sessionId) {
+  if (lease === undefined) return { state: "available", owner: "none" };
+  return {
+    state: "held",
+    owner: lease.sessionId === sessionId ? "current_session" : "other_session",
+    connectionId: lease.connectionId,
+    connectionGeneration: lease.connectionGeneration,
+    expiresAt: lease.expiresAt,
+  };
+}
+
+function targetLeaseError(code, message, details = {}) {
+  return { code, message, details: { actionState: "not_started", retryable: true, inspectFirst: false, ...details } };
+}
+
+function targetLeaseResponseObservability() {
+  const document = observabilityDocument();
+  return {
+    metrics: document.metrics,
+    targetRecovery: document.targetRecovery,
+    targetLeases: document.targetLeases,
+  };
+}
+
+function handleTargetLease(client, id, message) {
+  const params = requestParams(message);
+  const action = nonEmptyString(params.action);
+  const sessionId = nonEmptyString(params.sessionId);
+  const browserId = nonEmptyString(params.browserId);
+  if (!action || !["acquire", "release", "status"].includes(action) || !sessionId || (action !== "status" && !browserId)) {
+    sendError(client, id, "INVALID_TARGET_LEASE", "target_lease requires action acquire, release or status, sessionId, and browserId for acquire/release.");
+    return;
+  }
+  if (action === "status") {
+    const entries = browserId === undefined ? [...extensionTargets.keys()] : [browserId];
+    send(client, {
+      type: "response",
+      id,
+      result: {
+        ok: true,
+        action,
+        leases: entries.map(currentBrowserId => ({ browserId: currentBrowserId, lease: leaseView(activeTargetLease(currentBrowserId), sessionId) })),
+        observability: targetLeaseResponseObservability(),
+      },
+    });
+    return;
+  }
+  const target = extensionTargets.get(browserId);
+  if (!target || target.state !== "ready" || target.client?.readyState !== 1) {
+    const failure = targetLeaseError("TARGET_UNAVAILABLE", `Browser target ${browserId} is not connected.`, { browserId, nextAction: "browser_targets", recommendation: "refresh_browser_targets", targetLease: { state: "unavailable", owner: "none" } });
+    sendError(client, id, failure.code, failure.message, failure.details);
+    return;
+  }
+  const existing = activeTargetLease(browserId);
+  if (action === "release") {
+    if (existing === undefined) {
+      send(client, { type: "response", id, result: { ok: true, action, released: false, browserId, lease: leaseView(undefined, sessionId), observability: targetLeaseResponseObservability() } });
+      return;
+    }
+    if (existing.client !== client || existing.sessionId !== sessionId) {
+      metrics.targetLeaseNotOwned += 1;
+      recordDiagnostic("target_lease_not_owned", { browserId, sessionId, ownerSessionId: existing.sessionId });
+      const failure = targetLeaseError("TARGET_LEASE_NOT_OWNED", `Browser target ${browserId} is leased by another session.`, { browserId, nextAction: "browser_target_lease", recommendation: "release_target_lease", targetLease: leaseView(existing, sessionId) });
+      sendError(client, id, failure.code, failure.message, failure.details);
+      return;
+    }
+    clearTargetLease(browserId, "explicit_release");
+    send(client, { type: "response", id, result: { ok: true, action, released: true, browserId, lease: leaseView(undefined, sessionId), observability: targetLeaseResponseObservability() } });
+    return;
+  }
+  if (existing !== undefined && (existing.client !== client || existing.sessionId !== sessionId)) {
+    metrics.targetLeaseConflicts += 1;
+    recordDiagnostic("target_lease_conflict", { browserId, sessionId, ownerSessionId: existing.sessionId });
+    const failure = targetLeaseError("TARGET_LEASE_CONFLICT", `Browser target ${browserId} is already leased by another session.`, { browserId, nextAction: "browser_target_lease", recommendation: "choose_another_browser_target", targetLease: leaseView(existing, sessionId) });
+    sendError(client, id, failure.code, failure.message, failure.details);
+    return;
+  }
+  const lease = existing ?? {
+    client,
+    sessionId,
+    browserId,
+    connectionId: target.connectionId,
+    connectionGeneration: target.connectionGeneration,
+    acquiredAt: Date.now(),
+    expiresAt: Date.now() + TARGET_LEASE_TTL_MS,
+  };
+  lease.expiresAt = Date.now() + TARGET_LEASE_TTL_MS;
+  targetLeases.set(browserId, lease);
+  if (existing === undefined) metrics.targetLeaseAcquisitions += 1;
+  else metrics.targetLeaseRenewals += 1;
+  recordDiagnostic(existing === undefined ? "target_lease_acquired" : "target_lease_renewed", { browserId, sessionId, connectionId: target.connectionId, connectionGeneration: target.connectionGeneration });
+  send(client, {
+    type: "response",
+    id,
+    result: {
+      ok: true,
+      action,
+      acquired: true,
+      browserId,
+      target: publicTarget(target),
+      lease: leaseView(lease, sessionId),
+      observability: targetLeaseResponseObservability(),
+    },
+  });
+}
+
+function enforceTargetLease(client, message, target) {
+  if (!target || TARGET_LEASE_CONTROL_METHODS.has(message.method)) return undefined;
+  const lease = activeTargetLease(target.browserId);
+  if (lease === undefined) return undefined;
+  const params = requestParams(message);
+  const sessionId = nonEmptyString(params.sessionId);
+  if (lease.client !== client || lease.sessionId !== sessionId) {
+    metrics.targetLeaseConflicts += 1;
+    recordDiagnostic("target_lease_conflict", { browserId: target.browserId, sessionId, ownerSessionId: lease.sessionId, method: message.method });
+    return targetLeaseError("TARGET_LEASE_CONFLICT", `Browser target ${target.browserId} is leased by another session.`, { browserId: target.browserId, nextAction: "browser_target_lease", recommendation: "acquire_or_choose_another_browser_target", targetLease: leaseView(lease, sessionId) });
+  }
+  if (lease.connectionId !== target.connectionId || lease.connectionGeneration !== target.connectionGeneration) {
+    const previousLease = leaseView(lease, sessionId);
+    clearTargetLease(target.browserId, "connection_changed");
+    return targetLeaseError("TARGET_LEASE_STALE", `Browser target ${target.browserId} was reconnected; reacquire its target lease.`, { browserId: target.browserId, nextAction: "browser_target_lease", recommendation: "reacquire_target_lease", targetLease: previousLease });
+  }
+  lease.expiresAt = Date.now() + TARGET_LEASE_TTL_MS;
+  return undefined;
 }
 
 function selectExtension(message) {
@@ -451,6 +669,7 @@ function handleBridgeRestart(client, id, message) {
     return;
   }
   restarting = true;
+  for (const browserId of targetLeases.keys()) clearTargetLease(browserId, "bridge_restart");
   const requester = nonEmptyString(params.requester) ?? "unknown";
   if (!send(client, {
     type: "response",
@@ -647,6 +866,7 @@ function handleMessage(client, message) {
           instanceId,
           targets: listTargets(),
           extensionConnected: [...clients].some(entry => entry.role === "extension" && entry.readyState === 1),
+           observability: targetLeaseResponseObservability(),
         },
       });
       return;
@@ -661,6 +881,10 @@ function handleMessage(client, message) {
       return;
     }
     if (rejectWhileRestarting(client, id)) return;
+    if (message.method === "target_lease") {
+      handleTargetLease(client, id, message);
+      return;
+    }
     const selected = selectExtension(message);
     if (selected.errorCode) {
       metrics.requestErrors += 1;
@@ -688,6 +912,13 @@ function handleMessage(client, message) {
     if (target && requestTargetSelector(message).expectedConnectionGeneration !== undefined && requestTargetSelector(message).expectedConnectionGeneration !== target.connectionGeneration) {
       metrics.requestErrors += 1;
       sendError(client, id, "TARGET_CONNECTION_CHANGED", `Browser target ${target.browserId} connection generation changed.`);
+      return;
+    }
+    const leaseFailure = enforceTargetLease(client, message, target);
+    if (leaseFailure !== undefined) {
+      metrics.requestErrors += 1;
+      recordDiagnostic("request_rejected", { method: message.method, errorCode: leaseFailure.code, browserId: target?.browserId });
+      sendError(client, id, leaseFailure.code, leaseFailure.message, leaseFailure.details);
       return;
     }
     const entry = {
@@ -870,6 +1101,7 @@ function healthDocument() {
       ...BRIDGE_CAPABILITIES,
       multiTargetRouting: true,
       targetList: true,
+      targetLeases: true,
       connectionGeneration: true,
       targetScopedEvents: true,
     },
@@ -897,10 +1129,7 @@ function healthDocument() {
     unidentifiedExtensionConnections: extensionConnections().filter(client => !client.browserIdentity).length,
     observability: {
       startedAt,
-      pendingRequests: pending.size,
-      drainingRequests: draining.size,
-      metrics: { ...metrics },
-      recentEvents: diagnostics.slice(-20),
+      ...observabilityDocument(targets, ready),
     },
   };
 }
@@ -917,6 +1146,17 @@ function bridgeDoctor() {
   }
   if (health.unidentifiedExtensionConnections > 0) {
     notices.push({ code: "unidentified_browser_target", message: "At least one extension connection has not completed its browser identity handshake." });
+  }
+  const recovery = health.observability?.targetRecovery;
+  if (recovery?.disconnectedTargets > 0) {
+    notices.push({ code: "target_recovery_pending", message: `${recovery.disconnectedTargets} browser target(s) are disconnected; refresh browser_targets before retrying.` });
+  }
+  const leaseSummary = health.observability?.targetLeases;
+  if (leaseSummary?.activeCount > 0) {
+    notices.push({ code: "target_leases_active", message: `${leaseSummary.activeCount} browser target lease(s) are active; release or renew them explicitly before switching ownership.` });
+  }
+  if (health.observability?.metrics?.targetLeaseConflicts > 0) {
+    notices.push({ code: "target_lease_conflicts", message: "Target lease conflicts have occurred; inspect target lease status before retrying multi-target operations." });
   }
   return {
     ok: issues.length === 0,
@@ -991,6 +1231,7 @@ wss.on("connection", (client, request) => {
       ...BRIDGE_CAPABILITIES,
       multiTargetRouting: true,
       targetList: true,
+      targetLeases: true,
       connectionGeneration: true,
       targetScopedEvents: true,
     },
@@ -1009,13 +1250,17 @@ wss.on("connection", (client, request) => {
   client.on("close", () => {
     clients.delete(client);
     if (client.role === "pi") {
+      clearTargetLeasesForClient(client, "pi_client_disconnected");
       detachPendingForClient(client);
       broadcast({ type: "event", event: "connection", role: "pi", connected: false });
     }
     if (client.role === "extension") {
       rejectPendingForExtension(client, "EXTENSION_OFFLINE", "Chrome/Edge extension disconnected.");
       const target = targetForClient(client);
+      if (target) clearTargetLease(target.browserId, "target_disconnected");
       if (target) {
+        metrics.targetDisconnects += 1;
+        lastTargetDisconnectAt = Date.now();
         target.client = undefined;
         target.state = "disconnected";
         target.lastSeenAt = Date.now();

@@ -19,6 +19,7 @@ const lifecycleContract = JSON.parse(readFileSync(new URL('../../tests/fixtures/
   readonly targetInventory: { readonly requiredFields: readonly string[]; readonly states: readonly string[]; readonly mustNotSelect: boolean }
   readonly targetSelection: { readonly errorCode: string; readonly nextAction: string }
   readonly staleTarget: { readonly errorCodes: readonly string[]; readonly recommendation: string }
+  readonly targetObservability: { readonly requiredFields: readonly string[]; readonly requiredHealthFields: readonly string[]; readonly metricFields: readonly string[]; readonly leaseFields: readonly string[] }
 }
 
 type EventHandler = (...args: unknown[]) => unknown
@@ -166,7 +167,7 @@ function execution(agent: Agent): ToolRunContext {
 
 describe('DSH browser tool catalog', () => {
   it('exposes the complete Pi browser tool surface', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(42)
+    expect(BROWSER_TOOL_NAMES).toHaveLength(43)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_targets')
@@ -274,6 +275,35 @@ describe('DSH browser tool catalog', () => {
       bridgeHealth: expect.objectContaining({ ok: true, extensionConnected: true }),
     })
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('acquires and releases an explicit session-scoped target lease', async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'target_lease') return {
+        ok: true,
+        action: params.action,
+        acquired: params.action === 'acquire',
+        released: params.action === 'release',
+        browserId: params.browserId,
+        sessionId: params.sessionId,
+        observability: {
+          metrics: { targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+          targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
+          targetLeases: { activeCount: params.action === 'release' ? 0 : 1, heldTargets: [] },
+          recentEvents: [{ event: 'target_lease_acquired' }],
+        },
+      }
+      return { method }
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health })
+    const acquired = await harness.tools.get('browser_target_lease')?.execute({ action: 'acquire', browserId: 'edge:test' }, execution(harness.agent))
+    expect(acquired).toMatchObject({ ok: true, action: 'acquire', acquired: true, browserId: 'edge:test', sessionId: 'session-test' })
+    for (const field of lifecycleContract.targetObservability.requiredFields) expect((acquired as { observability: Record<string, unknown> }).observability[field]).toBeDefined()
+    const released = await harness.tools.get('browser_target_lease')?.execute({ action: 'release', browserId: 'edge:test' }, execution(harness.agent))
+    expect(released).toMatchObject({ ok: true, action: 'release', released: true, browserId: 'edge:test', sessionId: 'session-test' })
+    expect(request).toHaveBeenNthCalledWith(1, 'target_lease', { action: 'acquire', browserId: 'edge:test', sessionId: 'session-test' }, expect.any(AbortSignal))
+    expect(request).toHaveBeenNthCalledWith(2, 'target_lease', { action: 'release', browserId: 'edge:test', sessionId: 'session-test' }, expect.any(AbortSignal))
   })
 
   it('treats blank browserId values as omitted during single-target status lookup', async () => {
@@ -497,11 +527,20 @@ describe('DSH browser tool catalog', () => {
       browserId: 'edge:test',
       connectionId: 'connection-1',
       connectionGeneration: 2,
-      observability: { metrics: { requests: 4 }, recentEvents: Array.from({ length: 100 }, () => ({ event: 'internal' })) },
+      observability: {
+         metrics: { requests: 4, targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+         targetRecovery: { trackedTargets: 2, readyTargets: 1, disconnectedTargets: 1 },
+         targetLeases: { activeCount: 1, heldTargets: [{ browserId: 'edge:test', state: 'held', expiresAt: 123 }] },
+         recentEvents: Array.from({ length: 100 }, () => ({ event: 'internal' })),
+       },
     }))
     const harness = setup({ request, health })
     const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
-    expect(result).toMatchObject({ state: 'connected', browserId: 'edge:test', bridgeHealth: { browserId: 'edge:test', connectionGeneration: 2, observability: { metrics: { requests: 4 } } } })
+    expect(result).toMatchObject({ state: 'connected', browserId: 'edge:test', bridgeHealth: { browserId: 'edge:test', connectionGeneration: 2, observability: { metrics: { requests: 4 }, targetRecovery: { disconnectedTargets: 1 }, targetLeases: { activeCount: 1 } } } })
+    const compactHealth = (result as { bridgeHealth: { observability: Record<string, unknown> } }).bridgeHealth
+    for (const field of lifecycleContract.targetObservability.requiredFields) expect(compactHealth.observability[field]).toBeDefined()
+    for (const field of lifecycleContract.targetObservability.metricFields) expect((compactHealth.observability.metrics as Record<string, unknown>)[field]).toBeDefined()
+    for (const field of lifecycleContract.targetObservability.leaseFields) expect((compactHealth.observability.targetLeases as Record<string, unknown>)[field]).toBeDefined()
     expect(JSON.stringify(result)).not.toContain('internal')
   })
 

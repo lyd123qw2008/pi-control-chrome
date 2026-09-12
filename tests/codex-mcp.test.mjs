@@ -109,10 +109,11 @@ test("Codex MCP adapter exposes the initial browser tool catalog over stdio", as
 
     mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listed = await mcp.nextMessage();
-    assert.equal(listed.result.tools.length, 11);
+    assert.equal(listed.result.tools.length, 12);
     assert.deepEqual(listed.result.tools.map((tool) => tool.name), [
       "browser_status",
       "browser_targets",
+      "browser_target_lease",
       "browser_restart",
       "browser_tabs",
       "browser_snapshot",
@@ -191,6 +192,10 @@ test("Codex browser_restart cooperatively replaces the Bridge after confirmation
     const value = JSON.parse(restarted.result.content[0].text);
     for (const field of lifecycleContract.restart.requiredFields) assert.notEqual(value[field], undefined, `missing restart field: ${field}`);
     assert.equal(value.restarted, true);
+    for (const field of lifecycleContract.targetObservability.requiredHealthFields) assert.notEqual(value.bridgeHealth[field], undefined, `missing restart observability field: ${field}`);
+    for (const field of lifecycleContract.targetObservability.requiredFields) assert.notEqual(value.bridgeHealth.observability[field], undefined, `missing restart observability detail: ${field}`);
+    for (const field of lifecycleContract.targetObservability.metricFields) assert.notEqual(value.bridgeHealth.observability.metrics[field], undefined, `missing restart observability metric: ${field}`);
+    for (const field of lifecycleContract.targetObservability.leaseFields) assert.notEqual(value.bridgeHealth.observability.targetLeases[field], undefined, `missing restart lease observability field: ${field}`);
     assert.notEqual(value.previousInstanceId, value.bridgeHealth.instanceId);
     assert.equal(value.bridgeHealth.startedBy, "codex");
     assert.equal(value.previousBrowserId, identity.browserId);
@@ -273,6 +278,7 @@ test("Codex MCP adapter routes a selected target through the existing Bridge", a
     assert.equal(lifecycleContract.targetInventory.mustNotSelect, true);
     assert.ok(lifecycleContract.targetInventory.states.includes(inventoryValue.state));
     assert.deepEqual(inventoryValue.targets.map(target => target.browserId), [identity.browserId]);
+    for (const field of lifecycleContract.targetObservability.requiredFields) assert.notEqual(inventoryValue.bridgeHealth.observability[field], undefined, `missing target inventory observability detail: ${field}`);
     mcp.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
       name: "browser_status",
       arguments: { browserId: identity.browserId, acknowledgeBrowserId: identity.browserId },

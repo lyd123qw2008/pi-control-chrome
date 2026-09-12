@@ -182,6 +182,7 @@ let bridgeProcess;
 let browserA;
 let browserB;
 let pi;
+let piOther;
 try {
   bridgeProcess = spawnIgnored(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile, "--started-by", "pi", "--startup-marker", bridgeStartupMarker]);
   const bridgeHealth = await waitFor(() => {
@@ -209,6 +210,7 @@ try {
 
   const token = readFileSync(tokenFile, "utf8").trim();
   pi = connectPi(bridgePort, token);
+  piOther = connectPi(bridgePort, token);
   const targets = await pi.request("list_targets");
   assert.equal(targets.targets.filter((target) => target.state === "ready").length, 2);
   const readyTargetCandidates = targets.targets.filter((target) => target.state === "ready");
@@ -222,6 +224,15 @@ try {
   const targetB = readyTargetCandidates[targetBIndex];
   assert.notEqual(targetA.browserId, targetB.browserId);
   assert.notEqual(targetA.connectionId, targetB.connectionId);
+
+  const leaseA = await pi.request("target_lease", { action: "acquire", browserId: targetA.browserId, sessionId: "lease-session-a" });
+  assert.equal(leaseA.acquired, true);
+  await assert.rejects(
+    () => piOther.request("target_lease", { action: "acquire", browserId: targetA.browserId, sessionId: "lease-session-other" }),
+    (error) => error.code === "TARGET_LEASE_CONFLICT",
+  );
+  const leaseReleaseA = await pi.request("target_lease", { action: "release", browserId: targetA.browserId, sessionId: "lease-session-a" });
+  assert.equal(leaseReleaseA.released, true);
 
   await assert.rejects(() => pi.request("status"), (error) => error.code === "TARGET_REQUIRED");
   const statusA = await pi.request("status", {}, route(targetA));
@@ -298,6 +309,7 @@ try {
   }));
 } finally {
   await closeSocket(pi?.socket);
+  await closeSocket(piOther?.socket);
   await stopProcess(browserA);
   await stopProcess(browserB);
   await stopProcess(bridgeProcess);

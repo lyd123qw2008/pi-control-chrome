@@ -351,6 +351,12 @@ test("Pi exposes a lightweight user-confirmed browser_restart and invalidates th
           extensionConnected: true,
           instanceId: "new-instance",
           targets: [{ browser: "edge", browserId: "edge:test", profile: "profile-test", state: "ready", connectionId: "new-connection", connectionGeneration: 2 }],
+          observability: {
+            metrics: { targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 0, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+            targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
+            targetLeases: { activeCount: 0, heldTargets: [] },
+            recentEvents: [],
+          },
         },
       };
     };
@@ -358,6 +364,10 @@ test("Pi exposes a lightweight user-confirmed browser_restart and invalidates th
     const value = JSON.parse(restarted.content[0].text);
     assert.equal(restartCalls, 1);
     for (const field of lifecycleContract.restart.requiredFields) assert.notEqual(value[field], undefined, `missing restart field: ${field}`);
+    for (const field of lifecycleContract.targetObservability.requiredHealthFields) assert.notEqual(value.bridgeHealth[field], undefined, `missing restart observability field: ${field}`);
+    for (const field of lifecycleContract.targetObservability.requiredFields) assert.notEqual(value.bridgeHealth.observability[field], undefined, `missing restart observability detail: ${field}`);
+    for (const field of lifecycleContract.targetObservability.metricFields) assert.notEqual(value.bridgeHealth.observability.metrics[field], undefined, `missing restart observability metric: ${field}`);
+    for (const field of lifecycleContract.targetObservability.leaseFields) assert.notEqual(value.bridgeHealth.observability.targetLeases[field], undefined, `missing restart lease observability field: ${field}`);
     assert.equal(value.restarted, true);
     assert.equal(value.nextAction, lifecycleContract.restart.nextAction);
     for (const field of ["handleRefreshRequired", "snapshotRefreshRequired", "documentIncarnationRefreshRequired"]) {
@@ -384,6 +394,38 @@ test("Pi exposes a lightweight user-confirmed browser_restart and invalidates th
     } catch {
       // The test must still release the mock Bridge when disconnect itself fails.
     }
+    await mock.close();
+  }
+});
+
+test("Pi exposes explicit session-scoped target lease operations", async () => {
+  const mock = await createMockBridge({ targets: [{ browser: "edge", browserId: "edge:test", profile: "profile-test", state: "ready", connectionId: "edge-connection", connectionGeneration: 1 }] });
+  const harness = createPiHarness();
+  piControlChrome(harness.pi);
+  const context = createContext();
+  try {
+    await harness.emit("session_start", {}, context);
+    mock.enqueue("target_lease", async (_message, respond) => respond({
+      ok: true,
+      action: "acquire",
+      acquired: true,
+      browserId: "edge:test",
+      observability: {
+        metrics: { targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0 },
+        targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
+        targetLeases: { activeCount: 1, heldTargets: [{ browserId: "edge:test", state: "held" }] },
+        recentEvents: [{ event: "target_lease_acquired" }],
+      },
+    }));
+    const acquired = JSON.parse((await harness.tools.get("browser_target_lease").execute("acquire", { action: "acquire", browserId: "edge:test" })).content[0].text);
+    assert.equal(acquired.ok, true);
+    for (const field of lifecycleContract.targetObservability.requiredFields) assert.notEqual(acquired.observability[field], undefined, `missing lease observability detail: ${field}`);
+    const leaseRequest = mock.requests.find(message => message.method === "target_lease");
+    assert.deepEqual(leaseRequest.params.action, "acquire");
+    assert.deepEqual(leaseRequest.params.browserId, "edge:test");
+    assert.equal(typeof leaseRequest.params.sessionId, "string");
+  } finally {
+    try { await harness.commands.get("chrome").handler("disconnect", context); } catch { /* release mock below */ }
     await mock.close();
   }
 });

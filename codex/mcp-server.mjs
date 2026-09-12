@@ -88,6 +88,10 @@ const ALL_TOOLS = [
     acknowledgeBrowserId: string("Explicitly acknowledge this browserId after confirming a browser switch."),
   })),
   tool("browser_targets", "List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available.", "list_targets", schema()),
+  tool("browser_target_lease", "Explicitly acquire, release, or inspect a session-scoped lease for a browser target before advanced multi-target control. Ordinary single-target browser operations do not require a lease.", "target_lease", schema({
+    action: { type: "string", enum: ["acquire", "release", "status"], description: "Lease action." },
+    browserId: string("Browser target id. Required for acquire and release."),
+  }, ["action"])),
   tool("browser_restart", "After the user explicitly confirms a Bridge restart, restart the shared Bridge cooperatively without asking the user to type a command. Pass confirmed=true only after that confirmation; this does not restart DSH or Edge and does not close tabs.", "bridge_restart", schema({
     confirmed: boolean("Must be true only after the user explicitly confirms the Bridge restart."),
   }, ["confirmed"])),
@@ -229,6 +233,7 @@ const ALL_TOOLS = [
 const EXPOSED_TOOL_NAMES = new Set([
   "browser_status",
   "browser_targets",
+  "browser_target_lease",
   "browser_restart",
   "browser_tabs",
   "browser_snapshot",
@@ -441,6 +446,7 @@ async function invokeTool(spec, args, signal) {
   if (spec.name === "browser_status") {
     if (targetSelectionRequired && args.browserId === undefined && args.acknowledgeBrowserId === undefined) {
       const inventory = await listTargets(client, signal).catch(() => ({ targets: [] }));
+      const health = await readBridgeHealth().catch(() => undefined);
       return {
         connected: false,
         state: "target_required",
@@ -450,6 +456,7 @@ async function invokeTool(spec, args, signal) {
         nextAction: "browser_status",
         recommendation: "select_browser_target",
         error: { code: "TARGET_REQUIRED", message: "The browser connection changed; provide browserId to acknowledge the current target before retrying browser operations." },
+        ...(health === undefined ? {} : { bridgeHealth: health }),
         targets: Array.isArray(inventory?.targets) ? inventory.targets : [],
       };
     }
@@ -460,6 +467,7 @@ async function invokeTool(spec, args, signal) {
     } catch (error) {
       if (["TARGET_REQUIRED", "TARGET_UNAVAILABLE", "TARGET_CONNECTION_CHANGED"].includes(error?.code)) {
         const inventory = await listTargets(client, signal).catch(() => ({ targets: [] }));
+        const health = await readBridgeHealth().catch(() => undefined);
         const code = error.code;
         return {
           connected: false,
@@ -469,8 +477,13 @@ async function invokeTool(spec, args, signal) {
           retryable: code !== "TARGET_CONNECTION_CHANGED",
           nextAction: "browser_status",
           recommendation: code === "TARGET_REQUIRED" ? "select_browser_target" : "refresh_browser_targets",
-          error: { code, message: error.message },
+          error: {
+             code,
+             message: error.message,
+             ...(error?.details === undefined ? {} : { details: error.details }),
+           },
           targets: Array.isArray(inventory?.targets) ? inventory.targets : [],
+         ...(health === undefined ? {} : { bridgeHealth: health }),
         };
       }
       throw error;

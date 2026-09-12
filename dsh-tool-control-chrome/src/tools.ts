@@ -335,6 +335,15 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     method: 'bridge_restart',
   },
   {
+    name: 'browser_target_lease',
+    description: 'Explicitly acquire, release, or inspect a session-scoped lease for a browser target before advanced multi-target control. Ordinary single-target browser operations do not require a lease.',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['acquire', 'release', 'status'] },
+      browserId: { type: 'string', description: 'Browser target id. Required for acquire and release.' },
+    },
+    method: 'target_lease',
+  },
+  {
     name: 'browser_tabs',
     description: 'List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.',
     parameters: EMPTY_PARAMETERS,
@@ -1046,6 +1055,16 @@ function compactBridgeHealth(value: Record<string, unknown>): JsonValue {
       if (value.observability[field] !== undefined) observability[field] = value.observability[field]
     }
     if (isRecord(value.observability.metrics)) observability.metrics = value.observability.metrics
+    if (isRecord(value.observability.targetRecovery)) observability.targetRecovery = value.observability.targetRecovery
+    if (isRecord(value.observability.targetLeases)) observability.targetLeases = value.observability.targetLeases
+    if (Array.isArray(value.observability.recentEvents)) {
+      const eventKeys = ['event', 'at', 'browserId', 'connectionId', 'connectionGeneration', 'previousConnectionId', 'previousConnectionGeneration', 'reason', 'method', 'errorCode'] as const
+      observability.recentEvents = value.observability.recentEvents
+        .filter(isRecord)
+        .filter(event => typeof event.event === 'string' && (event.event.startsWith('target_') || (event.event === 'request_rejected' && typeof event.errorCode === 'string' && event.errorCode.startsWith('TARGET_LEASE'))))
+        .slice(-20)
+        .map(event => Object.fromEntries(eventKeys.filter(key => event[key] !== undefined).map(key => [key, event[key]])))
+    }
     if (Object.keys(observability).length > 0) result.observability = observability
   }
   return asJsonValue(result)
@@ -2415,6 +2434,9 @@ export function registerBrowserTools(
             targets: targetRecords(bridgeHealth),
             bridgeHealth: compactBridgeHealth(bridgeHealth),
           })
+        }
+        if (spec.name === 'browser_target_lease') {
+          return asJsonValue(await bridge.request('target_lease', params, operationSignal))
         }
         if (spec.name === 'browser_cleanup' || spec.name === 'browser_context_reset') {
           const mode = spec.name === 'browser_context_reset' ? 'context' : 'task'

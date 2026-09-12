@@ -731,6 +731,10 @@ async function targetRequiredDetails(session: string): Promise<BrowserTarget[]> 
 async function targetRecoveryResult(session: string, error: unknown): Promise<Record<string, unknown>> {
   const code = bridgeErrorCode(error);
   const targets = code === "TARGET_UNAVAILABLE" || code === "TARGET_CONNECTION_CHANGED" ? await availableTargets(session).catch(() => []) : [];
+  const details = error && typeof error === "object" && "details" in error && error.details && typeof error.details === "object" && !Array.isArray(error.details)
+    ? error.details as Record<string, unknown>
+    : undefined;
+  const bridgeHealth = await bridge.health().catch(() => undefined);
   return {
     connected: false,
     state: code === "TARGET_CONNECTION_CHANGED" ? "target_reconnecting" : "target_unavailable",
@@ -742,8 +746,10 @@ async function targetRecoveryResult(session: string, error: unknown): Promise<Re
     error: {
       code: code ?? "TARGET_UNAVAILABLE",
       message: error instanceof Error ? error.message : String(error),
+      ...(details === undefined ? {} : { details }),
     },
     targets,
+    ...(bridgeHealth === undefined ? {} : { bridgeHealth }),
   };
 }
 
@@ -762,6 +768,7 @@ function targetSelectionRequiredError(targets: BrowserTarget[] = [], staleBrowse
 }
 
 async function targetSelectionRequiredResult(session: string): Promise<Record<string, unknown>> {
+  const bridgeHealth = await bridge.health().catch(() => undefined);
   return {
     connected: false,
     state: "target_required",
@@ -775,6 +782,7 @@ async function targetSelectionRequiredResult(session: string): Promise<Record<st
       message: "The previously selected browser target is unavailable; call browser_status with an explicit browserId before retrying browser operations.",
     },
     targets: await targetRequiredDetails(session).catch(() => []),
+    ...(bridgeHealth === undefined ? {} : { bridgeHealth }),
   };
 }
 
@@ -1199,8 +1207,9 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
       assertCurrent();
       if (bridgeErrorCode(error) === "TARGET_REQUIRED") {
         const targets = await targetRequiredDetails(requestSessionId);
+        const bridgeHealth = await bridge.health().catch(() => undefined);
         assertCurrent();
-        return { connected: false, targetRequired: true, error: { code: "TARGET_REQUIRED", message: "Multiple browser targets are connected; provide browserId to select one." }, targets };
+        return { connected: false, targetRequired: true, error: { code: "TARGET_REQUIRED", message: "Multiple browser targets are connected; provide browserId to select one." }, targets, ...(bridgeHealth === undefined ? {} : { bridgeHealth }) };
       }
       if (bridgeErrorCode(error) === "TARGET_UNAVAILABLE" || bridgeErrorCode(error) === "TARGET_CONNECTION_CHANGED") return targetRecoveryResult(requestSessionId, error);
       throw error;
@@ -1362,6 +1371,24 @@ function registerBrowserTools(pi: ExtensionAPI) {
           targets: targetRecords(inventory),
           ...(health === undefined ? {} : { bridgeHealth: health }),
         });
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  });
+
+  pi.registerTool({
+    executionMode: "sequential",
+    name: "browser_target_lease",
+    label: "Browser Target Lease",
+    description: "Explicitly acquire, release, or inspect a session-scoped lease for a browser target before advanced multi-target control. Ordinary single-target browser operations do not require a lease.",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("acquire"), Type.Literal("release"), Type.Literal("status")]),
+      browserId: Type.Optional(Type.String({ description: "Browser target id. Required for acquire and release." })),
+    }),
+    async execute(_toolCallId, params) {
+      try {
+        return textResult(await bridgeRequest("target_lease", { action: params.action, ...(params.browserId === undefined ? {} : { browserId: params.browserId }), sessionId }));
       } catch (error) {
         return errorResult(error);
       }

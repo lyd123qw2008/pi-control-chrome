@@ -214,7 +214,7 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
         extension.send(JSON.stringify({ type: "response", id: message.id, result: rawSnapshot }));
       }
     });
-    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:compact", profile: "profile-compact", capabilities: { tabIncarnationFence: true } }));
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:compact", profile: "profile-compact", capabilities: { tabIncarnationFence: true, turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }));
     await waitHealthTarget(port, "edge:compact");
     pi = await connect("pi", pair.body.token);
 
@@ -597,6 +597,101 @@ test("bridge routes explicit targets and fences disconnected generations", async
   }
 });
 
+test("bridge enforces session-scoped target leases and invalidates them on target reconnect", async () => {
+  const port = 17800 + Math.floor(Math.random() * 500);
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-target-lease-test-"));
+  const tokenFile = join(temp, "token");
+  const child = spawn(process.execPath, [serverPath, "--port", String(port), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let pi;
+  let first;
+  let second;
+  let replacement;
+  try {
+    await waitHealth(port);
+    const pair = await getJson(port, "/pair");
+    const connect = (role) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}&token=${encodeURIComponent(pair.body.token)}`);
+      socket.once("open", () => resolve(socket));
+      socket.once("error", reject);
+    });
+    const responseFor = (socket, id) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`response timeout for ${id}`)), 3000);
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "response" || message.id !== id) return;
+        clearTimeout(timer);
+        socket.off("message", onMessage);
+        resolve(message);
+      };
+      socket.on("message", onMessage);
+    });
+    const request = (id, method, params = {}, target) => {
+      pi.send(JSON.stringify({ type: "request", id, method, params, ...(target === undefined ? {} : { target }) }));
+      return responseFor(pi, id);
+    };
+    const respondTo = (socket, browserId) => socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "request") socket.send(JSON.stringify({ type: "response", id: message.id, result: { browserId, tabs: [] } }));
+    });
+
+    first = await connect("extension");
+    first.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:profile-a", profile: "profile-a", extensionVersion: "0.5.7", capabilities: { tabIncarnationFence: true, turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }));
+    second = await connect("extension");
+    second.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "chrome", browserId: "chrome:profile-b", profile: "profile-b", extensionVersion: "0.5.7", capabilities: { tabIncarnationFence: true, turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }));
+    respondTo(first, "edge:profile-a");
+    respondTo(second, "chrome:profile-b");
+    await waitHealthTarget(port, "chrome:profile-b");
+    pi = await connect("pi");
+    const health = (await getJson(port, "/health")).body;
+    const targetA = health.targets.find((target) => target.browserId === "edge:profile-a");
+    const targetB = health.targets.find((target) => target.browserId === "chrome:profile-b");
+    const routeA = { browserId: targetA.browserId, connectionId: targetA.connectionId, connectionGeneration: targetA.connectionGeneration };
+    const routeB = { browserId: targetB.browserId, connectionId: targetB.connectionId, connectionGeneration: targetB.connectionGeneration };
+
+    const acquiredA = await request("lease-a", "target_lease", { action: "acquire", browserId: targetA.browserId, sessionId: "session-a" });
+    assert.equal(acquiredA.result.acquired, true);
+    const conflict = await request("lease-conflict", "target_lease", { action: "acquire", browserId: targetA.browserId, sessionId: "session-b" });
+    assert.equal(conflict.error.code, "TARGET_LEASE_CONFLICT");
+    const blocked = await request("lease-blocked", "list_tabs", { sessionId: "session-b" }, routeA);
+    assert.equal(blocked.error.code, "TARGET_LEASE_CONFLICT");
+    const acquiredB = await request("lease-b", "target_lease", { action: "acquire", browserId: targetB.browserId, sessionId: "session-b" });
+    assert.equal(acquiredB.result.acquired, true);
+    const releasedA = await request("lease-release", "target_lease", { action: "release", browserId: targetA.browserId, sessionId: "session-a" });
+    assert.equal(releasedA.result.released, true);
+    const reacquiredA = await request("lease-reacquire", "target_lease", { action: "acquire", browserId: targetA.browserId, sessionId: "session-b" });
+    assert.equal(reacquiredA.result.acquired, true);
+
+    first.close();
+    await waitHealth(port);
+    replacement = await connect("extension");
+    replacement.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:profile-a", profile: "profile-a", extensionVersion: "0.5.7" }));
+    await waitHealthTarget(port, "edge:profile-a");
+    const reconnectedA = (await getJson(port, "/health")).body.targets.find((target) => target.browserId === "edge:profile-a");
+    assert.notEqual(reconnectedA.connectionId, targetA.connectionId);
+    const reacquiredAfterReconnect = await request("lease-after-reconnect", "target_lease", { action: "acquire", browserId: reconnectedA.browserId, sessionId: "session-c" });
+    assert.equal(reacquiredAfterReconnect.result.acquired, true);
+    const observedHealth = (await getJson(port, "/health")).body;
+    assert.ok(observedHealth.observability.metrics.targetLeaseAcquisitions >= 3);
+    assert.ok(observedHealth.observability.metrics.targetLeaseConflicts >= 2);
+    assert.ok(observedHealth.observability.metrics.targetLeaseReleases >= 1);
+    assert.ok(observedHealth.observability.metrics.targetDisconnects >= 1);
+    assert.equal(observedHealth.observability.targetLeases.activeCount, 2);
+    assert.ok(observedHealth.observability.targetRecovery.lastTargetReconnectAt > 0);
+    assert.ok(observedHealth.observability.recentEvents.some((event) => event.event === "target_lease_conflict"));
+    const doctor = await request("lease-doctor", "doctor");
+    assert.ok(doctor.result.notices.some((notice) => notice.code === "target_leases_active"));
+    assert.ok(doctor.result.notices.some((notice) => notice.code === "target_lease_conflicts"));
+  } finally {
+    pi?.close();
+    first?.close();
+    second?.close();
+    replacement?.close();
+    await stopProcess(child);
+    await sleep(100);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test("bridge allows a paired local Host to cooperatively restart its instance", async () => {
   const port = 17800 + Math.floor(Math.random() * 500);
   const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-bridge-restart-test-"));
@@ -825,7 +920,7 @@ test("bridge rejects malformed and duplicate pending request ids", async () => {
     pi.send(JSON.stringify({ type: "request", id: "malformed-response", method: "malformed_probe", params: {} }));
     await malformedForwarded;
     extension.send(JSON.stringify({ type: "response", id: malformedForwardedId }));
-    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:malformed", profile: "malformed", capabilities: { tabIncarnationFence: true } }));
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:malformed", profile: "malformed", capabilities: { tabIncarnationFence: true, turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }));
     await waitHealthTarget(port, "edge:malformed");
     let malformedSideEffectId;
     const malformedSideEffectForwarded = new Promise((resolve) => {
