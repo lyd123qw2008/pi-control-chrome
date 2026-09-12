@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.8 - 2026-09-12
+
+- Add explicit session-scoped `browser_target_lease` acquisition, release, and status operations for opt-in multi-target control; leased target operations fail closed on conflicts, ownership mismatch, disconnect, reconnect, replacement, expiry, or Bridge restart.
+
+- Add bounded Bridge lease and target-recovery observability, including connection/reconnect/disconnect metrics, lease conflict/release/expiry counters, target recovery timestamps, redacted active lease state, Bridge Doctor notices, and sanitized Pi/DSH/Codex recovery diagnostics.
+
+- Add cross-harness lease/recovery contract coverage and isolated multi-Profile browser verification without changing default single-target behavior.
+
 ## 0.5.7 - 2026-09-12
 
 - Add lightweight, explicitly confirmed Bridge restart handling for Pi and align restart recovery metadata across Pi, DSH, and Codex without restarting the browser or closing tabs.
