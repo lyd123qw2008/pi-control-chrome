@@ -155,8 +155,23 @@ function localGet(path, timeoutMs = 2000) {
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-function spawnProcess(command, args) {
-  return spawn(command, args, { stdio: "ignore", windowsHide: true });
+function spawnProcess(command, args, options = {}) {
+  if (options.captureStderr !== true) return spawn(command, args, { stdio: "ignore", windowsHide: true });
+  const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  // The isolated browser is the only component here that reports nothing
+  // through the Bridge, so keep a bounded tail of its stderr: an extension
+  // load failure and a slow handshake are indistinguishable without it.
+  child.diagnostics = [];
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk) => {
+    for (const line of String(chunk).split(/\r?\n/)) {
+      const text = line.trim();
+      if (text.length === 0) continue;
+      child.diagnostics.push(text);
+      if (child.diagnostics.length > 40) child.diagnostics.shift();
+    }
+  });
+  return child;
 }
 
 function isInstalledGoogleChrome(executable) {
@@ -306,10 +321,14 @@ try {
     "--no-default-browser-check",
     "--new-window",
     `http://127.0.0.1:${pagePort}/`,
-  ]);
+  ], { captureStderr: true });
 
+  // Two isolated browsers may cold-start at the same time in the matrix job, so
+  // the handshake budget has to tolerate a contended runner; it still exits as
+  // soon as the extension connects.
+  const handshakeStartedAt = Date.now();
   let health;
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 480; i++) {
     await sleep(250);
     if (edgeProcess.exitCode !== null) throw new Error(`browser process exited before extension handshake; isolated launch may have been delegated (exit=${edgeProcess.exitCode})`);
     try {
@@ -318,9 +337,10 @@ try {
     } catch {}
   }
   if (edgeProcess.exitCode !== null) throw new Error(`browser process exited before extension handshake; isolated launch may have been delegated (exit=${edgeProcess.exitCode})`);
+  const browserDiagnostics = edgeProcess.diagnostics?.length ? `; browser stderr: ${edgeProcess.diagnostics.join(" | ")}` : "";
   assert.equal(health?.extensionConnected, true, `${isInstalledGoogleChrome(browserExecutable)
     ? "Installed Google Chrome ignored command-line unpacked-extension loading (Chrome logged that --disable-extensions-except is not allowed). Use Chrome for Testing for this isolated smoke, or manually load extension/ in chrome://extensions for a normal-profile check."
-    : "extension did not connect"}: ${JSON.stringify(health)}`);
+    : "extension did not connect"} after ${Date.now() - handshakeStartedAt}ms: ${JSON.stringify(health)}${browserDiagnostics}`);
   assert.equal(health.instanceId, bridgeHealth.instanceId);
   assert.equal(health.port, bridgePort);
   await sleep(1500);

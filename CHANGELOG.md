@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make the isolated browser handshake tolerate a contended runner and capture a bounded tail of browser stderr so an extension load failure is distinguishable from a slow handshake.
+
 - Remove a cross-socket ordering race in the cooperative Bridge restart test by waiting for the Bridge to drain pending browser requests before asserting the restart response.
 
 - List the DSH integration package in the community plugin marketplaces by adding the `dsh-plugin` repository topic, matching npm keywords, and the documented `dsh plugin --profile web add` install command.
