@@ -88,9 +88,22 @@ function waitForExit(child, timeoutMs = 5000) {
 async function stopProcess(child) {
   if (!child?.pid) return;
   await new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
     const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-    killer.once("error", resolve);
-    killer.once("close", resolve);
+    killer.once("error", finish);
+    killer.once("close", finish);
+    timer = setTimeout(() => {
+      try { killer.kill(); } catch {}
+      try { child.kill(); } catch {}
+      finish();
+    }, 5_000);
   });
   await waitForExit(child);
 }
@@ -285,14 +298,33 @@ try {
   const unaffectedB = await pi.request("list_tabs", {}, route(targetB));
   assert.equal(unaffectedB.browserId, targetB.browserId);
 
-  browserA = spawnBrowser(profileA, extension, pageUrlA);
-  const reconnectedHealth = await waitFor(
-    async () => (await localGet(bridgePort, "/health")).body,
-    (value) => value.targets?.some((target) => target.browserId === targetA.browserId && target.state === "ready"
-      && target.connectionGeneration > oldGenerationA),
-    "target A reconnection with a new generation",
-    60_000,
-  );
+  // A force-killed browser can keep its --user-data-dir occupied for a moment
+  // after the launcher process exits. A relaunch that lands inside that window
+  // either exits immediately or hands off to the dying instance, so its
+  // extension never connects and the target never returns. Retry the launch
+  // instead of failing the run on the first collision.
+  let reconnectedHealth;
+  let relaunchAttempt = 0;
+  while (true) {
+    relaunchAttempt += 1;
+    browserA = spawnBrowser(profileA, extension, pageUrlA);
+    try {
+      reconnectedHealth = await waitFor(
+        async () => (await localGet(bridgePort, "/health")).body,
+        (value) => value.targets?.some((target) => target.browserId === targetA.browserId && target.state === "ready"
+          && target.connectionGeneration > oldGenerationA),
+        "target A reconnection with a new generation",
+        30_000,
+      );
+      break;
+    } catch (error) {
+      const exited = browserA.exitCode === null ? "" : ` (relaunched process exited with ${browserA.exitCode})`;
+      await stopProcess(browserA);
+      browserA = undefined;
+      if (relaunchAttempt >= 3) throw new Error(`${error.message}${exited}; gave up after ${relaunchAttempt} relaunch attempts`);
+      await sleep(2_000);
+    }
+  }
   const reconnectedA = reconnectedHealth.targets.find((target) => target.browserId === targetA.browserId);
   await assert.rejects(() => pi.request("status", {}, route(targetA)), (error) => error.code === "TARGET_CONNECTION_CHANGED");
   const currentA = await pi.request("status", {}, route(reconnectedA));
