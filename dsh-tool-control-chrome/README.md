@@ -4,7 +4,13 @@ DSH model-facing browser tools backed by the local [`pi-control-chrome`](https:/
 
 ## Installation
 
-Install the DSH package in the active Profile:
+Install the DSH package into the active Profile:
+
+```powershell
+dsh plugin --profile web add @lyd123qw2008/dsh-tool-control-chrome
+```
+
+Or install it with pnpm directly:
 
 ```powershell
 corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.5.8
