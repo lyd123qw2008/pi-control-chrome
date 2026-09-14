@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Remove a cross-socket ordering race in the cooperative Bridge restart test by waiting for the Bridge to drain pending browser requests before asserting the restart response.
+
 - List the DSH integration package in the community plugin marketplaces by adding the `dsh-plugin` repository topic, matching npm keywords, and the documented `dsh plugin --profile web add` install command.
 
 - Harden release publishing with exact-commit CI/Compatibility gates, a real installed-package smoke test, Node 24-compatible Actions, and cancellation of stale push runs.

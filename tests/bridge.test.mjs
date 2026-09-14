@@ -54,6 +54,23 @@ async function waitHealth(port) {
   throw new Error("bridge did not become healthy");
 }
 
+// A restart request is rejected while any browser request is pending or
+// draining. The response that clears it arrives on a different socket than the
+// restart request, and two WebSocket clients have no ordering guarantee between
+// them, so wait for the Bridge itself to drain instead of assuming the response
+// was processed first.
+async function waitBridgeIdle(port) {
+  for (let i = 0; i < 50; i += 1) {
+    try {
+      const result = await getJson(port, "/health");
+      const observability = result.body.observability;
+      if (observability && observability.pendingRequests === 0 && observability.drainingRequests === 0) return observability;
+    } catch {}
+    await sleep(50);
+  }
+  throw new Error("bridge did not drain pending browser requests");
+}
+
 async function waitHealthIdentity(port, browserId) {
   for (let i = 0; i < 50; i += 1) {
     try {
@@ -804,6 +821,7 @@ test("bridge allows a paired local Host to cooperatively restart its instance", 
     });
     assert.equal(blockedRestart.error.code, "BRIDGE_IN_USE");
     extension.send(JSON.stringify({ type: "response", id: forwardedId, result: { ok: true } }));
+    await waitBridgeIdle(port);
 
     const restartId = "restart-local-user";
     const piClosed = new Promise((resolve) => pi.once("close", resolve));
@@ -828,6 +846,7 @@ test("bridge allows a paired local Host to cooperatively restart its instance", 
         },
       }));
     });
+    assert.equal(response.error, undefined, `unexpected restart failure: ${JSON.stringify(response)}`);
     assert.deepEqual(response.result, {
       ok: true,
       restarting: true,
