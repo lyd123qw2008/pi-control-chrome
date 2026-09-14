@@ -4,7 +4,7 @@
 
 - Retry the isolated multi-profile browser relaunch within a bounded budget, because a force-killed browser can still occupy its `--user-data-dir` and strand the extension handshake.
 
-- Declare a `dsh.bundle.patch` manifest and ship `cordis.patch.yml` so `dsh plugin --profile web add` mounts the DSH package automatically instead of requiring a hand-merged Profile patch.
+- Declare a `dsh.bundle.patch` manifest and ship `cordis.patch.yml` so `dsh plugin --profile web add` mounts the DSH package automatically instead of requiring a hand-merged Profile patch; published as `@lyd123qw2008/dsh-tool-control-chrome@0.5.9`.
 
 - Make the isolated browser handshake tolerate a contended runner and capture a bounded tail of browser stderr so an extension load failure is distinguishable from a slow handshake.
 
