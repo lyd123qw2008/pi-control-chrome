@@ -135,7 +135,7 @@ When DSH depends on a new Pi release, use this order:
    ```
 
 3. Merge the Pi PR only after CI passes.
-4. Wait for the post-merge `CI` and `Compatibility and Profile Validation` runs for the exact release commit to pass. The CI gate includes `npm run test:package-install`, which installs the packed npm tarball and imports its exported projection.
+4. Wait for the post-merge `CI` and `Compatibility` runs for the exact release commit to pass. The CI gate includes `npm run test:package-install`, which installs the packed npm tarball and imports its exported projection.
 5. Publish the root package with `publish-pi-control-chrome.yml`, providing `expected_version`. The publish workflow verifies both exact-commit gates, then runs version verification, pack, and npm publish without repeating the full test suite.
 6. Verify the published metadata before touching DSH:
 
@@ -151,7 +151,7 @@ When DSH depends on a new Pi release, use this order:
    corepack pnpm --dir dsh-tool-control-chrome run pack:check
    ```
 
-10. Create and merge the DSH release PR, wait for the post-merge exact-commit `CI` and `Compatibility and Profile Validation` gates, then publish with `publish-dsh-tool-control-chrome.yml`, providing `expected_version`. The workflow verifies both gates, installs dependencies, builds the generated `lib/`, and publishes with scripts disabled so the already-passed tests are not repeated.
+10. Create and merge the DSH release PR, wait for the post-merge exact-commit `CI` and `Compatibility` gates, then publish with `publish-dsh-tool-control-chrome.yml`, providing `expected_version`. The workflow verifies both gates, installs dependencies, builds the generated `lib/`, and publishes with scripts disabled so the already-passed tests are not repeated.
 11. Verify the published DSH metadata:
 
    ```powershell

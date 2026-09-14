@@ -86,7 +86,7 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
 
 ## 发布前置 Gate 与发布 workflow
 
-推送到 `main` 后，`CI` 与 `Compatibility and Profile Validation` 会针对同一个 commit 并行运行。它们是发布的正式验证 Gate：
+推送到 `main` 后，`CI` 与 `Compatibility` 会针对同一个 commit 并行运行。它们是发布的正式验证 Gate：
 
 - `CI`：静态检查、Bridge tests、包内容 dry-run，以及真实安装 npm tarball 的 `test:package-install` smoke test；
 - `Compatibility`：Root Node 22/24、DSH Node 22/24、Chrome/Edge 隔离浏览器 E2E；

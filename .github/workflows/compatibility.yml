@@ -1,4 +1,4 @@
-name: Compatibility and Profile Validation
+name: Compatibility
 
 on:
   push:

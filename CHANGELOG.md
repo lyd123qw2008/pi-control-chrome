@@ -12,7 +12,7 @@
 
 - List the DSH integration package in the community plugin marketplaces by adding the `dsh-plugin` repository topic, matching npm keywords, and the documented `dsh plugin --profile web add` install command.
 
-- Keep the public CI free of private infrastructure: the reusable-Profile compatibility check moved into the private Profile repository's own workflow, so the public build no longer needs a private-repository token and outside contributors get a green build without one.
+- Keep the public CI free of private infrastructure: the reusable-Profile compatibility check moved into the private Profile repository's own workflow, so the public build no longer needs a private-repository token, outside contributors get a green build without one, and the `Compatibility` workflow no longer claims to validate a Profile it never sees.
 
 - Harden release publishing with exact-commit CI/Compatibility gates, a real installed-package smoke test, Node 24-compatible Actions, and cancellation of stale push runs.
 
