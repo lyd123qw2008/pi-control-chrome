@@ -3,11 +3,18 @@
   "version": "0.5.8",
   "description": "DeepSeek Harness browser-control tools backed by the pi-control-chrome local Bridge",
   "keywords": [
+    "dsh-plugin",
     "deepseek-harness",
     "dsh",
     "browser-control",
+    "browser-automation",
     "chrome",
     "edge",
+    "chrome-extension",
+    "edge-extension",
+    "manifest-v3",
+    "mcp",
+    "cdp",
     "pi-control-chrome"
   ],
   "license": "MIT",

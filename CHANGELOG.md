@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- List the DSH integration package in the community plugin marketplaces by adding the `dsh-plugin` repository topic and matching npm keywords.
+
 - Harden release publishing with exact-commit CI/Compatibility gates, a real installed-package smoke test, Node 24-compatible Actions, and cancellation of stale push runs.
 
 - Reduce isolated Chrome/Edge E2E runtime by running browser candidates concurrently and bounding Windows browser/server cleanup.
