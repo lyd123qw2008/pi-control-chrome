@@ -75,16 +75,14 @@
     "test:skill": "node --test tests/skill-script.test.mjs",
     "test:codex": "node --test tests/codex-mcp.test.mjs",
     "test:output": "node --test tests/output-projection.test.mjs",
-    "test:profile": "node --test tests/profile-compatibility.test.mjs",
     "test:stability": "node tests/bridge-stability.mjs",
     "test:package-install": "node tests/package-install-smoke.mjs",
-    "test:ci": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:codex && npm run test:output && npm run test:profile && npm run test:stability",
+    "test:ci": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:codex && npm run test:output && npm run test:stability",
     "test:all": "npm run test:ci && npm run test:skill",
     "bridge": "node bridge/server.mjs",
     "smoke:e2e": "node tests/e2e-browser.mjs",
     "smoke:e2e:matrix": "node tests/e2e-browser-matrix.mjs",
     "smoke:e2e:multi-profile": "node tests/e2e-multi-profile.mjs",
-    "profile:check": "node profile-compatibility.mjs",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {

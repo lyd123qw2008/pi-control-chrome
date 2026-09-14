@@ -89,9 +89,25 @@ if ($literalEscapeCount -ge 2 -and $literalEscapeCount -gt $realLineBreakCount) 
 推送到 `main` 后，`CI` 与 `Compatibility and Profile Validation` 会针对同一个 commit 并行运行。它们是发布的正式验证 Gate：
 
 - `CI`：静态检查、Bridge tests、包内容 dry-run，以及真实安装 npm tarball 的 `test:package-install` smoke test；
-- `Compatibility`：Root Node 22/24、DSH Node 22/24、Chrome/Edge 隔离浏览器 E2E、Profile 当前/回滚校验；
+- `Compatibility`：Root Node 22/24、DSH Node 22/24、Chrome/Edge 隔离浏览器 E2E；
 - 同一个 workflow/ref 的旧 push run 会被新 push 自动取消，避免过期 commit 占用浏览器 runner；
 - `checkout`、`setup-node` 和 `pnpm/action-setup` 使用 Node 24 运行时版本，避免 Actions Node 20 弃用告警。
+
+公开仓库的 CI **不校验私有 Profile**。私有 `dsh-profile-config` 的兼容性由该私有仓库自己的 workflow 负责（见下方“私有 Profile 校验”）。这样公开构建不依赖任何私有仓库或密钥，外部贡献者 fork 后无需额外凭据也能拿到绿色构建。
+
+## 私有 Profile 校验
+
+私有 Profile 的校验归属私有仓库 `lyd123qw2008/dsh-profile-config`，公开仓库不参与：
+
+- 校验脚本 `profile-compatibility.mjs` 与其测试位于该私有仓库，不在本仓库；
+- 该仓库的 `profile-check` workflow 在 Profile 或脚本变更时自动校验 Profile 元数据、lockfile importer、packages/snapshots 条目与 workspace 版本允许列表的一致性；
+- **跨仓库断言**（Profile 固定的插件/根包版本是否等于本次发布的版本）是发布时的显式步骤，在私有仓库执行：
+
+  ```powershell
+  node profile-compatibility.mjs --profile profiles/web --plugin-version <dsh-version> --pi-version <pi-version>
+  ```
+
+这样设计的原因：公开仓库不应当为了判断自己的构建是否通过而访问私有仓库，也不应当把私有仓库的名称、目录结构和版本固定策略暴露给外部贡献者。私有 Profile 的 lockfile 只有在包发布之后才能引用对应版本，因此这项校验天然只能在发布之后、在私有侧执行。
 
 发布 workflow 不再重复执行全量测试。它们会先用 `gh run list` 校验当前 commit 已有成功的 `CI` 和 `Compatibility` run，然后只执行发布所需的轻量步骤：版本校验、必要的 DSH 构建、pack 和 npm publish。发布 workflow 保留 `cancel-in-progress: false`，避免发布过程中被后续 push 中断。
 
@@ -145,13 +161,16 @@ gh release view v<pi-version> --json tagName,targetCommitish,isDraft,isPrereleas
 
 11. 更新同一个 `v<pi-version>` GitHub Release notes，补充 DSH 版本、DSH publish workflow、npm 元数据和 Profile 验证链接；不要为 DSH companion 单独创建一个与根包版本混淆的 `v<dsh-version>` tag。
 12. 在私有 `dsh-profile-config` 仓库中更新 `profiles/web/package.json`、`profiles/web/pnpm-lock.yaml`、`profiles/web/pnpm-workspace.yaml`、`.agent-presets/` 下的自定义 preset composition 和 `preset.yml` 元数据，以及 README 和 bootstrap 相关说明。该仓库的 bootstrap 脚本会从 npm 安装发布包并复制自定义 presets；只更新 active Profile 不会更新新机器的配置源，也不能把这个仓库当作 npm 发布包。
-13. 从 `dsh-profile-config` 的 `profiles/web` 运行安装和依赖解析检查，创建并合并独立的私有 Profile 配置 PR；不要为该仓库触发 npm 发布：
+13. 从 `dsh-profile-config` 的 `profiles/web` 运行安装、依赖解析和 Profile 兼容性检查，创建并合并独立的私有 Profile 配置 PR；不要为该仓库触发 npm 发布：
 
     ```powershell
     corepack pnpm --dir profiles/web install --frozen-lockfile
     corepack pnpm --dir profiles/web list @lyd123qw2008/dsh-tool-control-chrome --depth 0
     corepack pnpm --dir profiles/web why pi-control-chrome
+    node profile-compatibility.mjs --profile profiles/web --plugin-version <dsh-version> --pi-version <pi-version>
     ```
+
+    该私有仓库自带 `profile-check` workflow，会自动校验 Profile 元数据与 lockfile 的一致性；带 `--plugin-version` / `--pi-version` 的跨仓库断言是发布时的额外确认步骤。
 
 14. 配置 PR 合并后，重新 bootstrap 或把配置同步到 `<DSH_HOME>`，再重启 DSH 做运行验证。
 

@@ -176,7 +176,10 @@ The matching GitHub gate and publish workflow must pass. A local `npm pack --dry
    corepack pnpm --dir profiles/web install --frozen-lockfile
    corepack pnpm --dir profiles/web list @lyd123qw2008/dsh-tool-control-chrome --depth 0
    corepack pnpm --dir profiles/web why pi-control-chrome
+   node profile-compatibility.mjs --profile profiles/web --plugin-version <dsh-version> --pi-version <pi-version>
    ```
+
+   The checker and its tests live in this private repository, and its `profile-check` workflow validates Profile metadata and lockfile consistency on every change. The public `pi-control-chrome` repository deliberately does not check the private Profile: its CI must not depend on a private repository or a cross-repository token, because the Profile lockfile cannot reference a package version before that version is published.
 
 6. Create and merge a separate private Profile configuration PR. Do not mix its files into the public `pi-control-chrome` release PR and do not trigger an npm publish for this repository.
 
