@@ -1,0 +1,8 @@
+# Profile patch applied automatically by `dsh plugin --profile web add`.
+# Manual alternative: merge this insert entry into the active Profile's
+# cordis.patch.yml without replacing unrelated entries.
+# The Profile should also include @deepseek-ai/dsh-skill for the model-facing
+# Skill registry and the `skill` tool.
+- insert:
+    - id: tool-control-chrome
+      name: '@lyd123qw2008/dsh-tool-control-chrome'

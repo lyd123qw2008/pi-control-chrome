@@ -26,7 +26,7 @@ Alternatively add it to the Profile's `package.json`:
 }
 ```
 
-Merge the `insert` entry from [`config/cordis.patch.yml.example`](./config/cordis.patch.yml.example) into the active Profile's `cordis.patch.yml`, preserve unrelated patch entries, then install dependencies with a frozen lockfile.
+The package declares a `dsh.bundle.patch`, so `dsh plugin --profile web add` mounts it automatically. When you add it to the Profile's `package.json` by hand instead, merge the `insert` entry from [`cordis.patch.yml`](./cordis.patch.yml) (or the annotated [`config/cordis.patch.yml.example`](./config/cordis.patch.yml.example)) into the active Profile's `cordis.patch.yml`, preserve unrelated patch entries, then install dependencies with a frozen lockfile.
 
 The package is a function plugin. It registers the `pi-control-chrome` Skill when the optional DSH Skill service is present, registers browser tools according to `lazyTools`, and registers the `/chrome` human command; it does not export a default plugin function.
 

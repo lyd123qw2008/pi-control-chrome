@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Declare a `dsh.bundle.patch` manifest and ship `cordis.patch.yml` so `dsh plugin --profile web add` mounts the DSH package automatically instead of requiring a hand-merged Profile patch.
+
 - Make the isolated browser handshake tolerate a contended runner and capture a bounded tail of browser stderr so an extension load failure is distinguishable from a slow handshake.
 
 - Remove a cross-socket ordering race in the cooperative Bridge restart test by waiting for the Bridge to drain pending browser requests before asserting the restart response.

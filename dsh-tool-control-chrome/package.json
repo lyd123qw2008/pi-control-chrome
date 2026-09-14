@@ -35,6 +35,7 @@
   },
   "type": "module",
   "files": [
+    "cordis.patch.yml",
     "config/cordis.patch.yml.example",
     "config/settings.yaml.example",
     "lib/bridge.js",
@@ -64,6 +65,11 @@
       "default": "./lib/invariant.js"
     },
     "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
