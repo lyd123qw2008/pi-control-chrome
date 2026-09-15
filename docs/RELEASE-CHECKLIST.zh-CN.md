@@ -262,6 +262,23 @@ corepack pnpm --dir <DSH_HOME>/profiles/web why pi-control-chrome
 
 扩展 Manifest 版本可能与 npm 根包版本不同，不能单独用扩展显示版本判断根包是否发布成功；必须同时看 Bridge health、Profile 依赖解析和 npm 元数据。
 
+## 三层运行时各自缓存代码（验证前先定位过期层）
+
+同一份源码在三个**独立进程**里各有一份副本，改源码不会改变任何一层的行为。每次验证前必须先确认自己在看哪一层、它是否已经刷新：
+
+| 层 | 承载的代码 | 刷新方式 | 刷新后必须做 |
+| --- | --- | --- | --- |
+| 扩展 service worker | `extension/background.js`、`extension/page-agent.js`、`extension/manifest.json` | `browser_reload_extension({ confirmed: true })`（用户确认后） | 重新 `browser_status` 并确认目标；旧 Tab 句柄的 fence/incarnation 可能变化，必要时重开标签页 |
+| Bridge 进程 | `bridge/server.mjs` 与它 import 的 `pi-extension/output.js` | `browser_restart({ confirmed: true })` | 重新 `browser_status` 并 acknowledge；Bridge 渲染 compact 摘要，**投影层改动必须重启 Bridge 才会生效** |
+| DSH / Pi / Codex 宿主进程 | 宿主的工具层与 `dsh-tool-control-chrome/lib/`（构建产物） | 由维护者手动重启宿主 | 重新加载 `pi-control-chrome` Skill，再确认精简的 `browser_status` 与 `browser_doctor.runtime.fresh` |
+
+判定要点：
+
+- `browser_status.extensionVersion` 反映的是**运行中的** worker，不是磁盘上的 manifest；重载前它可能仍是旧版本号，这不代表发布失败。
+- 宿主重启会重置懒加载的工具目录：`unknown tool "browser_status"` 是 `lazyTools` 的预期表现，先成功调用一次 `pi-control-chrome` Skill 即可恢复，不要把它当成插件损坏。
+- 结构化的错误码需要在**每一层的码表里都存在**才能透出：扩展抛出 → Bridge 透传 → 宿主映射。宿主层遇到码表里没有的码，会把它折进通用兜底（表现为只剩一句 `Error: <message>`，没有 `code`/`nextAction`）。新增错误码时三层都要同步，并用宿主侧的 fixture 测试钉住。
+- 因此"修复没生效"的第一个问题不是"哪里写错了"，而是**哪一层还是旧的**；只改动其中一层就去验证，会把旧层的行为误判成新代码的缺陷。
+
 ## 发布执行约束
 
 后续任何“提交并发布”请求都必须先完成版本矩阵检查，并在执行前明确列出：
