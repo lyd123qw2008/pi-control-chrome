@@ -1,6 +1,6 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.5.9",
+  "version": "0.6.0",
   "description": "Codex-aligned Chrome and Edge browser control for Pi, Codex and DSH",
   "type": "module",
   "exports": {
@@ -83,6 +83,7 @@
     "smoke:e2e": "node tests/e2e-browser.mjs",
     "smoke:e2e:matrix": "node tests/e2e-browser-matrix.mjs",
     "smoke:e2e:multi-profile": "node tests/e2e-multi-profile.mjs",
+    "measure:reads": "node tests/measure-reads.mjs",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
