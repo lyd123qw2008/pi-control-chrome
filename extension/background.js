@@ -7878,7 +7878,6 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
   const timeoutMs = boundedTimeout(params.timeoutMs, 30000, 120000);
   const deadline = Date.now() + timeoutMs;
   let lastTab;
-  let lastUrlMatched = true;
   const assertExpectedIncarnation = async () => {
     if (expectedIncarnation === undefined) return;
     const currentIncarnation = await readTabIncarnation(tabId, expectedFence);
@@ -7900,7 +7899,6 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
     const transitionReady = !transition || (params.state === "url" ? transition.observed === true : transition.completed === true);
     const urlMatches = tabUrlMatches(tab, params);
     lastTab = tab;
-    lastUrlMatched = urlMatches;
     const stateMatches = (params.state === "url" && urlMatches) || (params.state !== "url" && tab.status === "complete" && urlMatches);
     if (transitionReady && stateMatches) {
       const currentTab = await chrome.tabs.get(Number(tabId));
@@ -7918,6 +7916,12 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
     }
     await waitWithSignal(100, signal);
   }
+  // The poll loop may never run with a very small timeout, so read the tab once more before giving up:
+  // the caller needs to know whether the page loaded at another URL even when the deadline expired
+  // immediately. A tab that disappeared in the meantime keeps whatever the loop last observed.
+  const finalTab = await chrome.tabs.get(Number(tabId)).catch(() => undefined);
+  const observedTab = finalTab ?? lastTab;
+  const urlMatched = observedTab === undefined || tabUrlMatches(observedTab, params);
   // A post-effect load wait is the most common place a dispatched navigation ends up uncertain, so
   // its timeout carries the same structured code as the other wait path. Without a code the
   // uncertainty envelope could only say "unknown", leaving the caller no way to tell "the page never
@@ -7928,8 +7932,8 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
   error.details = {
     tabId: Number(tabId),
     state: String(params.state || "load"),
-    ...(params.url === undefined || lastUrlMatched ? {} : { urlMismatch: true }),
-    ...(lastTab?.status === "complete" ? { loaded: true } : {}),
+    ...(params.url === undefined || observedTab === undefined || urlMatched ? {} : { urlMismatch: true }),
+    ...(observedTab?.status === "complete" ? { loaded: true } : {}),
   };
   throw error;
 }
