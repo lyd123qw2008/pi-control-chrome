@@ -669,6 +669,8 @@ function compactResponseToolName(method, params = {}) {
   if (method === "extract") return "browser_extract";
   if (method === "list_tabs") return "browser_tabs";
   if (method === "selected_tab") return "browser_selected";
+  if (method === "console_logs") return "browser_console";
+  if (method === "network_requests") return "browser_network";
   if (method === "dom_cua" && params.action === "get_visible_dom") return "browser_dom_cua";
   return undefined;
 }

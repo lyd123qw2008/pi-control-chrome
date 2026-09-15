@@ -66,6 +66,20 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
 | `recommendation` | `narrow_read` |
 | `nextAction` | 应当用来取回上下文的工具名 |
 
+逐工具的省略与展开（同一契约，2026-09-15 落地）：
+
+| 工具 | 省略计数 | 展开路径 |
+| --- | --- | --- |
+| `browser_snapshot`（页面摘要） | `omitted.regions/controls/fields/characters` | `browser_snapshot({ target })`、`browser_extract({ selector })` |
+| `browser_snapshot`（文本/AX 状态） | `omitted.nodes`、`omitted.characters`、`sourceCharacters` | 同一工具的 `selector` / `maxNodes` |
+| `browser_extract` | `omitted.characters`、`sourceCharacters` | `browser_extract({ selector, maxChars })`、`scope: "log"` + `logMatch` |
+| `browser_console` | `omitted.events`（源侧 `logTotalCount`） | `browser_console({ since: <nextSince> })`、`only: "errors"` |
+| `browser_network` | `omitted.requests`（源侧 `requestTotalCount`） | 游标续读或收窄过滤 |
+| `browser_tabs` | `omittedTabs` | `browser_tabs({ query, limit })` |
+| `browser_accessibility_snapshot`、`browser_evaluate` | **仍是 `truncated` 标志**（见下） | 同一工具收窄参数 |
+
+> 尚未覆盖：`browser_accessibility_snapshot` 的节点/字符省略计数、`browser_evaluate` 的数组项/字段省略计数。两者目前只报 `truncated`（AX 为 `truncated` + `maxNodes`/`maxChars`，evaluate 为 `outputTruncated` + `outputLimits`）。原因是这两条路径的**预算发生在更内层的收集器里**（`normalizeAxNodes` 与 `boundEvaluateValue`），需要在递归裁剪处累计丢弃量后再逐层上抛，属于纯实现工作而非契约缺口；在补齐之前，读者应把 `truncated` 当作"内容不完整"并直接用同一工具收窄参数重读。
+
 展开路径（同一契约递归适用）：
 
 1. `browser_snapshot({ target })` 或 `{ ref }`：把读取范围收窄到该区域，返回**同一形状**的摘要（因此可以逐层深入）。

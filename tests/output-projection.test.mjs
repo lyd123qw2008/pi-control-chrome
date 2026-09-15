@@ -510,6 +510,39 @@ test("Pi tab projection reports a bounded listing as retrievable", () => {  cons
   assert.equal(complete.recommendation, undefined);
 });
 
+test("Pi bounded reads report what a budget dropped and how to retrieve it", () => {
+  // Extract: over-budget prose is retrieved by reading a known subtree, not by widening the read.
+  const extract = compactExtractResult({ content: { text: "x".repeat(200), sourceCharacters: 1200, scope: "body" } }, 200);
+  assert.equal(extract.truncated, true);
+  assert.equal(extract.omitted.characters, 1000);
+  assert.equal(extract.nextAction, "browser_extract");
+  assert.equal(extract.recommendation, "narrow_read");
+  assert.match(extract.recovery, /selector/);
+
+  const whole = compactExtractResult({ content: { text: "short", sourceCharacters: 5 } }, 200);
+  assert.equal(whole.truncated, undefined);
+  assert.equal(whole.omitted, undefined);
+  assert.equal(whole.nextAction, undefined);
+
+  // Console and network listings are retrieved by their cursor instead of by re-reading.
+  const console12 = compactBrowserResult("browser_console", {}, { tabId: 1, logs: [{ text: "a" }], logCount: 1, logTotalCount: 250, logTruncated: true, nextSince: "cursor-2", only: "all" });
+  assert.equal(console12.truncated, true);
+  assert.equal(console12.omitted.events, 249);
+  assert.equal(console12.nextAction, "browser_console");
+  assert.match(console12.recovery, /since/);
+  assert.equal(console12.nextSince, "cursor-2");
+  assert.equal(console12.logs.length, 1);
+
+  const consoleComplete = compactBrowserResult("browser_console", {}, { tabId: 1, logs: [{ text: "a" }], logCount: 1, logTotalCount: 1, logTruncated: false });
+  assert.equal(consoleComplete.truncated, undefined);
+  assert.equal(consoleComplete.omitted, undefined);
+
+  const network = compactBrowserResult("browser_network", {}, { tabId: 1, requests: [{ url: "https://example.test" }], requestCount: 1, requestTotalCount: 40, requestTruncated: true });
+  assert.equal(network.truncated, true);
+  assert.equal(network.omitted.requests, 39);
+  assert.equal(network.nextAction, "browser_network");
+});
+
 const extensionCapabilities = { turnCleanup: true, tabIncarnationFence: true, waitTerminalStates: true, extractLogMatch: true };
 const bridgeHealthFixture = () => ({
   ok: true,

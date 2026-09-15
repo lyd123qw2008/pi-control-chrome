@@ -2196,6 +2196,14 @@ test("console reads support incremental cursors and pageerror filtering", async 
   const all = await fixture.api.handleRequest("console_logs", { tabId: 314, sessionId: "session-test", since: baseline.nextSince, only: "all" });
   assert.equal(all.logs.length, 2);
   assert.equal(typeof all.nextSince, "string");
+  // The source reports how many events the budget considered, so a host can publish an omission
+  // count instead of only a truncation flag.
+  assert.equal(all.logTotalCount, 2);
+  assert.equal(all.logCount, all.logs.length);
+  const bounded = await fixture.api.handleRequest("console_logs", { tabId: 314, sessionId: "session-test", since: baseline.nextSince, only: "all", maxEvents: 1 });
+  assert.equal(bounded.logs.length, 1);
+  assert.equal(bounded.logTotalCount, 2);
+  assert.equal(bounded.logTruncated, true);
 });
 
 test("probe_interaction returns one confirmed action and bounded post-action diagnostics", async () => {

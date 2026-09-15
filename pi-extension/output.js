@@ -116,11 +116,17 @@ function compactStateSnapshot(snapshot, maxChars, maxNodes) {
   const sourceState = text(snapshot.state);
   const state = bounded(sourceState, maxChars);
   const sourceNodeCount = typeof snapshot.nodeCount === "number" && Number.isFinite(snapshot.nodeCount) ? Math.max(0, snapshot.nodeCount) : 0;
+  const truncated = snapshot.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars;
   return {
     state,
     nodeCount: Math.min(sourceNodeCount, maxNodes),
     charCount: state.length,
-    truncated: snapshot.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+    truncated,
+    // The contract wants an omission count, not just a flag: say how much text and how many nodes
+    // the budget dropped, and keep the source size for the same reason.
+    ...(truncated ? { omitted: { ...(sourceNodeCount > maxNodes ? { nodes: sourceNodeCount - Math.min(sourceNodeCount, maxNodes) } : {}), ...(sourceState.length > maxChars ? { characters: sourceState.length - state.length } : {}) } } : {}),
+    ...(truncated ? { nextAction: "browser_snapshot", recommendation: "narrow_read" } : {}),
+    ...(Number.isInteger(snapshot.sourceCharacters) ? { sourceCharacters: snapshot.sourceCharacters } : {}),
   };
 }
 
@@ -439,6 +445,23 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
   };
 }
 
+/**
+ * A bounded read must be retrievable (contract section 2.2): when a budget drops content, report
+ * how much was dropped and name the narrower call that gets it back.
+ */
+function omissionEnvelope({ truncated, omitted, nextAction, recommendation, recovery }) {
+  const counts = Object.fromEntries(Object.entries(omitted || {}).filter(([, value]) => typeof value === "number" && value > 0));
+  const reportTruncation = truncated === true || Object.keys(counts).length > 0;
+  if (!reportTruncation) return {};
+  return {
+    truncated: true,
+    ...(Object.keys(counts).length > 0 ? { omitted: counts } : {}),
+    ...(nextAction === undefined ? {} : { nextAction }),
+    ...(recommendation === undefined ? {} : { recommendation }),
+    ...(recovery === undefined ? {} : { recovery }),
+  };
+}
+
 /** Project extracted page content with one shared text budget. */
 export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
   if (!isRecord(value)) return value;
@@ -447,6 +470,16 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
   const contentText = bounded(content.text, maxChars);
   const remainingChars = Math.max(0, maxChars - contentText.length);
   const contentMarkdown = remainingChars > 0 ? bounded(content.markdown, remainingChars) : "";
+  const sourceCharacters = Number.isInteger(content.sourceCharacters) ? content.sourceCharacters : undefined;
+  const truncated = content.truncated === true || text(content.text).length > maxChars || text(content.markdown).length > remainingChars;
+  // Over-budget prose is retrieved by reading a known subtree, not by widening the whole read.
+  const envelope = omissionEnvelope({
+    truncated,
+    omitted: { characters: sourceCharacters === undefined ? undefined : sourceCharacters - contentText.length },
+    nextAction: "browser_extract",
+    recommendation: "narrow_read",
+    recovery: "Narrow with browser_extract({ selector, maxChars }) on the region you already know, or read one log scope with scope: \"log\" and logMatch.",
+  });
   return {
     ...compactResultEnvelope(value),
     content: {
@@ -459,10 +492,36 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
        ...(content.matchTruncated === true ? { matchTruncated: true } : {}),
       text: contentText,
       markdown: contentMarkdown,
-      ...(content.truncated === true || text(content.text).length > maxChars || text(content.markdown).length > remainingChars ? { truncated: true } : {}),
+      ...(Number.isInteger(content.sourceCharacters) ? { sourceCharacters: content.sourceCharacters } : {}),
+      ...(truncated ? { truncated: true } : {}),
       ...frameProjectionFields(content),
     },
+    ...envelope,
   };
+}
+
+/**
+ * Project a console or network listing. The list stays as bounded as the source made it; what is
+ * added is the omission count and the cursor that retrieves the rest.
+ */
+function compactEventListing(toolName, value) {
+  if (!isRecord(value)) return value;
+  const isConsole = toolName === "browser_console";
+  const entries = isConsole ? value.logs : value.requests;
+  const returned = Array.isArray(entries) ? entries.length : 0;
+  const total = isConsole ? value.logTotalCount : value.requestTotalCount;
+  const truncated = isConsole ? value.logTruncated === true || value.truncated === true : value.requestTruncated === true || value.truncated === true;
+  const omitted = Number.isInteger(total) ? total - returned : undefined;
+  const envelope = omissionEnvelope({
+    truncated,
+    omitted: { [isConsole ? "events" : "requests"]: omitted },
+    nextAction: toolName,
+    recommendation: "narrow_read",
+    recovery: isConsole
+      ? "Continue from the cursor: browser_console({ since: <nextSince> }) reads only newer events, and only: \"errors\" narrows the read."
+      : "Continue from the cursor, or narrow with the network filter, instead of re-reading the whole listing.",
+  });
+  return { ...compactResultEnvelope(value), ...value, ...envelope };
 }
 
 function compactError(value) {
@@ -768,6 +827,7 @@ export function compactBrowserResult(toolName, params = {}, value) {
   const currentSessionId = typeof params.sessionId === "string" && params.sessionId.length > 0 ? params.sessionId : undefined;
   if (toolName === "browser_new_tab") return compactNewTabResult(value, currentSessionId);
   if (toolName === "browser_tabs") return compactTabsResult(value, currentSessionId);
+  if (toolName === "browser_console" || toolName === "browser_network") return compactEventListing(toolName, value);
   if (toolName === "browser_selected" && isRecord(value)) return compactResultEnvelope(value, currentSessionId);
   if (toolName === "browser_dom_cua" && params.action === "get_visible_dom") return compactDomCuaResult(value, maxChars, maxNodes);
   return value;

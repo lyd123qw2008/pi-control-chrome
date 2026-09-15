@@ -251,7 +251,9 @@ function boundedEventCollection(entries, maxChars = 20_000, maxItems = 200) {
     items.push(entry);
     charCount += cost;
   }
-  return { items, charCount, truncated, maxChars, maxItems };
+  // `totalItems` lets a host report how many events the budget dropped instead of only flagging
+  // that something was cut; the cursor (`nextSince`) remains the retrieval path.
+  return { items, charCount, truncated, maxChars, maxItems, totalItems: entries.length };
 }
 
 function appendConsoleEvent(state, event) {
@@ -4361,6 +4363,10 @@ function extractPage(options = {}) {
     text,
     markdown: markdownText,
     maxChars,
+    // The pre-budget size of this read, reported so a host can publish an omission count instead
+    // of only a truncation flag (the value is the whole point of a bounded read's retrieval path).
+    sourceCharacters: selectedText.text.length,
+    sourceMarkdownCharacters: rawMarkdownSource.length,
     truncated: sourceText.length > maxChars || rawMarkdownSource.length > remainingChars || framesTruncated || matchTruncated,
     ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
     ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
@@ -6168,15 +6174,15 @@ function mergeFrameObservation(value, frameInfo, kind, options = {}) {
     const text = bound(rawText, maxChars);
     const remaining = Math.max(0, maxChars - text.length);
     const rawMarkdown = [value.markdown, ...frameInfo.frames.filter((frame) => frame?.readable === true && frame.text).map((frame) => `### Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}\n\n${frame.text}`)].filter(Boolean).join("\n\n");
-    return withFrameFields({ ...value, text, markdown: bound(rawMarkdown, remaining), truncated: value.truncated === true || rawText.length > maxChars || rawMarkdown.length > remaining });
+    return withFrameFields({ ...value, text, markdown: bound(rawMarkdown, remaining), sourceCharacters: rawText.length, sourceMarkdownCharacters: rawMarkdown.length, truncated: value.truncated === true || rawText.length > maxChars || rawMarkdown.length > remaining });
   }
   if (kind === "snapshot") {
     const rawText = [value.text, frameText].filter(Boolean).join("\n\n");
-    return withFrameFields({ ...value, text: bound(rawText, Math.min(8_000, maxChars)), truncated: value.truncated === true || rawText.length > Math.min(8_000, maxChars) });
+    return withFrameFields({ ...value, text: bound(rawText, Math.min(8_000, maxChars)), sourceCharacters: rawText.length, truncated: value.truncated === true || rawText.length > Math.min(8_000, maxChars) });
   }
   if (kind === "dom_cua") {
     const rawState = [value.state, frameText ? `Embedded frames:\n${frameText}` : ""].filter(Boolean).join("\n\n");
-    return withFrameFields({ ...value, state: bound(rawState, maxChars), charCount: Math.min(rawState.length, maxChars), truncated: value.truncated === true || rawState.length > maxChars });
+    return withFrameFields({ ...value, state: bound(rawState, maxChars), charCount: Math.min(rawState.length, maxChars), sourceCharacters: rawState.length, truncated: value.truncated === true || rawState.length > maxChars });
   }
   return withFrameFields(value);
 }
@@ -8962,7 +8968,7 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const state = stateForTab(tab.id);
     const logs = consoleCollectionFor(state, params, expectedFence);
     if (params.clear === true) state.console.length = 0;
-    return { tabId: tab.id, logs: logs.items, logCount: logs.items.length, logCharCount: logs.charCount, logTruncated: logs.truncated, maxLogChars: logs.maxChars, maxLogs: logs.maxItems, only: logs.only, baseline: logs.baseline, nextSince: logs.nextSince, ...(logs.documentChanged ? { documentChanged: true } : {}), ...(logs.sinceInvalid ? { sinceInvalid: true } : {}) };
+    return { tabId: tab.id, logs: logs.items, logCount: logs.items.length, logTotalCount: logs.totalItems, logCharCount: logs.charCount, logTruncated: logs.truncated, maxLogChars: logs.maxChars, maxLogs: logs.maxItems, only: logs.only, baseline: logs.baseline, nextSince: logs.nextSince, ...(logs.documentChanged ? { documentChanged: true } : {}), ...(logs.sinceInvalid ? { sinceInvalid: true } : {}) };
   }
   if (method === "network_requests") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
@@ -8972,7 +8978,7 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     const state = stateForTab(tab.id);
     const requests = boundedEventCollection(state.network);
     if (params.clear === true) state.network.length = 0;
-    return { tabId: tab.id, requests: requests.items, requestCount: requests.items.length, requestCharCount: requests.charCount, requestTruncated: requests.truncated, maxRequestChars: requests.maxChars, maxRequests: requests.maxItems };
+    return { tabId: tab.id, requests: requests.items, requestCount: requests.items.length, requestTotalCount: requests.totalItems, requestCharCount: requests.charCount, requestTruncated: requests.truncated, maxRequestChars: requests.maxChars, maxRequests: requests.maxItems };
   }
   if (method === "network_response_body") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));

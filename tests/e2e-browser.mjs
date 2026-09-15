@@ -909,6 +909,15 @@ try {
     assert.ok(snapshot.snapshot.omitted?.controls > 0, "a bounded digest reports its omitted controls");
     assert.equal(snapshot.snapshot.nextAction, "browser_snapshot");
     assert.equal(snapshot.snapshot.recommendation, "narrow_read");
+    // The same discipline applies to a text read: the source size is reported and the retrieval
+    // path is the narrow selector read, not a wider one.
+    const bulkExtract = await request("extract", { tabId: archetypeTabs.get("bulk"), maxChars: 200, responseMode: "compact" });
+    assert.equal(bulkExtract.content.truncated, true);
+    assert.ok(bulkExtract.content.sourceCharacters > 200, "a budgeted extract reports the source size");
+    assert.ok(bulkExtract.omitted?.characters > 0, "a budgeted extract reports the dropped characters");
+    assert.equal(bulkExtract.nextAction, "browser_extract");
+    assert.equal(bulkExtract.recommendation, "narrow_read");
+    assert.match(bulkExtract.recovery, /selector/);
   }
 
   {
