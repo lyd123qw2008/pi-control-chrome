@@ -157,25 +157,25 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
 - 矩阵载体：`tests/e2e-browser.mjs` 提供 `/archetype/<kind>` 六类独立原型页，逐类断言上面的不变量——`landmark`（landmark 容器/重复链接计数/确定性/scoped 读回）、`wrapper`（冗余包装只列一次）、`data`（声明对可长、推断对须短且非句子）、`secrets`（凭据与内联脚本不进上下文）、`bulk`（`omitted` + `narrow_read` 可检索）、`hostile`（重复 id、120 层嵌套、20k 文本仍须有界）。新增摘要规则时先加一格原型，再改规则。
 - 真实页面读数：`npm run measure:reads -- <build-tab-id> <console-tab-id>` 在真实页面上只读地对比"线上字节数 vs 投影后模型可见字节数"，并等 Bridge 排空后再测（`tests/measure-reads.mjs`，只打印尺寸不打印载荷）。
 
-实测样例（真实 Jenkins 构建页 `#701` 与控制台页，只读，2026-09-15）：
+实测样例（真实 Jenkins 构建页 `#708` 与控制台页，只读，2026-09-15，`branch=dev`、`Finished: SUCCESS`）：
 
 | 读法 | 线上字节 | 模型可见字节 | 耗时 |
 | --- | --- | --- | --- |
-| `browser_status` | 1140 | **395** | 3 ms |
-| 中性摘要 `browser_snapshot`（pageMap compact） | 4443 | **3952** | 179 ms |
-| 旧式整页语义读（未投影） | 37175 | 7389 | 151 ms |
-| 定向 `browser_extract #main-panel`（600 字符上限） | 1623 | 1623 | 35 ms |
-| 控制台 `logMatch "Finished"`（300 字符上限） | 1598 | **1421** | 42 ms |
-| 控制台整页读（compact 12k 预算） | 13326 | 13149 | 40 ms |
+| `browser_status` | 1140 | **395** | 4 ms |
+| 中性摘要 `browser_snapshot`（pageMap compact） | 4631 | **4461** | 180 ms |
+| 旧式整页语义读（未投影） | 37083 | 7531 | 236 ms |
+| 定向 `browser_extract #main-panel`（600 字符上限） | 1829 | 1829 | 61 ms |
+| 控制台 `logMatch "Finished"`（300 字符上限） | 1708 | **1969** | 148 ms |
+| 控制台整页读（compact 12k 预算） | 13817 | 13686 | 37 ms |
 
-同一个"构建是否成功、修订号/分支/耗时是多少"的验证问题：**旧路径**（status + 未投影整页读 + 控制台全文）约 21.1 KB；**新路径**（status + 中性摘要 + 定向读 + `logMatch`）约 7.4 KB；**最省路径**（status + 定向读 + `logMatch`）约 3.4 KB。整页 `snapshot` 的**线上**载荷也从 37 KB 降到 4.4 KB——中性摘要同时省了扩展/桥接传输。注意上表全部是只读调用，且"旧式整页读"在页面复杂时会显著变慢（一次实测在排空残留请求时达到 100 s 量级），这也是有界读的价值之一。
+> 测量脚本会在 Bridge 已投影的 compact 响应上再套一次宿主投影，也就是它量的是**两跳**路径：因此 `logMatch` 这一行的"模型可见字节"会略大于线上字节（第二跳补上 `sourceCharacters`/`resolvedScope` 等字段），而 `browser_status`/摘要这类单跳读法仍显著小于线上。摘要比修复前多 ~300 字节，正是省略计数从空对象变成真实数字的代价。
 
-整个**验证流程**的对比（`npm run measure:flow -- <detail-tab> <log-url> [selector] [terminalMatch]`，同一天、同一构建 #701、只读）：
+整个**验证流程**的对比（`npm run measure:flow -- <detail-tab> <log-url> [selector] [terminalMatch]`，同一天、同一构建 #708、只读）：
 
 | 流程 | 调用次数 | 模型可见字节 |
 | --- | --- | --- |
-| 穷举式：status + 未投影整页读 + 整页文本 + 整页日志 | 4 | 29,271 |
-| 有界式：status + 中性摘要 + 定向区域读 + 日志 `logMatch`（终态 + 失败证据） | 5 | 9,748（**0.33×**） |
-| 有界式但省略"先看一眼摘要"（已知页面结构时） | 4 | 5,719（**0.20×**） |
+| 穷举式：status + 未投影整页读 + 整页文本 + 整页日志 | 4 | 29,627 |
+| 有界式：status + 中性摘要 + 定向区域读 + 日志 `logMatch`（终态 + 失败证据） | 5 | 10,040（**0.34×**） |
+| 有界式但省略"先看一眼摘要"（已知页面结构时） | 4 | 5,579（**0.19×**） |
 
 有界式多花一次往返（证据分两次取：终态行 + 失败证据），换来 3 倍字节下降；如果调用的 Skill 已经知道页面结构，直接定向读可以做到 4 次调用、5 倍字节下降。
