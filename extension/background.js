@@ -1899,14 +1899,15 @@ async function ownedTabForSession(tabId, sessionId, action, required = false, al
     if (required) throw new Error(`Cannot ${action} tab ${tabId}; it is not owned by an Agent session`);
     return undefined;
   }
-  if (record.runtimeId !== runtimeInstanceIdentity) {
+  const inherited = record.runtimeId !== runtimeInstanceIdentity;
+  if (inherited) {
     const refusal = inheritedRuntimeRefusal(record, action, tabId);
     if (refusal) throw refusal;
   }
   if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another browser target`);
   if (record.sessionId !== sessionKey(sessionId) && !allowOtherSession) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another Agent session`);
   try {
-    await assertOwnedTabFence(record, action);
+    if (!inherited) await assertOwnedTabFence(record, action);
   } catch (error) {
     if (action === "release" && error?.code === "BROWSER_TAB_CLOSED") return record;
     throw error;
@@ -2443,10 +2444,14 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (lifecycleTombstone) throw uncertainBrowserOperationError("tab lookup", { tabId: tab.id, removalPending: true });
   const record = owned[targetStateKey(tab.id)];
   if (record) {
-    if (record.runtimeId !== runtimeInstanceIdentity && !allowInheritedAgentRecord) throw inheritedRuntimeTabError("use", tab.id, record);
+    // An inherited record has no verifiable fence by definition, so the fence check only applies to a
+    // record this runtime wrote. The actions that may cross the generation establish identity by tabId
+    // plus this session's own ownership record instead.
+    const inherited = record.runtimeId !== runtimeInstanceIdentity;
+    if (inherited && !allowInheritedAgentRecord) throw inheritedRuntimeTabError("use", tab.id, record);
     if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw browserTargetMismatchError(record.browserId);
     if (record.sessionId !== sessionKey(requestSessionId) && !allowCrossSessionRead) throw new Error(`Cannot use tab ${tab.id}; it belongs to another Agent session`);
-    await assertOwnedTabFence(record, "use");
+    if (!inherited) await assertOwnedTabFence(record, "use");
     if (explicitTabId !== undefined && !allowRecordedSnapshotChange && !hasCompleteNestedHandle && record.owner === "claimed") {
       // A claimed tab's title is user-visible metadata, not document identity. Users and
       // sites commonly update it while Agent work continues in the same document.
@@ -8307,10 +8312,12 @@ async function cleanup(params) {
       if (record.browserId !== undefined && record.browserId !== targetId) continue;
       if (record.sessionId !== sessionId) continue;
       const tabId = recordTabId(record, key);
-      if (record.runtimeId !== runtimeInstanceIdentity && record.owner !== "agent") {
+      const inherited = record.runtimeId !== runtimeInstanceIdentity;
+      if (inherited && record.owner !== "agent") {
         // A claimed user tab was authorised by a document identity this runtime cannot re-verify, so
-        // it stays quarantined for manual review. A tab this session opened is different: its fence is
-        // persisted per tab, so the normal release/close handling below still applies.
+        // it stays quarantined for manual review. A tab this session opened is different: it is
+        // identified by its tabId plus this session's own record, so the normal handling below applies
+        // with the fence this runtime can actually observe.
         if (recoverStale) {
           recovered.push(tabId);
           delete owned[key];
@@ -8319,6 +8326,7 @@ async function cleanup(params) {
         }
         continue;
       }
+      const liveFence = inherited ? await tabFenceFor(tabId, true) : record.tabFence;
       const activeReplacement = tabRemovalTombstones.get(runtimeStateKey(tabId));
       if (activeReplacement?.replaced === true && Number(activeReplacement.addedTabId) >= 0) {
         if (!activeReplacement.removedRecord) activeReplacement.removedRecord = { ...record };
@@ -8339,7 +8347,9 @@ async function cleanup(params) {
         continue;
       }
       try {
-        await assertOwnedTabFence(record, "cleanup");
+        // An inherited record carries a fence this runtime cannot reproduce, so the tab this session
+        // opened is closed by its tabId under the fence currently observed for it.
+        if (!inherited) await assertOwnedTabFence(record, "cleanup");
       } catch (error) {
         if (recoverStale && isRecoverableStaleOwnershipError(error)) {
           recovered.push(tabId);
@@ -8365,8 +8375,8 @@ async function cleanup(params) {
       if (!removable) continue;
       try {
         await chrome.tabs.get(tabId);
-        await assertOwnedTabFence(record, "close");
-        await removeTabWithFence(tabId, record.tabFence, "cleanup");
+        if (!inherited) await assertOwnedTabFence(record, "close");
+        await removeTabWithFence(tabId, liveFence, "cleanup");
         removed.push(tabId);
         delete owned[key];
       } catch (error) {

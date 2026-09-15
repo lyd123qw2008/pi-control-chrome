@@ -831,7 +831,8 @@ test("a tab inherited from an earlier runtime stays closable and refuses documen
   const inherited = { ...record(360), runtimeId: "old-runtime" };
   fixture.tabs.set(360, { id: 360, windowId: 1, title: "inherited", url: "https://example.test/inherited", status: "complete" });
   fixture.storage[ownedTabsKey] = { version: 3, records: { "edge:test-extension:profile-id::360": inherited } };
-  fixture.storage[tabFencesKey] = { "test-extension::360": inherited.tabFence };
+  // No fence token is registered for this tab, which is what a replaced extension runtime looks
+  // like: the record still carries its own fence, and this runtime can only observe a new one.
 
   // Document-bound work cannot vouch for its own identity after a runtime change, so it fails closed
   // with a code and the exit that works instead of a bare message the caller cannot act on.
@@ -852,7 +853,8 @@ test("a tab inherited from an earlier runtime stays closable and refuses documen
   );
   assert.equal(fixture.tabs.has(360), true);
 
-  // Closing a tab this session opened is its own bookkeeping, so it crosses the generation.
+  // Closing a tab this session opened is its own bookkeeping and does not need the recorded fence,
+  // so it crosses the generation even when that fence cannot be reproduced.
   const closed = await fixture.api.handleRequest("close_tab", { tabId: 360, sessionId: "session-test" });
   assert.equal(closed.closed, 360);
   assert.equal(fixture.tabs.has(360), false);
