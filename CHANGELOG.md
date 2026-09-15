@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Stop publishing nonsense from a table's shape. Reading a real build page published `w: Description · %` and `x: x` as structured data: the declared-pair path took any row with two or more cells and paired the first cell with the rest, so a chart legend's header row became a `label: value` pair and a single-character placeholder cell became a field name. A row that is entirely header cells (`th`/`role=columnheader`) or lives in a `<thead>` is now skipped, because column names are not data, and a label must be at least two characters, because a one-character cell is a coordinate or placeholder. A real row-header pair (`<th>Label</th><td>Value</td>`) still publishes, and the archetype fixture pins all three cases.
+
 - Name the reason a post-effect wait failed instead of leaving a dispatched navigation unexplained. `waitForTabState` threw a code-less `Error` on timeout while the other wait path already reported a structured `BROWSER_WAIT_TIMEOUT`, and the uncertainty envelope can only forward a failure that carries a code — so a `navigate(wait: true)` whose page never reached the requested URL came back as `BROWSER_OPERATION_UNCERTAIN` with `actionState: unknown` and no reason at all (observed live: a Jenkins `/git` URL the server redirects to `/git/`). The timeout now carries `BROWSER_WAIT_TIMEOUT`, and a navigation wait that finished at another URL adds `postEffectUrlMismatch` with `postEffectLoaded`, so a server redirect is distinguishable from a changed tab fence before the inspection. The page's own URL and title stay out of the envelope.
 
 ## 0.6.0 - 2026-09-15

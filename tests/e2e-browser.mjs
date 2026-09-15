@@ -351,6 +351,10 @@ const archetypePage = (kind) => {
       "<p>Note: the deployment finished successfully and the log was archived.</p>",
       `<table id="data-table"><tr><th>Change summary</th><td>${"change-".repeat(25)}</td></tr></table>`,
       `<dl id="data-terms"><dt>Operator note</dt><dd>${"b".repeat(150)}</dd></dl>`,
+      // Shapes copied from a real build page that published nonsense: a chart legend's header row
+      // (column names are not a label/value pair) and a row whose cells are single-character
+      // placeholders. A real row-header pair must keep working.
+      "<table id=\"data-legend\"><thead><tr><th>W</th><th>Description</th><th>%</th></tr></thead><tbody><tr><td>x</td><td>x</td></tr><tr><th>Row label</th><td>row-value-77</td></tr></tbody></table>",
       "</main>",
       // A nested id container and the table inside it both carry the same declared pair: the
       // document-order-first region publishes it and the descendant must not repeat it.
@@ -888,6 +892,12 @@ try {
     assert.doesNotMatch(values, /the deployment finished successfully/, "prose must not become a value");
     assert.doesNotMatch(values, /summary=aaaa/, "an oversized inferred value must be rejected");
     assert.ok(values.indexOf("change summary=") < values.indexOf("revision="), "declared pairs precede inferred pairs");
+    // Named shapes from a real page: column headers and single-character placeholder cells are not
+    // data, while a row-header pair on the same table still is.
+    assert.match(values, /row label=row-value-77/, "a row-header pair is still declared data");
+    assert.doesNotMatch(values, /description/, "a header row must not be read as a label/value pair");
+    assert.doesNotMatch(values, /(^|[^a-z])x=x($|[^a-z])/, "a one-character placeholder cell is not a field");
+    assert.doesNotMatch(values, /w=/, "a header row must not invent a label from its first column");
     const nested = state.match(/nested fact=nested-value-1234/g) ?? [];
     assert.equal(nested.length, 1, `a nested region must not repeat its ancestor's pair, saw ${nested.length}`);
   }

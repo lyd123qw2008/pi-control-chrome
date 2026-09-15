@@ -3941,7 +3941,9 @@ function collectSnapshot(options = {}) {
     const put = (label, value, origin) => {
       const normalizedLabel = normalize(label).toLowerCase().replace(/\s+/g, " ");
       const normalizedValue = normalize(value);
-      if (!normalizedLabel || normalizedLabel.length > METADATA_LIMITS.labelCharacters || !/[a-z]/.test(normalizedLabel)) return;
+      // A one-character cell is a grid coordinate or a layout placeholder, not a field name: a build
+      // table that renders a placeholder cell used to publish `x: x` as structured data.
+      if (normalizedLabel.length < 2 || normalizedLabel.length > METADATA_LIMITS.labelCharacters || !/[a-z]/.test(normalizedLabel)) return;
       // A prose line such as "- confirmed: the plugin ... node_modules." renders a colon but is
       // not a data pair: a term-like label carries no sentence punctuation.
       if (LABEL_PUNCTUATION.test(normalizedLabel)) return;
@@ -3969,8 +3971,14 @@ function collectSnapshot(options = {}) {
       }
       try {
         for (const row of Array.from(source.querySelectorAll("tr,[role='row']")).slice(0, METADATA_LIMITS.rows)) {
-          const cells = Array.from(row.querySelectorAll("th,td,[role='cell'],[role='gridcell']")).map(textOf).filter(Boolean);
-          if (cells.length >= 2) put(cells[0], cells.slice(1).join(" · "), "declared");
+          // A header row declares column names, so pairing its first cell with the rest invents data
+          // (a chart legend's `W | Description | %` published `w: Description · %`). A row-header pair
+          // (`<th>Label</th><td>Value</td>`) is still data, because only its first cell is a header.
+          const cells = Array.from(row.querySelectorAll("th,td,[role='cell'],[role='gridcell']"))
+            .map((cell) => ({ text: textOf(cell), header: cell.tagName === "TH" || cell.getAttribute("role") === "columnheader" }))
+            .filter((cell) => Boolean(cell.text));
+          if (cells.length === 0 || cells.every((cell) => cell.header) || row.closest("thead") !== null) continue;
+          if (cells.length >= 2) put(cells[0].text, cells.slice(1).map((cell) => cell.text).join(" · "), "declared");
         }
       } catch {
         // Ignore one inaccessible table while retaining text metadata.
