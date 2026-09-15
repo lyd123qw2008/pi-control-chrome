@@ -172,6 +172,7 @@ This requests a unique temporary `--user-data-dir` rather than the normal user p
 4. **Agent tabs are reclaimable.** Agent-created tabs carry ownership and session metadata and are cleaned up according to lifecycle policy.
 5. **Chrome and Edge share one implementation.** The extension uses Manifest V3 and capability detection.
 6. **Observable behavior is aligned without copying private Codex runtime code.** Pi uses its own Bridge protocol and Extension API.
+7. **Capability layer, not a site adapter.** The plugin understands page structure, identity, safety boundaries, and generic primitives; a product's DOM, workflow, and field names belong to the calling Skill. See [Capability layer and personalization layer](./ARCHITECTURE.md#capability-layer-and-personalization-layer).
 
 ## Documentation
 

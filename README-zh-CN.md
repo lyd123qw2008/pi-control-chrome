@@ -15,8 +15,8 @@
 
 - [功能对齐清单](./FEATURES.md)
 - [Codex 默认行为对齐说明](./CODEX-ALIGNMENT.zh-CN.md)
-- [项目决策](./DECISIONS.zh-CN.md)
-- [中文架构说明](./ARCHITECTURE.zh-CN.md)
+- [项目决策](./DECISIONS.zh-CN.md)（第 10 节：能力层与个性化层边界）
+- [中文架构说明](./ARCHITECTURE.zh-CN.md)（六点五：能力层与个性化层边界）
 - [英文架构说明](./ARCHITECTURE.md)
 - [变更记录](./CHANGELOG.md)
 - [发布与依赖更新检查清单](./docs/RELEASE-CHECKLIST.zh-CN.md)

@@ -71,6 +71,31 @@ Debugger attachment records include browser id, tab fence, attach epoch, and CDP
 
 The extension serializes ownership mutations and tracks create flights, completion markers, removal intents, and lifecycle tombstones. A `tabs.onCreated` event that arrives before reservation setup is reconciled only when its tab id, window, URL, event sequence, and active create flight agree. Replaced tabs transfer ownership only after old and new fences, stable tab metadata, document identity, and replacement epoch agree. Chrome does not provide an authoritative creation token or atomic incarnation-qualified numeric removal API, so unresolved ambiguity fails closed and is surfaced for inspection.
 
+## Capability layer and personalization layer
+
+This distribution is a capability layer. It knows page *structure* and how to observe or act on a page safely; it deliberately knows nothing about any product's field names, status vocabulary, or layout. Site-specific handling belongs to the calling Skill, which composes it from the generic primitives.
+
+| Concern | Owner | Examples |
+| --- | --- | --- |
+| Page structure | Capability layer | landmarks, headings, primary page object, utility/boilerplate demotion, secondary regions, key actions, truncation flags |
+| Identity, safety, lifecycle | Capability layer | `browserId` / `tabFence` / `incarnation` / `snapshotId`, tab ownership and leases, cleanup, capability advertisement, extension self-reload, no automatic replay of uncertain side effects |
+| Generic primitives | Capability layer | wait states including caller-supplied terminal text sets, extract scopes with `tail` and `logMatch`, `evaluate`, CDP, Console, Network, Dialog, Upload, Download, Clipboard |
+| Site-agnostic data | Capability layer | rendered-text-only page map, bounded `label: value` pairs, ARIA status regions, redaction of secret-labelled lines |
+| A site's DOM shape | Personalization layer (Skill) | selectors, field names, status vocabulary, layout specifics |
+| A site's workflow | Personalization layer (Skill) | step ordering, trigger de-duplication, retry policy, evidence contract, reporting |
+| Domain parsing | Personalization layer (Skill) | build number, revision, branch, node, duration, or result for a CI page, and the equivalents on any other product page |
+
+Rules:
+
+1. If a site fact can be carried by a caller-supplied literal or a caller-authored page script, it stays out of the plugin.
+2. A site fact enters the plugin only after it generalizes to a *structural* principle that holds for unrelated page archetypes — for example "search, header, footer, breadcrumb, pagination, sidebars, and per-row history controls are utility regions or lists, never the primary object". A product name, a site URL, or a site selector never does.
+3. Site logic lives in the Skill that owns the workflow: read-only, bounded, self-contained, and documented with its field contract next to that workflow.
+4. When the plugin's structural output is wrong for a site, fix the generic ranking or noise rule and add an archetype fixture; do not add a site special case.
+5. Tests follow the same split. Plugin tests assert generic invariants over synthetic archetypes (landmark-free shell, `<main>` application, business page, log pane, hostile page). The owning Skill asserts its own domain fields.
+6. Capability advertisement is the enforcement point: the plugin exposes primitives such as `waitTerminalStates` and `extractLogMatch` so it never has to recognize a product's terminal strings itself, and a stale runtime is rejected instead of silently degrading.
+
+A review that adds a product name, a site URL, a site selector, or a domain field name to `extension/`, `bridge/`, or a host adapter is out of scope by default; move that logic to the calling Skill.
+
 ## Trusted local mode (v1)
 
 The initial extension installation and local pairing are the only user-facing trust boundary. Normal browser operations reuse the paired session and do not ask for shell authorization or browser-action confirmation.

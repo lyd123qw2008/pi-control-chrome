@@ -238,6 +238,32 @@ dsh.debug.raw-cdp
 
 一旦某个私有能力被用户稳定调用，它就已经成为公开 API，需要版本、文档、权限和兼容承诺。
 
+### 5.5 站点个性化留在 Skill 层
+
+上面判断的是"哪些能力进入共享能力契约"。对**单个站点**还有一个更严格的边界：共享层与浏览器插件是**能力层**，只理解页面结构和安全控制；站点 DOM、站点流程和领域字段属于**个性化层**，由调用方 Skill 负责。
+
+| 关注点 | 归属 | 说明 |
+| --- | --- | --- |
+| 页面结构、身份与安全、通用原语、站点无关数据 | 能力层 | landmark/主对象/工具区降权、`tabFence`/`incarnation`/`snapshotId`、wait/extract/evaluate/CDP、渲染文本与有界 `label: value` |
+| 站点 DOM 形状（选择器、字段名、状态词表、布局） | 个性化层 | 由 Skill 用 `browser_evaluate`、`browser_extract({ selector })`、`textAny`/`failureTextAny`、`logMatch` 组合 |
+| 站点流程（步骤顺序、去重、重试、证据契约、汇报） | 个性化层 | 由拥有该流程的 Skill 编排 |
+| 领域字段解析（build/revision/branch/node/duration/result 等） | 个性化层 | Skill 自带的只读页面脚本，并记录字段契约 |
+
+```text
+判断顺序：
+  这个事实是页面结构/安全/通用原语吗？        → 进能力层
+  它能上升为对多种页面原型成立的结构原则吗？  → 进能力层（并补原型用例）
+  否则                                      → 留在拥有该流程的 Skill
+```
+
+三条硬性约束：
+
+- 产品名、站点 URL、站点选择器、领域字段名不进入 `extension/`、`bridge/` 和宿主适配器。
+- 插件对某站点结构输出不正确时，修通用排序/降噪规则并补原型用例，不加站点特例。
+- 能力声明是强制点：插件通过 `waitTerminalStates`、`extractLogMatch` 这类原语暴露能力，因此不需要自己识别产品终态字符串；陈旧运行时被拒绝而不是静默降级。
+
+该边界的完整描述见 [`../ARCHITECTURE.zh-CN.md`](../ARCHITECTURE.zh-CN.md) 的"六点五、能力层与个性化层边界"，模型侧调用约定见 [`../skills/pi-control-chrome/references/workflows.md`](../skills/pi-control-chrome/references/workflows.md)。
+
 ## 6. Skill 驱动模型
 
 ### 6.1 Skill 负责控制，不负责执行

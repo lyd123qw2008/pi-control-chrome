@@ -38,6 +38,18 @@ Before any version bump, release commit, pull request, merge, npm publication, o
 
 The Pi and DSH packages are published from GitHub Actions, not from a local npm login. The existing workflows are [`Publish Pi Control Chrome`](.github/workflows/publish-pi-control-chrome.yml) and [`Publish DSH Chrome Control Package`](.github/workflows/publish-dsh-tool-control-chrome.yml); do not create a second npm publishing workflow. Verify each result with `npm view <package>@<version> version dist-tags dependencies --json`. Update the active DSH Profile only after the npm package is visible, inspect and correct any old `pi-control-chrome` override, install with a frozen lockfile when appropriate, and restart DSH before runtime verification. The npm packages must have these GitHub workflows configured as their npm Trusted Publishers; the workflows use the `id-token: write` permission.
 
+## Plugin scope: capability layer, not a site adapter
+
+This package is the capability layer: page structure, identity and safety boundaries, and generic primitives (waits, extraction, log matching, evaluate, CDP, tab and browser ownership). Site-specific knowledge belongs to the calling Skill.
+
+- Do not add a product name, a site URL, a site selector, or a domain field name (build/revision/branch/status vocabulary, host or image patterns, and similar) to `extension/`, `bridge/`, the Pi/Codex adapters, or the DSH package. Put that logic in the Skill that owns the workflow, as a read-only bounded page script or a typed `selector` extract.
+- A behavior may enter the plugin only when it generalizes to a structural principle that holds for unrelated page archetypes, for example "search, header, footer, breadcrumb, pagination, sidebars, and per-row history controls are utilities or lists, never the primary object".
+- When the plugin's structural output is wrong for a specific site, fix the generic ranking or noise rule and add an archetype fixture (landmark-free shell, `<main>` application, business page, log pane, hostile page). Do not add a site special case.
+- Prefer caller-supplied literals over plugin-side inference: the plugin exposes primitives such as `waitTerminalStates` and `extractLogMatch` so it never needs to recognize a product's terminal strings itself, and it advertises capabilities so a stale runtime is rejected instead of silently degrading.
+- Keep plugin tests on generic invariants; assert domain fields in the Skill that owns them.
+
+The full boundary is documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md) (see "Capability layer and personalization layer") and [`DECISIONS.zh-CN.md`](./DECISIONS.zh-CN.md) (section 10).
+
 ## Pull requests
 
 Keep changes focused, explain user-visible behavior, and include the commands used for verification. Changes to browser permissions, tab ownership, cleanup, or Bridge authentication should include a regression test.

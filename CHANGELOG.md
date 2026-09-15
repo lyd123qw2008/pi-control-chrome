@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Give all three host adapters one diagnostic contract instead of three implementations: `pi-extension/output.js` now owns `compactDoctorResult`, `compactBridgeHealth`, `capabilityRuntime` and `runtimeDiagnosis`, and Pi, DSH and Codex project through them. `browser_doctor` prints the extension capability map exactly once (inside `runtime.capabilities`), keeps Bridge health with its target inventory and observability, and stops repeating identity, `userAgent` and per-target capability maps inside every nested block. The Bridge keeps its public health contract unchanged — only the model-facing projection drops the duplicated copies — and `browser_targets` now reports compacted Bridge health, because the full health belongs to the doctor.
+
+- Keep `browser_status` small by splitting it from diagnostics. It now prints identity once (target stability no longer repeats `browser`/`browserId`/`profile`/connection fields), carries a single monotonic `capabilityRevision` instead of the boolean capability map, and summarizes the Bridge as `{ok, version, port, extensionConnected, readyTargets}`. The capability map, per-request metrics, target inventory, user agent, and recovery detail moved to `browser_doctor`; actionable state (selection `targets`, a lost `target`, `error`, `completed`/`retryable`, `recommendation`, `nextAction`, `recovery` with issues) stays in the status read. A versioned-but-older extension runtime is reported as `extension_runtime_stale`; an extension that advertises no revision is a notice, because the per-request gates still fail closed with the exact missing capability.
+
+- Derive the extension's advertised capability revision from a single `CAPABILITY_SINCE` table, so a capability can no longer be added to one surface and forgotten in the other; the Bridge relays `capabilityRevision` in its target identity and health.
+
+- Tighten neutral metadata collection with structural rules instead of site vocabulary: a label is at most 32 characters and must not contain sentence punctuation, an inferred `label: value` line must not read as a sentence (no sentence-ending punctuation and no sentence break) and is capped at 120 characters, while a pair the page declares itself in a table row or `dt`/`dd` is capped at 320. Ordinary body text such as `- confirmed: the plugin resolves ... node_modules.` no longer enters `Values:`.
+
+- Make `browser_tabs` filter at the source instead of paging: `query` matches title/URL case-insensitively, `owner` filters ownership, `limit` bounds the returned rows, and `documentIdentity: false` returns tab-fence-only handles. Document identity is probed only for the rows that are returned — a filtered listing no longer injects the Page Agent into tabs the caller did not ask about — and the result reports `totalTabs`/`matchedTabs`/`omittedTabs` with `recommendation: narrow_tab_query`. The default listing stays **complete** (hard-capped at 200 rows): a default that silently dropped rows hid the freshly created tab the bundled CLI looks up, which is the failure mode this rule exists to avoid.
+
 - Retry the isolated multi-profile browser relaunch within a bounded budget, because a force-killed browser can still occupy its `--user-data-dir` and strand the extension handshake.
 
 - Declare a `dsh.bundle.patch` manifest and ship `cordis.patch.yml` so `dsh plugin --profile web add` mounts the DSH package automatically instead of requiring a hand-merged Profile patch; published as `@lyd123qw2008/dsh-tool-control-chrome@0.5.9`.
@@ -17,6 +27,24 @@
 - Harden release publishing with exact-commit CI/Compatibility gates, a real installed-package smoke test, Node 24-compatible Actions, and cancellation of stale push runs.
 
 - Reduce isolated Chrome/Edge E2E runtime by running browser candidates concurrently and bounding Windows browser/server cleanup.
+
+- Replace the ranked Page Map with a neutral page digest. Regions are listed in document order — semantic landmarks plus containers carrying an id/test id, with a nested wrapper skipped only when it exposes exactly its ancestor's controls, and only `main`/`dialog` suppressing their contents — repeated containers are reported as counts instead of being expanded, and no region is called primary. The ~15 scoring thresholds, utility demotion, and key-action ranking are gone, so identical DOM now yields identical output and the plugin never decides which part of a page matters. See [`docs/COMPACT-READ-CONTRACT.zh-CN.md`](./docs/COMPACT-READ-CONTRACT.zh-CN.md).
+
+- Make every bounded read retrievable. A digest reports what it omitted (`omitted.regions`/`controls`/`fields`/`characters`), names the next step (`nextAction`, `recommendation: narrow_read`) and the recovery path, and keeps every listed region addressable by `target`, `ref`, `{role name}` or `{selector=...}`; a selector-scoped `browser_snapshot`/`browser_extract` returns the same shape for a subtree, so missing context is obtained by narrowing rather than by widening the read. Row-level `primaryTruncated`/`secondaryTruncated`/`actionsTruncated` flags are replaced by these counts.
+
+- Read page digest text from rendered content only. Falling back to `textContent` used to copy inline helper-script source into the summary on pages such as Jenkins.
+
+- Make the published field list site-agnostic and privacy-guarded (`values`, previously `metadata`): it carries the bounded `label: value` pairs the page renders, with no build/CI field-name whitelist and no verdict, host, or image inference, and a `label: value` line whose label names a credential is omitted from both the digest and the model-visible summary.
+
+- Add terminal-result waits and log matching as advertised capabilities: `browser_wait` accepts `textAny` with `failureTextAny` and reports `matchedText`/`terminalState`/`failed`, and `browser_extract({ scope: "log", logMatch })` reports `matchedLineCount`, bounded `matchedLineNumbers`, and `matchTruncated`. The Pi adapter's wait validation now accepts the same fields its schema already advertised.
+
+- Detect a stale extension runtime instead of silently degrading. The extension advertises `waitTerminalStates`, `extractLogMatch`, and `extensionSelfReload`; the Bridge, Pi, and DSH reject a request whose capability is missing.
+
+- Add `browser_reload_extension` so a refreshed distribution can be applied to a running browser without the browser's extension UI. It takes `confirmed: true`, restarts only the extension, and requires refreshed `browser_status`, tab, snapshot, ref, and handle state afterward.
+
+- Document the capability-layer/personalization-layer boundary in `ARCHITECTURE.md`, `ARCHITECTURE.zh-CN.md`, `DECISIONS.zh-CN.md`, `docs/AGENT-CAPABILITY-ARCHITECTURE.zh-CN.md`, `CONTRIBUTING.md`, both READMEs, and the bundled Skill: the plugin owns page structure, identity and safety boundaries, and generic primitives, while a site's DOM shape, workflow, and field names belong to the calling Skill.
+
+- Extend the isolated browser E2E with dedicated archetype pages — a region page with a landmark-free shell, a business page with no CI vocabulary, and a page that patches `String.prototype.trim` — so document order, region addressability, omission counts, credential redaction, and isolated-world immunity are asserted instead of a site's fields.
 
 ## 0.5.9 - 2026-09-12
 

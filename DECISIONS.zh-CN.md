@@ -223,3 +223,28 @@ browser_cleanup
 10. 用户标签页 release 且不关闭；
 11. Pi 重启后自动恢复连接；
 12. Edge 使用同一套扩展完成同样流程。
+
+## 10. 能力层与个性化层边界
+
+本发行版是**能力层**，只负责页面结构与安全控制；站点相关的处理属于调用方 Skill。这条边界是设计要求，不是实现偏好。
+
+### 归属
+
+| 关注点 | 归属 |
+| --- | --- |
+| 页面结构（landmark、标题、主对象、工具区降权、次要区域、Key actions、截断标记） | 能力层 |
+| 身份与安全（`browserId`/`tabFence`/`incarnation`/`snapshotId`、所有权与租约、清理、不自动重放） | 能力层 |
+| 通用原语（wait 状态与调用方终态文本、`tail`/`logMatch` 提取、`evaluate`、CDP、Console/Network/Dialog/Upload/Download/Clipboard） | 能力层 |
+| 站点无关数据（渲染文本、有界 `label: value`、ARIA status、凭据行脱敏） | 能力层 |
+| 站点 DOM 形状、站点流程、领域字段解析 | 个性化层（拥有该流程的 Skill） |
+
+### 规则
+
+1. 站点事实能用调用方字面量或调用方页面脚本承载的，一律不进插件。
+2. 站点事实只有在上升为对多种页面原型都成立的结构性原则时才可进入插件；产品名、站点 URL、站点选择器永远不允许进入。
+3. 站点逻辑以只读、有界、自包含的脚本形式放在 Skill 中，并在该流程旁记录字段契约。
+4. 插件对某站点输出不正确时，修通用排序/降噪规则并补原型用例，不加站点特例。
+5. 插件测试断言通用不变量；领域字段由 Skill 自己断言。
+6. 能力声明（如 `waitTerminalStates`、`extractLogMatch`）是强制点：插件不识别产品终态字符串，陈旧运行时被拒绝而非静默降级。
+
+详细背景与示例见 [`ARCHITECTURE.zh-CN.md`](./ARCHITECTURE.zh-CN.md) 的"六点五、能力层与个性化层边界"，模型侧调用约定见 [`skills/pi-control-chrome/references/workflows.md`](./skills/pi-control-chrome/references/workflows.md)。
