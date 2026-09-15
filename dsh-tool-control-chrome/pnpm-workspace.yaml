@@ -1,6 +1,11 @@
 allowBuilds:
   '@google/genai': false
   protobufjs: false
+# Develop the plugin against the pi-control-chrome working copy instead of the
+# published registry tarball. `link:..` is the repository root; the published
+# manifest still declares `pi-control-chrome: ^0.5.9`, so consumers are unaffected.
+overrides:
+  pi-control-chrome: link:..
 minimumReleaseAgeExclude:
   - '@deepseek-ai/dsh-agent@0.1.1-rc.1'
   - '@deepseek-ai/dsh-attachment@0.1.1-rc.1'

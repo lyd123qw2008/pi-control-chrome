@@ -25,6 +25,7 @@ it('resolveConfig rejects non-loopback Bridge hosts and accepts defaults', () =>
   expect(defaults.autoStartBridge).toBe(true)
   expect(defaults.extensionReadyTimeoutMs).toBe(6_000)
   expect(defaults.lazyTools).toBe(true)
+  expect(() => resolveConfig({ requestTimeoutMs: 120_001 })).toThrow(/requestTimeoutMs/)
   expect(() => resolveConfig({ extensionReadyTimeoutMs: -1 })).toThrow(/extensionReadyTimeoutMs/)
   expect(() => resolveConfig({ bridgeHost: '192.0.2.10' })).toThrow(/must be loopback/)
 })
@@ -86,6 +87,34 @@ it('deduplicates concurrent cooperative restarts and rejects an already-cancelle
   } finally {
     restartBridge.mockRestore()
     await client.stop()
+  }
+})
+
+it('BrowserBridgeClient extends read-only wait timeouts without widening ordinary requests', async () => {
+  const server = createServer((request, response) => {
+    if (request.url === '/health') return json(response, 200, { ok: true, protocol: 1, extensionConnected: true })
+    if (request.url === '/pair') return json(response, 200, { ok: true, protocol: 1, token: 'test-token' })
+    return json(response, 404, { ok: false })
+  })
+  const port = await listen(server)
+  const websocketServer = new WebSocketServer({ server, path: '/ws' })
+  let received: { method?: string; params?: Record<string, unknown> } | undefined
+  websocketServer.on('connection', socket => {
+    socket.on('message', raw => {
+      const message = JSON.parse(raw.toString()) as { id: string; method: string; params: Record<string, unknown> }
+      received = message
+      socket.send(JSON.stringify({ type: 'response', id: message.id, result: { ok: true } }))
+    })
+  })
+  const client = new BrowserBridgeClient(() => resolveConfig({ bridgePort: port, autoStartBridge: false }))
+  try {
+    await expect(client.request('wait', { state: 'text', text: 'done', timeoutMs: 30 * 60 * 1000 })).resolves.toEqual({ ok: true })
+    expect(received).toMatchObject({ method: 'wait', params: { timeoutMs: 30 * 60 * 1000 } })
+  } finally {
+    await client.stop()
+    websocketServer.close()
+    server.close()
+    await once(server, 'close')
   }
 })
 

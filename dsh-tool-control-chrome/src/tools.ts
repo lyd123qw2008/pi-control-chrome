@@ -17,7 +17,7 @@ import {
 import type { BrowserBridgeClient } from './bridge.js'
 import { bridgeRecovery, unavailableBridgeRecovery } from './diagnostics.js'
 import { BROWSER_SKILL_NAME } from './skill.js'
-import { compactBrowserResult } from './output.js'
+import { compactBridgeHealth, compactBrowserResult, compactDoctorResult, compactStatusResult, runtimeDiagnosis } from './output.js'
 import type { BrowserTarget, BrowserTargetRoute, ResolvedConfig, ScreenshotResult } from './types.js'
 
 const TAB_ID: ParameterPropertySpec = { type: 'number', description: 'Browser tab id. Omit to use the selected tab.' }
@@ -32,8 +32,15 @@ const OPTIONAL_BOOLEAN: ParameterPropertySpec = { type: 'boolean' }
 const WAIT_EXACT: ParameterPropertySpec = { type: 'boolean', description: 'For text/text_gone waits only. For visible/hidden/enabled waits, put exact inside target.' }
 const SELECTOR: ParameterPropertySpec = { type: 'string', description: 'Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot.' }
 const INCLUDE_FRAMES: ParameterPropertySpec = { type: 'boolean', description: 'Include same-origin iframe summaries and readable frame text; cross-origin frames are reported as unavailable.' }
-const OUTPUT_MAX_CHARS: ParameterPropertySpec = { type: 'integer', description: 'Optional output character budget. The extension caps this at 100000; the default is 20000 for snapshots and DOM CUA.' }
-const OUTPUT_MAX_NODES: ParameterPropertySpec = { type: 'integer', description: 'Optional output node budget. The extension caps this at 1000; the default is 200.' }
+const TAIL: ParameterPropertySpec = { type: 'boolean', description: 'For browser_extract, keep the end of selected visible text/Markdown instead of the beginning. Useful for logs.' }
+const LOG_MATCH: ParameterPropertySpec = { type: 'string', description: 'For scope=log, keep only lines containing this case-insensitive literal.' }
+const LOG_MAX_MATCHES: ParameterPropertySpec = { type: 'integer', description: 'For scope=log with logMatch, maximum matching lines to return.' }
+const TEXT_ANY: ParameterPropertySpec = { type: 'array', items: { type: 'string' }, description: 'For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState.' }
+const FAILURE_TEXT_ANY: ParameterPropertySpec = { type: 'array', items: { type: 'string' }, description: 'For state=text waits, return immediately with failed=true when any listed failure literal is present.' }
+const RESPONSE_MODE: ParameterPropertySpec = { type: 'string', enum: ['compact', 'raw'], description: 'Output mode. Compact is the default semantic Page Map; use raw only to diagnose a page abstraction or inspect whole-page detail.' }
+const EXTRACT_SCOPE: ParameterPropertySpec = { type: 'string', enum: ['primary', 'log', 'body'], description: 'Extraction region. Compact reads select primary content by default; use log for a log/pre region or body only for raw whole-page diagnostics.' }
+const OUTPUT_MAX_CHARS: ParameterPropertySpec = { type: 'integer', description: 'Optional output character budget. The extension caps this at 100000; compact model reads default to a smaller budget and can be increased explicitly.' }
+const OUTPUT_MAX_NODES: ParameterPropertySpec = { type: 'integer', description: 'Optional output node budget. Compact model reads default to about 100 nodes; the extension caps this at 1000.' }
 const TAB_HANDLE_PROPERTIES: ParameterSchemaSpec = {
   tabId: { type: 'number', required: true },
   browserId: OPTIONAL_STRING,
@@ -313,7 +320,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_status',
-    description: 'Return the connected Chrome/Edge browser, active browser target stability and local Bridge status.',
+    description: 'Return the connected Chrome/Edge browser identity, target stability and Bridge state as one small read. The capability revision stands in for the boolean capability map, and per-request metrics, browser targets and recovery detail live in browser_doctor.',
     parameters: {
       browserId: { type: 'string', description: 'Select a connected browser target by browserId. Omit or leave blank for automatic discovery; choose one explicitly when multiple targets are connected.' },
       acknowledgeBrowserId: { type: 'string', description: 'Explicitly acknowledge this browserId after the user confirms a browser switch.' },
@@ -344,9 +351,23 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
     method: 'target_lease',
   },
   {
+    name: 'browser_reload_extension',
+    description: 'Apply an updated pi-control-chrome distribution to the running browser by reloading its extension. The loaded service worker keeps the code it started with, so a refreshed profile or plugin update stays inert until this runs; the extension restarts, in-flight browser work is cancelled, and the Bridge reconnects the same browser target. Pass confirmed=true only after the user explicitly confirms the reload, then refresh browser_status and every tab/snapshot handle.',
+    parameters: {
+      confirmed: { type: 'boolean', required: true, description: 'Must be true only after the user explicitly confirms the extension reload.' },
+      delayMs: { type: 'integer', description: 'Delay before the worker restarts, so the response can reach the caller first; defaults to 250 ms and is capped at 5000 ms.' },
+    },
+    method: 'reload_extension',
+  },
+  {
     name: 'browser_tabs',
-    description: 'List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.',
-    parameters: EMPTY_PARAMETERS,
+    description: 'List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The listing is complete by default and hard-capped at 200 rows; narrow it with query (title/url substring) and owner (user/agent/claimed) instead of paging, and pass limit only when you want fewer rows. totalTabs/matchedTabs/omittedTabs report any bound that applied. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.',
+    parameters: {
+      query: { type: 'string', description: 'Case-insensitive substring matched against tab title and URL.' },
+      limit: { type: 'integer', description: 'Maximum rows to return; omit for the complete listing (hard-capped at 200). omittedTabs reports dropped rows.' },
+      owner: { type: 'string', enum: ['user', 'agent', 'claimed'], description: 'Return only tabs with this ownership state.' },
+      documentIdentity: { type: 'boolean', description: 'When false, return tab-fence-only handles without probing document identity; re-observe before document-bound work.' },
+    },
     method: 'list_tabs',
   },
   {
@@ -388,19 +409,19 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   {
     name: 'browser_snapshot',
     description: 'Read the active page title and one bounded semantic page state with document-scoped live eN refs; same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames: false. Ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, while navigation remains a hard boundary. Read-only observation may retry once if the tab document changes.',
-    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES },
+    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, responseMode: RESPONSE_MODE, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES },
     method: 'snapshot',
   },
   {
     name: 'browser_extract',
-    description: 'Extract the current page as bounded plain text and simple Markdown without using a separate web scraper; same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames: false. Read-only observation may retry once if the tab document changes.',
-    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS },
+    description: 'Extract the current page as bounded plain text and simple Markdown without using a separate web scraper. Compact reads select the primary content by default; use scope=log with tail=true for log-like pages, or logMatch to return only matching log lines; body is for whole-page diagnostics. Same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames: false. Read-only observation may retry once if the tab document changes.',
+    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, responseMode: RESPONSE_MODE, scope: EXTRACT_SCOPE, tail: TAIL, logMatch: LOG_MATCH, logMaxMatches: LOG_MAX_MATCHES, maxChars: OUTPUT_MAX_CHARS },
     method: 'extract',
   },
   {
     name: 'browser_accessibility_snapshot',
     description: 'Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. Same-origin iframe context is included by default and can be disabled with includeFrames: false. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.',
-    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: OPTIONAL_BOOLEAN },
+    parameters: { tabId: TAB_ID, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, responseMode: RESPONSE_MODE, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: OPTIONAL_BOOLEAN },
     method: 'snapshot',
   },
   {
@@ -417,16 +438,20 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_wait',
-    description: 'Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state. For text states use text; for element states use target. Ordinary role/name, label, and accessible-text targets use Chromium AX first; eN/aN ref targets require the matching snapshotId. Keep tab identity in handle and locator fields in target.',
+    description: 'Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state. Text states accept text or textAny and report matchedText for the first terminal literal found; element states use target. Ordinary role/name, label, and accessible-text targets use Chromium AX first; eN/aN ref targets require the matching snapshotId. Keep tab identity in handle and locator fields in target. For externally refreshed pages such as Jenkins, opt into reload=true so polling stays inside one tool call.',
     parameters: {
       tabId: TAB_ID,
       state: WAIT_STATE,
       url: OPTIONAL_STRING,
       urlIncludes: OPTIONAL_STRING,
       text: OPTIONAL_STRING,
+      textAny: TEXT_ANY,
+      failureTextAny: FAILURE_TEXT_ANY,
       target: ELEMENT_TARGET,
       snapshotId: OPTIONAL_STRING,
       exact: WAIT_EXACT,
+      reload: { type: 'boolean', description: 'For text/element waits, reload the page between polls. Opt in only for externally updated pages such as Jenkins.' },
+      reloadIntervalMs: { type: 'integer', description: 'Minimum interval between opt-in reload polls; defaults to 5000 ms.' },
       timeoutMs: TIMEOUT_MS,
     },
     method: 'wait',
@@ -453,6 +478,8 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
           url: OPTIONAL_STRING,
           urlIncludes: OPTIONAL_STRING,
           text: OPTIONAL_STRING,
+          textAny: TEXT_ANY,
+          failureTextAny: FAILURE_TEXT_ANY,
           target: ELEMENT_TARGET,
           exact: OPTIONAL_BOOLEAN,
           timeoutMs: TIMEOUT_MS,
@@ -908,8 +935,16 @@ function validateOutputLimit(value: unknown, name: string): void {
 function validateRequestNumbers(params: Record<string, JsonValue>): void {
   const timeoutMs = params.timeoutMs
   if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 1)) throw new Error('timeoutMs must be a positive finite number')
+  const reloadIntervalMs = params.reloadIntervalMs
+  if (reloadIntervalMs !== undefined && (typeof reloadIntervalMs !== 'number' || !Number.isInteger(reloadIntervalMs) || reloadIntervalMs < 250)) throw new Error('reloadIntervalMs must be an integer of at least 250 ms')
   validateElementIndex(params.index)
   validateElementTargetNumbers(params.target)
+  if (params.scope !== undefined && !['primary', 'log', 'body'].includes(String(params.scope))) throw new Error('Extract scope must be primary, log or body')
+  if (params.logMatch !== undefined && (typeof params.logMatch !== 'string' || params.logMatch.trim().length === 0)) throw new Error('logMatch must be a non-empty string')
+  const logMaxMatches = params.logMaxMatches
+  if (logMaxMatches !== undefined && (typeof logMaxMatches !== 'number' || !Number.isInteger(logMaxMatches) || logMaxMatches < 1 || logMaxMatches > 200)) throw new Error('logMaxMatches must be an integer from 1 to 200')
+  if (params.textAny !== undefined && (!Array.isArray(params.textAny) || params.textAny.length < 1 || params.textAny.length > 20 || params.textAny.some(value => typeof value !== 'string' || value.trim().length === 0))) throw new Error('textAny must contain 1 to 20 non-empty strings')
+  if (params.failureTextAny !== undefined && (!Array.isArray(params.failureTextAny) || params.failureTextAny.length < 1 || params.failureTextAny.length > 20 || params.failureTextAny.some(value => typeof value !== 'string' || value.trim().length === 0))) throw new Error('failureTextAny must contain 1 to 20 non-empty strings')
   validateOutputLimit(params.maxChars, 'maxChars')
   validateOutputLimit(params.maxNodes, 'maxNodes')
 }
@@ -1029,45 +1064,6 @@ function targetRecords(value: unknown): BrowserTarget[] {
 
 function readyTargetRecords(value: unknown): BrowserTarget[] {
   return targetRecords(value).filter(target => target.state === undefined || target.state === 'ready')
-}
-
-function compactBridgeHealth(value: Record<string, unknown>): JsonValue {
-  const fields = [
-    'ok', 'protocol', 'service', 'bridgeVersion', 'instanceId', 'startedBy', 'controlDomain', 'port',
-    'extensionConnected', 'targetCount', 'readyTargetCount', 'targetAmbiguous', 'browser', 'browserId',
-    'profile', 'extensionVersion', 'connectionId', 'connectionGeneration', 'state',
-  ] as const
-  const result: Record<string, unknown> = {}
-  for (const field of fields) if (value[field] !== undefined) result[field] = value[field]
-  if (isRecord(value.capabilities) && value.capabilities.compactResponses === true) result.capabilities = { compactResponses: true }
-  if (Array.isArray(value.targets)) {
-    result.targets = value.targets.filter(isRecord).map(target => {
-      const compact: Record<string, unknown> = {}
-      for (const field of ['browser', 'browserId', 'profile', 'extensionVersion', 'connectionId', 'connectionGeneration', 'state'] as const) {
-        if (target[field] !== undefined) compact[field] = target[field]
-      }
-      return compact
-    })
-  }
-  if (isRecord(value.observability)) {
-    const observability: Record<string, unknown> = {}
-    for (const field of ['pendingRequests', 'drainingRequests'] as const) {
-      if (value.observability[field] !== undefined) observability[field] = value.observability[field]
-    }
-    if (isRecord(value.observability.metrics)) observability.metrics = value.observability.metrics
-    if (isRecord(value.observability.targetRecovery)) observability.targetRecovery = value.observability.targetRecovery
-    if (isRecord(value.observability.targetLeases)) observability.targetLeases = value.observability.targetLeases
-    if (Array.isArray(value.observability.recentEvents)) {
-      const eventKeys = ['event', 'at', 'browserId', 'connectionId', 'connectionGeneration', 'previousConnectionId', 'previousConnectionGeneration', 'reason', 'method', 'errorCode'] as const
-      observability.recentEvents = value.observability.recentEvents
-        .filter(isRecord)
-        .filter(event => typeof event.event === 'string' && (event.event.startsWith('target_') || (event.event === 'request_rejected' && typeof event.errorCode === 'string' && event.errorCode.startsWith('TARGET_LEASE'))))
-        .slice(-20)
-        .map(event => Object.fromEntries(eventKeys.filter(key => event[key] !== undefined).map(key => [key, event[key]])))
-    }
-    if (Object.keys(observability).length > 0) result.observability = observability
-  }
-  return asJsonValue(result)
 }
 
 function requestWithTarget(
@@ -1514,19 +1510,27 @@ function validateWaitRequest(params: Record<string, JsonValue>): void {
   const state = params.state === undefined ? 'load' : String(params.state)
   if (!['load', 'url', 'text', 'text_gone', 'visible', 'hidden', 'enabled'].includes(state)) throw new Error(`Unsupported browser wait state: ${state}`)
   const hasText = params.text !== undefined
+  const hasTextAny = params.textAny !== undefined
+  const hasFailureTextAny = params.failureTextAny !== undefined
   const hasTarget = params.target !== undefined
   if (state === 'text' || state === 'text_gone') {
     if (hasTarget) throw new Error(`${state} wait cannot combine text with target`)
-    if (typeof params.text !== 'string' || !params.text.trim()) throw new Error(`${state} wait requires text`)
+    if (hasText && hasTextAny) throw new Error(`${state} wait cannot combine text with textAny`)
+    if (hasFailureTextAny && state !== 'text') throw new Error('failureTextAny requires state=text')
+    if (!hasText && !hasTextAny) throw new Error(`${state} wait requires text or textAny`)
+    if (hasText && (typeof params.text !== 'string' || !params.text.trim())) throw new Error(`${state} wait requires non-empty text`)
   } else if (['visible', 'hidden', 'enabled'].includes(state)) {
     if (params.exact !== undefined) throw new Error(`${state} wait exact matching belongs inside target`)
-    if (hasText) throw new Error(`${state} wait cannot combine target with text`)
+    if (hasText || hasTextAny || hasFailureTextAny) throw new Error(`${state} wait cannot combine target with text, textAny or failureTextAny`)
     if (!hasTarget) throw new Error(`${state} wait requires target`)
   } else if (state === 'url') {
-    if (hasText || hasTarget) throw new Error('url wait cannot combine URL matching with text or target')
+    if (hasText || hasTextAny || hasFailureTextAny || hasTarget) throw new Error('url wait cannot combine URL matching with text, textAny, failureTextAny or target')
     if ((typeof params.url !== 'string' || !params.url) && (typeof params.urlIncludes !== 'string' || !params.urlIncludes)) throw new Error('url wait requires url or urlIncludes')
-  } else if (hasText || hasTarget) {
-    throw new Error('load wait cannot combine load matching with text or target')
+  } else if (hasText || hasTextAny || hasFailureTextAny || hasTarget) {
+    throw new Error('load wait cannot combine load matching with text, textAny, failureTextAny or target')
+  }
+  if (params.reload === true && !['text', 'text_gone', 'visible', 'hidden', 'enabled'].includes(state)) {
+    throw new Error('reload waits require a text or element state')
   }
 }
 
@@ -1535,12 +1539,36 @@ function validateLocatorRequest(params: Record<string, JsonValue>): void {
   if (['strategy', 'selector', 'exact', 'name', 'index', 'hasText', 'hasSelector'].some(key => params[key] !== undefined)) throw new Error('locator target cannot be combined with legacy locator fields')
 }
 
+const MODEL_READ_BUDGETS = Object.freeze({
+  snapshotChars: 8_000,
+  snapshotNodes: 100,
+  extractChars: 6_000,
+  domChars: 8_000,
+  domNodes: 100,
+  consoleChars: 4_000,
+  consoleEvents: 40,
+})
+
 function compactResponseParams(toolName: string, params: Record<string, JsonValue>, health: Record<string, unknown>): Record<string, JsonValue> {
   const supported = ['browser_snapshot', 'browser_accessibility_snapshot', 'browser_extract', 'browser_tabs', 'browser_selected'].includes(toolName)
     || (toolName === 'browser_dom_cua' && params.action === 'get_visible_dom')
-  if (!supported || params.responseMode !== undefined) return params
-  if (!isRecord(health.capabilities) || health.capabilities.compactResponses !== true) return params
-  return { ...params, responseMode: 'compact' }
+  if (params.responseMode === 'raw') return params
+  const budgeted = { ...params }
+  if (toolName === 'browser_snapshot' || toolName === 'browser_accessibility_snapshot') {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.snapshotChars
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = MODEL_READ_BUDGETS.snapshotNodes
+  } else if (toolName === 'browser_extract') {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.extractChars
+  } else if (toolName === 'browser_dom_cua' && params.action === 'get_visible_dom') {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.domChars
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = MODEL_READ_BUDGETS.domNodes
+  } else if (toolName === 'browser_console' && params.action !== 'enable') {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.consoleChars
+    if (budgeted.maxEvents === undefined) budgeted.maxEvents = MODEL_READ_BUDGETS.consoleEvents
+  }
+  if (!supported) return budgeted
+  if (!isRecord(health.capabilities) || health.capabilities.compactResponses !== true) return budgeted
+  return { ...budgeted, responseMode: 'compact' }
 }
 
 function hasAccessibilityReference(value: unknown): boolean {
@@ -1573,12 +1601,23 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
     if (settle?.target !== undefined) requireTargetSupport()
   }
   if (method === 'locator' && (params.target !== undefined || isTargetLocator(params.locator))) requireTargetSupport()
+  if (method === 'extract') {
+    if (params.tail === true) requiredExtension.push('tailExtract')
+    if (params.scope === 'primary' || params.scope === 'log') requiredExtension.push('scopedExtract')
+    if (params.logMatch !== undefined) requiredExtension.push('extractLogMatch')
+  }
   if (method === 'wait') {
     const state = String(params.state ?? 'load')
     if (params.target !== undefined) requireTargetSupport()
     if (['text', 'text_gone', 'visible', 'hidden', 'enabled'].includes(state)) {
       requiredBridge.push('pageWaitStates')
       requiredExtension.push('pageWaitStates')
+    }
+    if (params.textAny !== undefined || params.failureTextAny !== undefined) requiredExtension.push('waitTerminalStates')
+    if (params.reload === true) requiredExtension.push('reloadAwareWait')
+    if (typeof params.timeoutMs === 'number' && params.timeoutMs > 120_000) {
+      requiredBridge.push('longWait')
+      requiredExtension.push('longWait')
     }
   }
   if (TAB_INCARNATION_METHODS.has(method)) requiredExtension.push('tabIncarnationFence')
@@ -1590,6 +1629,10 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
   ]
   if (missing.length > 0) throw new Error(`The browser Bridge or extension does not support: ${[...new Set(missing)].join(', ')}; update pi-control-chrome before sending this request.`)
 }
+
+// The runtime-vintage verdict (revision, freshness, stale/unversioned messages) lives in the
+// shared projection (`runtimeDiagnosis` from pi-extension/output.js) so Pi, DSH and Codex cannot
+// drift apart on what counts as a stale extension runtime.
 
 async function requestBrowserOperation(
   bridge: BrowserBridgeClient,
@@ -1846,16 +1889,22 @@ async function browserDoctor(
     : notices.length > 0
       ? 'confirm_browser_target'
       : 'ready'
-  return asJsonValue({
+  // Compose the facts (status base, Bridge health, stability, runtime verdict, recovery) and let
+  // the shared projection decide the model-facing shape, so DSH cannot drift from Pi and Codex.
+  const diagnosisIssues = isRecord(bridgeDiagnosis) && Array.isArray(bridgeDiagnosis.issues) ? bridgeDiagnosis.issues : []
+  const diagnosisNotices = isRecord(bridgeDiagnosis) && Array.isArray(bridgeDiagnosis.notices) ? bridgeDiagnosis.notices : []
+  const diagnosis = runtimeDiagnosis(status)
+  return compactDoctorResult({
     ...base,
     state: 'connected',
-    ok: issues.length === 0,
-    recommendation,
+    ok: issues.length === 0 && diagnosis.stale === undefined,
+    recommendation: diagnosis.stale === undefined ? recommendation : 'reload_extension',
     bridgeHealth,
     targetStability,
+    ...(diagnosis.runtime === undefined ? {} : { runtime: diagnosis.runtime }),
     recovery: bridgeRecovery(bridgeHealth),
-    issues,
-    notices,
+    issues: [...diagnosisIssues, ...issues, ...(diagnosis.stale === undefined ? [] : [diagnosis.stale])],
+    notices: [...diagnosisNotices, ...notices, ...(diagnosis.unversioned === undefined ? [] : [diagnosis.unversioned])],
   })
 }
 
@@ -2475,7 +2524,7 @@ export function registerBrowserTools(
           const requestedBrowserId = optionalBrowserId(args.browserId)
           const status = await browserStatus(bridge, tracker, sessionId, operationSignal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId, requestedBrowserId, hasTargetUsage(session))
           if (statusCanArmCleanup(status)) markBrowserUsed(session, false)
-          return status
+          return compactStatusResult(status)
         }
         const connection = await readBrowserConnection(bridge, sessionId, operationSignal, resolveSettings().extensionReadyTimeoutMs, tracker.route())
         if (connection.state !== 'connected') return connectionResult(connection)

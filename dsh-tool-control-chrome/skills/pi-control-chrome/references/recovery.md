@@ -135,6 +135,11 @@ For ownership or cleanup trouble:
 4. Use `browser_mark_handoff` or `browser_mark_deliverable` when the user needs an Agent tab preserved.
 5. Use `browser_cleanup` only after the user explicitly requests cleanup. If an extension runtime changed, pass `recoverStale: true` only after an explicit recovery decision; it forgets unknown-incarnation ownership records without closing unknown tabs.
 6. If the selected target is gone, choose a replacement explicitly with `browser_status` before retrying.
+7. Cleanup is **session-scoped**: a request only touches records whose `record.sessionId` equals the requesting session (`browser_cleanup` reports the rest as retained, and `recoverStale` cannot release them either). Tabs left behind by a session that no longer exists — a finished CLI or test run — therefore need that session's id, not the current one:
+   - `browser_tabs({ owner: "agent" })` shows the owning `sessionId` of each stale tab and `stale: true` for records from an earlier extension runtime;
+   - `node skills/pi-control-chrome/scripts/browser.mjs cleanup --session <that-session-id> --browser-id <browserId> --recover-stale` (or the same `cleanup` parameters through the harness client) releases the ownership record; the tab stays open;
+   - the released tab is now an ordinary user tab, so close it with `browser_close_tab({ tabId, userRequested: true })` only after the user authorizes closing it.
+   Never relay another session's id to *pretend* to be that session for a side effect; use this path only to forget stale ownership of a session that has already ended.
 
 Never delete the browser group or tabs belonging to another session. Do not inspect browser storage, cookies, passwords, or session stores as a discovery shortcut. Automated verification should use an Agent-owned test tab or an isolated browser profile rather than the active DSH GUI tab.
 

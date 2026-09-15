@@ -167,7 +167,7 @@ function execution(agent: Agent): ToolRunContext {
 
 describe('DSH browser tool catalog', () => {
   it('exposes the complete Pi browser tool surface', () => {
-    expect(BROWSER_TOOL_NAMES).toHaveLength(43)
+    expect(BROWSER_TOOL_NAMES).toHaveLength(44)
     expect(new Set(BROWSER_TOOL_NAMES).size).toBe(BROWSER_TOOL_NAMES.length)
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_doctor')
     expect(browserToolCatalog.core.map(tool => tool.name)).toContain('browser_targets')
@@ -491,6 +491,26 @@ describe('DSH browser tool catalog', () => {
     })
   })
 
+  it('rejects a terminal text wait when the extension runtime is stale', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.8', capabilities: { pageWaitStates: true, tabIncarnationFence: true } }
+      : { matched: true })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { pageWaitStates: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    await expect(harness.tools.get('browser_wait')?.execute({ state: 'text', tabId: 7, textAny: ['Finished: SUCCESS'], timeoutMs: 5000 }, execution(harness.agent))).rejects.toThrow(/waitTerminalStates/)
+    expect(request.mock.calls.filter(([method]) => method === 'wait')).toHaveLength(0)
+  })
+
+  it('rejects log matching when the extension runtime is stale', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.8', capabilities: { scopedExtract: true, tailExtract: true, tabIncarnationFence: true } }
+      : { text: 'Finished: SUCCESS' })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { scopedExtract: true, tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+    await expect(harness.tools.get('browser_extract')?.execute({ logMatch: 'Finished:', scope: 'log', tabId: 7 }, execution(harness.agent))).rejects.toThrow(/extractLogMatch/)
+    expect(request.mock.calls.filter(([method]) => method === 'extract')).toHaveLength(0)
+  })
+
   it('drops blank selectors from page observation requests', async () => {
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => method === 'status'
       ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilities: { tabIncarnationFence: true } }
@@ -534,7 +554,7 @@ describe('DSH browser tool catalog', () => {
 
   it('keeps browser_status compact without dropping target identity', async () => {
     const request = vi.fn(async (method: string) => method === 'status'
-      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', connectionId: 'connection-1', connectionGeneration: 2, capabilities: { tabIncarnationFence: true } }
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilityRevision: 8, connectionId: 'connection-1', connectionGeneration: 2, capabilities: { tabIncarnationFence: true } }
       : { method })
     const health = vi.fn(async () => ({
       ok: true,
@@ -551,12 +571,73 @@ describe('DSH browser tool catalog', () => {
     }))
     const harness = setup({ request, health })
     const result = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
-    expect(result).toMatchObject({ state: 'connected', browserId: 'edge:test', bridgeHealth: { browserId: 'edge:test', connectionGeneration: 2, observability: { metrics: { requests: 4 }, targetRecovery: { disconnectedTargets: 1 }, targetLeases: { activeCount: 1 } } } })
+    // Identity once, one capability revision instead of the boolean map, and a Bridge summary.
+    expect(result).toMatchObject({
+      state: 'connected',
+      browser: 'edge',
+      browserId: 'edge:test',
+      profile: 'current',
+      extensionVersion: '0.4.1',
+      capabilityRevision: 8,
+      connectionId: 'connection-1',
+      connectionGeneration: 2,
+      bridge: { ok: true, extensionConnected: true },
+    })
+    // Diagnostics moved to browser_doctor and must not reappear in the ordinary status read.
+    expect(result).not.toHaveProperty('capabilities')
+    expect(result).not.toHaveProperty('bridgeHealth')
+    expect(result).not.toHaveProperty('observability')
+    expect(JSON.stringify(result)).not.toContain('internal')
+    expect(JSON.stringify(result)).not.toContain('tabIncarnationFence')
+  })
+
+  it('keeps the diagnostics that browser_status shed available in browser_doctor', async () => {
+    const status = { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.4.1', capabilityRevision: 8, capabilities: { tabIncarnationFence: true } }
+    const health = vi.fn(async () => ({
+      ok: true,
+      extensionConnected: true,
+      browserId: 'edge:test',
+      targets: [{ browser: 'edge', browserId: 'edge:test', profile: 'current', state: 'ready' }],
+      observability: {
+        pendingRequests: 0,
+        metrics: { requests: 4, targetConnections: 1, targetDisconnects: 0, targetReconnects: 0, targetLeaseAcquisitions: 1, targetLeaseConflicts: 0, targetLeaseReleases: 0, targetLeaseSessionReleases: 0, targetLeaseExpirations: 0 },
+        targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
+        targetLeases: { activeCount: 0, heldTargets: [] },
+        recentEvents: [{ event: 'target_connected' }],
+      },
+    }))
+    const request = vi.fn(async (method: string) => method === 'status' ? status : { ok: true, state: 'connected', issues: [], notices: [] })
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_doctor')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: true,
+      state: 'connected',
+      browserId: 'edge:test',
+      runtime: { extensionVersion: '0.4.1', capabilityRevision: 8, requiredCapabilityRevision: 8, fresh: true, capabilities: { tabIncarnationFence: true } },
+    })
+    // Diagnostics are verbose, but each fact is printed once: the capability map lives only in
+    // `runtime`, not repeated in the status base, the bridge health and every target record.
+    expect(result).not.toHaveProperty('capabilities')
+    const serialized = JSON.stringify(result)
+    expect(serialized.match(/tabIncarnationFence/g) ?? []).toHaveLength(1)
     const compactHealth = (result as { bridgeHealth: { observability: Record<string, unknown> } }).bridgeHealth
     for (const field of lifecycleContract.targetObservability.requiredFields) expect(compactHealth.observability[field]).toBeDefined()
     for (const field of lifecycleContract.targetObservability.metricFields) expect((compactHealth.observability.metrics as Record<string, unknown>)[field]).toBeDefined()
     for (const field of lifecycleContract.targetObservability.leaseFields) expect((compactHealth.observability.targetLeases as Record<string, unknown>)[field]).toBeDefined()
-    expect(JSON.stringify(result)).not.toContain('internal')
+  })
+
+  it('names the missing capability revision when the extension runtime is stale', async () => {
+    const status = { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.5.9', capabilityRevision: 7, capabilities: { tabIncarnationFence: true } }
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const request = vi.fn(async (method: string) => method === 'status' ? status : { ok: true, state: 'connected', issues: [], notices: [] })
+    const harness = setup({ request, health })
+    const result = await harness.tools.get('browser_doctor')?.execute({}, execution(harness.agent))
+    expect(result).toMatchObject({
+      ok: false,
+      recommendation: 'reload_extension',
+      runtime: { capabilityRevision: 7, requiredCapabilityRevision: 8, fresh: false },
+      issues: [{ code: 'extension_runtime_stale' }],
+    })
   })
 
 
@@ -589,7 +670,7 @@ describe('DSH browser tool catalog', () => {
       nextAction: 'browser_status',
       recommendation: 'retry_browser_status',
       error: { code: 'extension_not_connected' },
-      bridgeHealth: { extensionConnected: false },
+      bridge: { extensionConnected: false },
     })
     expect(request).not.toHaveBeenCalled()
   })
@@ -641,7 +722,7 @@ describe('DSH browser tool catalog', () => {
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(0)
 
     const status = await harness.tools.get('browser_status')?.execute({ browserId: 'edge:test', acknowledgeBrowserId: 'edge:test' }, execution(harness.agent))
-    expect(status).toMatchObject({ state: 'connected', targetStability: { acknowledged: true, connectionGeneration: 2 } })
+    expect(status).toMatchObject({ state: 'connected', connectionGeneration: 2, targetStability: { acknowledged: true } })
     await harness.tools.get('browser_click')?.execute({ tabId: 8, handle: { tabId: 8, browserId: 'edge:test', tabFence: 'new', incarnation: 'new' }, selector: '#button' }, execution(harness.agent))
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })
@@ -842,7 +923,7 @@ describe('DSH browser tool catalog', () => {
     const ambiguous = await harness.tools.get('browser_status')?.execute({ browserId: '' }, execution(harness.agent))
     expect(ambiguous).toMatchObject({ state: 'target_required', recommendation: 'select_browser_target', targets: [{ browserId: 'edge:profile-a' }, { browserId: 'chrome:profile-b' }] })
     const selected = await harness.tools.get('browser_status')?.execute({ browserId: 'chrome:profile-b' }, execution(harness.agent))
-    expect(selected).toMatchObject({ browserId: 'chrome:profile-b', targetStability: { connectionGeneration: 2 } })
+    expect(selected).toMatchObject({ browserId: 'chrome:profile-b', connectionId: 'chrome-connection', connectionGeneration: 2 })
     await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
     expect(request).toHaveBeenLastCalledWith('interaction', expect.objectContaining({ expectedBrowserId: 'chrome:profile-b' }), expect.any(AbortSignal), {
       browserId: 'chrome:profile-b',
@@ -926,7 +1007,7 @@ describe('DSH browser tool catalog', () => {
     expect(unacknowledged).toMatchObject({ targetStability: { stable: false, changed: true, acknowledged: false, requiresAcknowledgement: true } })
     await expect(harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))).rejects.toThrow(/acknowledgeBrowserId/)
     const status = await harness.tools.get('browser_status')?.execute({ acknowledgeBrowserId: 'chrome:test' }, execution(harness.agent))
-    expect(status).toMatchObject({ targetStability: { stable: false, changed: true, acknowledged: true, browser: 'chrome' } })
+    expect(status).toMatchObject({ browser: 'chrome', targetStability: { stable: false, changed: true, acknowledged: true } })
     await harness.tools.get('browser_click')?.execute({ tabId: 7, ref: 'e4' }, execution(harness.agent))
     expect(request.mock.calls.filter(([method]) => method === 'interaction')).toHaveLength(1)
   })
@@ -1610,7 +1691,9 @@ describe('DSH browser tool catalog', () => {
     expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(0)
 
     const unselected = await harness.tools.get('browser_status')?.execute({}, execution(harness.agent))
-    expect(unselected).toMatchObject({ state: 'target_required', recommendation: 'select_browser_target', targets: [replacement, other] })
+    // A selection-required status keeps the ids needed to choose, but not the full target records.
+    expect(unselected).toMatchObject({ state: 'target_required', recommendation: 'select_browser_target', targets: [{ browserId: replacement.browserId }, { browserId: other.browserId }] })
+    expect((unselected as { targets: Array<Record<string, unknown>> }).targets[0]).not.toHaveProperty('connectionGeneration')
 
     const selected = await harness.tools.get('browser_status')?.execute({ browserId: 'edge:replacement', acknowledgeBrowserId: 'edge:replacement' }, execution(harness.agent))
     expect(selected).toMatchObject({ browserId: 'edge:replacement', targetStability: { acknowledged: true } })

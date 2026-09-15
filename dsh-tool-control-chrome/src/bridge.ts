@@ -14,6 +14,8 @@ const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 17318
 const MAX_REQUEST_TIMEOUT_MS = 120_000
 const DEFAULT_TIMEOUT_MS = MAX_REQUEST_TIMEOUT_MS
+const MAX_WAIT_TIMEOUT_MS = 30 * 60 * 1000
+const WAIT_REQUEST_GRACE_MS = 20_000
 const DEFAULT_EXTENSION_READY_TIMEOUT_MS = 6_000
 const DEFAULT_TOKEN_FILE = join(homedir(), '.pi', 'agent', 'pi-control-chrome.token')
 const BRIDGE_WAIT_ATTEMPTS = 30
@@ -64,6 +66,14 @@ export function resolveConfig(config: Config): ResolvedConfig {
     lazyTools: config.lazyTools ?? true,
     ...(config.bridgeScript === undefined ? {} : { bridgeScript: config.bridgeScript }),
   }
+}
+
+function requestTimeoutFor(method: string, params: Record<string, unknown>, config: ResolvedConfig): number {
+  if (method !== 'wait') return config.requestTimeoutMs
+  const requested = Number(params.timeoutMs)
+  if (!Number.isFinite(requested) || requested <= 0) return config.requestTimeoutMs
+  const bounded = Math.min(Math.floor(requested), MAX_WAIT_TIMEOUT_MS)
+  return Math.min(MAX_WAIT_TIMEOUT_MS + WAIT_REQUEST_GRACE_MS, Math.max(config.requestTimeoutMs, bounded + WAIT_REQUEST_GRACE_MS))
 }
 
 function authority(host: string, port: number): string {
@@ -277,7 +287,7 @@ export class BrowserBridgeClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.settlePending(id, new Error(`Browser request timed out: ${method}`), undefined, true)
-      }, config.requestTimeoutMs)
+      }, requestTimeoutFor(method, params, config))
       const onAbort = () => {
         this.settlePending(id, new Error(`Browser request aborted: ${method}`), undefined, true)
       }
