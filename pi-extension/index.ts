@@ -8,7 +8,7 @@ import WebSocket from "ws";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applyBrowserToolMask, createBrowserActivation } from "./activation.js";
-import { compactBrowserResult } from "./output.js";
+import { compactBridgeHealth, compactBrowserResult, compactDoctorResult, compactStatusResult, runtimeDiagnosis } from "./output.js";
 
 const BRIDGE_HOST = "127.0.0.1";
 const configuredBridgePort = Number.parseInt(process.env.PI_CONTROL_CHROME_BRIDGE_PORT ?? "", 10);
@@ -32,6 +32,9 @@ let agentRunCleanupDone = false;
 const activeWaitControllers = new Set<AbortController>();
 const BRIDGE_WAIT_DELAY_MS = 100;
 const BRIDGE_WAIT_ATTEMPTS = 30;
+const DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS = 120_000;
+const MAX_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const WAIT_REQUEST_GRACE_MS = 20_000;
 let paused = false;
 
 type BrowserTarget = {
@@ -172,8 +175,22 @@ const TAB_HANDLE = Type.Optional(Type.Object({
 }, { additionalProperties: false }));
 const SELECTOR = Type.Optional(Type.String({ description: "Optional CSS selector. Prefer a semantic target or a ref from browser_snapshot." }));
 const INCLUDE_FRAMES = Type.Optional(Type.Boolean({ description: "Include same-origin iframe summaries and readable frame text; cross-origin frames are reported as unavailable." }));
-const OUTPUT_MAX_CHARS = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output character budget; the extension caps this at 100000." }));
+const TAIL = Type.Optional(Type.Boolean({ description: "For browser_extract, keep the end of the selected visible text/Markdown instead of the beginning. Useful for logs." }));
+const LOG_MATCH = Type.Optional(Type.String({ description: "For scope=log, keep only lines containing this case-insensitive literal." }));
+const LOG_MAX_MATCHES = Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "For scope=log with logMatch, maximum matching lines to return." }));
+const RESPONSE_MODE = Type.Optional(Type.Union([
+  Type.Literal("compact"),
+  Type.Literal("raw"),
+], { description: "Output mode. Compact is the default semantic Page Map; use raw only to diagnose the page abstraction or inspect whole-page detail." }));
+const EXTRACT_SCOPE = Type.Optional(Type.Union([
+  Type.Literal("primary"),
+  Type.Literal("log"),
+  Type.Literal("body"),
+], { description: "Extraction region. Compact reads select primary content by default; use log for a log/pre region or body only for whole-page diagnostics." }));
+const OUTPUT_MAX_CHARS = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output character budget; compact model reads default to a smaller budget, and the extension caps this at 100000." }));
 const OUTPUT_MAX_NODES = Type.Optional(Type.Integer({ minimum: 1, description: "Optional output node budget; the extension caps this at 1000." }));
+const TEXT_ANY = Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 20, description: "For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState." }));
+const FAILURE_TEXT_ANY = Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 20, description: "For state=text waits, return immediately with failed=true when any listed failure literal is present." }));
 const WAIT_STATE = Type.Optional(Type.Union([
   Type.Literal("load"),
   Type.Literal("url"),
@@ -200,6 +217,14 @@ const ELEMENT_TARGET = Type.Optional(Type.Object({
   hasText: Type.Optional(Type.String()),
   hasSelector: Type.Optional(Type.String()),
 }, { additionalProperties: false }));
+
+function bridgeRequestTimeout(method: string, params: Record<string, unknown>): number {
+  if (method !== "wait") return DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS;
+  const requested = Number(params.timeoutMs);
+  if (!Number.isFinite(requested) || requested <= 0) return DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS;
+  const bounded = Math.min(Math.floor(requested), MAX_WAIT_TIMEOUT_MS);
+  return Math.min(MAX_WAIT_TIMEOUT_MS + WAIT_REQUEST_GRACE_MS, Math.max(DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS, bounded + WAIT_REQUEST_GRACE_MS));
+}
 
 /** Client for the local Pi-to-Bridge WebSocket protocol. */
 export class BridgeClient {
@@ -313,7 +338,7 @@ export class BridgeClient {
         this.pending.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       };
-      const timer = setTimeout(() => rejectRequest(localBrowserRequestError(method, params, new Error(`Browser request timed out: ${method}`), true), true), 120_000);
+      const timer = setTimeout(() => rejectRequest(localBrowserRequestError(method, params, new Error(`Browser request timed out: ${method}`), true), true), bridgeRequestTimeout(method, params));
       this.pending.set(id, { resolve, reject, timer, socket, method, params, removeAbort: () => removeAbort?.() });
       if (signal !== undefined) {
         const onAbort = () => rejectRequest(localBrowserRequestError(method, params, signal.reason ?? new Error(`Browser request aborted: ${method}`), true), true);
@@ -651,14 +676,39 @@ function localBrowserRequestError(method: string, params: Record<string, unknown
   return result;
 }
 
+const MODEL_READ_BUDGETS = Object.freeze({
+  snapshotChars: 8_000,
+  snapshotNodes: 100,
+  extractChars: 6_000,
+  domChars: 8_000,
+  domNodes: 100,
+  consoleChars: 4_000,
+  consoleEvents: 40,
+});
+
 function compactResponseParams(method: string, params: Record<string, unknown>, health: unknown): Record<string, unknown> {
   const supported = method === "snapshot" || method === "extract" || method === "list_tabs" || method === "selected_tab" || (method === "dom_cua" && params.action === "get_visible_dom");
-  if (!supported || params.responseMode !== undefined) return params;
+  const explicitlyRaw = params.responseMode === "raw";
+  if (explicitlyRaw) return params;
+  const budgeted = { ...params };
+  if (method === "snapshot") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.snapshotChars;
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = MODEL_READ_BUDGETS.snapshotNodes;
+  } else if (method === "extract") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.extractChars;
+  } else if (method === "dom_cua" && params.action === "get_visible_dom") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.domChars;
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = MODEL_READ_BUDGETS.domNodes;
+  } else if (method === "console_logs") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.consoleChars;
+    if (budgeted.maxEvents === undefined) budgeted.maxEvents = MODEL_READ_BUDGETS.consoleEvents;
+  }
+  if (!supported) return budgeted;
   const capabilities = health && typeof health === "object" && !Array.isArray(health)
     ? (health as { capabilities?: unknown }).capabilities
     : undefined;
-  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities) || (capabilities as Record<string, unknown>).compactResponses !== true) return params;
-  return { ...params, responseMode: "compact" };
+  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities) || (capabilities as Record<string, unknown>).compactResponses !== true) return budgeted;
+  return { ...budgeted, responseMode: "compact" };
 }
 
 function hasAccessibilityReference(value: unknown): boolean {
@@ -693,12 +743,23 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
     if (settle?.target !== undefined) requireTargetSupport();
   }
   if (method === "locator" && (params.target !== undefined || isTargetLocator(params.locator))) requireTargetSupport();
+  if (method === "extract") {
+    if (params.tail === true) requiredExtension.push("tailExtract");
+    if (params.scope === "primary" || params.scope === "log") requiredExtension.push("scopedExtract");
+    if (params.logMatch !== undefined) requiredExtension.push("extractLogMatch");
+  }
   if (method === "wait") {
     const state = String(params.state || "load");
     if (params.target !== undefined) requireTargetSupport();
     if (["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) {
       requiredBridge.push("pageWaitStates");
       requiredExtension.push("pageWaitStates");
+    }
+    if (params.textAny !== undefined || params.failureTextAny !== undefined) requiredExtension.push("waitTerminalStates");
+    if (params.reload === true) requiredExtension.push("reloadAwareWait");
+    if (typeof params.timeoutMs === "number" && params.timeoutMs > 120_000) {
+      requiredBridge.push("longWait");
+      requiredExtension.push("longWait");
     }
   }
   if (TAB_INCARNATION_METHODS.has(method)) requiredExtension.push("tabIncarnationFence");
@@ -714,6 +775,10 @@ function assertBridgeRequestCapabilities(method: string, params: Record<string, 
     throw error;
   }
 }
+
+/** Diagnose the extension runtime vintage so a stale worker is named instead of guessed. */
+// The runtime-vintage verdict and the doctor shape live in the shared projection
+// (`runtimeDiagnosis`/`compactDoctorResult` from ./output.js) so Pi, DSH and Codex cannot drift.
 
 function bridgeErrorCode(error: unknown): string | undefined {
   if (!(error instanceof Error)) return undefined;
@@ -1060,9 +1125,9 @@ function errorResult(error: unknown) {
   };
 }
 
-function bridgeRestartConfirmationError(): Error & { code: string; details: Record<string, unknown> } {
-  const error = new Error("Bridge restart requires explicit user confirmation; ask the user before retrying with confirmed=true") as Error & { code: string; details: Record<string, unknown> };
-  error.code = "BRIDGE_RESTART_CONFIRMATION_REQUIRED";
+function bridgeRestartConfirmationError(message = "Bridge restart requires explicit user confirmation; ask the user before retrying with confirmed=true", code = "BRIDGE_RESTART_CONFIRMATION_REQUIRED"): Error & { code: string; details: Record<string, unknown> } {
+  const error = new Error(message) as Error & { code: string; details: Record<string, unknown> };
+  error.code = code;
   error.details = { requiresUserConfirmation: true };
   return error;
 }
@@ -1073,19 +1138,32 @@ function validateWaitRequest(params: Record<string, unknown>): void {
   const state = params.state === undefined ? "load" : String(params.state);
   if (!["load", "url", "text", "text_gone", "visible", "hidden", "enabled"].includes(state)) throw new Error(`Unsupported browser wait state: ${state}`);
   const hasText = params.text !== undefined;
+  const hasTextAny = params.textAny !== undefined;
+  const hasFailureTextAny = params.failureTextAny !== undefined;
   const hasTarget = params.target !== undefined;
   if (state === "text" || state === "text_gone") {
     if (hasTarget) throw new Error(`${state} wait cannot combine text with target`);
-    if (typeof params.text !== "string" || !params.text.trim()) throw new Error(`${state} wait requires text`);
+    if (hasText && hasTextAny) throw new Error(`${state} wait cannot combine text with textAny`);
+    if (hasFailureTextAny && state !== "text") throw new Error("failureTextAny requires state=text");
+    if (!hasText && !hasTextAny) throw new Error(`${state} wait requires text or textAny`);
+    if (hasText && (typeof params.text !== "string" || !params.text.trim())) throw new Error(`${state} wait requires non-empty text`);
+    for (const key of ["textAny", "failureTextAny"]) {
+      const value = params[key];
+      if (value === undefined) continue;
+      if (!Array.isArray(value) || value.length === 0 || value.some(item => typeof item !== "string" || !item.trim())) throw new Error(`${key} requires a non-empty array of strings`);
+    }
   } else if (["visible", "hidden", "enabled"].includes(state)) {
     if (params.exact !== undefined) throw new Error(`${state} wait exact matching belongs inside target`);
-    if (hasText) throw new Error(`${state} wait cannot combine target with text`);
+    if (hasText || hasTextAny || hasFailureTextAny) throw new Error(`${state} wait cannot combine target with text, textAny or failureTextAny`);
     if (!hasTarget) throw new Error(`${state} wait requires target`);
   } else if (state === "url") {
-    if (hasText || hasTarget) throw new Error("url wait cannot combine URL matching with text or target");
+    if (hasText || hasTextAny || hasFailureTextAny || hasTarget) throw new Error("url wait cannot combine URL matching with text, textAny, failureTextAny or target");
     if ((typeof params.url !== "string" || !params.url) && (typeof params.urlIncludes !== "string" || !params.urlIncludes)) throw new Error("url wait requires url or urlIncludes");
-  } else if (hasText || hasTarget) {
-    throw new Error("load wait cannot combine load matching with text or target");
+  } else if (hasText || hasTextAny || hasFailureTextAny || hasTarget) {
+    throw new Error("load wait cannot combine load matching with text, textAny, failureTextAny or target");
+  }
+  if (params.reload === true && !["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) {
+    throw new Error("reload waits require a text or element state");
   }
 }
 
@@ -1177,7 +1255,16 @@ async function callBrowserRequest(method: string, params: Record<string, unknown
         return { ...base, ok: false, recommendation: targetStability.connectionChanged ? "acknowledge_browser_connection" : "acknowledge_browser_target", targetStability, issues: [issue] };
       }
       const base = result && typeof result === "object" ? result : { result };
-      return { ...base, targetStability };
+      const diagnosis = runtimeDiagnosis(status);
+      const baseIssues = result && typeof result === "object" && Array.isArray((result as { issues?: unknown }).issues) ? (result as { issues: unknown[] }).issues : [];
+      const baseNotices = result && typeof result === "object" && Array.isArray((result as { notices?: unknown }).notices) ? (result as { notices: unknown[] }).notices : [];
+      return {
+        ...base,
+        targetStability,
+        ...(diagnosis.runtime === undefined ? {} : { runtime: diagnosis.runtime }),
+        ...(diagnosis.stale === undefined ? {} : { ok: false, issues: [...baseIssues, diagnosis.stale] }),
+        ...(diagnosis.unversioned === undefined ? {} : { notices: [...baseNotices, diagnosis.unversioned] }),
+      };
     } catch (error) {
       if (requestSignal?.aborted) throw error;
       return result;
@@ -1314,10 +1401,42 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_doctor",
     label: "Browser Doctor",
-    description: "Diagnose the local Bridge, extension connection, active browser target and Chrome/Edge competition without changing tabs.",
+    description: "Diagnose the local Bridge, extension connection, active browser target and Chrome/Edge competition without changing tabs. This is the verbose diagnostic surface: it carries the extension capability map, `runtime.requiredCapabilityRevision`, Bridge targets, per-request observability, and recovery detail, each printed once.",
     parameters: Type.Object({}),
     async execute() {
-      try { return textResult(await call("doctor")); } catch (error) { return errorResult(error); }
+      try { return textResult(compactDoctorResult(await call("doctor"))); } catch (error) { return errorResult(error); }
+    },
+  });
+
+  pi.registerTool({
+    executionMode: "sequential",
+    name: "browser_reload_extension",
+    label: "Browser Extension Reload",
+    description: "Apply an updated pi-control-chrome distribution to the running browser by reloading its extension. The loaded service worker keeps the code it started with, so a refreshed profile stays inert until this runs; the extension restarts, in-flight browser work is cancelled, and the Bridge reconnects the same target. Pass confirmed=true only after the user explicitly confirms the reload, then refresh browser_status and all tab/snapshot handles.",
+    parameters: Type.Object({
+      confirmed: Type.Boolean({ description: "Must be true only after the user explicitly confirms the extension reload." }),
+      delayMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 5000, description: "Delay before the worker restarts so the response can reach the caller first; defaults to 250 ms." })),
+    }),
+    async execute(_toolCallId, params) {
+      if (!browserToolsActive) return errorResult(new Error("Browser tools are inactive; load the pi-control-chrome Skill after the user explicitly requests browser control"));
+      if (params.confirmed !== true) return errorResult(bridgeRestartConfirmationError("Extension reload requires explicit user confirmation; ask the user before retrying with confirmed=true", "EXTENSION_RELOAD_CONFIRMATION_REQUIRED"));
+      try {
+        const result = await bridge.request("reload_extension", {
+          ...(params.delayMs === undefined ? {} : { delayMs: params.delayMs }),
+          confirmed: true,
+        });
+        bridgeUsed = true;
+        browserActivation.markUsed();
+        return textResult({
+          ...(result && typeof result === "object" && !Array.isArray(result) ? result : { result }),
+          reconnected: false,
+          nextAction: "browser_status",
+          recommendation: "refresh_browser_status",
+          note: "The extension restarts asynchronously. Re-run browser_status and wait for the target to reconnect before reusing any tab, snapshotId, ref, or handle.",
+        });
+      } catch (error) {
+        return errorResult(error);
+      }
     },
   });
 
@@ -1355,13 +1474,13 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_status",
     label: "Browser Status",
-    description: "Return the connected Chrome/Edge browser, target stability and Pi bridge status.",
+    description: "Return the connected Chrome/Edge browser identity, target stability and Bridge state as one small read: the capability revision replaces the boolean capability map, and per-request metrics, targets and the recovery detail live in browser_doctor.",
     parameters: Type.Object({
       browserId: Type.Optional(Type.String({ description: "Select a connected browser target by browserId." })),
       acknowledgeBrowserId: Type.Optional(Type.String({ description: "Explicitly acknowledge this browserId after confirming a browser switch." })),
     }),
     async execute(_toolCallId, params) {
-      try { return textResult(await call("status", params)); } catch (error) { return errorResult(error); }
+      try { return textResult(compactStatusResult(await call("status", params))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1369,7 +1488,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_targets",
     label: "Browser Targets",
-    description: "List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available.",
+    description: "List connected Chrome/Edge browser targets without selecting one. Use browser_status with an explicit browserId to activate the intended target when multiple targets are available. Browser-level diagnostics belong to browser_doctor.",
     parameters: Type.Object({}),
     async execute() {
       try {
@@ -1378,7 +1497,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
         return textResult({
           state: health?.extensionConnected === false ? "bridge_only" : "connected",
           targets: targetRecords(inventory),
-          ...(health === undefined ? {} : { bridgeHealth: health }),
+          ...(health === undefined ? {} : { bridgeHealth: compactBridgeHealth(health) }),
         });
       } catch (error) {
         return errorResult(error);
@@ -1412,10 +1531,15 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_tabs",
     label: "Browser Tabs",
-    description: "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.",
-    parameters: Type.Object({}),
-    async execute() {
-      try { return textResult(compactBrowserResult("browser_tabs", { sessionId }, await call("list_tabs"))); } catch (error) { return errorResult(error); }
+    description: "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The listing is complete by default and hard-capped at 200 rows; narrow it with query (title/url substring) and owner (user/agent/claimed) instead of paging, and pass limit only when you want fewer rows. totalTabs/matchedTabs/omittedTabs report any bound that applied. The Pi group may be shared by sessions; use owner, sessionId and sessionScope, never groupId alone, to choose a tab.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ description: "Case-insensitive substring matched against tab title and URL." })),
+      limit: Type.Optional(Type.Number({ description: "Maximum rows to return; omit for the complete listing (hard-capped at 200). omittedTabs reports dropped rows." })),
+      owner: Type.Optional(Type.Union([Type.Literal("user"), Type.Literal("agent"), Type.Literal("claimed")], { description: "Return only tabs with this ownership state." })),
+      documentIdentity: Type.Optional(Type.Boolean({ description: "When false, return tab-fence-only handles without probing document identity; re-observe before document-bound work." })),
+    }),
+    async execute(_toolCallId, params) {
+      try { return textResult(compactBrowserResult("browser_tabs", { sessionId }, await call("list_tabs", params))); } catch (error) { return errorResult(error); }
     },
   });
 
@@ -1481,7 +1605,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_snapshot",
     label: "Browser Snapshot",
     description: "Read the active page title and one bounded semantic page state with document-scoped live eN refs; same-origin iframe text and bounded frame metadata are included by default. Set includeFrames=false to exclude embedded documents. Ref actions require the matching returned snapshotId. Unrelated same-document UI changes do not stale a ref, but navigation remains a hard boundary.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES }),
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, responseMode: RESPONSE_MODE, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES }),
     async execute(_toolCallId, params) {
       try { return textResult(compactBrowserResult("browser_snapshot", params, await call("snapshot", params))); } catch (error) { return errorResult(error); }
     },
@@ -1491,8 +1615,8 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_extract",
     label: "Extract Browser Page",
-    description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper; same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames=false.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS }),
+    description: "Extract the current page as bounded plain text and simple Markdown without fetching it through a separate web scraper. Compact reads select primary content by default; use scope=log with tail=true for log-like pages, or logMatch to return only matching log lines; body is for whole-page diagnostics. Same-origin iframe text and bounded frame metadata are included by default and can be disabled with includeFrames=false.",
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, responseMode: RESPONSE_MODE, scope: EXTRACT_SCOPE, tail: TAIL, logMatch: LOG_MATCH, logMaxMatches: LOG_MAX_MATCHES, maxChars: OUTPUT_MAX_CHARS }),
     async execute(_toolCallId, params) {
       try { return textResult(compactBrowserResult("browser_extract", params, await call("extract", params))); } catch (error) { return errorResult(error); }
     },
@@ -1503,7 +1627,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_accessibility_snapshot",
     label: "Browser Accessibility Snapshot",
     description: "Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. Actionable/focusable nodes may include document-scoped aN refs; pass the matching snapshotId before using an AX ref. Same-origin iframe context is included by default and can be disabled with includeFrames=false. If the Accessibility domain is unavailable, the result safely falls back to the DOM semantic tree.",
-    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({ tabId: TAB_ID, handle: TAB_HANDLE, selector: SELECTOR, includeFrames: INCLUDE_FRAMES, responseMode: RESPONSE_MODE, maxChars: OUTPUT_MAX_CHARS, maxNodes: OUTPUT_MAX_NODES, disableDiffing: Type.Optional(Type.Boolean()) }),
     async execute(_toolCallId, params) {
       try {
         const result = await call("snapshot", { ...params, accessibilityOnly: true });
@@ -1568,7 +1692,7 @@ function registerBrowserTools(pi: ExtensionAPI) {
     executionMode: "sequential",
     name: "browser_wait",
     label: "Wait for Browser Page",
-    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state; ordinary role/name, label, and accessible-text targets use Chromium AX first, while eN/aN ref targets require the matching snapshotId and AX refs are revalidated against the current Chromium tree.",
+    description: "Wait for a selected browser tab to load, reach a URL, show or hide text, or reach an element state. Text waits accept text or textAny and report matchedText for the first terminal literal found; ordinary role/name, label, and accessible-text targets use Chromium AX first, while eN/aN ref targets require the matching snapshotId and AX refs are revalidated against the current Chromium tree.",
     parameters: Type.Object({
       tabId: TAB_ID,
       handle: TAB_HANDLE,
@@ -1576,9 +1700,13 @@ function registerBrowserTools(pi: ExtensionAPI) {
       url: Type.Optional(Type.String()),
       urlIncludes: Type.Optional(Type.String()),
       text: Type.Optional(Type.String()),
+      textAny: TEXT_ANY,
+      failureTextAny: FAILURE_TEXT_ANY,
       target: ELEMENT_TARGET,
       snapshotId: Type.Optional(Type.String()),
       exact: Type.Optional(Type.Boolean()),
+       reload: Type.Optional(Type.Boolean({ description: "For text/element waits, reload the page between polls. Opt in only for externally updated pages such as Jenkins." })),
+       reloadIntervalMs: Type.Optional(Type.Integer({ minimum: 250, description: "Minimum interval between opt-in reload polls; defaults to 5000 ms." })),
       timeoutMs: TIMEOUT_MS,
     }),
     async execute(_toolCallId, params) {

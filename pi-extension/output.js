@@ -9,6 +9,14 @@ const OUTPUT_HARD_MAX_NODES = 1_000;
 const DEFAULT_OUTPUT_NODES = 200;
 const FIELD_MAX_CHARS = 240;
 const RESULT_IDENTITY_KEYS = ["browserId", "profile", "connectionId", "connectionGeneration"];
+// The extension capability revision this host distribution needs. A connected extension that
+// advertises an older revision cannot serve the newest request shapes, so the host reports it
+// as a runtime-freshness issue instead of silently degrading. `browser_status` prints the single
+// number; `browser_doctor` prints the full boolean map for diagnosis.
+export const REQUIRED_CAPABILITY_REVISION = 8;
+const STATUS_IDENTITY_KEYS = ["browserId", "profile", "connectionId", "connectionGeneration", "connectedAt"];
+const TARGET_STABILITY_DECISION_KEYS = ["stable", "changed", "acknowledged", "connectionChanged", "requiresAcknowledgement", "competition"];
+const TARGET_STABILITY_IDENTITY_KEYS = ["browser", "browserId", "connectionId"];
 
 function outputChars(value, fallback) {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? Math.min(value, OUTPUT_HARD_MAX_CHARS) : fallback;
@@ -172,6 +180,93 @@ function accessibilityLine(node, prefix = "- ") {
   return `${prefix}${role}${name ? ` ${quote(name)}` : ""}${value}${disabled}${checked}${states}${level}${ref}`;
 }
 
+function regionAddress(region) {
+  const address = isRecord(region.address) ? region.address : {};
+  const role = typeof address.role === "string" ? address.role : typeof region.role === "string" ? region.role : "";
+  const name = typeof address.name === "string" ? address.name : "";
+  const selector = typeof address.selector === "string" ? address.selector : "";
+  if (selector) return ` {selector=${selector}}`;
+  if (role && name) return ` {${role} ${quote(name)}}`;
+  return "";
+}
+
+function nodeAddress(node) {
+  const role = bounded(text(node.role || "control"), 64);
+  const name = bounded(text(node.name || ""), FIELD_MAX_CHARS);
+  const ref = typeof node.ref === "string" ? ` [ref=${node.ref}]` : "";
+  const selector = isRecord(node.address) && typeof node.address.selector === "string" ? ` {selector=${node.address.selector}}` : "";
+  const target = !ref && !selector && isRecord(node.address) && typeof node.address.role === "string" && typeof node.address.name === "string"
+    ? ` {${node.address.role} ${quote(node.address.name)}}`
+    : "";
+  return `${role}${name ? ` ${quote(name)}` : ""}${ref}${selector}${target}`;
+}
+
+/**
+ * Neutral page digest: regions in document order, repeated containers as counts, every
+ * region addressable again, and any budget omission reported with how to retrieve it.
+ * This renderer makes no judgement about which part of the page matters.
+ */
+function pageMapState(pageMap, maxChars, maxNodes) {
+  if (!isRecord(pageMap) || !Array.isArray(pageMap.regions)) return undefined;
+  const sections = [];
+  sections.push(`Page: ${bounded(text(pageMap.title || ""), FIELD_MAX_CHARS)}`);
+  if (typeof pageMap.url === "string" && pageMap.url.length > 0) sections.push(`URL: ${bounded(pageMap.url, 512)}`);
+  const status = Array.isArray(pageMap.status) ? pageMap.status.filter(value => typeof value === "string" && value.length > 0).slice(0, 3) : [];
+  if (status.length > 0) sections.push(`Status:\n${status.map(value => `- ${bounded(value, 320)}`).join("\n")}`);
+  const metadata = Array.isArray(pageMap.metadata) ? pageMap.metadata.filter(isRecord).slice(0, 12) : [];
+  if (metadata.length > 0) {
+    sections.push(`Values:\n${metadata.map((entry) => `- ${bounded(text(entry.key || "value"), 64)}: ${bounded(text(entry.value), 320)}`).join("\n")}`);
+  }
+  let nodeCount = 0;
+  const regions = Array.isArray(pageMap.regions) ? pageMap.regions.filter(isRecord).slice(0, 12) : [];
+  if (regions.length > 0) {
+    const lines = [];
+    for (const region of regions) {
+      const kind = bounded(text(region.kind || region.role || "content"), 64);
+      const role = bounded(text(region.role || "content"), 64);
+      const name = bounded(text(region.name || ""), FIELD_MAX_CHARS);
+      const counts = isRecord(region.counts)
+        ? Object.entries(region.counts).filter(([, value]) => typeof value === "number").map(([key, value]) => `${key}=${value}`)
+        : [];
+      const address = regionAddress(region);
+      const ref = typeof region.ref === "string" ? ` [ref=${region.ref}]` : "";
+      lines.push(`- ${kind} ${quote(name || role)}${counts.length > 0 ? ` (${counts.join(", ")})` : ""}${ref}${address}`);
+      const controls = Array.isArray(region.controls) ? region.controls.filter(isRecord) : [];
+      const values = Array.isArray(region.values) ? region.values.filter(isRecord).slice(0, 6) : [];
+      const regionText = typeof region.text === "string" ? region.text : "";
+      if (controls.length === 0 && values.length === 0 && !regionText) continue;
+      const detail = [];
+      if (controls.length > 0) detail.push(`controls: ${controls.map(nodeAddress).join(", ")}`);
+      if (values.length > 0) detail.push(`values: ${values.map(entry => `${bounded(text(entry.key || "value"), 64)}=${bounded(text(entry.value), 240)}`).join(", ")}`);
+      if (regionText.length > 0) detail.push(`text: ${bounded(regionText, 480)}`);
+      lines.push(`  ${detail.join("\n  ")}`);
+      nodeCount += controls.length + values.length;
+    }
+    sections.push(`Regions (document order):\n${lines.join("\n")}`);
+  }
+  const omitted = isRecord(pageMap.omitted) ? pageMap.omitted : undefined;
+  const omittedParts = omitted === undefined
+    ? []
+    : Object.entries(omitted).filter(([, value]) => typeof value === "number" && value > 0).map(([key, value]) => `${value} ${key}`);
+  const stateSource = sections.join("\n\n");
+  const state = bounded(stateSource, maxChars);
+  const stateTruncated = stateSource.length > maxChars;
+  const omittedTruncated = omittedParts.length > 0 || pageMap.truncated === true;
+  const truncated = stateTruncated || omittedTruncated || nodeCount > maxNodes;
+  const recovery = truncated
+    ? "Narrow with browser_snapshot({ target }) on a listed region, browser_extract({ selector, maxChars }), or browser_locator({ target, action }); use responseMode: \"raw\" only for diagnosis."
+    : undefined;
+  return {
+    state,
+    nodeCount: Math.min(nodeCount, maxNodes),
+    ...(truncated ? { truncated: true } : {}),
+    ...(stateTruncated ? { stateTruncated: true } : {}),
+    ...(omittedParts.length > 0 ? { omitted: Object.fromEntries(Object.entries(omitted).filter(([, value]) => typeof value === "number" && value > 0)) } : {}),
+    ...(truncated ? { nextAction: "browser_snapshot", recommendation: "narrow_read" } : {}),
+    ...(recovery === undefined ? {} : { recovery }),
+  };
+}
+
 function snapshotState(snapshot, maxChars, maxNodes) {
   const sections = [];
   const allElements = Array.isArray(snapshot.elements) ? snapshot.elements.filter(isRecord) : [];
@@ -210,7 +305,9 @@ export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxN
   if (!isRecord(value)) return value;
   if (!isRecord(value.snapshot)) return compactResultEnvelope(value);
   const snapshot = value.snapshot;
-  const projected = compactStateSnapshot(snapshot, maxChars, maxNodes) ?? snapshotState(snapshot, maxChars, maxNodes);
+  const projected = pageMapState(snapshot.pageMap, maxChars, maxNodes)
+    ?? compactStateSnapshot(snapshot, maxChars, maxNodes)
+    ?? snapshotState(snapshot, maxChars, maxNodes);
   const embeddedFrameText = frameTextState(snapshot.frameSummaries, maxChars);
   const combinedState = [projected.state, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
   const state = bounded(combinedState, maxChars);
@@ -224,6 +321,11 @@ export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxN
       nodeCount: projected.nodeCount,
       charCount: state.length,
       truncated: projected.truncated || combinedState.length > maxChars,
+       ...(projected.stateTruncated === true || combinedState.length > maxChars ? { stateTruncated: true } : {}),
+       ...(isRecord(projected.omitted) ? { omitted: projected.omitted } : {}),
+       ...(projected.nextAction === undefined ? {} : { nextAction: projected.nextAction }),
+       ...(projected.recommendation === undefined ? {} : { recommendation: projected.recommendation }),
+       ...(projected.recovery === undefined ? {} : { recovery: projected.recovery }),
       ...(snapshot.viewport === undefined ? {} : { viewport: snapshot.viewport }),
       ...frameProjectionFields(snapshot),
     },
@@ -341,6 +443,11 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
     content: {
        ...(value.tab === undefined && content.title !== undefined ? { title: bounded(content.title, FIELD_MAX_CHARS) } : {}),
        ...(value.tab === undefined && content.url !== undefined ? { url: bounded(content.url, 4_096) } : {}),
+      ...(typeof content.scope === "string" ? { scope: bounded(content.scope, 64) } : {}),
+       ...(typeof content.logMatch === "string" ? { logMatch: bounded(content.logMatch, 240) } : {}),
+       ...(typeof content.matchedLineCount === "number" ? { matchedLineCount: content.matchedLineCount } : {}),
+       ...(Array.isArray(content.matchedLineNumbers) ? { matchedLineNumbers: content.matchedLineNumbers.filter(Number.isInteger).slice(0, 200) } : {}),
+       ...(content.matchTruncated === true ? { matchTruncated: true } : {}),
       text: contentText,
       markdown: contentMarkdown,
       ...(content.truncated === true || text(content.text).length > maxChars || text(content.markdown).length > remainingChars ? { truncated: true } : {}),
@@ -349,14 +456,277 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
   };
 }
 
+function compactError(value) {
+  if (!isRecord(value)) return undefined;
+  const error = {};
+  for (const key of ["code", "message"]) {
+    if (typeof value[key] === "string" && value[key].length > 0) error[key] = bounded(value[key], key === "message" ? 320 : FIELD_MAX_CHARS);
+  }
+  return Object.keys(error).length > 0 ? error : undefined;
+}
+
+function compactMessages(list) {
+  if (!Array.isArray(list)) return undefined;
+  const messages = list.filter(isRecord).slice(0, 6).map((entry) => {
+    const message = {};
+    for (const key of ["code", "message"]) if (typeof entry[key] === "string" && entry[key].length > 0) message[key] = bounded(entry[key], key === "message" ? 320 : FIELD_MAX_CHARS);
+    return message;
+  }).filter((entry) => Object.keys(entry).length > 0);
+  return messages.length > 0 ? messages : undefined;
+}
+
+function compactBridgeSummary(value) {
+  const health = isRecord(value.bridgeHealth) ? value.bridgeHealth : undefined;
+  if (health !== undefined) {
+    const summary = {};
+    if (health.ok !== undefined) summary.ok = health.ok === true;
+    if (typeof health.bridgeVersion === "string" && health.bridgeVersion.length > 0) summary.version = health.bridgeVersion;
+    if (health.port !== undefined) summary.port = health.port;
+    if (health.extensionConnected !== undefined) summary.extensionConnected = health.extensionConnected === true;
+    if (health.readyTargetCount !== undefined) summary.readyTargets = health.readyTargetCount;
+    return Object.keys(summary).length > 0 ? summary : undefined;
+  }
+  if (typeof value.bridge === "string" && value.bridge.length > 0) return { origin: bounded(value.bridge, FIELD_MAX_CHARS) };
+  return undefined;
+}
+
+function compactTargetStability(value) {
+  if (!isRecord(value)) return undefined;
+  const result = {};
+  for (const key of TARGET_STABILITY_DECISION_KEYS) if (value[key] !== undefined) result[key] = value[key];
+  if (typeof value.issue === "string" && value.issue.length > 0) result.issue = value.issue;
+  // Identity is printed once at the top level, so a stability record only carries the previous
+  // target when it actually disagrees with the current one.
+  if (value.changed === true || value.connectionChanged === true) {
+    for (const key of ["previousBrowser", "previousBrowserId", "previousConnectionId"]) {
+      if (value[key] !== undefined) result[key] = value[key];
+    }
+  }
+  const observed = Array.isArray(value.observedBrowserIds) ? value.observedBrowserIds.filter((id) => typeof id === "string" && id.length > 0) : [];
+  if (observed.length > 1) result.observedBrowserIds = observed.slice(0, 8);
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * Project a composed browser status into the small contract a model needs: identity printed
+ * once, one monotonic capability revision instead of the boolean map, and the target-stability
+ * decision without duplicated identity. Diagnostics (`capabilities`, `targets`, per-request
+ * metrics, recovery detail, user agent) belong to `browser_doctor`, which stays verbose.
+ */
+export function compactStatusResult(value) {
+  if (!isRecord(value)) return value;
+  const result = {};
+  for (const key of ["connected", "state", "ok", "targetRequired", "completed", "retryable", "userActionRequired"]) if (value[key] !== undefined) result[key] = value[key];
+  const error = compactError(value.error);
+  if (error !== undefined) result.error = error;
+  for (const key of ["browser", "extensionVersion"]) if (typeof value[key] === "string" && value[key].length > 0) result[key] = value[key];
+  for (const key of STATUS_IDENTITY_KEYS) if (value[key] !== undefined) result[key] = key === "profile" ? bounded(value[key], FIELD_MAX_CHARS) : value[key];
+  if (Number.isInteger(value.capabilityRevision)) result.capabilityRevision = value.capabilityRevision;
+  // A status that refuses to pick a target must still carry the ids the caller has to choose
+  // from; an ordinary status never repeats the target inventory that browser_targets owns.
+  if (value.targetRequired === true && Array.isArray(value.targets)) {
+    const targets = value.targets.filter(isRecord).slice(0, 8).map((target) => {
+      const compact = {};
+      for (const key of ["browser", "browserId", "profile", "state"]) {
+        if (typeof target[key] === "string" && target[key].length > 0) compact[key] = bounded(target[key], FIELD_MAX_CHARS);
+      }
+      return compact;
+    }).filter((target) => Object.keys(target).length > 0);
+    if (targets.length > 0) result.targets = targets;
+  }
+  const bridge = compactBridgeSummary(value);
+  if (bridge !== undefined) result.bridge = bridge;
+  // The target a recovery path lost stays in the status: the caller has to know which browser
+  // to re-select, and that is actionable rather than diagnostic.
+  if (isRecord(value.target)) {
+    const target = {};
+    for (const key of ["browser", "browserId", "profile"]) {
+      if (typeof value.target[key] === "string" && value.target[key].length > 0) target[key] = bounded(value.target[key], FIELD_MAX_CHARS);
+    }
+    if (Object.keys(target).length > 0) result.target = target;
+  }
+  const stability = compactTargetStability(value.targetStability);
+  if (stability !== undefined) result.targetStability = stability;
+  if (typeof value.recommendation === "string" && value.recommendation.length > 0) result.recommendation = value.recommendation;
+  const issues = compactMessages(value.issues);
+  const notices = compactMessages(value.notices);
+  if (issues !== undefined) {
+    result.issues = issues;
+    if (value.recovery !== undefined) result.recovery = value.recovery;
+  }
+  if (notices !== undefined) result.notices = notices;
+  if (typeof value.nextAction === "string" && value.nextAction.length > 0) result.nextAction = value.nextAction;
+  return result;
+}
+
+const BRIDGE_HEALTH_KEYS = [
+  "ok", "protocol", "service", "bridgeVersion", "instanceId", "startedBy", "startupMarker", "controlDomain", "port",
+  "extensionConnected", "targetCount", "readyTargetCount", "targetAmbiguous", "unidentifiedExtensionConnections",
+  "browser", "browserId", "profile", "extensionVersion", "extensionCapabilityRevision", "connectionId", "connectionGeneration", "state",
+];
+const BRIDGE_TARGET_KEYS = ["browser", "browserId", "profile", "extensionVersion", "capabilityRevision", "connectionId", "connectionGeneration", "state"];
+
+function compactBridgeTarget(value) {
+  const target = {};
+  for (const key of BRIDGE_TARGET_KEYS) if (value[key] !== undefined) target[key] = value[key];
+  return target;
+}
+
+/**
+ * Project Bridge health for a model-facing read. The Bridge keeps its public health contract (the
+ * extension capability map and user agent stay reachable there), but a host prints the map in
+ * `runtime` only, so this projection drops the nested copies and keeps one target inventory plus
+ * the observability a diagnosis needs.
+ */
+export function compactBridgeHealth(value) {
+  if (!isRecord(value)) return value;
+  const result = {};
+  for (const key of BRIDGE_HEALTH_KEYS) if (value[key] !== undefined) result[key] = value[key];
+  if (isRecord(value.capabilities) && value.capabilities.compactResponses === true) result.capabilities = { compactResponses: true };
+  if (Array.isArray(value.targets)) result.targets = value.targets.filter(isRecord).map(compactBridgeTarget);
+  if (isRecord(value.observability)) {
+    const observability = {};
+    for (const key of ["startedAt", "pendingRequests", "drainingRequests"]) if (value.observability[key] !== undefined) observability[key] = value.observability[key];
+    if (isRecord(value.observability.metrics)) observability.metrics = value.observability.metrics;
+    if (isRecord(value.observability.targetRecovery)) observability.targetRecovery = value.observability.targetRecovery;
+    if (isRecord(value.observability.targetLeases)) observability.targetLeases = value.observability.targetLeases;
+    if (Array.isArray(value.observability.recentEvents)) {
+      observability.recentEvents = value.observability.recentEvents
+        .filter((event) => isRecord(event) && typeof event.event === "string" && (event.event.startsWith("target_") || (event.event === "request_rejected" && typeof event.errorCode === "string" && event.errorCode.startsWith("TARGET_LEASE"))))
+        .slice(-20)
+        .map((event) => {
+          const compact = {};
+          for (const key of ["event", "at", "browserId", "connectionId", "connectionGeneration", "previousConnectionId", "previousConnectionGeneration", "reason", "method", "errorCode"]) {
+            if (event[key] !== undefined) compact[key] = event[key];
+          }
+          return compact;
+        });
+    }
+    if (Object.keys(observability).length > 0) result.observability = observability;
+  }
+  return result;
+}
+
+/** The extension capability map looks the same wherever a payload reports it. */
+function extensionCapabilitySource(value) {
+  const capabilities = isRecord(value.extensionCapabilities) ? value.extensionCapabilities : isRecord(value.capabilities) ? value.capabilities : undefined;
+  const revision = Number.isInteger(value.extensionCapabilityRevision) ? value.extensionCapabilityRevision : Number.isInteger(value.capabilityRevision) ? value.capabilityRevision : undefined;
+  return { capabilities, revision };
+}
+
+/**
+ * Diagnose the extension runtime vintage so a stale worker is named instead of guessed. An explicit
+ * `runtime` wins; otherwise the map and revision are read from whichever field the caller's payload
+ * uses (`extensionCapabilities`/`extensionCapabilityRevision` for a Bridge doctor payload,
+ * `capabilities`/`capabilityRevision` for an extension status payload).
+ */
+export function capabilityRuntime(value) {
+  if (!isRecord(value)) return undefined;
+  const explicit = isRecord(value.runtime) ? value.runtime : undefined;
+  if (explicit !== undefined) {
+    const runtime = {};
+    if (typeof explicit.extensionVersion === "string" && explicit.extensionVersion.length > 0) runtime.extensionVersion = explicit.extensionVersion;
+    if (Number.isInteger(explicit.capabilityRevision)) runtime.capabilityRevision = explicit.capabilityRevision;
+    if (Number.isInteger(explicit.requiredCapabilityRevision)) runtime.requiredCapabilityRevision = explicit.requiredCapabilityRevision;
+    if (explicit.fresh !== undefined) runtime.fresh = explicit.fresh === true;
+    if (isRecord(explicit.capabilities)) runtime.capabilities = explicit.capabilities;
+    return Object.keys(runtime).length > 0 ? runtime : undefined;
+  }
+  const { capabilities, revision } = extensionCapabilitySource(value);
+  if (capabilities === undefined && revision === undefined) return undefined;
+  const extensionVersion = typeof value.extensionVersion === "string" && value.extensionVersion.length > 0 ? value.extensionVersion : undefined;
+  return {
+    ...(extensionVersion === undefined ? {} : { extensionVersion }),
+    ...(revision === undefined
+      ? {}
+      : { capabilityRevision: revision, requiredCapabilityRevision: REQUIRED_CAPABILITY_REVISION, fresh: revision >= REQUIRED_CAPABILITY_REVISION }),
+    ...(capabilities === undefined ? {} : { capabilities }),
+  };
+}
+
+function runtimeStaleIssue(runtime) {
+  // Only a versioned-but-older runtime is a failure. A missing revision means "unknown vintage":
+  // the per-request capability gates still fail closed with the exact missing capability, so the
+  // doctor reports it as a notice instead of failing an otherwise healthy session.
+  if (runtime === undefined || runtime.fresh === true) return undefined;
+  if (runtime.capabilityRevision === undefined) return undefined;
+  return { code: "extension_runtime_stale", message: `The connected extension advertises capability revision ${String(runtime.capabilityRevision)}, but this host needs ${REQUIRED_CAPABILITY_REVISION}; reload the extension before relying on newer request shapes.` };
+}
+
+function runtimeUnversionedNotice(runtime) {
+  if (runtime === undefined || runtime.capabilityRevision !== undefined) return undefined;
+  return { code: "extension_runtime_unversioned", message: `The connected extension does not advertise a capability revision; this host needs revision ${REQUIRED_CAPABILITY_REVISION}. Reload the extension to compare runtimes.` };
+}
+
+/** The runtime verdict a host reports: freshness plus the two messages that explain it. */
+export function runtimeDiagnosis(value) {
+  const runtime = capabilityRuntime(value);
+  return { runtime, stale: runtimeStaleIssue(runtime), unversioned: runtimeUnversionedNotice(runtime) };
+}
+
+function compactTargetList(list) {
+  if (!Array.isArray(list)) return undefined;
+  const targets = list.filter(isRecord).slice(0, 8).map((target) => {
+    const compact = {};
+    for (const key of ["browser", "browserId", "profile", "state"]) {
+      if (typeof target[key] === "string" && target[key].length > 0) compact[key] = bounded(target[key], FIELD_MAX_CHARS);
+    }
+    return compact;
+  }).filter((target) => Object.keys(target).length > 0);
+  return targets.length > 0 ? targets : undefined;
+}
+
+/**
+ * Project a composed browser doctor into the diagnostic contract: one copy of the extension
+ * capability map (inside `runtime`), one target inventory, compacted Bridge health with the
+ * observability a diagnosis needs, and no identity repeated per nested block. Diagnostics stay
+ * verbose, but never by printing the same fact twice.
+ */
+export function compactDoctorResult(value) {
+  if (!isRecord(value)) return value;
+  const result = {};
+  for (const key of ["ok", "state", "connected", "targetRequired", "completed", "retryable", "userActionRequired"]) {
+    if (value[key] !== undefined) result[key] = value[key];
+  }
+  for (const key of ["browser", "extensionVersion"]) {
+    if (typeof value[key] === "string" && value[key].length > 0) result[key] = value[key];
+  }
+  for (const key of STATUS_IDENTITY_KEYS) if (value[key] !== undefined) result[key] = key === "profile" ? bounded(value[key], FIELD_MAX_CHARS) : value[key];
+  if (typeof value.recommendation === "string" && value.recommendation.length > 0) result.recommendation = value.recommendation;
+  if (typeof value.nextAction === "string" && value.nextAction.length > 0) result.nextAction = value.nextAction;
+  if (isRecord(value.error)) {
+    const error = compactError(value.error);
+    if (error !== undefined) result.error = error;
+  }
+  const runtime = capabilityRuntime(value);
+  if (runtime !== undefined) result.runtime = runtime;
+  const health = compactBridgeHealth(value.bridgeHealth);
+  if (health !== undefined) result.bridgeHealth = health;
+  const stability = compactTargetStability(value.targetStability);
+  if (stability !== undefined) result.targetStability = stability;
+  const targets = compactTargetList(value.targets);
+  if (targets !== undefined) result.targets = targets;
+  result.issues = compactMessages(value.issues) ?? [];
+  result.notices = compactMessages(value.notices) ?? [];
+  if (value.recovery !== undefined) result.recovery = value.recovery;
+  return result;
+}
+
 /** Project tab descriptors without favicon payloads. */
 export function compactTabsResult(value, currentSessionId) {
   if (!isRecord(value)) return value;
   const hasSession = typeof currentSessionId === "string" && currentSessionId.length > 0;
+  const omitted = Number.isInteger(value.omittedTabs) && value.omittedTabs > 0 ? value.omittedTabs : 0;
   return {
     ...compactResultEnvelope(value),
     ...(hasSession ? { currentAgentSessionId: currentSessionId } : {}),
     tabs: Array.isArray(value.tabs) ? value.tabs.map(tab => compactTab(tab, currentSessionId)) : [],
+    ...(Number.isInteger(value.totalTabs) ? { totalTabs: value.totalTabs } : {}),
+    ...(Number.isInteger(value.matchedTabs) ? { matchedTabs: value.matchedTabs } : {}),
+    // A bounded listing is still retrievable: the omitted count names how many rows the budget
+    // dropped and the next call narrows instead of silently losing them.
+    ...(omitted > 0 ? { omittedTabs: omitted, nextAction: "browser_tabs", recommendation: "narrow_tab_query" } : {}),
+    ...(isRecord(value.filters) ? { filters: value.filters } : {}),
     ...(Array.isArray(value.groups) ? { groups: value.groups } : {}),
   };
 }
@@ -374,10 +744,16 @@ export function compactNewTabResult(value, currentSessionId) {
 }
 
 /** Apply the model-facing projection selected by a browser tool. */
-export function compactBrowserResult(toolName, params, value) {
+export function compactBrowserResult(toolName, params = {}, value) {
+  // Raw is an explicit diagnostic escape hatch. Every ordinary model read still
+  // uses the Page Map projection, but callers can inspect a bounded raw result
+  // when the abstraction itself needs debugging.
+  if (isRecord(params) && params.responseMode === "raw") return value;
   const maxChars = outputChars(params.maxChars, toolName === "browser_extract" ? EXTRACT_MAX_CHARS : toolName === "browser_dom_cua" ? DOM_MAX_CHARS : SNAPSHOT_MAX_CHARS);
   const maxNodes = outputNodes(params.maxNodes);
   if (toolName === "browser_snapshot") return compactSnapshotResult(value, maxChars, maxNodes);
+  if (toolName === "browser_status") return compactStatusResult(value);
+  if (toolName === "browser_doctor") return compactDoctorResult(value);
   if (toolName === "browser_accessibility_snapshot") return compactAccessibilityResult(value, maxChars, maxNodes);
   if (toolName === "browser_extract") return compactExtractResult(value, maxChars);
   const currentSessionId = typeof params.sessionId === "string" && params.sessionId.length > 0 ? params.sessionId : undefined;

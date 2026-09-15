@@ -498,7 +498,9 @@ test("Pi requires explicit target selection and routes later operations with the
     const selectedResult = await harness.tools.get("browser_status").execute("selected", { browserId: "chrome:profile-b" });
     const selected = JSON.parse(selectedResult.content[0].text);
     assert.equal(selected.browserId, "chrome:profile-b");
-    assert.equal(selected.targetStability.connectionGeneration, 7);
+    // Status prints identity once; the stability record no longer duplicates it.
+    assert.equal(selected.connectionGeneration, 7);
+    assert.equal(selected.targetStability.connectionGeneration, undefined);
 
     await harness.tools.get("browser_click").execute("click", { tabId: 7, ref: "e4" });
     const interaction = mock.requests.filter(message => message.method === "interaction").at(-1);
@@ -642,7 +644,7 @@ test("Pi omits blank browser fields before dispatch", async () => {
     await harness.tools.get("browser_status").execute("bind", {});
     await harness.tools.get("browser_snapshot").execute("snapshot", { tabId: 7, selector: "", snapshotId: "  ", incarnation: "", maxChars: 1_000 });
     const snapshot = mock.requests.filter(message => message.method === "snapshot").at(-1);
-    assert.deepEqual(snapshot.params, { tabId: 7, maxChars: 1_000, sessionId: snapshot.params.sessionId, expectedBrowserId: "edge:test" });
+    assert.deepEqual(snapshot.params, { tabId: 7, maxChars: 1_000, maxNodes: 100, sessionId: snapshot.params.sessionId, expectedBrowserId: "edge:test" });
     assert.equal(Object.hasOwn(snapshot.params, "selector"), false);
     assert.equal(Object.hasOwn(snapshot.params, "snapshotId"), false);
     assert.equal(Object.hasOwn(snapshot.params, "incarnation"), false);

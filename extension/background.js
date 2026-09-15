@@ -15,26 +15,47 @@ const DOWNLOAD_CACHE_RETENTION_MS = 15 * 60_000;
 const PAGE_OBSERVATION_HISTORY_LIMIT = 16;
 const DOCUMENT_TRANSITION_TTL_MS = 30_000;
 const DOCUMENT_TRANSITION_HISTORY_LIMIT = 128;
-const EXTENSION_CAPABILITIES = Object.freeze({
-  turnCleanup: true,
-  turnScopedMarks: true,
-  retainedCleanup: true,
-  debuggerLeaseRecovery: true,
-  targetQualifiedHandles: true,
-  targetScopedState: true,
-  semanticTargets: true,
-  pageWaitStates: true,
-  requestCancellation: true,
-  snapshotRefs: true,
-  domCuaSnapshots: true,
-  liveRefs: true,
-  semanticRebind: true,
-  axRefs: true,
-  frameAwareReads: true,
-  tabIncarnationFence: true,
-  interactionDiagnostics: true,
-  incrementalConsole: true,
+// Single source of truth for the advertised capability surface: each name maps to the
+// revision that introduced it. `EXTENSION_CAPABILITY_REVISION` is derived from the highest
+// `since` value, so adding or removing a capability cannot desynchronise the two surfaces.
+// A host compares one monotonic number in `browser_status` and reads the whole boolean map
+// only in `browser_doctor`, which keeps the ordinary status read small without weakening the
+// per-request capability gates that still require the named boolean.
+const CAPABILITY_SINCE = Object.freeze({
+  turnCleanup: 1,
+  turnScopedMarks: 1,
+  retainedCleanup: 1,
+  debuggerLeaseRecovery: 1,
+  targetQualifiedHandles: 1,
+  targetScopedState: 1,
+  semanticTargets: 2,
+  pageWaitStates: 2,
+  reloadAwareWait: 3,
+  longWait: 3,
+  tailExtract: 4,
+  scopedExtract: 4,
+  requestCancellation: 4,
+  snapshotRefs: 5,
+  domCuaSnapshots: 5,
+  liveRefs: 5,
+  semanticRebind: 5,
+  axRefs: 6,
+  frameAwareReads: 6,
+  tabIncarnationFence: 6,
+  interactionDiagnostics: 7,
+  incrementalConsole: 7,
+  // Revision 8: the neutral document-order page digest, terminal-result waits
+  // (textAny/failureTextAny), log line matching, and applying an updated distribution to the
+  // live browser without the edge://extensions UI.
+  compactPageMap: 8,
+  waitTerminalStates: 8,
+  extractLogMatch: 8,
+  extensionSelfReload: 8,
 });
+const EXTENSION_CAPABILITY_REVISION = Math.max(...Object.values(CAPABILITY_SINCE));
+const EXTENSION_CAPABILITIES = Object.freeze(
+  Object.fromEntries(Object.keys(CAPABILITY_SINCE).map((name) => [name, true])),
+);
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
 const DEBUGGER_LEASE_IDLE_MS = 15_000;
@@ -168,19 +189,26 @@ function validateWaitParams(params = {}) {
   const state = params.state === undefined ? "load" : String(params.state);
   if (!["load", "url", "text", "text_gone", "visible", "hidden", "enabled"].includes(state)) throw new Error(`Unsupported browser wait state: ${state}`);
   const hasText = params.text !== undefined;
+  const hasTextAny = params.textAny !== undefined;
+  const hasFailureTextAny = params.failureTextAny !== undefined;
   const hasTarget = params.target !== undefined;
   if (state === "text" || state === "text_gone") {
     if (hasTarget) throw new Error(`${state} wait cannot combine text with target`);
-    if (typeof params.text !== "string" || !params.text.trim()) throw new Error(`${state} wait requires text`);
+    if (hasText && hasTextAny) throw new Error(`${state} wait cannot combine text with textAny`);
+    if (hasFailureTextAny && state !== "text") throw new Error("failureTextAny requires state=text");
+    if (hasTextAny) {
+      if (!Array.isArray(params.textAny) || params.textAny.length === 0 || params.textAny.some(value => typeof value !== "string" || !value.trim())) throw new Error(`${state} wait textAny requires a non-empty array of strings`);
+    } else if (typeof params.text !== "string" || !params.text.trim()) throw new Error(`${state} wait requires text or textAny`);
+    if (hasFailureTextAny && (!Array.isArray(params.failureTextAny) || params.failureTextAny.length === 0 || params.failureTextAny.some(value => typeof value !== "string" || !value.trim()))) throw new Error("failureTextAny requires a non-empty array of strings");
   } else if (["visible", "hidden", "enabled"].includes(state)) {
     if (params.exact !== undefined) throw new Error(`${state} wait exact matching belongs inside target`);
-    if (hasText) throw new Error(`${state} wait cannot combine target with text`);
+    if (hasText || hasTextAny || hasFailureTextAny) throw new Error(`${state} wait cannot combine target with text, textAny or failureTextAny`);
     if (!hasTarget) throw new Error(`${state} wait requires target`);
   } else if (state === "url") {
-    if (hasText || hasTarget) throw new Error("url wait cannot combine URL matching with text or target");
+    if (hasText || hasTextAny || hasFailureTextAny || hasTarget) throw new Error("url wait cannot combine URL matching with text, textAny, failureTextAny or target");
     if ((typeof params.url !== "string" || !params.url) && (typeof params.urlIncludes !== "string" || !params.urlIncludes)) throw new Error("url wait requires url or urlIncludes");
-  } else if (hasText || hasTarget) {
-    throw new Error("load wait cannot combine load matching with text or target");
+  } else if (hasText || hasTextAny || hasFailureTextAny || hasTarget) {
+    throw new Error("load wait cannot combine load matching with text, textAny, failureTextAny or target");
   }
   return state;
 }
@@ -1349,7 +1377,7 @@ async function connect() {
     socket = next;
     next.addEventListener("open", () => {
       connectedAt = Date.now();
-      send({ type: "hello", role: "extension", protocol: 1, capabilities: EXTENSION_CAPABILITIES, ...browserIdentity() }, next);
+      send({ type: "hello", role: "extension", protocol: 1, capabilities: EXTENSION_CAPABILITIES, capabilityRevision: EXTENSION_CAPABILITY_REVISION, ...browserIdentity() }, next);
       startBridgeHeartbeat(next);
       log("connected to Pi bridge");
     });
@@ -2417,11 +2445,23 @@ async function readTabIncarnationForListing(tabId, expectedFence) {
   }
 }
 
-async function listTabs() {
+// Discovery listing bound. Filtering exists so a caller pays only for the rows it asks about:
+// cheap tab fields are assembled first, `query`/`owner`/`limit` select the returned rows, and
+// only those rows may probe document identity — which injects the Page Agent into the page.
+// The default is deliberately the complete listing (hard-capped): silently dropping rows would
+// hide the very tab a caller just created or is looking for. Internal callers (ownership and
+// post-create verification) use listTabs() directly and are never truncated.
+const TAB_LIST_MAX_LIMIT = 200;
+
+async function listTabs(params = {}) {
+  const query = typeof params.query === "string" && params.query.trim().length > 0 ? params.query.trim().toLowerCase() : undefined;
+  const ownerFilter = params.owner === "user" || params.owner === "agent" || params.owner === "claimed" ? params.owner : undefined;
+  const limit = Number.isInteger(params.limit) ? Math.max(1, Math.min(TAB_LIST_MAX_LIMIT, Number(params.limit))) : Infinity;
+  const documentIdentity = params.documentIdentity !== false;
   const tabs = await chrome.tabs.query({});
   const owned = await ownedTabs();
   const identity = browserIdentity();
-  const entries = (await Promise.all(tabs.map(async (queriedTab) => {
+  const candidates = (await Promise.all(tabs.map(async (queriedTab) => {
     let tab;
     try {
       tab = await chrome.tabs.get(queriedTab.id);
@@ -2442,45 +2482,75 @@ async function listTabs() {
     tab = currentTab;
     const transition = pendingDocumentTransition(tab.id, currentFence);
     const transitionPending = transition !== undefined && transition.completed !== true;
-    const checksDocument = record?.owner === "claimed";
-    // Do not inject the Page Agent into a freshly created loading tab while its
-    // navigation is still in flight. The next stable listing will acquire the
-    // document identity; the tab fence remains available immediately.
-    const incarnation = record && !transitionPending && tab.status === "complete" ? await readTabIncarnationForListing(tab.id, currentFence) : undefined;
     return {
-      id: tab.id,
-      browserId: identity.browserId,
-      favicon: typeof tab.favIconUrl === "string" && /^https?:\/\//i.test(tab.favIconUrl) ? tab.favIconUrl.slice(0, 2048) : "",
-      windowId: tab.windowId,
-      index: tab.index,
-      active: Boolean(tab.active),
-      pinned: Boolean(tab.pinned),
-      title: tab.title || "",
-      url: tab.url || "",
-      status: tab.status,
-      groupId: tab.groupId,
-      owner: record?.owner === "agent" ? "agent" : "user",
-      ownership: record?.owner,
-      sessionId: record?.sessionId,
-      lifecycle: record?.lifecycle,
-      ...(transitionPending ? { transitionPending: true } : {}),
-      handle: {
-        tabId: tab.id,
+      record,
+      checksDocument: record?.owner === "claimed",
+      transitionPending,
+      tabStatus: tab.status,
+      currentFence,
+      entry: {
+        id: tab.id,
         browserId: identity.browserId,
+        favicon: typeof tab.favIconUrl === "string" && /^https?:\/\//i.test(tab.favIconUrl) ? tab.favIconUrl.slice(0, 2048) : "",
         windowId: tab.windowId,
-        ...(transitionPending ? {} : { title: tab.title || "", url: tab.url || "" }),
+        index: tab.index,
+        active: Boolean(tab.active),
+        pinned: Boolean(tab.pinned),
+        title: tab.title || "",
+        url: tab.url || "",
+        status: tab.status,
         groupId: tab.groupId,
+        owner: record?.owner === "agent" ? "agent" : "user",
+        ownership: record?.owner,
         sessionId: record?.sessionId,
-        tabFence: currentFence,
-        ...(incarnation === undefined ? {} : { incarnation }),
+        lifecycle: record?.lifecycle,
+        ...(transitionPending ? { transitionPending: true } : {}),
+        handle: {
+          tabId: tab.id,
+          browserId: identity.browserId,
+          windowId: tab.windowId,
+          ...(transitionPending ? {} : { title: tab.title || "", url: tab.url || "" }),
+          groupId: tab.groupId,
+          sessionId: record?.sessionId,
+          tabFence: currentFence,
+        },
       },
-      stale: transitionPending || (record !== undefined && (record.runtimeId !== runtimeInstanceIdentity || Number(record.windowId) !== Number(tab.windowId) || record.tabFence !== currentFence || (checksDocument && (record.url !== (tab.url || "") || record.incarnation === undefined || incarnation !== record.incarnation)))),
     };
-  }))).filter((entry) => entry !== undefined);
+  }))).filter((candidate) => candidate !== undefined);
+  const matched = candidates.filter(({ entry }) => {
+    if (ownerFilter === "claimed" ? entry.ownership !== "claimed" : ownerFilter !== undefined && entry.owner !== ownerFilter) return false;
+    if (query !== undefined && !`${entry.title}\n${entry.url}`.toLowerCase().includes(query)) return false;
+    return true;
+  });
+  const listed = matched.slice(0, limit);
+  if (documentIdentity) {
+    for (const candidate of listed) {
+      // Do not inject the Page Agent into a freshly created loading tab while its navigation is
+      // still in flight. The next stable listing acquires that document identity; the tab fence
+      // is already available. `documentIdentity: false` skips the probe entirely and returns
+      // tab-fence-only handles, which must be re-observed before document-bound work.
+      if (!candidate.record || candidate.transitionPending || candidate.tabStatus !== "complete") continue;
+      const incarnation = await readTabIncarnationForListing(candidate.entry.id, candidate.currentFence);
+      if (incarnation === undefined) continue;
+      const fenceNow = await tabFenceFor(candidate.entry.id, true);
+      if (fenceNow !== candidate.currentFence) throw uncertainBrowserOperationError("list_tabs", { tabId: candidate.entry.id });
+      candidate.entry.handle.incarnation = incarnation;
+    }
+  }
+  for (const candidate of listed) {
+    const { entry, record, checksDocument, transitionPending, currentFence } = candidate;
+    entry.stale = transitionPending || (record !== undefined && (record.runtimeId !== runtimeInstanceIdentity || Number(record.windowId) !== Number(entry.windowId) || record.tabFence !== currentFence || (checksDocument && (record.url !== (entry.url || "") || record.incarnation === undefined || entry.handle.incarnation !== record.incarnation))));
+  }
   return {
     browserId: identity.browserId,
     profile: identity.profile,
-    tabs: entries,
+    tabs: listed.map((candidate) => candidate.entry),
+    totalTabs: candidates.length,
+    matchedTabs: matched.length,
+    ...(listed.length < matched.length ? { omittedTabs: matched.length - listed.length } : {}),
+    ...(query === undefined && ownerFilter === undefined
+      ? {}
+      : { filters: { ...(query === undefined ? {} : { query: String(params.query).trim() }), ...(ownerFilter === undefined ? {} : { owner: ownerFilter }) } }),
     groups: await listGroups(),
   };
 }
@@ -3688,18 +3758,376 @@ function collectSnapshot(options = {}) {
   candidates.push(...Array.from(root.querySelectorAll(candidateSelector)));
   const elements = [];
   const refRecords = new Map();
+  const elementRefs = new WeakMap();
   let elementCharCount = 0;
   let elementsTruncated = false;
   let counter = 0;
+  const refFor = (element) => {
+    if (!refsAvailable || !element) return undefined;
+    const existing = elementRefs.get(element);
+    if (existing) return existing;
+    const ref = `e${++counter}`;
+    elementRefs.set(element, ref);
+    refRecords.set(ref, {
+      // Keep the original node without retaining removed application subtrees forever.
+      element: retainElement(element),
+      descriptor: {
+        tag: element.tagName.toLowerCase(),
+        role: roleOf(element),
+        name: accessibleName(element).slice(0, 240),
+        label: labelTextOf(element) || undefined,
+        placeholder: element.getAttribute("placeholder") || undefined,
+        testId: element.getAttribute("data-testid") || undefined,
+        id: element.id || undefined,
+        nameAttribute: element.getAttribute("name") || undefined,
+        inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
+      },
+      constraints: {
+        editable: isValueBearing(element),
+        actionable: true,
+        inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
+      },
+    });
+    return ref;
+  };
+  const mapBound = (value, limit) => {
+    const source = normalize(value);
+    if (source.length <= limit) return source;
+    if (limit <= 3) return source.slice(0, limit);
+    return `${source.slice(0, limit - 3)}...`;
+  };
+  const mapRole = (element) => String(element?.getAttribute?.("role") || roleOf(element) || element?.tagName || "content").toLowerCase();
+  const mapKind = (element) => {
+    const tag = String(element?.tagName || "").toLowerCase();
+    const role = mapRole(element);
+    if (tag === "dialog" || role === "dialog" || role === "alertdialog") return "dialog";
+    if (tag === "pre" || ["log", "status", "alert"].includes(role)) return "log";
+    if (tag === "form" || role === "form") return "form";
+    if (["table", "grid", "treegrid"].includes(role) || tag === "table") return "table";
+    if (["navigation", "complementary"].includes(role) || ["nav", "aside"].includes(tag)) return "secondary";
+    if (tag === "article") return "article";
+    if (tag === "main" || role === "main") return "main";
+    return "content";
+  };
+  const mapHeading = (element) => {
+    try {
+      const own = /^h[1-6]$/.test(String(element?.tagName || "").toLowerCase()) || mapRole(element) === "heading" ? textOf(element) : "";
+      if (own) return mapBound(own, 240);
+      const heading = element?.querySelector?.("h1,h2,h3,[role='heading']");
+      if (heading && visible(heading)) return mapBound(textOf(heading), 240);
+    } catch {
+      // A hostile page must not prevent a bounded observation.
+    }
+    return "";
+  };
+  const mapLabel = (element, fallback) => {
+    try {
+      const labelled = normalize(element?.getAttribute?.("aria-label") || element?.getAttribute?.("title") || "");
+      if (labelled) return mapBound(labelled, 240);
+      const heading = mapHeading(element);
+      if (heading) return heading;
+      const id = normalize(String(element?.id || "").replace(/[-_]+/g, " "));
+      if (id) return mapBound(id, 240);
+    } catch {
+      // Fall through to a stable generic label.
+    }
+    return fallback;
+  };
+  // Site-agnostic privacy guard: a "label: value" line whose label names a credential is not
+  // published as structured metadata, and is not copied into the bounded rendered-text
+  // summary that enters the model context. The page itself is untouched.
+  const secretLabel = /password|passcode|one[-_ ]?time|otp|token|secret|api[-_ ]?key|access[-_ ]?key|auth|credential|card|ssn|pin|cvv|cvc|bearer|private[-_ ]?key/i;
+  const secretLabelledLine = (line) => {
+    const pair = String(line).match(/^([^:：]{1,48})\s*[:：]\s*\S/);
+    return pair !== null && secretLabel.test(pair[1]);
+  };
+  const mapSummary = (element, limit = 480) => {
+    try {
+      // innerText only. Falling back to textContent would leak inline <script> source
+      // (for example a framework's bootstrap/helper call) into the page map summary.
+      const lines = String(element?.innerText || "")
+        .split(/\n+/)
+        .map(normalize)
+        .filter(Boolean)
+        .filter(line => !secretLabelledLine(line))
+        .slice(0, 6);
+      return mapBound(lines.join(" · "), limit);
+    } catch {
+      return "";
+    }
+  };
+  const uniqueVisible = (source, predicate = () => true, limit = 256) => {
+    const found = [];
+    const seen = new Set();
+    for (const element of Array.from(source || [])) {
+      if (!element || seen.has(element)) continue;
+      seen.add(element);
+      try {
+        if (visible(element) && predicate(element)) found.push(element);
+      } catch {
+        // Ignore one inaccessible element while preserving the rest of the page map.
+      }
+      if (found.length >= limit) break;
+    }
+    return found;
+  };
+  const actionDescriptor = (element) => ({
+    role: roleOf(element),
+    name: mapBound(accessibleName(element) || textOf(element) || "Action", 240),
+    ...(disabled(element) ? { disabled: true } : {}),
+    ...(element instanceof HTMLAnchorElement ? { href: bound(element.href, 4_096) } : {}),
+    ...(refFor(element) === undefined ? {} : { ref: refFor(element) }),
+  });
+  // A stable, page-owned way to address a region again: role+name when the page provides
+  // them, otherwise the page's own id or test id. Nothing is inferred or generated, and no
+  // text-content fallback is used — that would let an inline helper script become an address.
+  const addressOf = (element) => {
+    try {
+      const role = roleOf(element);
+      const name = mapLabel(element, "");
+      if (role && name) return { role, name: mapBound(name, 240) };
+      const testId = element.getAttribute?.("data-testid");
+      if (testId) return { selector: `[data-testid=${JSON.stringify(testId)}]` };
+      const id = element.id;
+      if (id && /^[A-Za-z][\w:.-]*$/.test(id)) return { selector: `#${id}` };
+      const nameAttribute = element.getAttribute?.("name");
+      if (nameAttribute && /^[A-Za-z][\w:.-]*$/.test(nameAttribute) && element.tagName.toLowerCase() === "form") return { selector: `form[name=${JSON.stringify(nameAttribute)}]` };
+    } catch {
+      // An inaccessible element simply has no address; its ref remains usable.
+    }
+    return undefined;
+  };
+  // Metadata budget. A label must read like a term, not a sentence fragment, and a pair inferred
+  // from free text must read like a data pair rather than prose. A pair the page itself declares
+  // (table row, `dt`/`dd`) may carry a longer value, because the page author marked it as data.
+  const METADATA_LIMITS = Object.freeze({
+    labelCharacters: 32,
+    inferredValueCharacters: 120,
+    declaredValueCharacters: 320,
+    lines: 512,
+    rows: 128,
+    terms: 64,
+  });
+  const SENTENCE_END = /[.!?。！？]/;
+  const LABEL_PUNCTUATION = /[.!?。！？;；,，]/;
+  // Site-agnostic, neutral metadata: the "label: value" pairs a region actually renders,
+  // bounded and privacy-filtered. This layer carries no product or domain vocabulary — a
+  // calling Skill that needs specific field names parses the page itself.
+  const collectMetadata = (source = root, limit = 12) => {
+    const values = new Map();
+    const put = (label, value, origin) => {
+      const normalizedLabel = normalize(label).toLowerCase().replace(/\s+/g, " ");
+      const normalizedValue = normalize(value);
+      if (!normalizedLabel || normalizedLabel.length > METADATA_LIMITS.labelCharacters || !/[a-z]/.test(normalizedLabel)) return;
+      // A prose line such as "- confirmed: the plugin ... node_modules." renders a colon but is
+      // not a data pair: a term-like label carries no sentence punctuation.
+      if (LABEL_PUNCTUATION.test(normalizedLabel)) return;
+      const valueBudget = origin === "declared" ? METADATA_LIMITS.declaredValueCharacters : METADATA_LIMITS.inferredValueCharacters;
+      if (!normalizedValue || normalizedValue.length > valueBudget) return;
+      // Inferred pairs must not read as sentences, otherwise ordinary body text enters the
+      // structured values. Declared pairs are exempt: the page marked them as data.
+      if (origin !== "declared" && (SENTENCE_END.test(normalizedValue.slice(-1)) || /[.!?。！？]\s+\S/.test(normalizedValue))) return;
+      if (secretLabel.test(normalizedLabel)) return;
+      if (values.has(normalizedLabel)) return;
+      values.set(normalizedLabel, mapBound(normalizedValue, METADATA_LIMITS.declaredValueCharacters));
+    };
+    try {
+      // innerText only so inline <script> source cannot be mined as page metadata.
+      const lines = String(source.innerText || "").split(/\n+/).map(normalize).filter(Boolean);
+      for (const line of lines.slice(0, METADATA_LIMITS.lines)) {
+        const pair = line.match(/^([A-Za-z][A-Za-z0-9 _./-]{0,47})\s*[:：]\s*(\S.*)$/);
+        if (pair) put(pair[1], pair[2], "inferred");
+      }
+      try {
+        for (const row of Array.from(source.querySelectorAll("tr,[role='row']")).slice(0, METADATA_LIMITS.rows)) {
+          const cells = Array.from(row.querySelectorAll("th,td,[role='cell'],[role='gridcell']")).map(textOf).filter(Boolean);
+          if (cells.length >= 2) put(cells[0], cells.slice(1).join(" · "), "declared");
+        }
+      } catch {
+        // Ignore one inaccessible table while retaining text metadata.
+      }
+      try {
+        for (const term of Array.from(source.querySelectorAll("dt")).slice(0, METADATA_LIMITS.terms)) {
+          const detail = term.nextElementSibling;
+          if (detail && String(detail.tagName || "").toUpperCase() === "DD") put(textOf(term), textOf(detail), "declared");
+        }
+      } catch {
+        // Ignore one inaccessible definition list while retaining text metadata.
+      }
+    } catch {
+      // Keep metadata best-effort and bounded on hostile pages.
+    }
+    return [...values.entries()].slice(0, limit).map(([key, value]) => ({ key, value }));
+  };
+  // Neutral page digest (pageMap v2). The map makes no judgement about which part of a page
+  // matters: regions are listed in DOCUMENT ORDER, repeated containers are reported as
+  // counts, and every listed region is addressable again by target/ref/selector. Anything a
+  // budget drops is reported in `omitted` together with how to retrieve it.
+  const PAGE_MAP_LIMITS = Object.freeze({
+    regions: 12,
+    regionCandidates: 320,
+    controlsPerRegion: 8,
+    controls: 24,
+    valuesPerRegion: 6,
+    values: 12,
+    textLinesPerRegion: 3,
+    statusRegions: 3,
+  });
+  const buildPageMap = () => {
+    // Neutral candidates, in document order: semantic landmarks plus elements that carry an
+    // explicit id or test id (which is what makes them addressable/zoomable again). Nothing is
+    // scored, so the same DOM always yields the same list in the same order.
+    const landmarkSelector = "main,[role='main'],dialog,[role='dialog'],[role='alertdialog'],article,form,[role='form'],pre,[role='log'],[role='status'],table,[role='table'],[role='grid'],section,aside,[role='complementary'],nav,[role='navigation']";
+    const identifiedSelector = "[id],[data-testid]";
+    const interactiveSelector = "a,button,input,select,textarea,summary,[contenteditable],[role='button'],[role='link'],[role='textbox'],[role='checkbox'],[role='radio'],[role='combobox'],[role='listbox'],[role='searchbox'],[role='slider'],[role='spinbutton'],[role='tab'],[role='menuitem'],[role='option'],[role='switch']";
+    const regionElements = [];
+    const landmarkElements = [];
+    const regionSeen = new Set();
+    const addRegion = (element, isLandmark) => {
+      if (!element || element === root || regionSeen.has(element)) return;
+      // An id-carrying candidate must be a container, not a leaf control: `[id]` alone would
+      // turn every labelled input on a form page into a "region".
+      if (!isLandmark) {
+        try {
+          if (element.matches?.(interactiveSelector) || (element.childElementCount || 0) === 0) return;
+        } catch {
+          return;
+        }
+      }
+      regionSeen.add(element);
+      try {
+        if (!visible(element)) return;
+        regionElements.push(element);
+        if (isLandmark) landmarkElements.push(element);
+      } catch {
+        // Ignore inaccessible regions.
+      }
+    };
+    for (const element of Array.from(root.querySelectorAll(landmarkSelector)).slice(0, PAGE_MAP_LIMITS.regionCandidates)) addRegion(element, true);
+    for (const element of Array.from(root.querySelectorAll(identifiedSelector)).slice(0, PAGE_MAP_LIMITS.regionCandidates)) addRegion(element, false);
+    // Document order. Only a true page-object container (`main`/`dialog`) suppresses the
+    // candidates nested inside it, because its contents stay counted in it and are reachable by
+    // zooming in. A generic wrapper (`section`, id-only container) never hides the page: that
+    // would let one arbitrary wrapper swallow the whole digest.
+    regionElements.sort((left, right) => {
+      const relation = left.compareDocumentPosition(right);
+      if (relation & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (relation & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    const suppressors = landmarkElements.filter(element => ["main", "dialog"].includes(mapKind(element)));
+    const controlSelector = "input,textarea,select,[contenteditable],[role='textbox'],[role='combobox'],[role='searchbox'],[role='spinbutton'],button,a[href],input[type='button'],input[type='submit'],input[type='reset'],[role='button'],[role='link']";
+    const controlCount = (element) => {
+      try {
+        return element.querySelectorAll(controlSelector).length;
+      } catch {
+        return -1;
+      }
+    };
+    const listed = [];
+    for (const element of regionElements) {
+      // A page-object container represents everything inside it.
+      if (suppressors.some(outer => outer !== element && outer.contains(element))) continue;
+      // A child candidate that exposes exactly the same controls as an already listed ancestor
+      // is a redundant wrapper of it; anything with its own controls stays listed.
+      const own = controlCount(element);
+      if (own >= 0 && listed.some(ancestor => ancestor.contains(element) && controlCount(ancestor) === own)) continue;
+      listed.push(element);
+    }
+    if (listed.length === 0) listed.push(root);
+    const budget = { controls: 0, values: 0, controlsOmitted: 0, valuesOmitted: 0, characters: 0, charactersOmitted: 0, fieldsDiscovered: 0 };
+    const regionDigest = (element) => {
+      const kind = mapKind(element);
+      const discoveredControls = Math.max(0, controlCount(element));
+      let controlElements = [];
+      try {
+        controlElements = uniqueVisible(element.querySelectorAll(controlSelector), () => true, 64);
+      } catch {
+        // Leave the region without published controls.
+      }
+      const allowed = Math.max(0, Math.min(PAGE_MAP_LIMITS.controlsPerRegion, PAGE_MAP_LIMITS.controls - budget.controls));
+      const published = controlElements.slice(0, allowed);
+      budget.controls += published.length;
+      budget.controlsOmitted += Math.max(0, discoveredControls - published.length);
+      const values = collectMetadata(element, PAGE_MAP_LIMITS.valuesPerRegion);
+      const valueAllowance = Math.max(0, PAGE_MAP_LIMITS.values - budget.values);
+      const publishedValues = values.slice(0, valueAllowance);
+      budget.values += publishedValues.length;
+      budget.valuesOmitted += Math.max(0, values.length - publishedValues.length);
+      budget.fieldsDiscovered += values.length;
+      let itemCount = 0;
+      try {
+        itemCount = element.querySelectorAll("li,[role='listitem'],tr,[role='row']").length;
+      } catch {
+        // Leave the item count at zero.
+      }
+      const textLines = String(element.innerText || "")
+        .split(/\n+/)
+        .map(normalize)
+        .filter(Boolean)
+        .filter(line => !secretLabelledLine(line))
+        .slice(0, PAGE_MAP_LIMITS.textLinesPerRegion);
+      const text = textLines.join(" · ");
+      budget.characters += text.length;
+      const rendered = String(element.innerText || "");
+      budget.charactersOmitted += Math.max(0, rendered.length - text.length);
+      const address = addressOf(element);
+      const ref = refFor(element);
+      return {
+        kind,
+        role: mapRole(element),
+        name: mapLabel(element, ""),
+        ...(address === undefined ? {} : { address }),
+        ...(ref === undefined ? {} : { ref }),
+        counts: {
+          ...(discoveredControls > 0 ? { controls: discoveredControls } : {}),
+          ...(itemCount > 0 ? { items: itemCount } : {}),
+          ...(values.length > 0 ? { values: values.length } : {}),
+        },
+        ...(published.length > 0 ? { controls: published.map(actionDescriptor) } : {}),
+        ...(publishedValues.length > 0 ? { values: publishedValues } : {}),
+        ...(text ? { text } : {}),
+      };
+    };
+    const regions = listed.slice(0, PAGE_MAP_LIMITS.regions).map(regionDigest);
+    const status = uniqueVisible(root.querySelectorAll("[role='status'],[role='alert'],output"), () => true, PAGE_MAP_LIMITS.statusRegions)
+      .map(element => mapSummary(element, 320))
+      .filter(Boolean)
+      .slice(0, PAGE_MAP_LIMITS.statusRegions);
+    const metadata = collectMetadata(root, PAGE_MAP_LIMITS.values);
+    const omitted = {
+      regions: Math.max(0, listed.length - regions.length),
+      controls: budget.controlsOmitted,
+      fields: Math.max(0, budget.fieldsDiscovered - budget.values),
+      characters: budget.charactersOmitted,
+    };
+    const truncated = omitted.regions > 0 || omitted.controls > 0 || omitted.fields > 0 || omitted.characters > 0;
+    return {
+      version: 2,
+      order: "document",
+      title: bound(document.title, 240),
+      url: documentIdentity.url,
+      regions,
+      ...(status.length > 0 ? { status } : {}),
+      ...(metadata.length > 0 ? { metadata } : {}),
+      ...(truncated ? { omitted, truncated: true } : {}),
+    };
+  };
+  const pageMap = options.pageMap === true ? buildPageMap() : undefined;
   for (const element of candidates) {
     if (element.hasAttribute("contenteditable") && !isContentEditableHost(element) && !element.getAttribute("role")) continue;
     if (!visible(element)) continue;
     const role = roleOf(element);
     if (!role || ["generic", "group", "listitem"].includes(role)) continue;
     const rect = element.getBoundingClientRect();
-    const ref = refsAvailable ? `e${++counter}` : undefined;
+    // Page Map controls may already have a live ref. For ordinary DOM-order
+    // entries, estimate the next ref before budgeting but only retain it after
+    // the entry is actually published; otherwise hidden/truncated candidates
+    // become guessable live refs and needlessly retain DOM nodes.
+    const existingRef = elementRefs.get(element);
+    const previewRef = existingRef ?? (refsAvailable ? `e${counter + 1}` : undefined);
     const entry = {
-      ref,
+      ref: previewRef,
       tag: element.tagName.toLowerCase(),
       role,
       name: accessibleName(element).slice(0, 240),
@@ -3714,26 +4142,7 @@ function collectSnapshot(options = {}) {
       elementsTruncated = true;
       break;
     }
-    refRecords.set(ref, {
-      // Keep the original node without retaining removed application subtrees forever.
-      element: retainElement(element),
-      descriptor: {
-        tag: entry.tag,
-        role: entry.role,
-        name: entry.name,
-        label: labelTextOf(element) || undefined,
-        placeholder: element.getAttribute("placeholder") || undefined,
-        testId: element.getAttribute("data-testid") || undefined,
-        id: element.id || undefined,
-        nameAttribute: element.getAttribute("name") || undefined,
-        inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
-      },
-      constraints: {
-        editable: isValueBearing(element),
-        actionable: true,
-        inputType: element instanceof HTMLInputElement ? String(element.type || "text").toLowerCase() : undefined,
-      },
-    });
+    if (existingRef === undefined) entry.ref = refFor(element);
     elements.push(entry);
     elementCharCount += cost;
   }
@@ -3773,6 +4182,7 @@ function collectSnapshot(options = {}) {
     ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
     ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
     ...(framesTruncated ? { framesTruncated: true } : {}),
+    ...(pageMap === undefined ? {} : { pageMap }),
     accessibility: undefined,
   };
 }
@@ -3787,25 +4197,94 @@ function extractPage(options = {}) {
     return Math.min(requested, MAX_CHARS);
   })();
   const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const tail = options.tail === true;
+  const requestedLogMatch = options.logMatch === undefined ? "" : String(options.logMatch).trim();
+  const logMatch = requestedLogMatch.length > 0 ? requestedLogMatch : undefined;
+  const logMaxMatches = (() => {
+    if (options.logMaxMatches === undefined) return 40;
+    const requested = Number(options.logMaxMatches);
+    if (!Number.isInteger(requested) || requested < 1) throw new Error("logMaxMatches must be a positive integer");
+    return Math.min(requested, 200);
+  })();
   const bound = (value) => {
     const text = String(value ?? "");
     if (maxChars <= 0) return "";
     if (text.length <= maxChars) return text;
-    if (maxChars <= 3) return text.slice(0, maxChars);
-    return `${text.slice(0, maxChars - 3)}...`;
+    if (maxChars <= 3) return text.slice(tail ? -maxChars : 0, tail ? undefined : maxChars);
+    return tail ? `...${text.slice(-(maxChars - 3))}` : `${text.slice(0, maxChars - 3)}...`;
   };
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  const root = (() => {
-    if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
+  const requestedScope = options.scope === undefined ? (tail ? "log" : "body") : String(options.scope);
+  if (!["body", "primary", "log"].includes(requestedScope)) throw new Error("Extract scope must be body, primary or log");
+  if (logMatch !== undefined && requestedScope !== "log") throw new Error("logMatch requires extract scope=log");
+  const isVisible = (element) => {
     try {
-      const selected = document.querySelector(String(options.selector));
-      if (!selected) throw new Error(`Extract selector did not match any element: ${String(options.selector)}`);
-      return selected;
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith("Extract selector did not match")) throw error;
-      throw new Error(`Invalid extract selector: ${String(options.selector)}`);
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      let current = element;
+      while (current && current.nodeType === Node.ELEMENT_NODE) {
+        const style = getComputedStyle(current);
+        if (current.hidden || String(current.getAttribute("aria-hidden") || "").toLowerCase() === "true" || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || style.contentVisibility === "hidden" || Number.parseFloat(style.opacity || "1") <= 0) return false;
+        current = current.parentElement;
+      }
+      return true;
+    } catch {
+      return false;
     }
+  };
+  const primaryRoot = () => {
+    const candidates = Array.from(document.querySelectorAll("main,[role='main'],dialog,[role='dialog'],[role='alertdialog'],article,form,[role='form'],pre,[role='log'],table,[role='table'],[role='grid']"))
+      .filter(isVisible);
+    const score = (element) => {
+      const tag = String(element.tagName || "").toLowerCase();
+      const role = String(element.getAttribute("role") || "").toLowerCase();
+      let value = tag === "main" || role === "main" ? 1_200
+        : tag === "dialog" || role === "dialog" || role === "alertdialog" ? 1_100
+          : tag === "form" || role === "form" ? 1_000
+            : tag === "article" ? 900
+              : tag === "pre" || role === "log" ? 800
+                : tag === "table" || role === "table" || role === "grid" ? 650 : 0;
+      try {
+        value += Math.min(250, Math.floor(String(element.innerText || element.textContent || "").length / 180));
+        value += Math.min(180, element.querySelectorAll("input,textarea,select,[contenteditable],[role='textbox'],[role='combobox'],button,input[type='submit'],[role='button']").length * 18);
+        if (element.closest("nav,[role='navigation'],aside,[role='complementary']")) value -= 1_000;
+      } catch {
+        // Preserve the semantic base score on hostile pages.
+      }
+      return value;
+    };
+    return candidates.sort((left, right) => score(right) - score(left))[0] || document.body || document.documentElement;
+  };
+  const logRoot = () => {
+    const candidates = Array.from(document.querySelectorAll("pre,[role='log'],[role='status'],output,code"))
+      .filter(isVisible);
+    const score = (element) => {
+      const tag = String(element.tagName || "").toLowerCase();
+      const role = String(element.getAttribute("role") || "").toLowerCase();
+      const length = String(element.innerText || element.textContent || "").length;
+      return (tag === "pre" ? 1_000 : role === "log" ? 900 : role === "status" ? 500 : tag === "code" ? 300 : 100) + Math.min(500, Math.floor(length / 80));
+    };
+    return candidates.sort((left, right) => score(right) - score(left))[0];
+  };
+  const rootResolution = (() => {
+    if (options.selector !== undefined && !(typeof options.selector === "string" && options.selector.trim().length === 0)) {
+      try {
+        const selected = document.querySelector(String(options.selector));
+        if (!selected) throw new Error(`Extract selector did not match any element: ${String(options.selector)}`);
+        return { root: selected, scope: "selector" };
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Extract selector did not match")) throw error;
+        throw new Error(`Invalid extract selector: ${String(options.selector)}`);
+      }
+    }
+    if (requestedScope === "log") {
+      const log = logRoot();
+      if (log) return { root: log, scope: "log" };
+    }
+    if (requestedScope === "primary") return { root: primaryRoot(), scope: "primary" };
+    return { root: document.body || document.documentElement, scope: "body" };
   })();
+  const root = rootResolution.root;
   const frameInfo = typeof pageAgent?.collectFrames === "function"
     ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
     : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
@@ -3825,29 +4304,53 @@ function extractPage(options = {}) {
     else if (tag === "a" && element.getAttribute("href")) markdown.push(`[${text}](<${element.href}>)`);
     else markdown.push(text);
   }
-  const frameText = frameInfo.frames
-    .filter((frame) => frame.readable === true && typeof frame.text === "string" && frame.text.length > 0)
-    .map((frame) => `[Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}]\n${frame.text}`)
-    .join("\n\n");
+  // A log tail must be the selected log tail—not the end of an unrelated
+  // iframe appended after it. Preserve frame diagnostics below, but do not mix
+  // frame text into a scope=log payload.
+  const includeFrameText = rootResolution.scope !== "log";
+  const frameText = includeFrameText
+    ? frameInfo.frames
+      .filter((frame) => frame.readable === true && typeof frame.text === "string" && frame.text.length > 0)
+      .map((frame) => `[Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}]\n${frame.text}`)
+      .join("\n\n")
+    : "";
   const sourceText = [String(root.innerText || root.textContent || "").replace(/\n{3,}/g, "\n\n").trim(), frameText]
     .filter(Boolean)
     .join("\n\n");
-  for (const frame of frameInfo.frames) {
-    if (frame.readable !== true || !frame.text) continue;
-    markdown.push(`### Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}\n\n${frame.text}`);
+  const selectLogMatches = (value) => {
+    const source = String(value || "");
+    if (logMatch === undefined) return { text: source, matchedLineCount: undefined, matchedLineNumbers: undefined, matchTruncated: false };
+    const lines = source.split(/\r?\n/);
+    const normalizedMatch = logMatch.toLocaleLowerCase();
+    const matches = lines.map((line, index) => ({ line, lineNumber: index + 1 })).filter(entry => entry.line.toLocaleLowerCase().includes(normalizedMatch));
+    const selected = tail ? matches.slice(-logMaxMatches) : matches.slice(0, logMaxMatches);
+    return { text: selected.map(entry => entry.line).join("\n"), matchedLineCount: matches.length, matchedLineNumbers: selected.map(entry => entry.lineNumber), matchTruncated: matches.length > selected.length };
+  };
+  if (includeFrameText) {
+    for (const frame of frameInfo.frames) {
+      if (frame.readable !== true || !frame.text) continue;
+      markdown.push(`### Embedded frame${frame.title ? `: ${frame.title}` : frame.name ? `: ${frame.name}` : ""}\n\n${frame.text}`);
+    }
   }
-  const text = bound(sourceText);
+  const selectedText = selectLogMatches(sourceText);
+  const text = bound(selectedText.text);
   const remainingChars = Math.max(0, maxChars - text.length);
-  const rawMarkdown = [...new Set(markdown)].join("\n\n");
-  const markdownText = remainingChars > 0 ? bound(rawMarkdown.slice(0, remainingChars)) : "";
+  const rawMarkdownSource = [...new Set(markdown)].join("\n\n");
+  const selectedMarkdown = selectLogMatches(rawMarkdownSource);
+  const rawMarkdown = selectedMarkdown.text;
+  const markdownSlice = tail ? rawMarkdown.slice(-remainingChars) : rawMarkdown.slice(0, remainingChars);
+  const markdownText = remainingChars > 0 ? bound(markdownSlice) : "";
   const framesTruncated = frameInfo.truncated === true || frameInfo.frames.some((frame) => frame.truncated === true);
+  const matchTruncated = selectedText.matchTruncated || selectedMarkdown.matchTruncated;
   return {
     title: clean(document.title).slice(0, 240),
     url: location.href,
+    scope: rootResolution.scope,
+    ...(logMatch === undefined ? {} : { logMatch, matchedLineCount: selectedText.matchedLineCount, matchedLineNumbers: selectedText.matchedLineNumbers, matchTruncated }),
     text,
     markdown: markdownText,
     maxChars,
-    truncated: sourceText.length > maxChars || rawMarkdown.length > remainingChars || framesTruncated,
+    truncated: sourceText.length > maxChars || rawMarkdownSource.length > remainingChars || framesTruncated || matchTruncated,
     ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
     ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
     ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
@@ -4286,9 +4789,17 @@ async function pageOperation(params = {}) {
   if (params.pageOperation === "wait") {
     const state = String(params.state || "load");
     if (state === "text" || state === "text_gone") {
-      if (typeof params.text !== "string" || !normalize(params.text)) throw new Error(`${state} wait requires text`);
-      const present = pageTextMatches(params.text, params.exact);
-      return { matched: state === "text" ? present : !present };
+      const matchers = Array.isArray(params.textAny) ? params.textAny.filter(value => typeof value === "string" && normalize(value)) : [params.text];
+      const failureMatchers = Array.isArray(params.failureTextAny) ? params.failureTextAny.filter(value => typeof value === "string" && normalize(value)) : [];
+      if (matchers.length === 0) throw new Error(`${state} wait requires text or textAny`);
+      const matchedFailure = failureMatchers.find(value => pageTextMatches(value, params.exact));
+      if (matchedFailure !== undefined) return { matched: true, failed: true, terminalState: "failure", matchedText: matchedFailure };
+      const matchedText = matchers.find(value => pageTextMatches(value, params.exact));
+      const present = matchedText !== undefined;
+      return {
+        matched: state === "text" ? present : !present,
+        ...(present ? { matchedText, terminalState: state === "text" ? "success" : "absent" } : {}),
+      };
     }
     if (!["visible", "hidden", "enabled"].includes(state)) throw new Error(`Unsupported page wait state: ${state}`);
     const found = elementsFor(params.target, { projectTextToActionable: true, indexAfterVisibility: state !== "hidden" });
@@ -6453,13 +6964,41 @@ function tabUrlMatches(tab, params = {}) {
 }
 
 async function waitForPageCondition(tabId, params = {}, signal, expectedFence, expectedIncarnation) {
-  const timeoutMs = boundedTimeout(params.timeoutMs, 30000, 120000);
+  const MAX_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+  const state = String(params.state || "load");
+  const timeoutMs = boundedTimeout(params.timeoutMs, 30000, MAX_WAIT_TIMEOUT_MS);
+  const reloadOnPoll = params.reload === true;
+  if (reloadOnPoll && !["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) {
+    throw new Error("reload waits require a text or element state");
+  }
+  const requestedReloadInterval = params.reloadIntervalMs === undefined ? 5000 : Number(params.reloadIntervalMs);
+  if (!Number.isInteger(requestedReloadInterval) || requestedReloadInterval < 250) throw new Error("reloadIntervalMs must be an integer of at least 250 ms");
+  const reloadIntervalMs = reloadOnPoll ? Math.min(requestedReloadInterval, 60000) : 0;
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
+  let activeExpectedIncarnation = expectedIncarnation;
+  let nextReloadAt = reloadOnPoll ? Date.now() + reloadIntervalMs : Number.POSITIVE_INFINITY;
   let lastResult;
   let lastTab;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw abortError(signal, "Browser request aborted");
+    if (reloadOnPoll && Date.now() >= nextReloadAt) {
+      const sourceObservations = capturePageObservationState(tabId);
+      await assertTabFence(tabId, expectedFence, "wait");
+      const transition = beginDocumentTransition(tabId, expectedFence);
+      try {
+        await chrome.tabs.reload(Number(tabId), { bypassCache: params.bypassCache === true });
+        invalidatePageObservationStateAfterDocumentTransition(tabId, sourceObservations);
+        await waitForTabState(tabId, { state: "load", timeoutMs: Math.min(30000, Math.max(1000, deadline - Date.now())) }, signal, expectedFence);
+        activeExpectedIncarnation = await readTabIncarnation(tabId, expectedFence);
+        await refreshOwnedTabDocument(tabId, expectedFence, params.sessionId, { allowPageChange: true });
+        nextReloadAt = Date.now() + reloadIntervalMs;
+      } catch (error) {
+        clearDocumentTransition(tabId, expectedFence, transition);
+        throw error;
+      }
+      continue;
+    }
     const tab = await chrome.tabs.get(Number(tabId));
     lastTab = tab;
     await assertTabFence(tabId, expectedFence, "wait");
@@ -6484,10 +7023,10 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
         await waitWithSignal(Math.min(100, Math.max(1, deadline - Date.now())), signal);
         continue;
       }
-      if (expectedIncarnation !== undefined && pageGenerationIdentity(observedPage?.generation) !== expectedIncarnation) {
+      if (activeExpectedIncarnation !== undefined && pageGenerationIdentity(observedPage?.generation) !== activeExpectedIncarnation) {
         const stale = new Error(`Tab ${tabId} document changed while waiting; take a new browser_tabs snapshot`);
         stale.code = "BROWSER_TAB_FENCE_CHANGED";
-        stale.details = { tabId: Number(tabId), expectedIncarnation };
+        stale.details = { tabId: Number(tabId), expectedIncarnation: activeExpectedIncarnation };
         throw stale;
       }
       lastResult = observedPage?.value;
@@ -6530,14 +7069,14 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
     }
     await waitWithSignal(100, signal);
   }
-  const state = String(params.state || "load");
+  const timeoutState = state;
   const matchCount = typeof lastResult?.count === "number" ? lastResult.count : undefined;
   const count = matchCount === undefined ? "" : ` (${matchCount} matches)`;
-  const error = new Error(`Timed out waiting for page condition ${state}${count}`);
+  const error = new Error(`Timed out waiting for page condition ${timeoutState}${count}`);
   error.code = "BROWSER_WAIT_TIMEOUT";
   error.details = {
     tabId: Number(tabId),
-    state,
+    state: timeoutState,
     ...(matchCount === undefined ? {} : { count: matchCount }),
     ...(lastTab?.title === undefined ? {} : { title: String(lastTab.title || "") }),
     ...(lastTab?.url === undefined ? {} : { url: String(lastTab.url || "") }),
@@ -7976,6 +8515,25 @@ function isReadOnlyTabRequest(method, params = {}) {
   return false;
 }
 
+let extensionReloadTimer;
+// Apply an updated distribution to the running browser. The caller must opt in explicitly
+// because the worker restarts and in-flight browser work is cancelled.
+function scheduleExtensionReload(params = {}) {
+  if (params.confirmed !== true) throw new Error("Extension reload requires explicit confirmation; pass confirmed=true");
+  if (extensionReloadTimer !== undefined) return false;
+  const requestedDelay = Number(params.delayMs);
+  const delayMs = Number.isInteger(requestedDelay) ? Math.min(Math.max(requestedDelay, 0), 5_000) : 250;
+  extensionReloadTimer = setTimeout(() => {
+    extensionReloadTimer = undefined;
+    try {
+      chrome.runtime.reload();
+    } catch (error) {
+      console.error("[pi-control-chrome] extension reload failed", error);
+    }
+  }, delayMs);
+  return true;
+}
+
 async function handleRequest(method, params, dispatchOptions = {}) {
   const signal = dispatchOptions.signal;
   assertRequestActive(signal);
@@ -8033,9 +8591,22 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     assertRequestActive(signal);
   }
   if (method === "status") {
-    return { connected: true, ...browserIdentity(), capabilities: EXTENSION_CAPABILITIES, bridge: BRIDGE_ORIGIN, connectedAt };
+    // The wire contract keeps the boolean capability map because per-request gates need it.
+    // Model-visible slimming happens in the host projection: `browser_status` prints one
+    // capabilityRevision, and `browser_doctor` prints the map and the diagnostics.
+    return { connected: true, state: "connected", ...browserIdentity(), capabilityRevision: EXTENSION_CAPABILITY_REVISION, capabilities: EXTENSION_CAPABILITIES, bridge: BRIDGE_ORIGIN, connectedAt };
   }
-  if (method === "list_tabs") return listTabs();
+  if (method === "reload_extension") {
+    // The response must reach the caller before the worker restarts, so the reload is
+    // scheduled rather than performed inline.
+    const scheduled = scheduleExtensionReload(params);
+    return { ok: true, reloading: scheduled, extensionVersion: chrome.runtime.getManifest().version, requestedAt: Date.now() };
+  }
+  if (method === "list_tabs") {
+    // Complete by default, hard-capped so a pathological window count cannot flood the caller.
+    // totalTabs/matchedTabs/omittedTabs report any bound that actually applied.
+    return listTabs({ ...params, limit: Number.isInteger(params.limit) ? params.limit : TAB_LIST_MAX_LIMIT });
+  }
   if (method === "selected_tab") {
     const tab = requestTab ?? await getTab(params.tabId, params, isReadOnlyTabRequest(method, params));
     const expectedFence = requestTabFence ?? authorizedTabFence(tab);
@@ -8208,6 +8779,10 @@ async function handleRequest(method, params, dispatchOptions = {}) {
         ...(params.maxChars === undefined ? {} : { maxChars: params.maxChars }),
         ...(params.selector === undefined ? {} : { selector: params.selector }),
         ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
+        ...(params.scope === undefined ? {} : { scope: params.scope }),
+         ...(params.logMatch === undefined ? {} : { logMatch: params.logMatch }),
+         ...(params.logMaxMatches === undefined ? {} : { logMaxMatches: params.logMaxMatches }),
+        ...(params.tail === undefined ? {} : { tail: params.tail }),
       }], expectedFence, signal, "extract");
       const frameInfo = Array.isArray(content?.frameSummaries) ? undefined : await readFrameObservation(tab.id, {
         ...(params.selector === undefined ? {} : { selector: params.selector }),
@@ -8229,6 +8804,7 @@ async function handleRequest(method, params, dispatchOptions = {}) {
       ...(params.maxNodes === undefined ? {} : { maxNodes: params.maxNodes }),
       ...(params.selector === undefined ? {} : { selector: params.selector }),
       ...(params.includeFrames === undefined ? {} : { includeFrames: params.includeFrames }),
+      ...(params.pageMap === true ? { pageMap: true } : {}),
       ...(params.accessibilityOnly === true ? { includeRefs: true } : {}),
     };
     return readOnlyWithRetry("snapshot", tab.id, signal, async () => {

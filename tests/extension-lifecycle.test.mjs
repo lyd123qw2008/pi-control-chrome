@@ -33,6 +33,7 @@ function loadExtension(options = {}) {
   let nextDownloadId = 1;
   let nextTabId = Number(options.nextTabId ?? 1000);
   let pageGenerationCalls = 0;
+  let reloadCalls = 0;
   const executeScriptCalls = [];
   const debuggerCommandCalls = [];
   const removeFailures = new Set();
@@ -136,8 +137,13 @@ function loadExtension(options = {}) {
       async reload(tabId) {
         const tab = tabs.get(Number(tabId));
         if (!tab) throw new Error("tab not found");
+        reloadCalls += 1;
         tab.status = "loading";
         await tabUpdated.emit(Number(tabId), { status: "loading" }, tab);
+        if (options.completeReload === true) {
+          tab.status = "complete";
+          await tabUpdated.emit(Number(tabId), { status: "complete" }, tab);
+        }
       },
       async remove(tabId) {
         const id = Number(tabId);
@@ -162,6 +168,7 @@ function loadExtension(options = {}) {
           return [{ result: clone(generation ?? fallback) }];
         }
         const scriptedResults = options.executeScriptResults && typeof options.executeScriptResults === "object" ? options.executeScriptResults : {};
+        if (typeof scriptedResults[func.name] === "function") return [{ result: clone(await scriptedResults[func.name](args, tab)) }];
         return [{ result: Object.hasOwn(scriptedResults, func.name) ? clone(scriptedResults[func.name]) : undefined }];
       },
     },
@@ -281,6 +288,7 @@ function loadExtension(options = {}) {
     runHeartbeat() { for (const { callback } of intervalCallbacks.values()) callback(); },
     heartbeatMessages,
     heartbeatIntervals: intervalCallbacks,
+    getReloadCalls() { return reloadCalls; },
     executeScriptCalls,
     debuggerCommandCalls,
     removeFailures,
@@ -443,6 +451,54 @@ test("advertises live-ref and semantic-rebind capabilities", async () => {
   assert.equal(status.capabilities.axRefs, true);
   assert.equal(status.capabilities.interactionDiagnostics, true);
   assert.equal(status.capabilities.incrementalConsole, true);
+  assert.equal(status.capabilities.reloadAwareWait, true);
+  assert.equal(status.capabilities.longWait, true);
+  assert.equal(status.capabilities.tailExtract, true);
+  assert.equal(status.capabilities.scopedExtract, true);
+  assert.equal(status.capabilities.compactPageMap, true);
+});
+
+test("keeps the advertised capability revision in sync with the capability map", async () => {
+  const source = readFileSync(backgroundPath, "utf8");
+  const start = source.indexOf("const CAPABILITY_SINCE = Object.freeze({");
+  assert.ok(start >= 0, "the extension must declare its capability vintage");
+  const body = source.slice(start, source.indexOf("});", start));
+  const entries = [...body.matchAll(/^\s*([A-Za-z][A-Za-z0-9]*):\s*(\d+),/gm)].map(([, name, since]) => [name, Number(since)]);
+  assert.ok(entries.length >= 25, `expected the full capability surface, saw ${entries.length}`);
+  const fixture = loadExtension();
+  const status = await fixture.api.handleRequest("status", {});
+  assert.deepEqual(entries.map(([name]) => name).sort(), Object.keys(status.capabilities).sort());
+  assert.equal(status.capabilityRevision, Math.max(...entries.map(([, since]) => since)));
+});
+
+test("list_tabs filters at the source and reports any bound that applied", async () => {
+  const fixture = loadExtension();
+  for (let id = 500; id < 530; id += 1) {
+    fixture.tabs.set(id, { id, windowId: 1, title: `orders ${id}`, url: `https://example.test/orders/${id}`, status: "complete" });
+  }
+  // The default listing stays complete: silently dropping rows would hide the tab a caller is
+  // looking for (the bundled CLI looks up a freshly created tab this way).
+  const complete = await fixture.api.handleRequest("list_tabs", {});
+  assert.equal(complete.tabs.length, 30);
+  assert.equal(complete.totalTabs, 30);
+  assert.equal(complete.matchedTabs, 30);
+  assert.equal(complete.omittedTabs, undefined);
+
+  const filtered = await fixture.api.handleRequest("list_tabs", { query: "orders/50", limit: 3 });
+  assert.equal(filtered.totalTabs, 30);
+  assert.equal(filtered.matchedTabs, 10);
+  assert.equal(filtered.tabs.length, 3);
+  assert.equal(filtered.omittedTabs, 7);
+  assert.equal(filtered.filters.query, "orders/50");
+  assert.ok(filtered.tabs.every((entry) => entry.url.includes("/orders/50")));
+
+  const bounded = await fixture.api.handleRequest("list_tabs", { limit: 2 });
+  assert.equal(bounded.tabs.length, 2);
+  assert.equal(bounded.totalTabs, 30);
+  assert.equal(bounded.omittedTabs, 28);
+
+  const owned = await fixture.api.handleRequest("list_tabs", { owner: "agent" });
+  assert.equal(owned.tabs.length, 0);
 });
 
 test("keeps the extension Bridge socket alive with application heartbeats", async () => {
@@ -1623,15 +1679,22 @@ test("page observations forward iframe scope and preserve bounded frame metadata
   });
   fixture.tabs.set(315, { id: 315, windowId: 1, title: "Frame shell", url: "https://example.test/frame-shell", status: "complete" });
 
-  const snapshot = await fixture.api.handleRequest("snapshot", { tabId: 315, includeFrames: false, sessionId: "session-test" });
+  const snapshot = await fixture.api.handleRequest("snapshot", { tabId: 315, includeFrames: false, pageMap: true, sessionId: "session-test" });
   const snapshotCall = fixture.executeScriptCalls.find((call) => call.functionName === "collectSnapshot");
   assert.equal(snapshotCall.args[0].includeFrames, false);
+  assert.equal(snapshotCall.args[0].pageMap, true);
   assert.equal(snapshot.snapshot.frameSummaries[0].name, "mainFrame");
 
   const extract = await fixture.api.handleRequest("extract", { tabId: 315, includeFrames: false, sessionId: "session-test" });
   const extractCall = fixture.executeScriptCalls.find((call) => call.functionName === "extractPage");
   assert.equal(extractCall.args[0].includeFrames, false);
   assert.equal(extract.content.frameCount, 1);
+
+  await fixture.api.handleRequest("extract", { tabId: 315, includeFrames: false, scope: "log", tail: true, maxChars: 4000, sessionId: "session-test" });
+  const tailExtractCall = fixture.executeScriptCalls.filter((call) => call.functionName === "extractPage").at(-1);
+  assert.equal(tailExtractCall.args[0].scope, "log");
+  assert.equal(tailExtractCall.args[0].tail, true);
+  assert.equal(tailExtractCall.args[0].maxChars, 4000);
 });
 
 test("extract accepts an unowned user tab without a returned document handle", async () => {
@@ -2221,6 +2284,29 @@ test("page condition timeouts carry tab and state diagnostics", async () => {
       && error?.details?.state === "visible"
       && error?.details?.url === "https://example.test/wait",
   );
+});
+
+test("page waits can reload externally refreshed pages inside one request", async () => {
+  let checks = 0;
+  const fixture = loadExtension({
+    completeReload: true,
+    executeScriptResults: {
+      pageOperation: () => ({ matched: checks++ > 3 }),
+    },
+  });
+  fixture.tabs.set(319, { id: 319, windowId: 1, title: "externally refreshed", url: "https://example.test/jenkins", status: "complete" });
+  const result = await fixture.api.handleRequest("wait", {
+    tabId: 319,
+    state: "text",
+    text: "Finished:",
+    reload: true,
+    reloadIntervalMs: 250,
+    timeoutMs: 2_000,
+    sessionId: "session-test",
+  });
+  assert.equal(result.condition, "text");
+  assert.equal(result.matched, true);
+  assert.equal(fixture.getReloadCalls() >= 1, true);
 });
 
 

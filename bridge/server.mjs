@@ -15,6 +15,8 @@ const DEFAULT_TOKEN_FILE = join(
   "pi-control-chrome.token",
 );
 const DRAINING_TIMEOUT_MS = 180_000;
+const MAX_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const WAIT_REQUEST_GRACE_MS = 15_000;
 const DEBUG = process.env.PI_CONTROL_CHROME_DEBUG === "1";
 const BRIDGE_SERVICE = "pi-control-chrome";
 const BRIDGE_CAPABILITIES = Object.freeze({
@@ -29,12 +31,15 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   targetScopedEvents: true,
   semanticTargetRequests: true,
   pageWaitStates: true,
+  longWait: true,
   requestCancellation: true,
   compactResponses: true,
+  compactPageMap: true,
   interactionDiagnostics: true,
   incrementalConsole: true,
 });
 const RESPONSE_MODES = new Set(["compact", "raw"]);
+const COMPACT_MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100 });
 const TAB_INCARNATION_METHODS = new Set([
   "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
   "close_tab", "locator", "interaction", "probe_interaction", "dom_cua", "cua", "screenshot", "evaluate", "cdp", "devtools_enable",
@@ -106,6 +111,10 @@ const metrics = {
   targetLeaseNotOwned: 0,
   targetLeaseExpirations: 0,
   targetLeaseInvalidations: 0,
+  modelResponses: 0,
+  modelResponseBytes: 0,
+  compactModelResponses: 0,
+  compactModelResponseBytes: 0,
 };
 let lastTargetDisconnectAt;
 let lastTargetReconnectAt;
@@ -129,6 +138,7 @@ function extensionIdentity(value) {
     browserId,
     profile,
     ...(nonEmptyString(value.extensionVersion) ? { extensionVersion: value.extensionVersion } : {}),
+    ...(Number.isInteger(value.capabilityRevision) ? { capabilityRevision: value.capabilityRevision } : {}),
     ...(value.capabilities && typeof value.capabilities === "object" ? { capabilities: value.capabilities } : {}),
     ...(nonEmptyString(value.userAgent) ? { userAgent: value.userAgent } : {}),
   };
@@ -187,6 +197,7 @@ function setExtensionIdentity(client, value, excludeBridgeRequestId) {
   if (existing?.client === client && (!previousIdentity || previousIdentity.browserId === identity.browserId)) {
     client.browserIdentity = identity;
     existing.extensionVersion = identity.extensionVersion;
+    existing.capabilityRevision = identity.capabilityRevision;
     existing.profile = identity.profile;
     existing.browser = identity.browser;
     existing.capabilities = identity.capabilities;
@@ -607,6 +618,46 @@ function requestParams(message) {
   return message.params && typeof message.params === "object" && !Array.isArray(message.params) ? message.params : {};
 }
 
+function compactRequestParams(method, params = {}) {
+  if (params.responseMode !== "compact") return params;
+  const budgeted = { ...params };
+  if (method === "snapshot") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = COMPACT_MODEL_READ_BUDGETS.snapshotChars;
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = COMPACT_MODEL_READ_BUDGETS.snapshotNodes;
+  } else if (method === "extract") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = COMPACT_MODEL_READ_BUDGETS.extractChars;
+  } else if (method === "dom_cua" && params.action === "get_visible_dom") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = COMPACT_MODEL_READ_BUDGETS.domChars;
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = COMPACT_MODEL_READ_BUDGETS.domNodes;
+  }
+  return budgeted;
+}
+
+function extensionCapabilities(extension) {
+  return extension?.browserIdentity?.capabilities ?? extension?.capabilities ?? {};
+}
+
+function routedRequestTimeoutMs(method, params = {}) {
+  if (method !== "wait") return DRAINING_TIMEOUT_MS;
+  const requested = Number(params.timeoutMs);
+  if (!Number.isFinite(requested) || requested <= 0) return DRAINING_TIMEOUT_MS;
+  const bounded = Math.min(Math.floor(requested), MAX_WAIT_TIMEOUT_MS);
+  return Math.min(MAX_WAIT_TIMEOUT_MS + WAIT_REQUEST_GRACE_MS, Math.max(DRAINING_TIMEOUT_MS, bounded + WAIT_REQUEST_GRACE_MS));
+}
+
+function negotiateCompactPageParams(method, params = {}, extension) {
+  if (params.responseMode !== "compact") return params;
+  const capabilities = extensionCapabilities(extension);
+  const negotiated = { ...params };
+  if (method === "snapshot" && params.accessibilityOnly !== true && negotiated.pageMap === undefined && capabilities.compactPageMap === true) {
+    negotiated.pageMap = true;
+  }
+  if (method === "extract" && negotiated.scope === undefined && capabilities.scopedExtract === true) {
+    negotiated.scope = negotiated.tail === true ? "log" : "primary";
+  }
+  return negotiated;
+}
+
 function extensionRequestParams(params) {
   if (!Object.prototype.hasOwnProperty.call(params, "responseMode")) return params;
   const { responseMode: _responseMode, ...extensionParams } = params;
@@ -673,25 +724,32 @@ function hasAccessibilityReference(value) {
     || hasAccessibilityReference(value.right);
 }
 
-function missingExtensionCapabilities(message, extension) {
-  const params = requestParams(message);
+function missingExtensionCapabilities(method, params = {}, extension) {
   const required = [];
-  if (message.method === "dom_cua") required.push("domCuaSnapshots");
-  if (["interaction", "locator", "wait"].includes(message.method) && params.snapshotId !== undefined) required.push("snapshotRefs");
-  if (["interaction", "locator", "wait"].includes(message.method) && hasAccessibilityReference(params)) required.push("axRefs");
-  if (message.method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery", "tabIncarnationFence");
-  if (message.method === "cleanup" && params.recoverStale === true) required.push("tabIncarnationFence", "debuggerLeaseRecovery");
-  if ((message.method === "mark_handoff" || message.method === "mark_deliverable") && params.turnId !== undefined) required.push("turnScopedMarks");
-  if (message.method === "interaction" && params.target !== undefined) required.push("semanticTargets");
-  if (message.method === "locator" && (params.target !== undefined || isTargetLocator(params.locator))) required.push("semanticTargets");
-  if (message.method === "wait") {
+  if (method === "dom_cua") required.push("domCuaSnapshots");
+  if (["interaction", "locator", "wait"].includes(method) && params.snapshotId !== undefined) required.push("snapshotRefs");
+  if (["interaction", "locator", "wait"].includes(method) && hasAccessibilityReference(params)) required.push("axRefs");
+  if (method === "cleanup" && params.mode === "turn") required.push("turnCleanup", "turnScopedMarks", "retainedCleanup", "debuggerLeaseRecovery", "tabIncarnationFence");
+  if (method === "cleanup" && params.recoverStale === true) required.push("tabIncarnationFence", "debuggerLeaseRecovery");
+  if ((method === "mark_handoff" || method === "mark_deliverable") && params.turnId !== undefined) required.push("turnScopedMarks");
+  if (method === "interaction" && params.target !== undefined) required.push("semanticTargets");
+  if (method === "locator" && (params.target !== undefined || isTargetLocator(params.locator))) required.push("semanticTargets");
+  if (method === "snapshot" && params.pageMap === true) required.push("compactPageMap");
+  if (method === "extract" && (params.scope === "primary" || params.scope === "log")) required.push("scopedExtract");
+  if (method === "extract" && params.tail === true) required.push("tailExtract");
+  if (method === "extract" && params.logMatch !== undefined) required.push("extractLogMatch");
+  if (method === "reload_extension") required.push("extensionSelfReload");
+  if (method === "wait") {
     const state = String(params.state || "load");
     if (params.target !== undefined) required.push("semanticTargets");
     if (["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) required.push("pageWaitStates");
+    if (params.textAny !== undefined || params.failureTextAny !== undefined) required.push("waitTerminalStates");
+    if (params.reload === true) required.push("reloadAwareWait");
+    if (Number(params.timeoutMs) > 120_000) required.push("longWait");
   }
-  if (TAB_INCARNATION_METHODS.has(message.method)) required.push("tabIncarnationFence");
-  const capabilities = extension.browserIdentity?.capabilities ?? extension.capabilities;
-  return required.filter((name) => capabilities?.[name] !== true);
+  if (TAB_INCARNATION_METHODS.has(method)) required.push("tabIncarnationFence");
+  const capabilities = extensionCapabilities(extension);
+  return [...new Set(required)].filter((name) => capabilities?.[name] !== true);
 }
 
 function handleBridgeRestart(client, id, message) {
@@ -769,11 +827,19 @@ function jsonResponse(res, status, value, extraHeaders = {}) {
   res.end(body);
 }
 
-function send(client, message) {
+function sendSerialized(client, serialized) {
   if (client?.readyState !== 1) return false;
   try {
-    client.send(JSON.stringify(message));
+    client.send(serialized);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+function send(client, message) {
+  try {
+    return sendSerialized(client, JSON.stringify(message));
   } catch {
     return false;
   }
@@ -885,7 +951,7 @@ function handleMessage(client, message) {
       sendError(client, id, "INVALID_REQUEST", "request.params must be an object.");
       return;
     }
-    const params = requestParams(message);
+    const params = compactRequestParams(message.method, requestParams(message));
     if (params.responseMode !== undefined && (typeof params.responseMode !== "string" || !RESPONSE_MODES.has(params.responseMode))) {
       metrics.requestErrors += 1;
       sendError(client, id, "INVALID_REQUEST", "request.params.responseMode must be compact or raw.");
@@ -943,7 +1009,8 @@ function handleMessage(client, message) {
       sendError(client, id, "EXTENSION_OFFLINE", "Chrome/Edge extension is not connected.");
       return;
     }
-    const missingCapabilities = missingExtensionCapabilities(message, extension);
+    const negotiatedParams = negotiateCompactPageParams(message.method, params, extension);
+    const missingCapabilities = missingExtensionCapabilities(message.method, negotiatedParams, extension);
     if (missingCapabilities.length > 0) {
       metrics.requestErrors += 1;
       sendError(client, id, "EXTENSION_CAPABILITY_MISSING", `The selected browser target does not support: ${missingCapabilities.join(", ")}. Reload the pi-control-chrome extension.`);
@@ -966,7 +1033,7 @@ function handleMessage(client, message) {
       clientRequestId: id,
       extension,
       method: message.method,
-      params,
+      params: negotiatedParams,
       target,
       connectionId: target?.connectionId,
       connectionGeneration: target?.connectionGeneration,
@@ -987,12 +1054,12 @@ function handleMessage(client, message) {
          const failure = pendingFailure(entry, "TIMEOUT", `Browser request timed out: ${message.method || "unknown"}`);
          sendError(entry.client, entry.clientRequestId, failure.code, failure.message, failure.details);
        }
-    }, DRAINING_TIMEOUT_MS);
+    }, routedRequestTimeoutMs(message.method, negotiatedParams));
     const forwarded = {
       type: "request",
       id: bridgeRequestId,
       method: message.method,
-      params: extensionRequestParams(params),
+      params: extensionRequestParams(negotiatedParams),
       ...(target === undefined ? {} : {
         target: {
           browserId: target.browserId,
@@ -1101,12 +1168,28 @@ function handleMessage(client, message) {
     pending.delete(bridgeRequestId);
     if (entry.client) {
       if (message.error) metrics.requestErrors += 1;
-      const delivered = send(entry.client, {
+      const outbound = {
         ...message,
         id: entry.clientRequestId,
         ...(message.error ? {} : { result: responseForClient(entry, message.result) }),
-      });
-       if (!delivered && isSideEffectingRequest(entry.method, entry.params)) markDraining(bridgeRequestId, entry, "client_response_send_failed");
+      };
+      let delivered = false;
+      try {
+        const serialized = JSON.stringify(outbound);
+        if (entry.client.role === "pi") {
+          const bytes = Buffer.byteLength(serialized, "utf8");
+          metrics.modelResponses += 1;
+          metrics.modelResponseBytes += bytes;
+          if (entry.params.responseMode === "compact") {
+            metrics.compactModelResponses += 1;
+            metrics.compactModelResponseBytes += bytes;
+          }
+        }
+        delivered = sendSerialized(entry.client, serialized);
+      } catch {
+        delivered = false;
+      }
+      if (!delivered && isSideEffectingRequest(entry.method, entry.params)) markDraining(bridgeRequestId, entry, "client_response_send_failed");
     }
     return;
   }
@@ -1161,6 +1244,7 @@ function healthDocument() {
       browserId: singleTarget.browserId,
       profile: singleTarget.profile,
       extensionVersion: singleTarget.extensionVersion,
+      extensionCapabilityRevision: singleTarget.capabilityRevision,
       userAgent: singleTarget.userAgent,
       extensionCapabilities: singleTarget.capabilities,
       connectionId: singleTarget.connectionId,

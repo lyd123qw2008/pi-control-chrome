@@ -18,6 +18,8 @@ const SESSION_ID = `codex-${process.pid}-${randomUUID()}`;
 const TURN_ID = `codex-${randomUUID()}`;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_REQUEST_TIMEOUT_MS = 170_000;
+const MAX_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+const WAIT_REQUEST_GRACE_MS = 20_000;
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
 const BRIDGE_HOST = process.env.PI_CONTROL_CHROME_BRIDGE_HOST || "127.0.0.1";
 const configuredBridgePort = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
@@ -71,6 +73,9 @@ const TAB_FIELDS = { tabId: number("Browser tab id. Omit to use the selected tab
 const PAGE_FIELDS = { ...TAB_FIELDS };
 const PAGE_TARGET_FIELDS = { ...PAGE_FIELDS, snapshotId: string(), ref: string(), selector: string(), target: TARGET, timeoutMs: number("Optional positive timeout in milliseconds.") };
 const WAIT_STATE = { type: "string", enum: ["load", "url", "text", "text_gone", "visible", "hidden", "enabled"] };
+const TEXT_ANY = { type: "array", items: string("Literal text to match."), minItems: 1, maxItems: 20, description: "For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState." };
+const FAILURE_TEXT_ANY = { type: "array", items: string("Literal failure text to match."), minItems: 1, maxItems: 20, description: "For state=text waits, return immediately with failed=true when any listed failure literal is present." };
+const RESPONSE_MODE = { type: "string", enum: ["compact", "raw"], description: "Compact semantic Page Map is the default; use raw only for page-abstraction diagnostics." };
 const COORDINATE = object({ x: number(), y: number() }, ["x", "y"]);
 
 function schema(properties, required = []) {
@@ -83,7 +88,7 @@ function tool(name, description, method, inputSchema, transform) {
 
 const ALL_TOOLS = [
   tool("browser_doctor", "Diagnose the local Bridge, extension connection, active browser target and Chrome/Edge competition without changing tabs.", "doctor", schema()),
-  tool("browser_status", "Return the connected Chrome/Edge browser, target stability and local Bridge status. When multiple targets exist, provide browserId and acknowledgeBrowserId explicitly.", "status", schema({
+  tool("browser_status", "Return the connected Chrome/Edge browser identity, target stability and Bridge state as one small read. The capability revision stands in for the boolean capability map, and per-request metrics, targets and recovery detail live in browser_doctor. When multiple targets exist, provide browserId and acknowledgeBrowserId explicitly.", "status", schema({
     browserId: string("Select a connected browser target by browserId."),
     acknowledgeBrowserId: string("Explicitly acknowledge this browserId after confirming a browser switch."),
   })),
@@ -95,7 +100,16 @@ const ALL_TOOLS = [
   tool("browser_restart", "After the user explicitly confirms a Bridge restart, restart the shared Bridge cooperatively without asking the user to type a command. Pass confirmed=true only after that confirmation; this does not restart DSH or Edge and does not close tabs.", "bridge_restart", schema({
     confirmed: boolean("Must be true only after the user explicitly confirms the Bridge restart."),
   }, ["confirmed"])),
-  tool("browser_tabs", "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. Choose tabs using owner, sessionId and sessionScope, never groupId alone.", "list_tabs", schema()),
+  tool("browser_reload_extension", "Apply an updated pi-control-chrome distribution to the running browser by reloading its extension. The loaded service worker keeps the code it started with, so a refreshed profile stays inert until this runs; the extension restarts, in-flight browser work is cancelled, and the Bridge reconnects the same target. Pass confirmed=true only after the user explicitly confirms the reload, then refresh browser_status and every tab, snapshotId, ref, and handle.", "reload_extension", schema({
+    confirmed: boolean("Must be true only after the user explicitly confirms the extension reload."),
+    delayMs: integer("Delay before the worker restarts so the response can reach the caller first; defaults to 250 ms and is capped at 5000 ms."),
+  }, ["confirmed"])),
+  tool("browser_tabs", "List Chrome/Edge windows, tabs, tab groups, ownership and lifecycle state. The listing is complete by default and hard-capped at 200 rows; narrow it with query (title/url substring) and owner (user/agent/claimed) instead of paging, and pass limit only when you want fewer rows. totalTabs/matchedTabs/omittedTabs report any bound that applied. Choose tabs using owner, sessionId and sessionScope, never groupId alone.", "list_tabs", schema({
+    query: string("Case-insensitive substring matched against tab title and URL."),
+    limit: integer("Maximum rows to return; omit for the complete listing (hard-capped at 200). omittedTabs reports dropped rows."),
+    owner: { type: "string", enum: ["user", "agent", "claimed"], description: "Return only tabs with this ownership state." },
+    documentIdentity: boolean("When false, return tab-fence-only handles without probing document identity; re-observe before document-bound work."),
+  })),
   tool("browser_selected", "Return the currently selected Chrome/Edge tab.", "selected_tab", schema()),
   tool("browser_claim_tab", "Claim an existing user tab using its id and optional snapshot checks. Fails if supplied tab identity changed.", "claim_tab", schema({ ...TAB_FIELDS, windowId: number(), title: string(), url: string() }, ["tabId", "handle"])),
   tool("browser_select_tab", "Select an existing browser tab by id, optionally focusing its window.", "select_tab", schema({ ...TAB_FIELDS, focusWindow: boolean() }, ["tabId", "handle"])),
@@ -107,9 +121,9 @@ const ALL_TOOLS = [
     timeoutMs: number("Optional positive timeout for the load wait."),
     allowRedirects: boolean("Allow the final URL to differ from the requested URL while waiting."),
   })),
-  tool("browser_snapshot", "Read the active page title and bounded semantic page state. eN refs require the matching snapshotId; navigation is a hard boundary.", "snapshot", schema({ ...PAGE_FIELDS, selector: string(), maxChars: integer(), maxNodes: integer() }, ["handle"])),
-  tool("browser_accessibility_snapshot", "Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. aN refs require the matching snapshotId; sensitive values remain redacted.", "snapshot", schema({ ...PAGE_FIELDS, selector: string(), maxChars: integer(), maxNodes: integer(), disableDiffing: boolean() }, ["handle"]), (args) => ({ ...args, accessibilityOnly: true })),
-  tool("browser_extract", "Extract the current page as bounded plain text and simple Markdown without using a separate web scraper.", "extract", schema({ ...PAGE_FIELDS, selector: string(), maxChars: integer() }, ["handle"])),
+  tool("browser_snapshot", "Read the active page title and bounded semantic Page Map. eN refs require the matching snapshotId; navigation is a hard boundary. Use responseMode=raw only to diagnose the abstraction.", "snapshot", schema({ ...PAGE_FIELDS, selector: string(), responseMode: RESPONSE_MODE, maxChars: integer(), maxNodes: integer() }, ["handle"])),
+  tool("browser_accessibility_snapshot", "Return the bounded Chromium accessibility tree as full, incremental diff or unchanged text. aN refs require the matching snapshotId; sensitive values remain redacted.", "snapshot", schema({ ...PAGE_FIELDS, selector: string(), responseMode: RESPONSE_MODE, maxChars: integer(), maxNodes: integer(), disableDiffing: boolean() }, ["handle"]), (args) => ({ ...args, accessibilityOnly: true })),
+  tool("browser_extract", "Extract the current page as bounded plain text and simple Markdown without using a separate web scraper. Compact reads select primary content by default; use scope=log with tail=true for a log/pre region, or logMatch to return only matching log lines.", "extract", schema({ ...PAGE_FIELDS, selector: string(), includeFrames: boolean(), responseMode: RESPONSE_MODE, scope: { type: "string", enum: ["primary", "log", "body"] }, tail: boolean(), logMatch: string("For scope=log, keep only lines containing this case-insensitive literal."), logMaxMatches: integer("Maximum matching log lines to return."), maxChars: integer() }, ["handle"])),
   tool("browser_locator", "Use locator operations with role/name, label, text, placeholder, testId, eN/aN ref or CSS selector. Ordinary role/name, label and accessible-text targets use Chromium AX first; unsafe AX mapping fails closed.", "locator", schema({
     ...PAGE_FIELDS,
     action: string("Locator action such as count, click, fill, text, attribute or waitFor."),
@@ -140,15 +154,19 @@ const ALL_TOOLS = [
     },
   })),
   tool("browser_navigate", "Navigate a selected or specified browser tab to a URL and optionally wait for loading. wait=false returns a transition-pending handle.", "navigate", schema({ ...PAGE_FIELDS, url: string("Destination URL."), wait: boolean(), timeoutMs: number(), allowRedirects: boolean() }, ["handle", "url"])),
-  tool("browser_wait", "Wait for a selected tab to load, reach a URL, show or hide text, or reach an element state. Use text for text waits and target for element waits.", "wait", schema({
+  tool("browser_wait", "Wait for a selected tab to load, reach a URL, show or hide text, or reach an element state. Use text or textAny for text waits; textAny returns the first terminal literal found. Use target for element waits; set reload=true for externally refreshed pages such as Jenkins.", "wait", schema({
     ...PAGE_FIELDS,
     state: WAIT_STATE,
     url: string(),
     urlIncludes: string(),
     text: string(),
+    textAny: TEXT_ANY,
+    failureTextAny: FAILURE_TEXT_ANY,
     target: TARGET,
     snapshotId: string(),
     exact: boolean(),
+    reload: boolean("Reload between polls; opt in only for externally refreshed pages."),
+    reloadIntervalMs: integer("Minimum interval between opt-in reload polls; defaults to 5000 ms."),
     timeoutMs: number("Optional positive timeout in milliseconds."),
   }, ["handle"])),
   tool("browser_probe_interaction", "Perform one explicit browser interaction and return target resolution, action confirmation, document identity, incremental Console errors and post-action target state. The side effect is never automatically replayed.", "probe_interaction", schema({
@@ -163,7 +181,7 @@ const ALL_TOOLS = [
      deltaX: number(),
      deltaY: number(),
      timeoutMs: number("Optional positive timeout in milliseconds."),
-     settle: schema({ state: WAIT_STATE, url: string(), urlIncludes: string(), text: string(), target: TARGET, exact: boolean(), timeoutMs: number() }),
+     settle: schema({ state: WAIT_STATE, url: string(), urlIncludes: string(), text: string(), textAny: TEXT_ANY, failureTextAny: FAILURE_TEXT_ANY, target: TARGET, exact: boolean(), timeoutMs: number() }),
      settleMs: number("Optional bounded settle delay in milliseconds."),
      only: { type: "string", enum: ["errors", "all"] },
      maxEvents: integer("Maximum post-action Console events."),
@@ -235,6 +253,7 @@ const EXPOSED_TOOL_NAMES = new Set([
   "browser_targets",
   "browser_target_lease",
   "browser_restart",
+  "browser_reload_extension",
   "browser_tabs",
   "browser_snapshot",
   "browser_accessibility_snapshot",
@@ -247,6 +266,7 @@ const EXPOSED_TOOL_NAMES = new Set([
 const TOOLS = ALL_TOOLS.filter(({ name }) => EXPOSED_TOOL_NAMES.has(name));
 const TOOL_MAP = new Map(TOOLS.map((entry) => [entry.name, entry]));
 const COMPACT_READS = new Set(["browser_snapshot", "browser_extract", "browser_accessibility_snapshot", "browser_tabs", "browser_selected"]);
+const MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100, consoleChars: 4_000, consoleEvents: 40 });
 let bridgeClient;
 let bridgeClientPromise;
 let shuttingDown = false;
@@ -258,10 +278,30 @@ function requestKey(id) {
   return `${typeof id}:${String(id)}`;
 }
 
-function requestTimeout(args) {
+function applyModelReadBudget(toolName, params) {
+  if (params.responseMode === "raw") return params;
+  const budgeted = { ...params };
+  if (toolName === "browser_snapshot" || toolName === "browser_accessibility_snapshot") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.snapshotChars;
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = MODEL_READ_BUDGETS.snapshotNodes;
+  } else if (toolName === "browser_extract") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.extractChars;
+  } else if (toolName === "browser_dom_cua" && params.action === "get_visible_dom") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.domChars;
+    if (budgeted.maxNodes === undefined) budgeted.maxNodes = MODEL_READ_BUDGETS.domNodes;
+  } else if (toolName === "browser_console" && params.action !== "enable") {
+    if (budgeted.maxChars === undefined) budgeted.maxChars = MODEL_READ_BUDGETS.consoleChars;
+    if (budgeted.maxEvents === undefined) budgeted.maxEvents = MODEL_READ_BUDGETS.consoleEvents;
+  }
+  return budgeted;
+}
+
+function requestTimeout(args, method) {
   const requested = Number(args?.timeoutMs);
   if (!Number.isFinite(requested) || requested <= 0) return DEFAULT_REQUEST_TIMEOUT_MS;
-  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(DEFAULT_REQUEST_TIMEOUT_MS, requested + 5_000));
+  if (method !== "wait") return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(DEFAULT_REQUEST_TIMEOUT_MS, requested + 5_000));
+  const bounded = Math.min(Math.floor(requested), MAX_WAIT_TIMEOUT_MS);
+  return Math.min(MAX_WAIT_TIMEOUT_MS + WAIT_REQUEST_GRACE_MS, Math.max(DEFAULT_REQUEST_TIMEOUT_MS, bounded + WAIT_REQUEST_GRACE_MS));
 }
 
 function assertRequestActive(signal) {
@@ -429,11 +469,12 @@ async function invokeTool(spec, args, signal) {
   if (spec.name === "browser_network" && params.action === "enable") spec = { ...spec, method: "devtools_enable" };
   if (spec.name === "browser_accessibility_snapshot") params.accessibilityOnly = true;
   if (spec.name === "browser_mark_handoff" || spec.name === "browser_mark_deliverable") params.turnId = TURN_ID;
+  params = applyModelReadBudget(spec.name, params);
   if ((COMPACT_READS.has(spec.name) || (spec.name === "browser_dom_cua" && params.action === "get_visible_dom")) && params.responseMode === undefined) params.responseMode = "compact";
   params = withSession(params);
   assertRequestActive(signal);
 
-  if (spec.name === "browser_doctor") return client.rawRequest("doctor", params, requestTimeout(args), undefined, signal);
+  if (spec.name === "browser_doctor") return client.rawRequest("doctor", params, requestTimeout(args, "doctor"), undefined, signal);
   if (spec.name === "browser_targets") {
     const inventory = await listTargets(client, signal);
     const health = await readBridgeHealth().catch(() => undefined);
@@ -461,7 +502,7 @@ async function invokeTool(spec, args, signal) {
       };
     }
     try {
-      const result = await client.request("status", { ...params, browserId: args.browserId, acknowledgeBrowserId: args.acknowledgeBrowserId }, requestTimeout(args), signal);
+      const result = await client.request("status", { ...params, browserId: args.browserId, acknowledgeBrowserId: args.acknowledgeBrowserId }, requestTimeout(args, "status"), signal);
       if (targetSelectionRequired && result?.targetStability?.acknowledged === true) targetSelectionRequired = false;
       return result;
     } catch (error) {
@@ -491,13 +532,13 @@ async function invokeTool(spec, args, signal) {
   }
   if (spec.name === "browser_context_reset") params.mode = "context";
   if (spec.name === "browser_cleanup" || spec.name === "browser_context_reset") {
-    const cleanupResult = await client.request("cleanup", params, requestTimeout(args), signal);
-    await client.request("target_lease", withSession({ action: "release_session" }), requestTimeout(args), signal);
+    const cleanupResult = await client.request("cleanup", params, requestTimeout(args, "cleanup"), signal);
+    await client.request("target_lease", withSession({ action: "release_session" }), requestTimeout(args, "target_lease"), signal);
     return cleanupResult;
   }
   if (spec.name === "browser_console" && params.action !== "enable") spec = { ...spec, method: "console_logs" };
   if (spec.name === "browser_network" && params.action !== "enable" && params.action !== "response_body") spec = { ...spec, method: "network_requests" };
-  return client.request(spec.method, params, requestTimeout(args), signal);
+  return client.request(spec.method, params, requestTimeout(args, spec.method), signal);
 }
 
 function jsonText(value) {

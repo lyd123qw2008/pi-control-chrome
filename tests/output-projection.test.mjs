@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compactAccessibilityResult, compactBrowserResult, compactDomCuaResult, compactNewTabResult, compactSnapshotResult, compactTabsResult } from "../pi-extension/output.js";
+import { capabilityRuntime, compactAccessibilityResult, compactBridgeHealth, compactBrowserResult, compactDoctorResult, compactDomCuaResult, compactExtractResult, compactNewTabResult, compactSnapshotResult, compactStatusResult, compactTabsResult, runtimeDiagnosis } from "../pi-extension/output.js";
 
 test("Pi snapshot projection keeps refs and drops duplicate raw fields", () => {
   const result = compactSnapshotResult({
@@ -33,6 +33,143 @@ test("Pi snapshot projection avoids repeating page text for interactive pages", 
   assert.equal(result.snapshot.url, undefined);
 });
 
+
+test("Pi snapshot projection renders the neutral document-order page digest", () => {
+  const result = compactSnapshotResult({
+    tab: { id: 1, title: "Jenkins", url: "https://ci.example/job/demo/build" },
+    snapshot: {
+      snapshotId: "snapshot-page-map",
+      text: "Prose that must not be used as a ranking signal.",
+      elements: [
+        { ref: "e1", role: "link", name: "#702" },
+        { ref: "e2", role: "link", name: "#701" },
+      ],
+      pageMap: {
+        version: 2,
+        order: "document",
+        title: "FXYF2_docker_5g-os-console #706",
+        url: "https://ci.example/job/demo/706/",
+        status: ["Build is running"],
+        metadata: [{ key: "revision", value: "abc123" }],
+        regions: [
+          {
+            kind: "form",
+            role: "search",
+            name: "search",
+            counts: { controls: 2 },
+            address: { role: "search", name: "search" },
+            ref: "e30",
+            controls: [
+              { role: "searchbox", name: "search", ref: "e31" },
+              { role: "button", name: "Search", ref: "e32" },
+            ],
+          },
+          {
+            kind: "content",
+            role: "content",
+            name: "Build #706",
+            counts: { controls: 4, items: 33, values: 2 },
+            address: { selector: "#main-panel" },
+            ref: "e40",
+            controls: [{ role: "link", name: "Console Output", href: "https://ci.example/job/demo/706/console", ref: "e41" }],
+            values: [{ key: "revision", value: "abc123" }],
+            text: "Took 2 min 8 sec on 192.169.2.81",
+          },
+        ],
+        omitted: { regions: 2, controls: 41 },
+        truncated: true,
+      },
+    },
+  });
+  const state = result.snapshot.state;
+  // Neutral: no ranking vocabulary, no invented "primary object", no key-action ranking.
+  assert.doesNotMatch(state, /Primary/);
+  assert.doesNotMatch(state, /Key actions/);
+  assert.match(state, /Regions \(document order\):/);
+  assert.match(state, /URL: https:\/\/ci\.example\/job\/demo\/706\//);
+  assert.match(state, /- form "search"/);
+  assert.match(state, /- content "Build #706"/);
+  // Document order: the search region is listed before the content region.
+  assert.ok(state.indexOf('form "search"') < state.indexOf('content "Build #706"'));
+  // Addressability: each region can be reached again.
+  assert.match(state, /\{search "search"\}/);
+  assert.match(state, /\{selector=#main-panel\}/);
+  assert.match(state, /\(controls=4, items=33, values=2\)/);
+  assert.match(state, /Console Output.*\[ref=e41\]/);
+  assert.match(state, /values: revision=abc123/);
+  assert.match(state, /Status:/);
+  // Retrieval contract: omission is reported with counts and a next step.
+  assert.deepEqual(result.snapshot.omitted, { regions: 2, controls: 41 });
+  assert.equal(result.snapshot.nextAction, "browser_snapshot");
+  assert.equal(result.snapshot.recommendation, "narrow_read");
+  assert.match(result.snapshot.recovery, /browser_extract/);
+  assert.equal(result.snapshot.truncated, true);
+});
+
+test("Pi Page Map projection keeps a listed region addressable when nothing is omitted", () => {
+  const result = compactSnapshotResult({
+    snapshot: {
+      snapshotId: "snapshot-plain",
+      pageMap: {
+        version: 2,
+        order: "document",
+        title: "Order A-1001",
+        url: "https://shop.example/orders/A-1001",
+        metadata: [
+          { key: "order id", value: "A-1001" },
+          { key: "total", value: "128.00" },
+        ],
+        regions: [
+          { kind: "main", role: "main", name: "Order A-1001", counts: { controls: 1 }, address: { role: "main", name: "Order A-1001" }, ref: "e1", controls: [{ role: "button", name: "Pay", ref: "e2" }] },
+        ],
+      },
+    },
+  });
+  assert.match(result.snapshot.state, /Page: Order A-1001/);
+  assert.match(result.snapshot.state, /order id: A-1001/);
+  assert.match(result.snapshot.state, /total: 128\.00/);
+  assert.match(result.snapshot.state, /- main "Order A-1001"/);
+  assert.equal(result.snapshot.omitted, undefined);
+  assert.equal(result.snapshot.nextAction, undefined);
+  assert.equal(result.snapshot.truncated, false);
+});
+
+test("Pi Page Map projection reports state truncation with a next step", () => {
+  const result = compactSnapshotResult({
+    snapshot: {
+      snapshotId: "snapshot-truncated",
+      pageMap: {
+        version: 2,
+        order: "document",
+        title: "Build",
+        url: "https://ci.example/job/demo/1/",
+        regions: [{ kind: "form", role: "form", name: "Build", counts: { controls: 3 }, controls: [{ role: "textbox", name: "Branch", ref: "e1" }] }],
+      },
+    },
+  }, 30, 10);
+  assert.equal(result.snapshot.stateTruncated, true);
+  assert.equal(result.snapshot.truncated, true);
+  assert.equal(result.snapshot.nextAction, "browser_snapshot");
+  assert.equal(result.snapshot.recommendation, "narrow_read");
+});
+test("Pi extract projection preserves bounded log-match metadata", () => {
+  const result = compactExtractResult({
+    content: {
+      scope: "log",
+      logMatch: "Finished:",
+      matchedLineCount: 3,
+      matchedLineNumbers: [4, 8, 12],
+      matchTruncated: true,
+      text: "Finished: SUCCESS",
+      markdown: "Finished: SUCCESS",
+    },
+  });
+  assert.equal(result.content.scope, "log");
+  assert.equal(result.content.logMatch, "Finished:");
+  assert.equal(result.content.matchedLineCount, 3);
+  assert.deepEqual(result.content.matchedLineNumbers, [4, 8, 12]);
+  assert.equal(result.content.matchTruncated, true);
+});
 
 test("Pi snapshot projection does not mark semantic state truncated for omitted page text", () => {
   const result = compactSnapshotResult({
@@ -78,6 +215,15 @@ test("Pi DOM CUA projection emits bounded node lines", () => {
   assert.equal(result.dom.nodes, undefined);
 });
 
+
+test("Pi raw response mode preserves the bounded diagnostic envelope", () => {
+  const raw = {
+    tabId: 1,
+    frameTree: { debug: "kept only on explicit raw request" },
+    snapshot: { snapshotId: "raw-snapshot", text: "Raw diagnostic page", elements: [{ ref: "e1", role: "button", name: "Build" }] },
+  };
+  assert.equal(compactBrowserResult("browser_snapshot", { responseMode: "raw" }, raw), raw);
+});
 
 test("Pi snapshot projection honors explicit budgets and preserves refs", () => {
   const result = compactBrowserResult("browser_snapshot", { maxChars: 80, maxNodes: 1 }, {
@@ -205,4 +351,235 @@ test("Pi tab projection annotates the current Agent session when a shared group 
 test("Pi tab projection removes data URL favicon", () => {
   const result = compactTabsResult({ tabs: [{ id: 1, favicon: `data:image/png;base64,${"A".repeat(1000)}` }] });
   assert.equal(result.tabs[0].favicon, undefined);
+});
+
+test("Pi status projection prints identity and the capability revision once", () => {
+  const status = compactStatusResult({
+    connected: true,
+    state: "connected",
+    browser: "edge",
+    browserId: "edge:profile",
+    profile: "profile",
+    userAgent: "Mozilla/5.0 ...",
+    extensionVersion: "0.6.0",
+    capabilityRevision: 8,
+    capabilities: { tabIncarnationFence: true, waitTerminalStates: true },
+    bridge: "http://127.0.0.1:17318",
+    connectedAt: 1,
+    connectionId: "connection-1",
+    connectionGeneration: 2,
+    targetStability: {
+      stable: true,
+      changed: false,
+      acknowledged: true,
+      requiresAcknowledgement: false,
+      competition: "verified",
+      browser: "edge",
+      browserId: "edge:profile",
+      profile: "profile",
+      connectionId: "connection-1",
+      connectionGeneration: 2,
+      observedBrowserIds: ["edge:profile"],
+    },
+    bridgeHealth: {
+      ok: true,
+      bridgeVersion: "0.6.0",
+      port: 17318,
+      extensionConnected: true,
+      readyTargetCount: 1,
+      targets: [{ browser: "edge", browserId: "edge:profile" }],
+      observability: { metrics: { requests: 9 }, recentEvents: [{ event: "internal" }] },
+    },
+    recommendation: "ready",
+    issues: [],
+    notices: [],
+    recovery: "restart the Bridge",
+  });
+  assert.deepEqual(status, {
+    connected: true,
+    state: "connected",
+    browser: "edge",
+    extensionVersion: "0.6.0",
+    browserId: "edge:profile",
+    profile: "profile",
+    connectionId: "connection-1",
+    connectionGeneration: 2,
+    connectedAt: 1,
+    capabilityRevision: 8,
+    bridge: { ok: true, version: "0.6.0", port: 17318, extensionConnected: true, readyTargets: 1 },
+    targetStability: { stable: true, changed: false, acknowledged: true, requiresAcknowledgement: false, competition: "verified" },
+    recommendation: "ready",
+  });
+  const serialized = JSON.stringify(status);
+  for (const diagnostic of ["capabilities", "bridgeHealth", "observability", "recentEvents", "userAgent", "targets", "internal"]) {
+    assert.doesNotMatch(serialized, new RegExp(diagnostic));
+  }
+});
+
+test("Pi status projection keeps selection and recovery detail actionable", () => {
+  const selection = compactStatusResult({
+    connected: false,
+    state: "target_required",
+    targetRequired: true,
+    completed: false,
+    retryable: true,
+    nextAction: "browser_status",
+    recommendation: "select_browser_target",
+    error: { code: "TARGET_REQUIRED", message: "Multiple browser targets are connected; provide browserId to select one." },
+    targets: [{ browser: "edge", browserId: "edge:a", profile: "a", state: "ready", connectionId: "c1", connectionGeneration: 3 }],
+    bridgeHealth: { ok: true, extensionConnected: true },
+  });
+  assert.deepEqual(selection.targets, [{ browser: "edge", browserId: "edge:a", profile: "a", state: "ready" }]);
+  assert.equal(selection.error.code, "TARGET_REQUIRED");
+  assert.equal(selection.completed, false);
+  assert.equal(selection.retryable, true);
+  assert.equal(selection.nextAction, "browser_status");
+
+  const lost = compactStatusResult({
+    connected: false,
+    state: "target_unavailable",
+    recommendation: "refresh_browser_targets",
+    error: { code: "TARGET_UNAVAILABLE", message: "The selected target disconnected." },
+    target: { browser: "edge", browserId: "edge:a", connectionId: "c1", connectionGeneration: 3 },
+    targetStability: { stable: false, changed: true, previousBrowser: "edge", previousBrowserId: "edge:a", browser: "edge", browserId: "edge:a" },
+    recovery: "restart the Bridge",
+    issues: [{ code: "TARGET_UNAVAILABLE", message: "The selected target disconnected." }],
+  });
+  assert.deepEqual(lost.target, { browser: "edge", browserId: "edge:a" });
+  assert.equal(lost.targetStability.previousBrowserId, "edge:a");
+  assert.equal(lost.targetStability.connectionGeneration, undefined);
+  assert.equal(lost.recovery, "restart the Bridge");
+});
+
+test("Pi tab projection reports a bounded listing as retrievable", () => {  const result = compactTabsResult({
+    browserId: "edge:test",
+    profile: "profile",
+    totalTabs: 40,
+    matchedTabs: 12,
+    omittedTabs: 4,
+    filters: { query: "orders" },
+    tabs: [{ id: 1, title: "orders 1", url: "https://example.test" }],
+  });
+  assert.equal(result.totalTabs, 40);
+  assert.equal(result.matchedTabs, 12);
+  assert.equal(result.omittedTabs, 4);
+  assert.deepEqual(result.filters, { query: "orders" });
+  assert.equal(result.nextAction, "browser_tabs");
+  assert.equal(result.recommendation, "narrow_tab_query");
+
+  const complete = compactTabsResult({ totalTabs: 3, matchedTabs: 3, tabs: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  assert.equal(complete.omittedTabs, undefined);
+  assert.equal(complete.recommendation, undefined);
+});
+
+const extensionCapabilities = { turnCleanup: true, tabIncarnationFence: true, waitTerminalStates: true, extractLogMatch: true };
+const bridgeHealthFixture = () => ({
+  ok: true,
+  protocol: 1,
+  service: "pi-control-chrome",
+  bridgeVersion: "0.6.0",
+  instanceId: "bridge-1",
+  startedBy: "dsh",
+  controlDomain: "local_user",
+  port: 17318,
+  extensionConnected: true,
+  targetCount: 1,
+  readyTargetCount: 1,
+  targetAmbiguous: false,
+  capabilities: { compactResponses: true, localUserRestart: true },
+  restart: { available: true, method: "cooperative_restart" },
+  browser: "edge",
+  browserId: "edge:test",
+  profile: "profile",
+  extensionVersion: "0.6.0",
+  extensionCapabilityRevision: 8,
+  extensionCapabilities,
+  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Edg/152",
+  connectionId: "connection-1",
+  connectionGeneration: 1,
+  targets: [{ browser: "edge", browserId: "edge:test", profile: "profile", extensionVersion: "0.6.0", capabilityRevision: 8, capabilities: extensionCapabilities, userAgent: "Mozilla/5.0 ...", connectionId: "connection-1", connectionGeneration: 1, state: "ready" }],
+  observability: {
+    startedAt: 1,
+    pendingRequests: 0,
+    drainingRequests: 0,
+    metrics: { requests: 4 },
+    targetRecovery: { trackedTargets: 1, readyTargets: 1, disconnectedTargets: 0 },
+    targetLeases: { activeCount: 0, heldTargets: [] },
+    recentEvents: [
+      { event: "internal" },
+      { event: "target_connected", at: 2, browserId: "edge:test", connectionId: "connection-1", connectionGeneration: 1 },
+    ],
+  },
+});
+
+test("Pi bridge-health projection keeps one capability map and one target inventory", () => {
+  const health = compactBridgeHealth(bridgeHealthFixture());
+  assert.deepEqual(health.capabilities, { compactResponses: true });
+  assert.equal(health.extensionCapabilities, undefined);
+  assert.equal(health.userAgent, undefined);
+  assert.equal(health.extensionCapabilityRevision, 8);
+  assert.deepEqual(health.targets, [{ browser: "edge", browserId: "edge:test", profile: "profile", extensionVersion: "0.6.0", capabilityRevision: 8, connectionId: "connection-1", connectionGeneration: 1, state: "ready" }]);
+  assert.deepEqual(health.observability.recentEvents.map((event) => event.event), ["target_connected"]);
+  const serialized = JSON.stringify(health);
+  assert.doesNotMatch(serialized, /userAgent/);
+  assert.doesNotMatch(serialized, /extensionCapabilities/);
+});
+
+test("Pi doctor projection prints every fact once and stays diagnostic", () => {
+  const result = compactDoctorResult({
+    bridgeHealth: bridgeHealthFixture(),
+    ok: true,
+    state: "connected",
+    connected: true,
+    browser: "edge",
+    browserId: "edge:test",
+    profile: "profile",
+    extensionVersion: "0.6.0",
+    targetStability: { stable: true, changed: false, browser: "edge", browserId: "edge:test", connectionId: "connection-1", connectionGeneration: 1 },
+    runtime: { extensionVersion: "0.6.0", capabilityRevision: 8, requiredCapabilityRevision: 8, fresh: true, capabilities: extensionCapabilities },
+    targets: [{ browser: "edge", browserId: "edge:test", profile: "profile", state: "ready", connectionId: "connection-1" }],
+    recommendation: "ready",
+    issues: [],
+    notices: [],
+    recovery: { available: true, method: "cooperative_restart" },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.state, "connected");
+  assert.equal(result.browserId, "edge:test");
+  assert.deepEqual(result.runtime.capabilities, extensionCapabilities);
+  assert.equal(result.runtime.fresh, true);
+  assert.equal(result.runtime.requiredCapabilityRevision, 8);
+  // Diagnostics stay available...
+  assert.deepEqual(result.bridgeHealth.observability.metrics, { requests: 4 });
+  assert.equal(result.bridgeHealth.targetAmbiguous, false);
+  assert.deepEqual(result.targets, [{ browser: "edge", browserId: "edge:test", profile: "profile", state: "ready" }]);
+  assert.deepEqual(result.issues, []);
+  assert.deepEqual(result.notices, []);
+  assert.equal(result.recovery.method, "cooperative_restart");
+  // ...but the capability map is printed exactly once, in `runtime`.
+  assert.equal(result.capabilities, undefined);
+  const serialized = JSON.stringify(result);
+  assert.equal((serialized.match(/tabIncarnationFence/g) ?? []).length, 1);
+  assert.equal((serialized.match(/userAgent/g) ?? []).length, 0);
+  assert.equal((serialized.match(/extensionCapabilities/g) ?? []).length, 0);
+});
+
+test("Pi runtime diagnosis names a stale or unversioned extension runtime", () => {
+  // The Bridge doctor payload reports the map as extensionCapabilities/extensionCapabilityRevision.
+  const fromBridgeDoctor = capabilityRuntime(bridgeHealthFixture());
+  assert.deepEqual(fromBridgeDoctor, { extensionVersion: "0.6.0", capabilityRevision: 8, requiredCapabilityRevision: 8, fresh: true, capabilities: extensionCapabilities });
+
+  const stale = runtimeDiagnosis({ ...bridgeHealthFixture(), extensionCapabilityRevision: 7 });
+  assert.equal(stale.runtime.fresh, false);
+  assert.equal(stale.stale.code, "extension_runtime_stale");
+  assert.equal(stale.unversioned, undefined);
+
+  const unversioned = runtimeDiagnosis({ extensionVersion: "0.5.9", extensionCapabilities });
+  assert.equal(unversioned.runtime.capabilityRevision, undefined);
+  assert.equal(unversioned.stale, undefined);
+  assert.equal(unversioned.unversioned.code, "extension_runtime_unversioned");
+
+  // An extension status payload reports the same facts as capabilities/capabilityRevision.
+  const fromStatus = capabilityRuntime({ extensionVersion: "0.6.0", capabilityRevision: 8, capabilities: extensionCapabilities });
+  assert.deepEqual(fromStatus, fromBridgeDoctor);
 });

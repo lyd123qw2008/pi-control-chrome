@@ -39,7 +39,7 @@ function usage() {
   node browser.mjs open <url> --session <id> --browser-id <id> [--active|--inactive] [--turn <n>] [--json]
   node browser.mjs view <url> --session <id> --browser-id <id> [--turn <n>] [--temporary] [--inactive] [--reuse-existing] [--screenshot <path>] [--raw] [--json]
   node browser.mjs snapshot <tabId> --browser-id <id> [--session <id>] [--no-frames] [--raw] [--json]
-  node browser.mjs extract <tabId> --browser-id <id> [--session <id>] [--no-frames] [--max-chars <n>] [--raw] [--json]
+  node browser.mjs extract <tabId> --browser-id <id> [--session <id>] [--no-frames] [--scope primary|log|body] [--tail] [--log-match <literal>] [--log-max-matches <n>] [--max-chars <n>] [--raw] [--json]
   node browser.mjs screenshot <tabId> <path> --browser-id <id> [--session <id>] [--full-page]
   node browser.mjs close <tabId> --browser-id <id> [--session <id>] [--json]
   node browser.mjs cleanup --session <id> --browser-id <id> [--recover-stale] [--json]
@@ -378,6 +378,10 @@ class BridgeClient {
       if (this.bridgeCapabilities.semanticTargetRequests !== true) required.push("Bridge.semanticTargetRequests");
       if (extensionCapabilities.semanticTargets !== true) required.push("extension.semanticTargets");
     }
+    if (method === "extract") {
+      if (params.tail === true && extensionCapabilities.tailExtract !== true) required.push("extension.tailExtract");
+      if (["primary", "log"].includes(String(params.scope || "")) && extensionCapabilities.scopedExtract !== true) required.push("extension.scopedExtract");
+    }
     if (method === "wait") {
       const state = String(params.state || "load");
       if (params.target !== undefined && this.bridgeCapabilities.semanticTargetRequests !== true) required.push("Bridge.semanticTargetRequests");
@@ -385,6 +389,11 @@ class BridgeClient {
       if (["text", "text_gone", "visible", "hidden", "enabled"].includes(state)) {
         if (this.bridgeCapabilities.pageWaitStates !== true) required.push("Bridge.pageWaitStates");
         if (extensionCapabilities.pageWaitStates !== true) required.push("extension.pageWaitStates");
+      }
+      if (params.reload === true && extensionCapabilities.reloadAwareWait !== true) required.push("extension.reloadAwareWait");
+      if (Number(params.timeoutMs) > 120000) {
+        if (this.bridgeCapabilities.longWait !== true) required.push("Bridge.longWait");
+        if (extensionCapabilities.longWait !== true) required.push("extension.longWait");
       }
     }
     if (method === "dom_cua" && extensionCapabilities.domCuaSnapshots !== true) required.push("extension.domCuaSnapshots");
@@ -441,9 +450,11 @@ function evaluationValue(result) {
   return result?.result?.result?.value ?? result?.result?.value ?? result?.value;
 }
 
-function truncate(value, maxChars) {
+function truncate(value, maxChars, fromEnd = false) {
   const text = String(value ?? "");
-  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}\n... [truncated at ${maxChars} characters]`;
+  if (text.length <= maxChars) return text;
+  if (fromEnd && maxChars > 3) return `...${text.slice(-(maxChars - 3))}`;
+  return fromEnd ? text.slice(-maxChars) : `${text.slice(0, maxChars)}\n... [truncated at ${maxChars} characters]`;
 }
 
 function tabSummary(tab) {
@@ -682,16 +693,25 @@ async function main() {
     }
     if (command === "snapshot" || command === "extract") {
       if (!positionals[0]) throw new Error(`${command} requires a tab id`);
-      const responseMode = boolOption(options, "raw", false) ? "raw" : "compact";
+      const raw = boolOption(options, "raw", false);
+      const responseMode = raw ? "raw" : "compact";
+      const tail = command === "extract" && boolOption(options, "tail", false);
+       const logMatch = command === "extract" && options.log_match !== undefined ? String(options.log_match) : undefined;
+       const logMaxMatches = command === "extract" && options.log_max_matches !== undefined ? numberOption(options, "log_max_matches", 40) : undefined;
+      const scope = command === "extract" && options.scope !== undefined ? String(options.scope) : undefined;
+      if (scope !== undefined && !["primary", "log", "body"].includes(scope)) throw new Error("extract --scope must be primary, log or body");
+       if (logMatch !== undefined && scope !== "log") throw new Error("extract --log-match requires --scope log");
+      const maxChars = command === "extract" ? numberOption(options, "max_chars", DEFAULT_MAX_CHARS) : undefined;
       const result = await client.request(command, {
         tabId: Number(positionals[0]),
         responseMode,
         ...(options.no_frames === true ? { includeFrames: false } : {}),
+        ...(command === "extract" ? { tail, maxChars, ...(scope === undefined ? {} : { scope }), ...(logMatch === undefined ? {} : { logMatch }), ...(logMaxMatches === undefined ? {} : { logMaxMatches }) } : {}),
         ...(options.session === undefined ? {} : { sessionId: String(options.session) }),
       });
       if (command === "extract") {
-        result.content.text = truncate(result.content.text, numberOption(options, "max_chars", DEFAULT_MAX_CHARS));
-        result.content.markdown = truncate(result.content.markdown, numberOption(options, "max_chars", DEFAULT_MAX_CHARS));
+        result.content.text = truncate(result.content.text, maxChars, tail);
+        result.content.markdown = truncate(result.content.markdown, maxChars, tail);
       }
       printResult(result, options);
       return;

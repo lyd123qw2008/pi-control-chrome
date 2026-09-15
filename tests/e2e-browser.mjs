@@ -97,6 +97,10 @@ const site = `<!doctype html>
 <script>
 const marker = new URLSearchParams(location.search).get('marker');
 if (marker) document.querySelector('h1').textContent = marker;
+if (marker === 'reload-status') {
+  const navigation = performance.getEntriesByType('navigation')[0];
+  document.querySelector('#async-status').textContent = navigation?.type === 'reload' ? 'Reload ready' : 'Waiting for reload';
+}
 const out = document.querySelector('#out');
 document.querySelector('#go').addEventListener('click', () => { out.textContent = 'Hello ' + document.querySelector('#name').value; });
 document.querySelector('#press-target').addEventListener('keydown', event => { out.textContent = 'Pressed ' + event.key; });
@@ -256,6 +260,126 @@ await new Promise((resolve, reject) => {
 const renderSite = () => site
   .replaceAll("__CROSS_ORIGIN_FRAME_URL__", `http://127.0.0.1:${crossOriginPort}/cross-origin-frame.html`)
   .replaceAll("__OOPIF_FRAME_URL__", `http://127.0.0.2:${crossOriginPort}/cross-origin-frame.html`);
+// A standalone landmark-free application shell shaped like the pages that exposed the
+// Page Map regression: a header search utility with an inline helper script, a link-heavy
+// history side panel, and an unlabelled main-content div that owns the page heading.
+const shellPage = [
+  "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Landmark-free build shell</title></head><body>",
+  "<header class=\"app-header\">",
+  "<div id=\"breadcrumb\"><a href=\"/\">Dashboard</a><a href=\"/job/x/\">job x</a></div>",
+  "<form role=\"search\"><input type=\"search\" aria-label=\"search\"><button type=\"submit\">Search</button><a href=\"https://jenkins.io/redirect/search-box\">Action</a></form>",
+  "<script>createSearchBox(\"/job/FXYF2_docker_5g-os-console/search/\");</script>",
+  "</header>",
+  "<div id=\"side-panel\"><h2>Build History</h2>",
+  Array.from({ length: 120 }, (_, index) => `<a href="#build-${index}">Historical build ${index}</a>`).join(""),
+  Array.from({ length: 30 }, () => "<div class=\"build-row\"><button type=\"button\">Open Job</button><button type=\"button\">Console</button></div>").join(""),
+  "</div>",
+  "<div id=\"main-panel\">",
+  "<h1>Build #706 (2026-9-15 9:08:53)</h1>",
+  "<img class=\"icon-blue icon-xlg\" alt=\"Success\" title=\"Success\">",
+  "<p>Started 41 min ago</p>",
+  "<p>Took 2 min 8 sec on 192.169.2.81</p>",
+  "<p>Revision: e00a7ed35b970e1e45390bbaff536acb1999d9d9</p>",
+  "<p>refs/remotes/origin/dev</p>",
+  "<a href=\"/job/x/706/console\">Console Output</a>",
+  "</div>",
+  "</body></html>",
+].join("\n");
+// A plain business page with no build/CI vocabulary at all: the generic metadata layer must
+// still publish its labelled fields, proving the extraction is site-agnostic. It also ships
+// a hostile built-in polyfill (the kind old Jenkins helper bundles install): the plugin's own
+// reads must stay immune because they run in the extension's isolated world.
+const genericPage = [
+  "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Order detail</title>",
+  "<script>String.prototype.trim = function () { return new String(String.prototype.replace.call(this, /^\\s+|\\s+$/g, '')); };</script>",
+  "</head><body>",
+  "<div id=\"app-header\"><div id=\"breadcrumb\"><a href=\"/\">Home</a><a href=\"/orders\">Orders</a></div></div>",
+  "<div id=\"main-content\">",
+  "<h1>Order A-1001</h1>",
+  "<p>Order ID: A-1001</p>",
+  "<p>Customer: 珠海测试客户</p>",
+  "<p>Total: 128.00</p>",
+  "<p>Payment: Paid</p>",
+  "<p>API token: should-never-appear</p>",
+  "<dl><dt>Channel</dt><dd>SMS</dd></dl>",
+  "<table><tr><th>Item</th><th>Quantity</th></tr><tr><td>Template pack</td><td>3</td></tr></table>",
+  "</div>",
+  "<aside id=\"related-orders\">",
+  Array.from({ length: 40 }, (_, index) => `<a href="#order-${index}">Related order ${index}</a>`).join(""),
+  "</aside>",
+  "</body></html>",
+].join("\n");
+// A dedicated page for the neutral-digest contract: a repeated navigation, a header search
+// utility, a landmark-free main container, an action bar and a log pane. It carries no CI
+// vocabulary; region listing must not depend on any site knowledge.
+const regionsPage = [
+  "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Deployment build</title></head><body>",
+  "<section id=\"page-map-fixture\">",
+  "<aside id=\"noisy-navigation\"><h2>Navigation</h2>",
+  Array.from({ length: 160 }, (_, index) => `<a href="#history-${index}">Historical navigation ${index}</a>`).join(""),
+  "</aside>",
+  "<form role=\"search\"><input type=\"search\" aria-label=\"Global search\"><button type=\"submit\">Search</button></form>",
+  "<main id=\"page-map-form\"><h1>Deployment build</h1><p>Use these current build parameters.</p><p>Build #704</p><p>Revision: abc123</p><p>Branch: dev</p><p>Node: agent-1</p><p>Note: the deployment finished successfully without errors and the log was archived.</p><label for=\"map-branch\">Branch</label><input id=\"map-branch\" value=\"dev\"><button id=\"map-build\">Build</button><table id=\"declared-values\"><tr><th>Change summary</th><td>change-change-change-change-change-change-change-change-change-change-change-change-change-change-change-change-change-change-change-change</td></tr></table></main>",
+  "<section id=\"detail-actions\"><a href=\"/console\">Console Output</a><a href=\"/git\">Git Build Data</a></section>",
+  "<pre id=\"build-log\">old log line\ncurrent log: build started\ncurrent log: Finished: SUCCESS</pre>",
+  "<footer>irrelevant footer history ".repeat(20) + "</footer>",
+  "</section>",
+  "</body></html>",
+].join("\n");
+// Archetype matrix for the compact-read contract: each page exercises ONE structural class, so a
+// changed digest rule fails on the class it breaks instead of on one site's fixture. The set is the
+// executable form of docs/COMPACT-READ-CONTRACT.zh-CN.md section 5, and the vocabulary is generic on
+// purpose — no product or CI field names appear here.
+const ARCHETYPE_KINDS = ["landmark", "wrapper", "data", "secrets", "bulk", "hostile"];
+const archetypePage = (kind) => {
+  const body = {
+    landmark: [
+      "<nav id=\"nav-a\">",
+      Array.from({ length: 40 }, (_, index) => `<a href="#l-${index}">Repeated link ${index}</a>`).join(""),
+      "</nav>",
+      "<main id=\"main-a\"><h1>Landmark heading</h1><p>Revision: abc123</p><label for=\"landmark-branch\">Branch</label><input id=\"landmark-branch\" value=\"dev\"><button id=\"landmark-go\">Run</button></main>",
+      "<section id=\"tail-a\"><a href=\"/tail\">Tail link</a></section>",
+    ].join(""),
+    wrapper: [
+      "<section id=\"outer-wrap\"><h2>Outer heading</h2><section id=\"inner-wrap\"><p>Nested content</p><button id=\"wrapper-one\">One</button><button id=\"wrapper-two\">Two</button></section></section>",
+      "<main id=\"wrapper-main\"><p>Main content</p></main>",
+    ].join(""),
+    data: [
+      "<main id=\"data-main\"><h1>Declared data</h1>",
+      "<p>Revision: abc123</p>",
+      `<p>Summary: ${"a".repeat(200)}</p>`,
+      "<p>Note: the deployment finished successfully and the log was archived.</p>",
+      `<table id="data-table"><tr><th>Change summary</th><td>${"change-".repeat(25)}</td></tr></table>`,
+      `<dl id="data-terms"><dt>Operator note</dt><dd>${"b".repeat(150)}</dd></dl>`,
+      "</main>",
+    ].join(""),
+    secrets: [
+      "<main id=\"secrets-main\"><h1>Redaction</h1>",
+      "<p>Status: SUCCESS</p>",
+      "<p>API token: should-never-appear</p>",
+      "<p>Password: hunter2-secret</p>",
+      "<script>var secretMark = \"SCRIPT_MARKER_9f3\";</script>",
+      "</main>",
+    ].join(""),
+    bulk: [
+      "<main id=\"bulk-main\"><h1>Bulk page</h1>",
+      "<nav id=\"bulk-nav\">",
+      Array.from({ length: 200 }, (_, index) => `<a href="#b-${index}">Bulk link ${index}</a>`).join(""),
+      "</nav>",
+      `<p>${"prose ".repeat(400)}</p>`,
+      "</main>",
+    ].join(""),
+    hostile: [
+      "<main id=\"hostile-main\"><h1>Hostile shapes</h1>",
+      "<div id=\"dup\"><p>first duplicate</p></div><div id=\"dup\"><p>second duplicate</p></div>",
+      `${"<div>".repeat(120)}deep${"</div>".repeat(120)}`,
+      `<div id="hostile-text">${"x".repeat(20_000)}</div>`,
+      "<div id=\"hostile-empty\"></div>",
+      "</main>",
+    ].join(""),
+  }[kind];
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Archetype ${kind}</title></head><body>${body ?? "<main><h1>Unknown archetype</h1></main>"}</body></html>`;
+};
 const siteServer = createServer((req, res) => {
   if (req.url === "/api/data") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -272,6 +396,27 @@ const siteServer = createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(renderSite());
     }, 400);
+    return;
+  }
+  if (req.url?.startsWith("/shell")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(shellPage);
+    return;
+  }
+  if (req.url?.startsWith("/regions")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(regionsPage);
+    return;
+  }
+  if (req.url?.startsWith("/archetype/")) {
+    const kind = req.url.slice("/archetype/".length).split("?")[0];
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(archetypePage(kind));
+    return;
+  }
+  if (req.url?.startsWith("/generic")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(genericPage);
     return;
   }
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -405,10 +550,23 @@ try {
   assert.equal(orderedResult.matched, true);
   await request("navigate", { tabId: selected.tab.id, url: `http://127.0.0.1:${pagePort}/`, wait: true });
   await request("wait", { tabId: selected.tab.id, state: "url", urlIncludes: `127.0.0.1:${pagePort}`, timeoutMs: 5000 });
+  await request("navigate", { tabId: selected.tab.id, url: `${pageOrigin}/?marker=reload-status`, wait: true });
+  const reloadReady = await request("wait", { tabId: selected.tab.id, state: "text", text: "Reload ready", exact: true, reload: true, reloadIntervalMs: 250, timeoutMs: 5000 });
+  assert.equal(reloadReady.matched, true);
+  await request("navigate", { tabId: selected.tab.id, url: `${pageOrigin}/`, wait: true });
   const loadingGone = await request("wait", { tabId: selected.tab.id, state: "text_gone", text: "Loading...", timeoutMs: 5000 });
   assert.equal(loadingGone.matched, true);
   const asyncReady = await request("wait", { tabId: selected.tab.id, state: "text", text: "Async ready", exact: true, timeoutMs: 5000 });
   assert.equal(asyncReady.matched, true);
+   const terminalState = await request("wait", { tabId: selected.tab.id, state: "text", textAny: ["Finished: FAILURE", "Async ready", "Finished: SUCCESS"], exact: true, timeoutMs: 5000 });
+   assert.equal(terminalState.matched, true);
+   assert.equal(terminalState.matchedText, "Async ready");
+   await request("evaluate", { tabId: selected.tab.id, expression: "document.querySelector('#out').textContent = 'Finished: FAILURE'" });
+   const failedTerminalState = await request("wait", { tabId: selected.tab.id, state: "text", textAny: ["Finished: SUCCESS"], failureTextAny: ["Finished: FAILURE"], exact: true, timeoutMs: 5000 });
+   assert.equal(failedTerminalState.matched, true);
+   assert.equal(failedTerminalState.failed, true);
+   assert.equal(failedTerminalState.terminalState, "failure");
+   assert.equal(failedTerminalState.matchedText, "Finished: FAILURE");
   const exactText = await request("wait", { tabId: selected.tab.id, state: "text", text: "Text target now", exact: true, timeoutMs: 5000 });
   assert.equal(exactText.matched, true);
   const nestedTextTarget = { text: "Disabled nested", exact: true };
@@ -531,6 +689,231 @@ try {
   assert.equal(compactWireSnapshot.snapshot.text, undefined);
   assert.equal(compactWireSnapshot.frameTree, undefined);
   assert.match(compactWireSnapshot.snapshot.state, /\[ref=/);
+  // A dedicated page for the neutral-digest contract: navigation with 160 repeated links, a
+  // header search utility, a landmark-free main container, an action bar, and a log pane.
+  const regionTab = await request("new_tab", { url: `${pageOrigin}/regions`, active: false, wait: true, sessionId: "e2e-regions" });
+  const pageMapWireSnapshot = await request("snapshot", { tabId: regionTab.tab.id, responseMode: "compact" });
+  const pageMapState = pageMapWireSnapshot.snapshot.state;
+  // Neutral contract: regions are listed in document order, nothing is called "primary", and
+  // no key-action ranking exists. Which region matters is the caller's decision.
+  assert.doesNotMatch(pageMapState, /Primary/);
+  assert.doesNotMatch(pageMapState, /Key actions/);
+  assert.match(pageMapState, /Regions \(document order\):/);
+  assert.match(pageMapState, /- main "Deployment build"/);
+  assert.match(pageMapState, /Deployment build/);
+  assert.match(pageMapState, /controls:/);
+  assert.match(pageMapState, /link "Console Output"/);
+  assert.match(pageMapState, /revision: abc123/);
+  assert.match(pageMapState, /branch: dev/);
+  assert.match(pageMapState, /node: agent-1/);
+  // Metadata stays terse and neutral: an inferred "label: value" line that reads as a sentence is
+  // body text, not structured data, while a pair the page itself declares in a table may carry a
+  // longer value. Both rules are structural and carry no site vocabulary.
+  const valueLines = pageMapState.split("\n").filter((line) => /^\s*values:/.test(line)).join("\n");
+  assert.match(valueLines, /revision=abc123/);
+  assert.match(valueLines, /change summary=change-change-/);
+  assert.doesNotMatch(valueLines, /the deployment finished successfully/);
+  // Document order is observable: navigation precedes the search form, which precedes main.
+  const navigationIndex = pageMapState.indexOf('- navigation "Navigation"') >= 0
+    ? pageMapState.indexOf('- navigation "Navigation"')
+    : pageMapState.indexOf('- secondary "Navigation"');
+  assert.ok(navigationIndex >= 0 && navigationIndex < pageMapState.indexOf('- main "Deployment build"'));
+  // Repeated controls are reported as counts, and only a bounded prefix is published.
+  assert.match(pageMapState, /\(controls=160/);
+  assert.doesNotMatch(pageMapState, /Historical navigation 159/);
+  // The published detail is globally bounded, so an overlapping nested region cannot flood it.
+  const publishedRefs = (pageMapState.match(/\[ref=e\d+\]/g) ?? []).length;
+  assert.ok(publishedRefs <= 40, `published refs must stay bounded, saw ${publishedRefs}`);
+  // Every listed region stays addressable for the follow-up read.
+  assert.match(pageMapState, /\{selector=#page-map-fixture\}|\{selector=#detail-actions\}|\{selector=#build-log\}/);
+  assert.match(pageMapState, /\[ref=e\d+\]/);
+  // Retrieval contract: a bounded read reports what it omitted and how to retrieve it.
+  assert.ok(pageMapWireSnapshot.snapshot.omitted, "bounded digest must report omitted counts");
+  assert.equal(pageMapWireSnapshot.snapshot.recommendation, "narrow_read");
+  assert.match(pageMapWireSnapshot.snapshot.recovery, /browser_snapshot|browser_extract/);
+  // Zooming into a listed region returns the same shape for that subtree.
+  const zoomed = await request("snapshot", { tabId: regionTab.tab.id, selector: "#page-map-form", responseMode: "compact" });
+  assert.match(zoomed.snapshot.state, /Deployment build/);
+  assert.doesNotMatch(zoomed.snapshot.state, /Historical navigation 0\b/);
+  const logTail = await request("extract", { tabId: regionTab.tab.id, scope: "log", tail: true, maxChars: 120, includeFrames: false });
+   const matchedLog = await request("extract", { tabId: regionTab.tab.id, scope: "log", logMatch: "Finished", logMaxMatches: 5, maxChars: 120, includeFrames: false });
+   assert.equal(matchedLog.content.logMatch, "Finished");
+   assert.equal(matchedLog.content.matchedLineCount, 1);
+   assert.deepEqual(matchedLog.content.matchedLineNumbers, [3]);
+   assert.match(matchedLog.content.text, /Finished: SUCCESS/);
+  assert.equal(logTail.content.scope, "log");
+  assert.match(logTail.content.text, /Finished: SUCCESS/);
+  assert.doesNotMatch(logTail.content.text, /irrelevant footer history/);
+  // Discovery reads are bounded and retrievable: a query narrows the listing at the source and
+  // the omitted count names what the budget dropped instead of silently losing rows.
+  const filteredTabs = await request("list_tabs", { query: "/regions", limit: 1 });
+  assert.equal(filteredTabs.tabs.length, 1);
+  assert.ok(filteredTabs.tabs[0].url.endsWith("/regions"), "the query must select the requested tab");
+  assert.equal(filteredTabs.filters.query, "/regions");
+  assert.ok(Number.isInteger(filteredTabs.totalTabs) && filteredTabs.totalTabs >= 1);
+  await request("close_tab", { tabId: regionTab.tab.id, sessionId: "e2e-regions" });
+  // Landmark-free application shell. The neutral digest must list its id-carrying containers
+  // (`#main-panel`, `#side-panel`) in document order so each is addressable again, must not
+  // rank any of them, must not surface inline helper-script text, and must not invent domain
+  // fields: only the labelled "Revision:" line is a value.
+  const shellTab = await request("new_tab", { url: `${pageOrigin}/shell`, active: false, wait: true, sessionId: "e2e-shell" });
+  const shellSnapshot = await request("snapshot", { tabId: shellTab.tab.id, responseMode: "compact" });
+  const shellState = shellSnapshot.snapshot.state;
+  assert.doesNotMatch(shellState, /Primary/);
+  assert.match(shellState, /Regions \(document order\):/);
+  assert.match(shellState, /Build #706 \(2026-9-15 9:08:53\)/);
+  assert.match(shellState, /revision: e00a7ed35b970e1e45390bbaff536acb1999d9d9/);
+  assert.doesNotMatch(shellState, /branch: dev/);
+  assert.doesNotMatch(shellState, /node: 192\.169\.2\.81/);
+  assert.doesNotMatch(shellState, /duration: 2 min 8 sec/);
+  assert.doesNotMatch(shellState, /status: SUCCESS/);
+  assert.doesNotMatch(shellState, /status: RUNNING/);
+  assert.doesNotMatch(shellState, /createSearchBox/);
+  // The id-carrying containers stay addressable for the follow-up read.
+  assert.match(shellState, /\{selector=#main-panel\}/);
+  assert.match(shellState, /\{selector=#side-panel\}/);
+  assert.ok(shellState.indexOf("selector=#side-panel") < shellState.indexOf("selector=#main-panel"), "document order must be preserved");
+  // Repeated history controls are counted, and the search utility is one small region.
+  assert.match(shellState, /\(controls=180/);
+  assert.match(shellState, /form "search"/);
+  await request("close_tab", { tabId: shellTab.tab.id, sessionId: "e2e-shell" });
+  // Generic-capability check: no CI vocabulary anywhere on this page, yet the labelled
+  // fields are still published, the secret-looking label is redacted, and the unrelated
+  // link list stays bounded by counts.
+  const genericTab = await request("new_tab", { url: `${pageOrigin}/generic`, active: false, wait: true, sessionId: "e2e-generic" });
+  const genericSnapshot = await request("snapshot", { tabId: genericTab.tab.id, responseMode: "compact" });
+  assert.match(genericSnapshot.snapshot.state, /Order A-1001/);
+  assert.match(genericSnapshot.snapshot.state, /order id: A-1001/);
+  assert.match(genericSnapshot.snapshot.state, /customer: 珠海测试客户/);
+  assert.match(genericSnapshot.snapshot.state, /total: 128\.00/);
+  assert.match(genericSnapshot.snapshot.state, /payment: Paid/);
+  assert.match(genericSnapshot.snapshot.state, /channel: SMS/);
+  assert.doesNotMatch(genericSnapshot.snapshot.state, /should-never-appear/);
+  assert.doesNotMatch(genericSnapshot.snapshot.state, /Related order 39/);
+  assert.doesNotMatch(genericSnapshot.snapshot.state, /Primary/);
+  // The page patched String.prototype.trim to return a boxed String. The plugin's isolated
+  // world must still produce plain strings, never a {0:"a",1:"b"} artifact.
+  assert.doesNotMatch(genericSnapshot.snapshot.state, /\d"\s*:/);
+  assert.match(genericSnapshot.snapshot.state, /Order A-1001/);
+  await request("close_tab", { tabId: genericTab.tab.id, sessionId: "e2e-generic" });
+  // --- Archetype matrix (docs/COMPACT-READ-CONTRACT.zh-CN.md section 5) ---------------------------
+  // Every structural class gets its own page and its own invariant set, so a digest change that
+  // breaks one class is reported by that class instead of by a site fixture.
+  const valuesOf = (state) => state.split("\n").filter((line) => /^\s*values:/.test(line)).join("\n");
+  // Region bullets only: the top-level `Values:` block also renders "- key: value" lines.
+  const regionLines = (state) => {
+    const start = state.indexOf("Regions (document order):");
+    return start < 0 ? [] : state.slice(start).split("\n").filter((line) => /^- /.test(line));
+  };
+  const readArchetype = async (kind) => {
+    const created = await request("new_tab", { url: `${pageOrigin}/archetype/${kind}`, active: false, wait: true, sessionId: `e2e-archetype-${kind}` });
+    const tabId = created.tab.id;
+    const snapshot = await request("snapshot", { tabId, responseMode: "compact" });
+    return { tabId, snapshot, state: snapshot.snapshot.state };
+  };
+
+  const archetypeTabs = new Map();
+  const archetypeStates = new Map();
+  const archetypeSnapshots = new Map();
+  for (const kind of ARCHETYPE_KINDS) {
+    const { tabId, snapshot, state } = await readArchetype(kind);
+    archetypeTabs.set(kind, tabId);
+    archetypeStates.set(kind, state);
+    archetypeSnapshots.set(kind, snapshot);
+    // Cross-class invariants: no ranking survives, every listed region stays addressable, and
+    // nothing internal leaks into the model-visible digest.
+    assert.match(state, /Regions \(document order\):/, `${kind}: regions must be listed`);
+    assert.match(state, /^Page: .+$/m, `${kind}: the page title stays at the top level`);
+    assert.doesNotMatch(state, /Primary|Key actions/, `${kind}: no ranking vocabulary`);
+    assert.doesNotMatch(state, /undefined|\[object Object\]/, `${kind}: no internal artifacts`);
+    for (const line of regionLines(state)) {
+      assert.match(line, /\[ref=e\d+\]/, `${kind}: every listed region stays addressable by ref (${line})`);
+    }
+  }
+
+  {
+    // landmark: document order is observable, repeated containers are counted instead of expanded,
+    // the digest is deterministic for the same DOM, and a listed region is retrievable by address.
+    const state = archetypeStates.get("landmark");
+    const tabId = archetypeTabs.get("landmark");
+    const bullets = regionLines(state);
+    const navIndex = bullets.findIndex((line) => /\(controls=40/.test(line));
+    const mainIndex = bullets.findIndex((line) => line.includes("Landmark heading"));
+    const tailIndex = bullets.findIndex((line) => /tail/i.test(line));
+    assert.ok(navIndex >= 0 && mainIndex > navIndex, `navigation precedes main in document order (${bullets.join(" | ")})`);
+    assert.ok(tailIndex > mainIndex, "main precedes the trailing section");
+    assert.doesNotMatch(state, /Repeated link 39\b/);
+    assert.match(valuesOf(state), /revision=abc123/);
+    const repeat = await request("snapshot", { tabId, responseMode: "compact" });
+    // Refs are opaque, observation-scoped handles that a fresh observation may renumber; the
+    // digest content and its order must be identical for the same DOM.
+    const withoutRefs = (value) => value.replace(/\[ref=e\d+\]/g, "[ref]");
+    const left = withoutRefs(state);
+    const right = withoutRefs(repeat.snapshot.state);
+    if (left !== right) {
+      let at = 0;
+      while (at < left.length && left[at] === right[at]) at += 1;
+      console.error(`determinism diff at ${at}\n  first : ${JSON.stringify(left.slice(Math.max(0, at - 80), at + 80))}\n  repeat: ${JSON.stringify(right.slice(Math.max(0, at - 80), at + 80))}\n  lengths: ${left.length} vs ${right.length}`);
+    }
+    assert.equal(right, left, "the same DOM must produce the same digest");
+    const scoped = await request("snapshot", { tabId, selector: "#main-a", responseMode: "compact" });
+    assert.match(scoped.snapshot.state, /Landmark heading/);
+  }
+
+  {
+    // wrapper: a nested wrapper that exposes exactly its ancestor's controls is not listed twice.
+    const state = archetypeStates.get("wrapper");
+    const addresses = state.match(/\{selector=#(?:outer|inner)-wrap\}/g) ?? [];
+    assert.equal(addresses.length, 1, `a redundant wrapper must be listed once, saw ${addresses.join(", ")}`);
+    assert.equal(addresses[0], "{selector=#outer-wrap}", "the outer wrapper is the one that stays listed");
+    assert.match(state, /Nested content/);
+  }
+
+  {
+    // data: the metadata rules are structural. A short inferred pair stays, a pair the page declares
+    // (table row, dt/dd) may be long, and prose or an oversized inferred pair is not data.
+    const values = valuesOf(archetypeStates.get("data"));
+    assert.match(values, /revision=abc123/, "a short inferred pair is structured data");
+    assert.match(values, /change summary=change-change-/, "a declared table pair may carry a long value");
+    assert.match(values, /operator note=bbb/, "a declared dt/dd pair may carry a long value");
+    assert.doesNotMatch(values, /the deployment finished successfully/, "prose must not become a value");
+    assert.doesNotMatch(values, /summary=aaaa/, "an oversized inferred value must be rejected");
+  }
+
+  {
+    // secrets: credential-labelled lines and inline helper scripts never enter the digest, while an
+    // ordinary pair on the same page still does.
+    const state = archetypeStates.get("secrets");
+    // The label is normalised (lowercased) while the rendered value keeps its own casing.
+    assert.match(valuesOf(state), /status=SUCCESS/);
+    assert.doesNotMatch(state, /should-never-appear/);
+    assert.doesNotMatch(state, /hunter2-secret/);
+    assert.doesNotMatch(state, /SCRIPT_MARKER_9f3/);
+  }
+
+  {
+    // bulk: a bounded read reports what it dropped and how to retrieve it instead of expanding.
+    const state = archetypeStates.get("bulk");
+    const snapshot = archetypeSnapshots.get("bulk");
+    assert.match(state, /\(controls=200/);
+    assert.doesNotMatch(state, /Bulk link 199\b/);
+    assert.equal(snapshot.snapshot.truncated, true);
+    assert.ok(snapshot.snapshot.omitted?.controls > 0, "a bounded digest reports its omitted controls");
+    assert.equal(snapshot.snapshot.nextAction, "browser_snapshot");
+    assert.equal(snapshot.snapshot.recommendation, "narrow_read");
+  }
+
+  {
+    // hostile: duplicate ids, 120-level nesting, a 20k-character text node and an empty container
+    // must stay bounded and readable rather than throwing or leaking internals.
+    const state = archetypeStates.get("hostile");
+    assert.ok(state.length <= 9_000, `a hostile page must stay bounded, saw ${state.length}`);
+    assert.equal(archetypeSnapshots.get("hostile").snapshot.truncated, true);
+  }
+
+  for (const kind of ARCHETYPE_KINDS) {
+    await request("close_tab", { tabId: archetypeTabs.get(kind), sessionId: `e2e-archetype-${kind}` });
+  }
   await request("evaluate", { tabId: selected.tab.id, expression: "document.title = 'Pi Control Chrome E2E · observed'; document.querySelector('#async-status').textContent = 'Unrelated UI update'" });
   const resilientFill = await request("interaction", { tabId: selected.tab.id, operation: "fill", ref: staleNameInput.ref, snapshotId: staleSnapshot.snapshot.snapshotId, value: "Live ref" });
   assert.equal(resilientFill.result?.resolvedBy, "original_ref");
@@ -702,8 +1085,8 @@ try {
   assert.ok(actionInput?.ref);
   const extracted = await request("extract", { tabId: selected.tab.id });
   const compactWireExtract = await request("extract", { tabId: selected.tab.id, responseMode: "compact" });
-  assert.equal(compactWireExtract.content.text.length <= 12000, true);
-  assert.equal(compactWireExtract.content.markdown.length <= 12000, true);
+  assert.equal(compactWireExtract.content.text.length <= 6000, true);
+  assert.equal(compactWireExtract.content.markdown.length <= 6000, true);
   assert.equal(compactWireExtract.frameTree, undefined);
 
   assert.match(extracted.content.text, /Pi Control Chrome E2E/);
@@ -1141,6 +1524,10 @@ try {
 
   const screenshot = await request("screenshot", { tabId: selected.tab.id });
   assert.ok(typeof screenshot.data === "string" && screenshot.data.length > 100);
+  const preRestartHealth = (await localGet("/health")).body;
+  const modelMetrics = preRestartHealth.observability?.metrics;
+  assert.ok(modelMetrics?.compactModelResponses > 0, `compact response telemetry missing: ${JSON.stringify(modelMetrics)}`);
+  assert.ok(modelMetrics.compactModelResponseBytes < modelMetrics.modelResponseBytes, `compact responses were not smaller: ${JSON.stringify(modelMetrics)}`);
 
   // Restart the isolated Bridge while keeping the isolated browser and its tab alive.
   // The old target route is intentionally retained so the next request proves it is stale.
@@ -1277,6 +1664,7 @@ try {
     snapshotBytes,
     projectedSnapshotBytes,
     pageBytes: Buffer.byteLength(site),
+     modelMetrics,
     group,
     cleanup,
     staleMarkCleanup,

@@ -44,7 +44,7 @@ async function stopProcess(child) {
 }
 
 async function waitHealth(port) {
-  for (let i = 0; i < 50; i += 1) {
+  for (let i = 0; i < 150; i += 1) {
     try {
       const result = await getJson(port, "/health");
       if (result.body.ok) return result.body;
@@ -60,7 +60,7 @@ async function waitHealth(port) {
 // them, so wait for the Bridge itself to drain instead of assuming the response
 // was processed first.
 async function waitBridgeIdle(port) {
-  for (let i = 0; i < 50; i += 1) {
+  for (let i = 0; i < 150; i += 1) {
     try {
       const result = await getJson(port, "/health");
       const observability = result.body.observability;
@@ -197,8 +197,8 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
       snapshotId: "snapshot-wire",
       title: "Orders",
       url: "https://example.test/orders",
-      text: "duplicate page text",
-      elements: [{ ref: "e1", role: "button", name: "Save" }],
+      text: "duplicate page text ".repeat(2_000),
+      elements: Array.from({ length: 350 }, (_, index) => ({ ref: index === 0 ? "e1" : `e${index + 1}`, role: "button", name: index === 0 ? "Save" : `Action ${index + 1}` })),
       accessibility: { children: [{ role: "button", name: "Save" }] },
     },
     frameTree: { frameTree: { frame: { id: "main" }, childFrames: [{ frame: { id: "child" } }] } },
@@ -222,6 +222,7 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
   try {
     const health = await waitHealth(port);
     assert.equal(health.capabilities.compactResponses, true);
+    assert.equal(health.capabilities.longWait, true);
     const pair = await getJson(port, "/pair");
     extension = await connect("extension", pair.body.token);
     extension.on("message", (raw) => {
@@ -231,7 +232,7 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
         extension.send(JSON.stringify({ type: "response", id: message.id, result: rawSnapshot }));
       }
     });
-    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:compact", profile: "profile-compact", capabilities: { tabIncarnationFence: true, turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true } }));
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, browser: "edge", browserId: "edge:compact", profile: "profile-compact", capabilities: { tabIncarnationFence: true, turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, compactPageMap: true } }));
     await waitHealthTarget(port, "edge:compact");
     pi = await connect("pi", pair.body.token);
 
@@ -247,19 +248,32 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
     assert.equal(compact.result.frameTree, undefined);
     assert.match(compact.result.snapshot.state, /\[ref=e1\]/);
     assert.equal(compact.result.tab.favicon, undefined);
+    assert.equal(forwardedSnapshot?.params.maxChars, 8_000);
+    assert.equal(forwardedSnapshot?.params.maxNodes, 100);
+    assert.equal(forwardedSnapshot?.params.pageMap, true);
     assert.equal(forwardedSnapshot?.params.responseMode, undefined);
 
-    const rawId = "raw-snapshot";
+    const compactSize = JSON.stringify(compact.result).length;
+
+     const rawId = "raw-snapshot";
     const rawPending = responseFor(pi, rawId);
     pi.send(JSON.stringify({ type: "request", id: rawId, method: "snapshot", params: { tabId: 7, responseMode: "raw" } }));
     const raw = await rawPending;
     assert.equal(raw.error, undefined);
-    assert.equal(raw.result.snapshot.text, "duplicate page text");
+    assert.equal(raw.result.snapshot.text.length, "duplicate page text ".length * 2_000);
+     const rawSize = JSON.stringify(raw.result).length;
+     assert.ok(compactSize < rawSize, `compact response should be smaller than raw (${compactSize} >= ${rawSize})`);
     assert.ok(raw.result.snapshot.elements);
     assert.ok(raw.result.frameTree);
     assert.equal(forwardedSnapshot?.params.responseMode, undefined);
 
-    const invalidId = "invalid-response-mode";
+    const measuredHealth = await getJson(port, "/health");
+     const measuredMetrics = measuredHealth.body.observability.metrics;
+     assert.equal(measuredMetrics.modelResponses >= 2, true);
+     assert.equal(measuredMetrics.compactModelResponses >= 1, true);
+     assert.equal(measuredMetrics.compactModelResponseBytes < measuredMetrics.modelResponseBytes, true);
+
+     const invalidId = "invalid-response-mode";
     const invalidPending = responseFor(pi, invalidId);
     pi.send(JSON.stringify({ type: "request", id: invalidId, method: "snapshot", params: { tabId: 7, responseMode: "verbose" } }));
     const invalid = await invalidPending;
@@ -272,6 +286,20 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
     const unsupported = await unsupportedPending;
     assert.equal(unsupported.error.code, "INVALID_REQUEST");
     assert.match(unsupported.error.message, /only supported for bounded browser read responses/);
+
+    const missingFeatureId = "missing-tail-feature";
+    const missingFeaturePending = responseFor(pi, missingFeatureId);
+    pi.send(JSON.stringify({ type: "request", id: missingFeatureId, method: "extract", params: { tabId: 7, tail: true } }));
+    const missingFeature = await missingFeaturePending;
+    assert.equal(missingFeature.error.code, "EXTENSION_CAPABILITY_MISSING");
+    assert.match(missingFeature.error.message, /tailExtract/);
+
+    const missingLongWaitId = "missing-long-wait-feature";
+    const missingLongWaitPending = responseFor(pi, missingLongWaitId);
+    pi.send(JSON.stringify({ type: "request", id: missingLongWaitId, method: "wait", params: { tabId: 7, state: "text", text: "finished", timeoutMs: 120_001 } }));
+    const missingLongWait = await missingLongWaitPending;
+    assert.equal(missingLongWait.error.code, "EXTENSION_CAPABILITY_MISSING");
+    assert.match(missingLongWait.error.message, /longWait/);
   } finally {
     pi?.close();
     extension?.close();
