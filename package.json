@@ -84,6 +84,7 @@
     "smoke:e2e:matrix": "node tests/e2e-browser-matrix.mjs",
     "smoke:e2e:multi-profile": "node tests/e2e-multi-profile.mjs",
     "measure:reads": "node tests/measure-reads.mjs",
+    "measure:flow": "node tests/measure-flow.mjs",
     "audit:digests": "node tests/audit-digests.mjs",
     "pack:check": "npm pack --dry-run"
   },
