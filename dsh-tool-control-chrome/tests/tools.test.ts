@@ -1129,6 +1129,34 @@ describe('DSH browser tool catalog', () => {
     expect(closed).toMatchObject({ ok: false, completed: false, actionState: 'not_completed', retryable: false, inspectFirst: true, nextAction: 'browser_tabs', recommendation: 'refresh_browser_tabs', error: { code: 'BROWSER_TAB_CLOSED', details: { tabId: 7 } } })
   })
 
+  it('keeps an inherited-runtime tab error actionable instead of masking it', async () => {
+    // The generic fallback rewrites an unmapped code into extension_disconnected_during_operation and
+    // tells the caller to inspect, which is the wrong instruction for a record left by an earlier
+    // extension runtime: the operation was never sent, and the exit is close or release.
+    const request = vi.fn(async (method: string) => {
+      if (method === 'status') return { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.6.0', capabilities: { tabIncarnationFence: true } }
+      const error = new Error('Cannot use tab 7; its ownership record came from an earlier extension runtime, so its document identity cannot be verified') as Error & { code?: string; details?: unknown }
+      error.code = 'BROWSER_TAB_RUNTIME_INHERITED'
+      error.details = { tabId: 7, actionState: 'not_completed', retryable: false, inspectFirst: false, inheritedRuntime: true, owned: 'agent', nextAction: 'browser_close_tab', recommendation: 'close_inherited_tab' }
+      throw error
+    })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health })
+
+    const refused = await harness.tools.get('browser_extract')?.execute({ tabId: 7, maxChars: 200 }, execution(harness.agent))
+    expect(refused).toMatchObject({
+      ok: false,
+      completed: false,
+      actionState: 'not_completed',
+      retryable: false,
+      inspectFirst: false,
+      nextAction: 'browser_close_tab',
+      recommendation: 'close_inherited_tab',
+      error: { code: 'BROWSER_TAB_RUNTIME_INHERITED', details: { tabId: 7, inheritedRuntime: true, owned: 'agent' } },
+    })
+    expect(JSON.stringify(refused)).toContain('earlier extension runtime')
+  })
+
   it('preserves the browser error message and explicit AX retry policy', async () => {
     const request = vi.fn(async (method: string) => {
       if (method === 'status') return {

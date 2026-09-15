@@ -1309,6 +1309,7 @@ type BrowserOperationErrorCode =
   | 'BROWSER_PAGE_CHANGING'
   | 'BROWSER_TAB_CLOSED'
   | 'BROWSER_TAB_FENCE_CHANGED'
+  | 'BROWSER_TAB_RUNTIME_INHERITED'
   | 'BROWSER_WAIT_TIMEOUT'
   | 'BROWSER_SELECTOR_NOT_FOUND'
   | 'BROWSER_SELECTOR_INVALID'
@@ -1379,6 +1380,26 @@ async function operationDisconnectedResult(
       ...(details === undefined ? {} : { details }),
     },
   })
+  if (code === 'BROWSER_TAB_RUNTIME_INHERITED') {
+    const detailRecord = isRecord(details) ? details : undefined
+    const agentOwned = detailRecord?.owned === 'agent'
+    return asJsonValue({
+      ok: false,
+      completed: false,
+      actionState: 'not_completed',
+      retryable: false,
+      inspectFirst: false,
+      nextAction: agentOwned ? 'browser_close_tab' : 'browser_release',
+      recommendation: agentOwned ? 'close_inherited_tab' : 'release_claimed_tab',
+      error: {
+        code,
+        message: messageOr(agentOwned
+          ? 'The tab ownership record came from an earlier extension runtime. Close the tab this session opened with browser_close_tab, or release the record with browser_release; document-bound work cannot be verified against it.'
+          : 'The tab ownership record came from an earlier extension runtime and the tab is a claimed user tab. Release the record with browser_release, and ask the user before closing the tab.'),
+        ...(details === undefined ? {} : { details }),
+      },
+    })
+  }
   if (AX_OPERATION_ERROR_CODES.has(code)) {
     const detailRecord = isRecord(details) ? details : undefined
     const actionState = detailRecord?.actionState === 'unknown'
@@ -1645,7 +1666,7 @@ async function requestBrowserOperation(
     return { ok: true, value: await requestWithTarget(bridge, method, params, signal, target) }
   } catch (error) {
     const code = bridgeErrorCode(error)
-    if (code === 'EXTENSION_OFFLINE' || code === 'BROWSER_BRIDGE_DISCONNECTED' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_TAB_CLOSED' || code === 'BROWSER_TAB_FENCE_CHANGED' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
+    if (code === 'EXTENSION_OFFLINE' || code === 'BROWSER_BRIDGE_DISCONNECTED' || code === 'TARGET_UNAVAILABLE' || code === 'TARGET_CONNECTION_CHANGED' || code === 'BROWSER_OPERATION_UNCERTAIN' || code === 'BROWSER_TARGET_MISMATCH' || code === 'BROWSER_PAGE_UNAVAILABLE' || code === 'BROWSER_PAGE_CHANGING' || code === 'BROWSER_TAB_CLOSED' || code === 'BROWSER_TAB_FENCE_CHANGED' || code === 'BROWSER_TAB_RUNTIME_INHERITED' || code === 'BROWSER_WAIT_TIMEOUT' || code === 'BROWSER_SELECTOR_NOT_FOUND' || code === 'BROWSER_SELECTOR_INVALID' || code === 'BROWSER_SCRIPT_ERROR' || AX_OPERATION_ERROR_CODES.has(code as BrowserOperationErrorCode)) {
       const details = error && typeof error === 'object' && 'details' in error ? (error as { readonly details?: unknown }).details : undefined
       const message = error instanceof Error && error.message.length > 0 ? error.message : undefined
       return {

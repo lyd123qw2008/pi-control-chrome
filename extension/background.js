@@ -1899,7 +1899,10 @@ async function ownedTabForSession(tabId, sessionId, action, required = false, al
     if (required) throw new Error(`Cannot ${action} tab ${tabId}; it is not owned by an Agent session`);
     return undefined;
   }
-  if (record.runtimeId !== runtimeInstanceIdentity) throw new Error(`Cannot ${action} tab ${tabId}; its tab incarnation is unknown after the extension runtime changed`);
+  if (record.runtimeId !== runtimeInstanceIdentity) {
+    const refusal = inheritedRuntimeRefusal(record, action, tabId);
+    if (refusal) throw refusal;
+  }
   if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another browser target`);
   if (record.sessionId !== sessionKey(sessionId) && !allowOtherSession) throw new Error(`Cannot ${action} tab ${tabId}; it belongs to another Agent session`);
   try {
@@ -1909,6 +1912,42 @@ async function ownedTabForSession(tabId, sessionId, action, required = false, al
     throw error;
   }
   return record;
+}
+
+/**
+ * An ownership record can outlive the extension runtime that created it. The tab fence is persisted
+ * per tab, so a tab this session opened is still identifiable — what no longer matches is the
+ * record's generational marker, and a *claimed* user tab was authorised by a document identity that
+ * cannot be re-verified now. Releasing a record never touches the tab and closing an Agent-opened tab
+ * is the calling session's own bookkeeping, so those may cross the generation; everything else fails
+ * closed with a code and the exit that actually works.
+ */
+function inheritedRuntimeRefusal(record, action, tabId) {
+  if (!record || record.runtimeId === runtimeInstanceIdentity) return undefined;
+  if (action === "release") return undefined;
+  if (record.owner === "agent" && ["close", "cleanup"].includes(action)) return undefined;
+  return inheritedRuntimeTabError(action, tabId, record);
+}
+
+function inheritedRuntimeTabError(action, tabId, record) {
+  const agentOwned = record?.owner === "agent";
+  const error = new Error(`Cannot ${action} tab ${tabId}; its ownership record came from an earlier extension runtime, so its document identity cannot be verified`);
+  error.code = "BROWSER_TAB_RUNTIME_INHERITED";
+  error.details = {
+    tabId: Number(tabId),
+    action: String(action),
+    actionState: "not_completed",
+    retryable: false,
+    inspectFirst: false,
+    inheritedRuntime: true,
+    owned: agentOwned ? "agent" : "claimed",
+    nextAction: agentOwned ? "browser_close_tab" : "browser_release",
+    recommendation: agentOwned ? "close_inherited_tab" : "release_claimed_tab",
+    note: agentOwned
+      ? "The tab was opened by this Agent session: browser_close_tab({ tabId }) closes it, or browser_release({ tabId }) drops the record and leaves the tab open."
+      : "The tab is a claimed user tab: browser_release({ tabId }) drops the record without touching the tab; ask the user before closing it.",
+  };
+  return error;
 }
 
 async function saveOwnedTabs(value) {
@@ -2009,7 +2048,9 @@ async function recordOwnedTab(tab, sessionId, owner = "agent", lifecycle = "temp
     const existing = owned[key];
     if (existing) {
       if (existing.runtimeId !== runtimeInstanceIdentity) {
-        if (!replaceStaleRuntime || owner !== "agent") throw new Error(`Cannot ${owner === "claimed" ? "claim" : "record"} tab ${tab.id}; its tab incarnation is unknown after the extension runtime changed`);
+        if (!replaceStaleRuntime || owner !== "agent") {
+          throw inheritedRuntimeTabError(owner === "claimed" ? "claim" : "record", tab.id, existing);
+        }
         delete owned[key];
       } else {
         throw new Error(`Tab ${tab.id} is already owned; release it before claiming or recording it again`);
@@ -2093,7 +2134,7 @@ async function updateOwnedTab(tabId, patch, sessionId) {
     const record = owned[key];
     if (!record) throw new Error(`Agent-owned tab not found: ${tabId}`);
     if (record.owner !== "agent") throw new Error(`Cannot update tab ${tabId}; only Agent-owned tabs can be marked for handoff or delivery`);
-    if (record.runtimeId !== runtimeInstanceIdentity) throw new Error(`Cannot update tab ${tabId}; its tab incarnation is unknown after the extension runtime changed`);
+    if (record.runtimeId !== runtimeInstanceIdentity) throw inheritedRuntimeTabError("update", tabId, record);
     if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw new Error(`Cannot update tab ${tabId}; it belongs to another browser target`);
     if (record.sessionId !== sessionKey(sessionId)) throw new Error(`Cannot update tab ${tabId}; it belongs to another Agent session`);
     await assertOwnedTabFence(record, "update");
@@ -2339,7 +2380,7 @@ async function removeTabWithFence(tabId, expectedFence, operation = "close") {
   }
 }
 
-async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecordedSnapshotChange = false, allowBlockedPageDocumentCheck = false) {
+async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecordedSnapshotChange = false, allowBlockedPageDocumentCheck = false, allowInheritedAgentRecord = false) {
   const hasNestedHandle = isRecordObject(handle.handle);
   const tabHandle = hasNestedHandle ? handle.handle : {};
   const handleTabId = tabHandle.tabId !== undefined ? Number(tabHandle.tabId) : undefined;
@@ -2402,7 +2443,7 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (lifecycleTombstone) throw uncertainBrowserOperationError("tab lookup", { tabId: tab.id, removalPending: true });
   const record = owned[targetStateKey(tab.id)];
   if (record) {
-    if (record.runtimeId !== runtimeInstanceIdentity) throw new Error(`Cannot use tab ${tab.id}; its tab incarnation is unknown after the extension runtime changed`);
+    if (record.runtimeId !== runtimeInstanceIdentity && !allowInheritedAgentRecord) throw inheritedRuntimeTabError("use", tab.id, record);
     if (record.browserId !== undefined && record.browserId !== browserIdentity().browserId) throw browserTargetMismatchError(record.browserId);
     if (record.sessionId !== sessionKey(requestSessionId) && !allowCrossSessionRead) throw new Error(`Cannot use tab ${tab.id}; it belongs to another Agent session`);
     await assertOwnedTabFence(record, "use");
@@ -6382,7 +6423,7 @@ function isSideEffectingPageOperation(params) {
   return SIDE_EFFECTING_PAGE_ACTIONS.has(String(params.operation || params.action || ""));
 }
 
-const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "STALE_AX_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "AX_NODE_NOT_FOUND", "AX_NODE_AMBIGUOUS", "AX_NODE_CHANGED", "AX_NODE_NOT_RESOLVABLE", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED", "AX_NODE_OPERATION_FAILED", "BROWSER_AX_UNAVAILABLE", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
+const STRUCTURED_PAGE_ERROR_CODES = new Set(["ELEMENT_NOT_EDITABLE", "ELEMENT_TARGET_AMBIGUOUS", "ELEMENT_TARGET_NOT_FOUND", "ELEMENT_TARGET_DETACHED", "ELEMENT_TARGET_DISABLED", "INVALID_ELEMENT_TARGET", "STALE_SNAPSHOT", "STALE_DOM_SNAPSHOT", "STALE_AX_SNAPSHOT", "DOM_NODE_NOT_FOUND", "DOM_NODE_AMBIGUOUS", "DOM_NODE_NOT_ACTIONABLE", "DOM_NODE_NOT_EDITABLE", "AX_NODE_NOT_FOUND", "AX_NODE_AMBIGUOUS", "AX_NODE_CHANGED", "AX_NODE_NOT_RESOLVABLE", "AX_NODE_NOT_ACTIONABLE", "AX_NODE_NOT_EDITABLE", "AX_NODE_DISABLED", "AX_NODE_OPERATION_FAILED", "BROWSER_AX_UNAVAILABLE", "BROWSER_DOCUMENT_CHANGED", "BROWSER_TAB_FENCE_CHANGED", "BROWSER_TAB_RUNTIME_INHERITED", "BROWSER_TAB_CLOSED", "BROWSER_OPERATION_UNCERTAIN", "BROWSER_PAGE_CHANGING"]);
 
 function isStructuredPageError(error) {
   return Boolean(error && typeof error === "object" && STRUCTURED_PAGE_ERROR_CODES.has(error.code));
@@ -8262,7 +8303,10 @@ async function cleanup(params) {
       if (record.browserId !== undefined && record.browserId !== targetId) continue;
       if (record.sessionId !== sessionId) continue;
       const tabId = recordTabId(record, key);
-      if (record.runtimeId !== runtimeInstanceIdentity) {
+      if (record.runtimeId !== runtimeInstanceIdentity && record.owner !== "agent") {
+        // A claimed user tab was authorised by a document identity this runtime cannot re-verify, so
+        // it stays quarantined for manual review. A tab this session opened is different: its fence is
+        // persisted per tab, so the normal release/close handling below still applies.
         if (recoverStale) {
           recovered.push(tabId);
           delete owned[key];
@@ -8709,15 +8753,18 @@ async function handleRequest(method, params, dispatchOptions = {}) {
     // complete handle still undergoes its own incarnation validation below.
     const allowRecordedSnapshotChange = dispatchOptions.expectedTabFence !== undefined || method === "dialog" || method === "wait";
     const allowReadOnlyDocumentChange = allowsReadOnlyDocumentChange(method, params);
+    // Closing a tab this session opened is its own bookkeeping, so it may cross an extension-runtime
+    // generation: the tab fence is persisted per tab, only the record's generational marker is stale.
+    const allowInheritedAgentRecord = method === "close_tab";
     if (method === "devtools_disable") {
       try {
-        requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || method === "close_tab" || allowReadOnlyDocumentChange);
+        requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || method === "close_tab" || allowReadOnlyDocumentChange, allowInheritedAgentRecord);
         requestTabFence = authorizedTabFence(requestTab);
       } catch (error) {
         if (!isMissingTabError(error)) throw error;
       }
     } else {
-      requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || method === "close_tab" || allowReadOnlyDocumentChange);
+      requestTab = await getTab(params.tabId, params, isReadOnlyTabRequest(method, params), allowRecordedSnapshotChange, method === "dialog" || method === "close_tab" || allowReadOnlyDocumentChange, allowInheritedAgentRecord);
       requestTabFence = authorizedTabFence(requestTab);
       const suppliedHandle = isRecordObject(params.handle) ? params.handle : undefined;
       requestTabIncarnation = typeof suppliedHandle?.incarnation === "string" ? suppliedHandle.incarnation : undefined;

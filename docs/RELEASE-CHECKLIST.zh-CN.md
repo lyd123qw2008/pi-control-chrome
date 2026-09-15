@@ -251,7 +251,7 @@ corepack pnpm --dir <DSH_HOME>/profiles/web why pi-control-chrome
 - extension 已连接；
 - `targetStability.stable: true`；
 - `turnCleanup`、`turnScopedMarks`、`retainedCleanup`、`debuggerLeaseRecovery` 和 `tabIncarnationFence` 能力存在；
-- 显式 `browser_cleanup({ recoverStale: true })` 只忘记未知 runtime 的 ownership 记录，不关闭 Tab，并在 `recovered` 返回记录的 id。
+- 显式 `browser_cleanup({ recoverStale: true })` 会关闭**本会话自己打开的**、ownership 记录继承自上一代扩展运行时的 Agent 标签页（在 `removed` 返回 id），而对同样继承的 `claimed` 记录只忘记记录、不关闭 Tab（在 `recovered` 返回 id）；两种结果都必须如实汇报，不能把未关闭的 Tab 报成已关闭。
 
 如果出现 `bridge_only` 或 `extension_not_connected`：
 

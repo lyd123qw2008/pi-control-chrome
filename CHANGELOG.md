@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 - 2026-09-15
+
+- Let a session clean up after its own runtime. An ownership record outlives the extension runtime that wrote it, and every path that touched such a record refused with a bare message — live, a tab this session had opened became both unreadable and unclosable (`Cannot use tab …; its tab incarnation is unknown after the extension runtime changed`), so only a human could clear it. The tab fence is persisted per tab, so a tab this session opened is still identifiable: closing it is now the calling session's own bookkeeping, `browser_release` drops the record without touching the tab, and `browser_cleanup` closes inherited Agent tabs instead of reporting them as a permanent failure. A `claimed` user tab keeps the stricter treatment, because its document identity is what authorised the claim, and document-bound work on an inherited record still fails closed — but now with `BROWSER_TAB_RUNTIME_INHERITED`, `actionState: not_completed`, `retryable: false`, and the exit that works (`browser_close_tab` for an Agent tab, `browser_release` for a claimed one) instead of a message the caller cannot act on. DSH also stops folding that code into its connection-failure fallback.
 
 - Stop publishing nonsense from a table's shape. Reading a real build page published `w: Description · %` and `x: x` as structured data: the declared-pair path took any row with two or more cells and paired the first cell with the rest, so a chart legend's header row became a `label: value` pair and a single-character placeholder cell became a field name. A row that is entirely header cells (`th`/`role=columnheader`) or lives in a `<thead>` is now skipped, because column names are not data, and a label must be at least two characters, because a one-character cell is a coordinate or placeholder. A real row-header pair (`<th>Label</th><td>Value</td>`) still publishes, and the archetype fixture pins all three cases.
 

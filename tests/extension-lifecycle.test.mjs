@@ -799,20 +799,66 @@ test("cleanup forgets ownership for a tab already closed by the browser", async 
   assert.equal(storedRecord(fixture, 101), undefined);
 });
 
-test("explicit stale ownership recovery forgets records without closing unknown tabs", async () => {
+test("stale runtime recovery closes a tab this session opened and quarantines a claimed one", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(305, { id: 305, windowId: 1, title: "stale agent tab", url: "about:blank" });
+  fixture.tabs.set(306, { id: 306, windowId: 1, title: "stale claimed tab", url: "about:blank" });
+  const agentRecord = { ...record(305), runtimeId: "old-runtime" };
+  const claimedRecord = { ...record(306, "temporary", "stale claimed tab", "about:blank"), owner: "claimed", runtimeId: "old-runtime" };
   fixture.storage[ownedTabsKey] = {
     version: 3,
-    records: { "edge:test-extension:profile-id::305": { ...record(305), runtimeId: "old-runtime" } },
+    records: {
+      "edge:test-extension:profile-id::305": agentRecord,
+      "edge:test-extension:profile-id::306": claimedRecord,
+    },
   };
+  fixture.storage[tabFencesKey] = { "test-extension::305": agentRecord.tabFence };
   const result = await fixture.api.handleRequest("cleanup", { sessionId: "session-test", recoverStale: true });
-  assert.deepEqual(Array.from(result.recovered), [305]);
-  assert.deepEqual(Array.from(result.removed), []);
-  assert.deepEqual(Array.from(result.failed), []);
-  assert.equal(fixture.tabs.has(305), true);
+  // A tab this Agent session opened is still its own: the fence is persisted per tab, so cleanup
+  // closes it instead of stranding it behind a stale generational marker.
+  assert.deepEqual(Array.from(result.removed), [305]);
+  assert.equal(fixture.tabs.has(305), false);
   assert.equal(storedRecord(fixture, 305), undefined);
+  // A claimed user tab keeps the stricter treatment: its document identity authorised the claim and
+  // cannot be re-verified, so recoverStale drops the record without touching the tab.
+  assert.deepEqual(Array.from(result.recovered), [306]);
+  assert.deepEqual(Array.from(result.failed), []);
+  assert.equal(fixture.tabs.has(306), true);
+  assert.equal(storedRecord(fixture, 306), undefined);
 });
+test("a tab inherited from an earlier runtime stays closable and refuses document work with an exit", async () => {
+  const fixture = loadExtension();
+  const inherited = { ...record(360), runtimeId: "old-runtime" };
+  fixture.tabs.set(360, { id: 360, windowId: 1, title: "inherited", url: "https://example.test/inherited", status: "complete" });
+  fixture.storage[ownedTabsKey] = { version: 3, records: { "edge:test-extension:profile-id::360": inherited } };
+  fixture.storage[tabFencesKey] = { "test-extension::360": inherited.tabFence };
+
+  // Document-bound work cannot vouch for its own identity after a runtime change, so it fails closed
+  // with a code and the exit that works instead of a bare message the caller cannot act on.
+  await assert.rejects(
+    () => fixture.api.handleRequest("extract", { tabId: 360, sessionId: "session-test" }),
+    (error) => {
+      assert.equal(error?.code, "BROWSER_TAB_RUNTIME_INHERITED");
+      assert.equal(error?.details?.actionState, "not_completed");
+      assert.equal(error?.details?.retryable, false);
+      assert.equal(error?.details?.inspectFirst, false);
+      assert.equal(error?.details?.inheritedRuntime, true);
+      assert.equal(error?.details?.owned, "agent");
+      assert.equal(error?.details?.nextAction, "browser_close_tab");
+      assert.equal(error?.details?.recommendation, "close_inherited_tab");
+      assert.match(String(error?.details?.note), /browser_close_tab/);
+      return true;
+    },
+  );
+  assert.equal(fixture.tabs.has(360), true);
+
+  // Closing a tab this session opened is its own bookkeeping, so it crosses the generation.
+  const closed = await fixture.api.handleRequest("close_tab", { tabId: 360, sessionId: "session-test" });
+  assert.equal(closed.closed, 360);
+  assert.equal(fixture.tabs.has(360), false);
+  assert.equal(storedRecord(fixture, 360), undefined);
+});
+
 test("cleanup retains ownership after a real close failure and retries it", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(101, { id: 101, windowId: 1, title: "temporary", url: "about:blank" });
@@ -2457,9 +2503,11 @@ test("explicit stale recovery detaches a persisted debugger lease after worker r
   await fixture.api.attachDebugger(310, "session-test", { lease: true });
   fixture.api.persistentDebuggers.clear();
   const result = await fixture.api.handleRequest("cleanup", { sessionId: "session-test", recoverStale: true, detachDevtools: true });
-  assert.deepEqual(Array.from(result.recovered), [310]);
+  assert.deepEqual(Array.from(result.removed), [310]);
   assert.equal(fixture.storage[debuggerLeasesKey]?.length ?? 0, 0);
-  assert.equal(fixture.tabs.has(310), true);
+  // The record was inherited from an earlier runtime, but the tab is one this session opened with a
+  // persisted fence, so recovery closes it rather than leaving it behind.
+  assert.equal(fixture.tabs.has(310), false);
 });
 
 
