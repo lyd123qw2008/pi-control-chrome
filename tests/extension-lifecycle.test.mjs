@@ -2311,6 +2311,50 @@ test("extension reports bounded wait timeouts", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(7, { id: 7, windowId: 1, title: "loading", url: "https://example.test/start", status: "loading" });
   await assert.rejects(() => fixture.api.waitForTabState(7, { state: "load", timeoutMs: 1 }), /Timed out waiting for tab 7/);
+  // The post-effect envelope can only forward a reason that exists: a code-less timeout made every
+  // dispatched-navigation failure look like an unexplained "unknown".
+  await assert.rejects(
+    () => fixture.api.waitForTabState(7, { state: "load", timeoutMs: 1 }),
+    (error) => error?.code === "BROWSER_WAIT_TIMEOUT" && error?.details?.tabId === 7 && error?.details?.loaded !== true,
+  );
+  fixture.tabs.set(8, { id: 8, windowId: 1, title: "elsewhere", url: "https://example.test/redirected", status: "complete" });
+  await assert.rejects(
+    () => fixture.api.waitForTabState(8, { state: "load", url: "https://example.test/requested", timeoutMs: 1 }),
+    (error) => error?.code === "BROWSER_WAIT_TIMEOUT" && error?.details?.urlMismatch === true && error?.details?.loaded === true,
+  );
+});
+
+test("a post-effect navigation wait names why the wait failed", async () => {
+  const fixture = loadExtension();
+  fixture.tabs.set(341, { id: 341, windowId: 1, title: "source", url: "https://example.test/source", status: "complete" });
+  // The server redirects during the post-effect wait (a trailing-slash canonical URL is the ordinary
+  // case), which is exactly the outcome that used to be reported as an unexplained "unknown".
+  const pending = fixture.api.handleRequest("navigate", {
+    tabId: 341,
+    url: "https://example.test/destination",
+    wait: true,
+    timeoutMs: 300,
+    sessionId: "session-test",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  Object.assign(fixture.tabs.get(341), { url: "https://example.test/destination/", status: "complete" });
+  await assert.rejects(
+    () => pending,
+    (error) => {
+      assert.equal(error?.code, "BROWSER_OPERATION_UNCERTAIN");
+      assert.equal(error?.details?.actionState, "unknown");
+      assert.equal(error?.details?.inspectFirst, true);
+      assert.equal(error?.details?.retryable, false);
+      assert.equal(error?.details?.phase, "direct_navigation_load");
+      assert.equal(error?.details?.postEffectErrorCode, "BROWSER_WAIT_TIMEOUT");
+      assert.equal(error?.details?.postEffectUrlMismatch, true);
+      assert.equal(error?.details?.postEffectLoaded, true);
+      // The page's own URL and title stay out of the envelope the model may repeat.
+      assert.equal(error?.details?.url, undefined);
+      assert.equal(error?.details?.title, undefined);
+      return true;
+    },
+  );
 });
 
 test("page condition timeouts carry tab and state diagnostics", async () => {

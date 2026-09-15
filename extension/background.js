@@ -6346,6 +6346,10 @@ async function waitAfterEffect(method, wait, details = {}) {
       ...details,
       ...(typeof error?.code === "string" ? { postEffectErrorCode: error.code } : {}),
       ...(error?.details?.pageChanged === true ? { postEffectPageChanged: true } : {}),
+      // A navigation that finished at another URL is the ordinary redirect case: the caller can pass
+      // allowRedirects instead of treating the whole operation as a mystery.
+      ...(error?.details?.urlMismatch === true ? { postEffectUrlMismatch: true } : {}),
+      ...(error?.details?.loaded === true ? { postEffectLoaded: true } : {}),
     });
   }
 }
@@ -7824,6 +7828,8 @@ async function disableDevtools(tabId, sessionId, expectedFence) {
 async function waitForTabState(tabId, params = {}, signal, expectedFence, expectedIncarnation) {
   const timeoutMs = boundedTimeout(params.timeoutMs, 30000, 120000);
   const deadline = Date.now() + timeoutMs;
+  let lastTab;
+  let lastUrlMatched = true;
   const assertExpectedIncarnation = async () => {
     if (expectedIncarnation === undefined) return;
     const currentIncarnation = await readTabIncarnation(tabId, expectedFence);
@@ -7844,6 +7850,8 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
     const transition = pendingDocumentTransition(tabId, expectedFence);
     const transitionReady = !transition || (params.state === "url" ? transition.observed === true : transition.completed === true);
     const urlMatches = tabUrlMatches(tab, params);
+    lastTab = tab;
+    lastUrlMatched = urlMatches;
     const stateMatches = (params.state === "url" && urlMatches) || (params.state !== "url" && tab.status === "complete" && urlMatches);
     if (transitionReady && stateMatches) {
       const currentTab = await chrome.tabs.get(Number(tabId));
@@ -7861,7 +7869,20 @@ async function waitForTabState(tabId, params = {}, signal, expectedFence, expect
     }
     await waitWithSignal(100, signal);
   }
-  throw new Error(`Timed out waiting for tab ${tabId}`);
+  // A post-effect load wait is the most common place a dispatched navigation ends up uncertain, so
+  // its timeout carries the same structured code as the other wait path. Without a code the
+  // uncertainty envelope could only say "unknown", leaving the caller no way to tell "the page never
+  // reached the requested URL" from "the tab fence changed". Only bounded booleans are attached: the
+  // page's own URL and title stay out of an envelope that a model may repeat.
+  const error = new Error(`Timed out waiting for tab ${tabId}`);
+  error.code = "BROWSER_WAIT_TIMEOUT";
+  error.details = {
+    tabId: Number(tabId),
+    state: String(params.state || "load"),
+    ...(params.url === undefined || lastUrlMatched ? {} : { urlMismatch: true }),
+    ...(lastTab?.status === "complete" ? { loaded: true } : {}),
+  };
+  throw error;
 }
 
 async function createTab(params) {

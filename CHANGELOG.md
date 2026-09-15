@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Name the reason a post-effect wait failed instead of leaving a dispatched navigation unexplained. `waitForTabState` threw a code-less `Error` on timeout while the other wait path already reported a structured `BROWSER_WAIT_TIMEOUT`, and the uncertainty envelope can only forward a failure that carries a code — so a `navigate(wait: true)` whose page never reached the requested URL came back as `BROWSER_OPERATION_UNCERTAIN` with `actionState: unknown` and no reason at all (observed live: a Jenkins `/git` URL the server redirects to `/git/`). The timeout now carries `BROWSER_WAIT_TIMEOUT`, and a navigation wait that finished at another URL adds `postEffectUrlMismatch` with `postEffectLoaded`, so a server redirect is distinguishable from a changed tab fence before the inspection. The page's own URL and title stay out of the envelope.
+
 ## 0.6.0 - 2026-09-15
 
 - Give all three host adapters one diagnostic contract instead of three implementations: `pi-extension/output.js` now owns `compactDoctorResult`, `compactBridgeHealth`, `capabilityRuntime` and `runtimeDiagnosis`, and Pi, DSH and Codex project through them. `browser_doctor` prints the extension capability map exactly once (inside `runtime.capabilities`), keeps Bridge health with its target inventory and observability, and stops repeating identity, `userAgent` and per-target capability maps inside every nested block. The Bridge keeps its public health contract unchanged — only the model-facing projection drops the duplicated copies — and `browser_targets` now reports compacted Bridge health, because the full health belongs to the doctor.
