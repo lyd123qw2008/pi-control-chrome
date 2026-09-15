@@ -1328,6 +1328,32 @@ test("text-only interactions fall back to DOM for custom clickable elements miss
   assert.ok(fixture.executeScriptCalls.some((call) => call.functionName === "pageOperation"));
 });
 
+test("an unresolvable role-name target fails closed and names the next step", async () => {
+  const fixture = loadExtension({
+    debuggerCommandResult: async (method) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-main", loaderId: "loader-ax-guidance" } } };
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [
+          { nodeId: "root", role: { type: "role", value: "RootWebArea" }, name: { type: "string", value: "AX guidance" }, ignored: false },
+          { nodeId: "save", backendDOMNodeId: 71, role: { type: "role", value: "button" }, name: { type: "string", value: "Save" }, ignored: false },
+        ],
+      };
+      return {};
+    },
+  });
+  fixture.tabs.set(334, { id: 334, windowId: 1, title: "AX guidance", url: "https://example.test/ax-guidance", status: "complete" });
+
+  // A role/name target stays fail-closed (no DOM fallback), but the diagnostic must say what to do
+  // instead of only that nothing matched.
+  await assert.rejects(
+    () => fixture.api.handleRequest("interaction", { tabId: 334, target: { role: "button", name: "No such control" }, operation: "click", sessionId: "session-test" }),
+    (error) => error?.code === "AX_NODE_NOT_FOUND"
+      && error?.details?.nextAction === "use_target_selector"
+      && error?.details?.recommendation === "inspect_or_scope_target"
+      && /target\.selector/.test(String(error?.details?.note ?? "")),
+  );
+});
+
 test("ordinary role-name operations resolve through Chromium AX before DOM semantic fallback", async () => {
   const fixture = loadExtension({
     debuggerCommandResult: async (method, params) => {

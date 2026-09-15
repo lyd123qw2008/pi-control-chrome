@@ -80,6 +80,10 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
 | `browser_tabs` | `omittedTabs` | `browser_tabs({ query, limit })` |
 
 > 一处已知回退：DOM 语义回退路径（Chromium AX 不可用时）不报 `omitted.nodes`——它不继续遍历候选就无法给出精确丢弃数，只报 `truncated` 与 `maxNodes`/`maxChars`。这是"宁可不报也不报错数字"的选择：省略计数必须是精确的，否则比没有更糟。
+>
+> **选择性读法**（`logMatch`、`tail`）遵守同一条原则：`truncated` 只表示"答案不完整"。日志本身比 `maxChars` 长**不算**截断（那正是请求），只有匹配行被裁（`matchTruncated`）或 iframe 文本被裁才算；同时选择性读法**不报** `omitted.characters`。因此一个 0 匹配的 `logMatch` 读法会返回 `truncated` 缺失 + 空 `text`，而不是一个巨大的、与答案无关的省略量。
+>
+> **失败也要可执行**：语义目标解析失败必须点名下一步。`AX_NODE_NOT_FOUND` 现在带 `nextAction`/`recommendation`，并区分成因——`frame_incomplete`（树还没加载完 → 重新观察后重试）、`tree_truncated`（解析预算用尽 → 收窄或加 `scopeSelector`）、`target_not_found`（树是完整的但没有该节点 → 改用 `target.selector`/CSS，或先读页面结构）。`retryable` 语义保持"同一请求重试是否有意义"，不承担引导职责。
 
 展开路径（同一契约递归适用）：
 

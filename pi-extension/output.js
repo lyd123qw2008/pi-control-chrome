@@ -482,7 +482,7 @@ function omissionEnvelope({ truncated, omitted, nextAction, recommendation, reco
 }
 
 /** Project extracted page content with one shared text budget. */
-export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
+export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS, params = {}) {
   if (!isRecord(value)) return value;
   if (!isRecord(value.content)) return compactResultEnvelope(value);
   const content = value.content;
@@ -490,14 +490,20 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS) {
   const remainingChars = Math.max(0, maxChars - contentText.length);
   const contentMarkdown = remainingChars > 0 ? bounded(content.markdown, remainingChars) : "";
   const sourceCharacters = Number.isInteger(content.sourceCharacters) ? content.sourceCharacters : undefined;
-  const truncated = content.truncated === true || text(content.text).length > maxChars || text(content.markdown).length > remainingChars;
-  // Over-budget prose is retrieved by reading a known subtree, not by widening the whole read.
+  // A selective read (`logMatch`, `tail`) answers with matching lines or the end of the document, so
+  // the source being longer than the budget drops nothing from the answer: reporting an omission
+  // count there would be misleading, and an inexact omission count is worse than none.
+  const selectiveRead = isRecord(params) && (params.logMatch !== undefined || params.tail === true);
+  const matchTruncated = content.matchTruncated === true;
+  const truncated = content.truncated === true || (!selectiveRead && (text(content.text).length > maxChars || text(content.markdown).length > remainingChars));
   const envelope = omissionEnvelope({
     truncated,
-    omitted: { characters: sourceCharacters === undefined ? undefined : sourceCharacters - contentText.length },
+    omitted: { characters: selectiveRead || sourceCharacters === undefined ? undefined : sourceCharacters - contentText.length },
     nextAction: "browser_extract",
     recommendation: "narrow_read",
-    recovery: "Narrow with browser_extract({ selector, maxChars }) on the region you already know, or read one log scope with scope: \"log\" and logMatch.",
+    recovery: matchTruncated
+      ? "More matching lines exist than were returned: raise logMaxMatches, or narrow logMatch to a more specific literal."
+      : "Narrow with browser_extract({ selector, maxChars }) on the region you already know, or read one log scope with scope: \"log\" and logMatch.",
   });
   return {
     ...compactResultEnvelope(value),
@@ -860,7 +866,7 @@ export function compactBrowserResult(toolName, params = {}, value) {
   if (toolName === "browser_status") return compactStatusResult(value);
   if (toolName === "browser_doctor") return compactDoctorResult(value);
   if (toolName === "browser_accessibility_snapshot") return compactAccessibilityResult(value, maxChars, maxNodes);
-  if (toolName === "browser_extract") return compactExtractResult(value, maxChars);
+  if (toolName === "browser_extract") return compactExtractResult(value, maxChars, params);
   const currentSessionId = typeof params.sessionId === "string" && params.sessionId.length > 0 ? params.sessionId : undefined;
   if (toolName === "browser_new_tab") return compactNewTabResult(value, currentSessionId);
   if (toolName === "browser_tabs") return compactTabsResult(value, currentSessionId);

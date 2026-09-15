@@ -524,6 +524,26 @@ test("Pi bounded reads report what a budget dropped and how to retrieve it", () 
   assert.equal(whole.omitted, undefined);
   assert.equal(whole.nextAction, undefined);
 
+  // A selective read answers with matching lines or the document tail, so a longer source drops
+  // nothing from the answer: no misleading truncation flag and no misleading omission count.
+  const logMatchRead = compactBrowserResult("browser_extract", { logMatch: "ERROR", tail: true }, {
+    content: { scope: "log", logMatch: "ERROR", matchedLineCount: 0, text: "", sourceCharacters: 4_901 },
+  }, 300);
+  assert.equal(logMatchRead.truncated, undefined);
+  assert.equal(logMatchRead.omitted, undefined);
+
+  const cutMatches = compactBrowserResult("browser_extract", { logMatch: "finished", tail: true }, {
+    content: { scope: "log", logMatch: "finished", matchedLineCount: 80, matchTruncated: true, truncated: true, text: "line", sourceCharacters: 9_000 },
+  }, 300);
+  assert.equal(cutMatches.truncated, true);
+  assert.equal(cutMatches.omitted, undefined);
+  assert.match(cutMatches.recovery, /logMaxMatches/);
+
+  const tailRead = compactBrowserResult("browser_extract", { tail: true }, {
+    content: { scope: "log", text: "end of the log", sourceCharacters: 4_901 },
+  }, 200);
+  assert.equal(tailRead.truncated, undefined);
+
   // Console and network listings are retrieved by their cursor instead of by re-reading.
   const console12 = compactBrowserResult("browser_console", {}, { tabId: 1, logs: [{ text: "a" }], logCount: 1, logTotalCount: 250, logTruncated: true, nextSince: "cursor-2", only: "all" });
   assert.equal(console12.truncated, true);

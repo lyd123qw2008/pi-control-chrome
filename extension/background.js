@@ -4371,6 +4371,11 @@ function extractPage(options = {}) {
   const markdownText = remainingChars > 0 ? bound(markdownSlice) : "";
   const framesTruncated = frameInfo.truncated === true || frameInfo.frames.some((frame) => frame.truncated === true);
   const matchTruncated = selectedText.matchTruncated || selectedMarkdown.matchTruncated;
+  // `truncated` must mean "the answer is incomplete", not "the document is longer than the budget".
+  // A log-match read answers with matching lines and a tail read answers with the end of the
+  // document: in both cases the source being longer is the request, so only a cut match set or a
+  // cut frame set makes the answer incomplete.
+  const selectiveRead = logMatch !== undefined || tail;
   return {
     title: clean(document.title).slice(0, 240),
     url: location.href,
@@ -4383,7 +4388,9 @@ function extractPage(options = {}) {
     // of only a truncation flag (the value is the whole point of a bounded read's retrieval path).
     sourceCharacters: selectedText.text.length,
     sourceMarkdownCharacters: rawMarkdownSource.length,
-    truncated: sourceText.length > maxChars || rawMarkdownSource.length > remainingChars || framesTruncated || matchTruncated,
+    truncated: selectiveRead
+      ? matchTruncated || framesTruncated
+      : sourceText.length > maxChars || rawMarkdownSource.length > remainingChars || framesTruncated || matchTruncated,
     ...(frameInfo.frames.length > 0 ? { frameSummaries: frameInfo.frames } : {}),
     ...(frameInfo.frameCount > 0 ? { frameCount: frameInfo.frameCount } : {}),
     ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
@@ -6424,8 +6431,33 @@ function chromiumAxSemanticNameMatches(actual, expected, exact) {
   return exact === true ? left === right : left.toLowerCase().includes(right.toLowerCase());
 }
 
+// A semantic resolution failure must say what the caller should do next: "no AX node" has several
+// distinct causes, and only some of them are worth retrying. `retryable` alone left the caller to
+// guess between "re-observe", "scope the target" and "use a selector instead".
+const AX_REASON_GUIDANCE = Object.freeze({
+  frame_incomplete: { nextAction: "retry_after_load", recommendation: "refresh_accessibility_snapshot", retryable: true },
+  tree_truncated: { nextAction: "narrow_target", recommendation: "scope_target", retryable: false },
+  // `retryable` describes whether this exact request may succeed on retry; a text target keeps it
+  // true because the DOM-semantic fallback for a custom clickable element is gated on that flag.
+  // The actionable part is `nextAction`/`note`, not the flag.
+  target_not_found: { nextAction: "use_target_selector", recommendation: "inspect_or_scope_target", retryable: true },
+  target_not_visible: { nextAction: "wait_or_scope_target", recommendation: "wait_for_visibility", retryable: true },
+  frame_not_found: { nextAction: "refresh_accessibility_snapshot", recommendation: "reobserve_document", retryable: true },
+  no_equivalent_target: { nextAction: "refresh_accessibility_snapshot", recommendation: "reobserve_document", retryable: false },
+  invalid_option: { nextAction: "inspect_select_options", recommendation: "inspect_before_retry", retryable: false },
+});
+
 function chromiumAxSemanticError(code, message, details = {}) {
-  return accessibilityReferenceError(code, message, details);
+  const guidance = details.reason === undefined ? undefined : AX_REASON_GUIDANCE[details.reason];
+  return accessibilityReferenceError(code, message, {
+    ...details,
+    ...(guidance === undefined ? {} : { nextAction: guidance.nextAction, recommendation: guidance.recommendation, retryable: guidance.retryable }),
+    // The AX tree itself being unusable is not the same as the target being absent: the first is a
+    // freshness problem to re-observe, the second means the semantic target needs a selector.
+    ...(details.reason === "target_not_found"
+      ? { note: "The accessibility tree is complete but has no matching node; retry with target.selector (CSS) or scopeSelector, or read the page structure first." }
+      : {}),
+  });
 }
 
 function chromiumAxSemanticNodes(captured) {

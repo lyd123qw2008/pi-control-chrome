@@ -918,6 +918,11 @@ try {
     assert.equal(bulkExtract.nextAction, "browser_extract");
     assert.equal(bulkExtract.recommendation, "narrow_read");
     assert.match(bulkExtract.recovery, /selector/);
+    // A tail read answers with the end of the document, so a longer source drops nothing from the
+    // answer: it must not report truncation or an omission count.
+    const bulkTail = await request("extract", { tabId: archetypeTabs.get("bulk"), tail: true, maxChars: 200, responseMode: "compact" });
+    assert.equal(bulkTail.content.truncated, undefined);
+    assert.equal(bulkTail.omitted, undefined);
   }
 
   {
