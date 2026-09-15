@@ -3914,7 +3914,12 @@ function collectSnapshot(options = {}) {
   // bounded and privacy-filtered. This layer carries no product or domain vocabulary — a
   // calling Skill that needs specific field names parses the page itself.
   const collectMetadata = (source = root, limit = 12) => {
-    const values = new Map();
+    // Declared pairs (table row, dt/dd) outrank inferred ones (a free-text "label: value" line):
+    // the page marked the former as data, while the latter is a guess from rendered prose. Each
+    // class keeps its own discovery order, and the emitted list is declared-first so prose
+    // lookalikes cannot crowd real page data out of the budget.
+    const declared = new Map();
+    const inferred = new Map();
     const put = (label, value, origin) => {
       const normalizedLabel = normalize(label).toLowerCase().replace(/\s+/g, " ");
       const normalizedValue = normalize(value);
@@ -3928,8 +3933,14 @@ function collectSnapshot(options = {}) {
       // structured values. Declared pairs are exempt: the page marked them as data.
       if (origin !== "declared" && (SENTENCE_END.test(normalizedValue.slice(-1)) || /[.!?。！？]\s+\S/.test(normalizedValue))) return;
       if (secretLabel.test(normalizedLabel)) return;
-      if (values.has(normalizedLabel)) return;
-      values.set(normalizedLabel, mapBound(normalizedValue, METADATA_LIMITS.declaredValueCharacters));
+      const boundedValue = mapBound(normalizedValue, METADATA_LIMITS.declaredValueCharacters);
+      if (origin === "declared") {
+        inferred.delete(normalizedLabel);
+        if (!declared.has(normalizedLabel)) declared.set(normalizedLabel, boundedValue);
+        return;
+      }
+      if (declared.has(normalizedLabel) || inferred.has(normalizedLabel)) return;
+      inferred.set(normalizedLabel, boundedValue);
     };
     try {
       // innerText only so inline <script> source cannot be mined as page metadata.
@@ -3957,7 +3968,7 @@ function collectSnapshot(options = {}) {
     } catch {
       // Keep metadata best-effort and bounded on hostile pages.
     }
-    return [...values.entries()].slice(0, limit).map(([key, value]) => ({ key, value }));
+    return [...declared.entries(), ...inferred.entries()].slice(0, limit).map(([key, value]) => ({ key, value }));
   };
   // Neutral page digest (pageMap v2). The map makes no judgement about which part of a page
   // matters: regions are listed in DOCUMENT ORDER, repeated containers are reported as

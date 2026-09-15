@@ -352,6 +352,9 @@ const archetypePage = (kind) => {
       `<table id="data-table"><tr><th>Change summary</th><td>${"change-".repeat(25)}</td></tr></table>`,
       `<dl id="data-terms"><dt>Operator note</dt><dd>${"b".repeat(150)}</dd></dl>`,
       "</main>",
+      // A nested id container and the table inside it both carry the same declared pair: the
+      // document-order-first region publishes it and the descendant must not repeat it.
+      "<section id=\"data-outer\"><button id=\"data-refresh\">Refresh</button><table id=\"data-nested\"><tr><th>Nested fact</th><td>nested-value-1234</td></tr></table></section>",
     ].join(""),
     secrets: [
       "<main id=\"secrets-main\"><h1>Redaction</h1>",
@@ -871,13 +874,18 @@ try {
 
   {
     // data: the metadata rules are structural. A short inferred pair stays, a pair the page declares
-    // (table row, dt/dd) may be long, and prose or an oversized inferred pair is not data.
-    const values = valuesOf(archetypeStates.get("data"));
+    // (table row, dt/dd) may be long, prose or an oversized inferred pair is not data, declared pairs
+    // are published before inferred ones, and a nested region does not repeat its ancestor's pair.
+    const state = archetypeStates.get("data");
+    const values = valuesOf(state);
     assert.match(values, /revision=abc123/, "a short inferred pair is structured data");
     assert.match(values, /change summary=change-change-/, "a declared table pair may carry a long value");
     assert.match(values, /operator note=bbb/, "a declared dt/dd pair may carry a long value");
     assert.doesNotMatch(values, /the deployment finished successfully/, "prose must not become a value");
     assert.doesNotMatch(values, /summary=aaaa/, "an oversized inferred value must be rejected");
+    assert.ok(values.indexOf("change summary=") < values.indexOf("revision="), "declared pairs precede inferred pairs");
+    const nested = state.match(/nested fact=nested-value-1234/g) ?? [];
+    assert.equal(nested.length, 1, `a nested region must not repeat its ancestor's pair, saw ${nested.length}`);
   }
 
   {

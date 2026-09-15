@@ -48,7 +48,8 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
   - label ≤ 32 字符，且不含句末标点（`。！？.!?;；,，`）——"terms" 不像句子；
   - 从自由文本**推断**出来的对：value 非空、≤ 120 字符，且**不得读起来像句子**（不以句末标点结尾、不含"句末标点 + 空白"的断句）；
   - 页面**自己声明**为数据的对（表格行、`dt`/`dd`）：value ≤ 320 字符。
-  于是 `- confirmed: the plugin resolves ... node_modules.` 这类正文行不再进入 `Values:`，而 `Revision: abc123`、`Change summary: …` 保留。
+  于是 `- confirmed: the plugin resolves ... node_modules.` 这类正文行不再进入 `Values:`，而 `Revision: abc123`、`Change summary: …` 保留。**声明对优先于推断对**：两者都在各自类别内保持发现顺序，但输出时声明对在前，避免正文里像 `label: value` 的行把页面真正的表格/`dt` 数据挤出预算。
+- **同一对不在区域之间重复**：区域是嵌套/重叠的，真实构建页曾把 2 个事实打印 8 次。文档顺序上**第一个**发布的区域保留该对，后代区域不再重复（读者缩放到该区域时仍会拿回它，因此不损失可检索性）。页面级 `Values:` 是**刻意的聚合视图**（≤12 条，用于不扫区域就能取到关键事实），因此它会与首个区域各出现一次——这是本契约里唯一允许的重复。
 - `text` 只取渲染文本（`innerText`），最多若干行；内联脚本与 `textContent` 永不进入。
 - 不设置 `Primary`：需要"当前关注区域"的调用方，自己用 `target`/`ref`/`selector` 指定。
 

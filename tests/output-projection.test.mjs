@@ -451,6 +451,44 @@ test("Pi status projection keeps selection and recovery detail actionable", () =
   assert.equal(lost.recovery, "restart the Bridge");
 });
 
+test("Pi page digest publishes each label:value pair once across nested regions", () => {
+  const region = (name, extra) => ({
+    kind: "content",
+    role: "content",
+    name,
+    ref: `e${name.length}`,
+    counts: { controls: 1, items: 2, values: 1 },
+    controls: [{ role: "button", name: `${name} action`, ref: `e${name.length}0` }],
+    values: [{ key: "revision", value: "abc123" }],
+    text: name,
+    ...extra,
+  });
+  const result = compactSnapshotResult({
+    snapshot: {
+      snapshotId: "snapshot-values",
+      url: "https://example.test",
+      title: "Nested values",
+      pageMap: {
+        version: 2,
+        order: "document",
+        title: "Nested values",
+        url: "https://example.test",
+        regions: [region("outer"), region("inner"), region("sibling", { values: [{ key: "revision", value: "abc123" }, { key: "branch", value: "dev" }] })],
+        metadata: [],
+        omitted: {},
+        truncated: false,
+      },
+    },
+  });
+  const lines = result.snapshot.state.split("\n").filter((line) => /^\s*values:/.test(line));
+  // The pair appears once (first region in document order) but the distinct sibling pair stays.
+  assert.equal((result.snapshot.state.match(/revision=abc123/g) ?? []).length, 1);
+  assert.equal((result.snapshot.state.match(/branch=dev/g) ?? []).length, 1);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /revision=abc123/);
+  assert.match(lines[1], /branch=dev/);
+});
+
 test("Pi tab projection reports a bounded listing as retrievable", () => {  const result = compactTabsResult({
     browserId: "edge:test",
     profile: "profile",

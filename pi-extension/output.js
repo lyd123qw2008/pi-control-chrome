@@ -221,6 +221,11 @@ function pageMapState(pageMap, maxChars, maxNodes) {
   const regions = Array.isArray(pageMap.regions) ? pageMap.regions.filter(isRecord).slice(0, 12) : [];
   if (regions.length > 0) {
     const lines = [];
+    // One fact once: nested regions overlap, so the same `label: value` pair would otherwise be
+    // published by an ancestor and every descendant (a real build page printed two facts eight
+    // times). The first region in document order keeps the pair; a descendant still returns it when
+    // the reader zooms into that region, so nothing becomes unretrievable.
+    const publishedValues = new Set();
     for (const region of regions) {
       const kind = bounded(text(region.kind || region.role || "content"), 64);
       const role = bounded(text(region.role || "content"), 64);
@@ -232,12 +237,16 @@ function pageMapState(pageMap, maxChars, maxNodes) {
       const ref = typeof region.ref === "string" ? ` [ref=${region.ref}]` : "";
       lines.push(`- ${kind} ${quote(name || role)}${counts.length > 0 ? ` (${counts.join(", ")})` : ""}${ref}${address}`);
       const controls = Array.isArray(region.controls) ? region.controls.filter(isRecord) : [];
-      const values = Array.isArray(region.values) ? region.values.filter(isRecord).slice(0, 6) : [];
+      const values = (Array.isArray(region.values) ? region.values.filter(isRecord) : [])
+        .map((entry) => [entry, `${text(entry.key || "value")}=${text(entry.value)}`])
+        .filter(([, key]) => !publishedValues.has(key))
+        .slice(0, 6);
+      for (const [, key] of values) publishedValues.add(key);
       const regionText = typeof region.text === "string" ? region.text : "";
       if (controls.length === 0 && values.length === 0 && !regionText) continue;
       const detail = [];
       if (controls.length > 0) detail.push(`controls: ${controls.map(nodeAddress).join(", ")}`);
-      if (values.length > 0) detail.push(`values: ${values.map(entry => `${bounded(text(entry.key || "value"), 64)}=${bounded(text(entry.value), 240)}`).join(", ")}`);
+      if (values.length > 0) detail.push(`values: ${values.map(([entry]) => `${bounded(text(entry.key || "value"), 64)}=${bounded(text(entry.value), 240)}`).join(", ")}`);
       if (regionText.length > 0) detail.push(`text: ${bounded(regionText, 480)}`);
       lines.push(`  ${detail.join("\n  ")}`);
       nodeCount += controls.length + values.length;
