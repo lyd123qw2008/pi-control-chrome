@@ -438,18 +438,24 @@ const SENSITIVE_EVENT_FIELD = /(?:authorization|proxy-authorization|cookie|set-c
 const EVALUATE_OUTPUT_LIMITS = Object.freeze({ depth: 8, arrayItems: 2_000, objectFields: 200, stringChars: 200_000 });
 
 function boundEvaluateValue(value, state, depth = 0, ancestors = new WeakSet()) {
+  const drop = (kind, amount) => {
+    state.truncated = true;
+    if (!Number.isInteger(amount) || amount <= 0) return;
+    state.dropped = state.dropped ?? { items: 0, fields: 0, characters: 0 };
+    state.dropped[kind] += amount;
+  };
   if (typeof value === "string") {
     if (value.length <= EVALUATE_OUTPUT_LIMITS.stringChars) return value;
-    state.truncated = true;
+    drop("characters", value.length - EVALUATE_OUTPUT_LIMITS.stringChars);
     return `${value.slice(0, EVALUATE_OUTPUT_LIMITS.stringChars - 3)}...`;
   }
   if (value === null || typeof value !== "object") return value;
   if (depth >= EVALUATE_OUTPUT_LIMITS.depth) {
-    state.truncated = true;
+    drop("fields", 1);
     return "[Max depth reached]";
   }
   if (ancestors.has(value)) {
-    state.truncated = true;
+    drop("fields", 1);
     return "[Circular]";
   }
   ancestors.add(value);
@@ -457,7 +463,7 @@ function boundEvaluateValue(value, state, depth = 0, ancestors = new WeakSet()) 
   if (Array.isArray(value)) {
     result = value.slice(0, EVALUATE_OUTPUT_LIMITS.arrayItems).map((entry) => boundEvaluateValue(entry, state, depth + 1, ancestors));
     if (value.length > EVALUATE_OUTPUT_LIMITS.arrayItems) {
-      state.truncated = true;
+      drop("items", value.length - EVALUATE_OUTPUT_LIMITS.arrayItems);
       result.push(`[${value.length - EVALUATE_OUTPUT_LIMITS.arrayItems} more items omitted]`);
     }
   } else {
@@ -465,7 +471,7 @@ function boundEvaluateValue(value, state, depth = 0, ancestors = new WeakSet()) 
     const entries = Object.entries(value);
     for (const [key, entry] of entries.slice(0, EVALUATE_OUTPUT_LIMITS.objectFields)) result[key] = boundEvaluateValue(entry, state, depth + 1, ancestors);
     if (entries.length > EVALUATE_OUTPUT_LIMITS.objectFields) {
-      state.truncated = true;
+      drop("fields", entries.length - EVALUATE_OUTPUT_LIMITS.objectFields);
       result.__piControlChromeTruncatedFields = `${entries.length - EVALUATE_OUTPUT_LIMITS.objectFields} fields omitted`;
     }
   }
@@ -477,7 +483,14 @@ function boundEvaluateResult(value) {
   const state = { truncated: false };
   const bounded = boundEvaluateValue(value, state);
   if (!state.truncated || !bounded || typeof bounded !== "object" || Array.isArray(bounded)) return bounded;
-  return { ...bounded, outputTruncated: true, outputLimits: { ...EVALUATE_OUTPUT_LIMITS } };
+  return {
+    ...bounded,
+    outputTruncated: true,
+    outputLimits: { ...EVALUATE_OUTPUT_LIMITS },
+    // How much the depth/array/field/string budgets actually dropped, so a host can report an
+    // omission count instead of only a truncation flag.
+    ...(state.dropped === undefined ? {} : { outputOmitted: { ...state.dropped } }),
+  };
 }
 
 function redactEventText(value, limit = 2048) {
@@ -3618,6 +3631,9 @@ async function collectChromiumAccessibilitySnapshot(tabId, options = {}, session
         truncated,
         maxChars,
         maxNodes,
+        // Exact pre-budget size of the captured tree, so a host can report how many nodes the
+        // node/character budget dropped instead of only that it dropped something.
+        sourceNodeCount: rawNodes.length,
         source: "chromium_ax",
         frameCount: captured.frameCount,
         frameFailures: captured.frameFailures,
@@ -5482,6 +5498,7 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     truncated: accessibility?.truncated === true,
     maxChars: accessibility?.maxChars,
     maxNodes: accessibility?.maxNodes,
+    ...(Number.isInteger(accessibility?.sourceNodeCount) ? { sourceNodeCount: accessibility.sourceNodeCount } : {}),
     ...(typeof accessibility?.source === "string" ? { source: accessibility.source } : {}),
     ...(typeof accessibility?.frameCount === "number" ? { frameCount: accessibility.frameCount } : {}),
     ...(typeof accessibility?.frameFailures === "number" && accessibility.frameFailures > 0 ? { frameFailures: accessibility.frameFailures } : {}),

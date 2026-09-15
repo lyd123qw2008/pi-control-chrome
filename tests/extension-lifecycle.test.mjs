@@ -2155,6 +2155,11 @@ test("evaluate bounds deep, wide and long return values", async () => {
   const result = await fixture.api.handleRequest("evaluate", { tabId: 7, sessionId: "session-test", expression: "window.result" });
   assert.equal(result.result.outputTruncated, true);
   assert.equal(result.result.outputLimits.depth, 8);
+  // The truncation counters say how much each budget dropped, so a host can publish an omission
+  // count instead of only a flag.
+  assert.equal(result.result.outputOmitted.items, 5);
+  assert.equal(result.result.outputOmitted.fields >= 5, true);
+  assert.equal(result.result.outputOmitted.characters, 5);
   assert.equal(Object.keys(result.result.result.value).length, 201);
   assert.equal(result.result.result.value.items.length, 2_001);
   assert.equal(result.result.result.value.long.length, 200_000);

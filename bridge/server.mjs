@@ -671,6 +671,7 @@ function compactResponseToolName(method, params = {}) {
   if (method === "selected_tab") return "browser_selected";
   if (method === "console_logs") return "browser_console";
   if (method === "network_requests") return "browser_network";
+  if (method === "evaluate") return "browser_evaluate";
   if (method === "dom_cua" && params.action === "get_visible_dom") return "browser_dom_cua";
   return undefined;
 }

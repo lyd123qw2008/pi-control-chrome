@@ -75,10 +75,11 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
 | `browser_extract` | `omitted.characters`、`sourceCharacters` | `browser_extract({ selector, maxChars })`、`scope: "log"` + `logMatch` |
 | `browser_console` | `omitted.events`（源侧 `logTotalCount`） | `browser_console({ since: <nextSince> })`、`only: "errors"` |
 | `browser_network` | `omitted.requests`（源侧 `requestTotalCount`） | 游标续读或收窄过滤 |
+| `browser_accessibility_snapshot` | `omitted.nodes`（源侧精确 `sourceNodeCount`）、`omitted.characters` | `browser_accessibility_snapshot({ selector, maxNodes })`、`disableDiffing` |
+| `browser_evaluate` | `omitted.items/fields/characters`（源侧 `outputOmitted`） | 收窄表达式；文本改用 `browser_extract({ selector })` / `browser_locator` |
 | `browser_tabs` | `omittedTabs` | `browser_tabs({ query, limit })` |
-| `browser_accessibility_snapshot`、`browser_evaluate` | **仍是 `truncated` 标志**（见下） | 同一工具收窄参数 |
 
-> 尚未覆盖：`browser_accessibility_snapshot` 的节点/字符省略计数、`browser_evaluate` 的数组项/字段省略计数。两者目前只报 `truncated`（AX 为 `truncated` + `maxNodes`/`maxChars`，evaluate 为 `outputTruncated` + `outputLimits`）。原因是这两条路径的**预算发生在更内层的收集器里**（`normalizeAxNodes` 与 `boundEvaluateValue`），需要在递归裁剪处累计丢弃量后再逐层上抛，属于纯实现工作而非契约缺口；在补齐之前，读者应把 `truncated` 当作"内容不完整"并直接用同一工具收窄参数重读。
+> 一处已知回退：DOM 语义回退路径（Chromium AX 不可用时）不报 `omitted.nodes`——它不继续遍历候选就无法给出精确丢弃数，只报 `truncated` 与 `maxNodes`/`maxChars`。这是"宁可不报也不报错数字"的选择：省略计数必须是精确的，否则比没有更糟。
 
 展开路径（同一契约递归适用）：
 

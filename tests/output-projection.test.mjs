@@ -543,6 +543,41 @@ test("Pi bounded reads report what a budget dropped and how to retrieve it", () 
   assert.equal(network.nextAction, "browser_network");
 });
 
+test("Pi accessibility and evaluate reads report their dropped detail", () => {
+  // Chromium AX: the captured total is exact, so the omission count is exact. The precompact path
+  // reads a flat observation (state at the top level).
+  const accessibility = compactAccessibilityResult({
+    tabId: 1,
+    mode: "full",
+    state: "- button \"One\"\n- button \"Two\"",
+    nodeCount: 2,
+    sourceNodeCount: 900,
+    truncated: true,
+    maxNodes: 2,
+    maxChars: 8_000,
+  }, 8_000, 2);
+  assert.equal(accessibility.truncated, true);
+  assert.equal(accessibility.omitted.nodes, 898);
+  assert.equal(accessibility.sourceNodeCount, 900);
+  assert.equal(accessibility.nextAction, "browser_accessibility_snapshot");
+  assert.match(accessibility.recovery, /selector/);
+
+  // Evaluate: the extension counts what each depth/array/field/string budget dropped.
+  const evaluate = compactBrowserResult("browser_evaluate", {}, {
+    tabId: 1,
+    result: { result: { type: "object", value: { items: [1, 2] } }, outputTruncated: true, outputOmitted: { items: 5, fields: 2, characters: 7 } },
+  });
+  assert.equal(evaluate.truncated, true);
+  assert.deepEqual(evaluate.omitted, { items: 5, fields: 2, characters: 7 });
+  assert.equal(evaluate.nextAction, "browser_evaluate");
+  assert.match(evaluate.recovery, /browser_extract/);
+  assert.deepEqual(evaluate.result.result.value, { items: [1, 2] });
+
+  const complete = compactBrowserResult("browser_evaluate", {}, { tabId: 1, result: { result: { type: "number", value: 3 } } });
+  assert.equal(complete.truncated, undefined);
+  assert.equal(complete.omitted, undefined);
+});
+
 const extensionCapabilities = { turnCleanup: true, tabIncarnationFence: true, waitTerminalStates: true, extractLogMatch: true };
 const bridgeHealthFixture = () => ({
   ok: true,

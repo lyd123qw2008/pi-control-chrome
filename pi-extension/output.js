@@ -135,11 +135,25 @@ function compactAccessibilityState(value, maxChars, maxNodes) {
   const sourceState = text(value.state);
   const state = bounded(sourceState, maxChars);
   const sourceNodeCount = typeof value.nodeCount === "number" && Number.isFinite(value.nodeCount) ? Math.max(0, value.nodeCount) : 0;
+  const capturedNodeCount = typeof value.sourceNodeCount === "number" && Number.isFinite(value.sourceNodeCount) ? Math.max(0, value.sourceNodeCount) : undefined;
+  const droppedNodes = capturedNodeCount === undefined ? undefined : capturedNodeCount - Math.min(sourceNodeCount, maxNodes);
+  const droppedChars = sourceState.length > maxChars ? sourceState.length - state.length : undefined;
+  const truncated = value.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars;
+  const envelope = omissionEnvelope({
+    truncated,
+    omitted: { nodes: droppedNodes, characters: droppedChars },
+    nextAction: "browser_accessibility_snapshot",
+    recommendation: "narrow_read",
+    recovery: "Narrow the same read with a selector or scopeSelector, a smaller maxNodes/maxChars, or disableDiffing: true for a full tree of the region you need.",
+  });
   return {
     state,
     nodeCount: Math.min(sourceNodeCount, maxNodes),
     charCount: state.length,
-    truncated: value.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+    ...(capturedNodeCount === undefined ? {} : { sourceNodeCount: capturedNodeCount }),
+    ...(truncated ? { truncated: true } : {}),
+    ...(isRecord(value.accessibility) ? {} : {}),
+    ...envelope,
   };
 }
 
@@ -365,6 +379,11 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
       ...(typeof value.changedNodeCount === "number" ? { changedNodeCount: value.changedNodeCount } : {}),
       charCount: state.length,
       truncated: precompact.truncated || combinedState.length > maxChars,
+      ...(precompact.sourceNodeCount === undefined ? {} : { sourceNodeCount: precompact.sourceNodeCount }),
+      ...(precompact.omitted === undefined ? {} : { omitted: precompact.omitted }),
+      ...(precompact.nextAction === undefined ? {} : { nextAction: precompact.nextAction }),
+      ...(precompact.recommendation === undefined ? {} : { recommendation: precompact.recommendation }),
+      ...(precompact.recovery === undefined ? {} : { recovery: precompact.recovery }),
       ...frameProjectionFields(value),
     };
   }
@@ -520,6 +539,24 @@ function compactEventListing(toolName, value) {
     recovery: isConsole
       ? "Continue from the cursor: browser_console({ since: <nextSince> }) reads only newer events, and only: \"errors\" narrows the read."
       : "Continue from the cursor, or narrow with the network filter, instead of re-reading the whole listing.",
+  });
+  return { ...compactResultEnvelope(value), ...value, ...envelope };
+}
+
+/**
+ * Project a bounded evaluate result. The value is already bounded by the extension's depth/array/
+ * field/string limits; what this adds is how much those limits dropped and the narrower call that
+ * retrieves it.
+ */
+function compactEvaluateResult(value) {
+  if (!isRecord(value) || !isRecord(value.result) || value.result.outputTruncated !== true) return value;
+  const dropped = isRecord(value.result.outputOmitted) ? value.result.outputOmitted : {};
+  const envelope = omissionEnvelope({
+    truncated: true,
+    omitted: { items: dropped.items, fields: dropped.fields, characters: dropped.characters },
+    nextAction: "browser_evaluate",
+    recommendation: "narrow_read",
+    recovery: "Return one field or a page-side slice instead of the whole value; for page text prefer browser_extract({ selector, maxChars }) or browser_locator({ target, action }).",
   });
   return { ...compactResultEnvelope(value), ...value, ...envelope };
 }
@@ -828,6 +865,7 @@ export function compactBrowserResult(toolName, params = {}, value) {
   if (toolName === "browser_new_tab") return compactNewTabResult(value, currentSessionId);
   if (toolName === "browser_tabs") return compactTabsResult(value, currentSessionId);
   if (toolName === "browser_console" || toolName === "browser_network") return compactEventListing(toolName, value);
+  if (toolName === "browser_evaluate") return compactEvaluateResult(value);
   if (toolName === "browser_selected" && isRecord(value)) return compactResultEnvelope(value, currentSessionId);
   if (toolName === "browser_dom_cua" && params.action === "get_visible_dom") return compactDomCuaResult(value, maxChars, maxNodes);
   return value;
