@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-09-15
 
 - Give all three host adapters one diagnostic contract instead of three implementations: `pi-extension/output.js` now owns `compactDoctorResult`, `compactBridgeHealth`, `capabilityRuntime` and `runtimeDiagnosis`, and Pi, DSH and Codex project through them. `browser_doctor` prints the extension capability map exactly once (inside `runtime.capabilities`), keeps Bridge health with its target inventory and observability, and stops repeating identity, `userAgent` and per-target capability maps inside every nested block. The Bridge keeps its public health contract unchanged — only the model-facing projection drops the duplicated copies — and `browser_targets` now reports compacted Bridge health, because the full health belongs to the doctor.
 
