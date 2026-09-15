@@ -51,6 +51,7 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
   于是 `- confirmed: the plugin resolves ... node_modules.` 这类正文行不再进入 `Values:`，而 `Revision: abc123`、`Change summary: …` 保留。**声明对优先于推断对**：两者都在各自类别内保持发现顺序，但输出时声明对在前，避免正文里像 `label: value` 的行把页面真正的表格/`dt` 数据挤出预算。
 - **同一对不在区域之间重复**：区域是嵌套/重叠的，真实构建页曾把 2 个事实打印 8 次。文档顺序上**第一个**发布的区域保留该对，后代区域不再重复（读者缩放到该区域时仍会拿回它，因此不损失可检索性）。页面级 `Values:` 是**刻意的聚合视图**（≤12 条，用于不扫区域就能取到关键事实），因此它会与首个区域各出现一次——这是本契约里唯一允许的重复。
 - `text` 只取渲染文本（`innerText`），最多若干行；内联脚本与 `textContent` 永不进入。
+- **shadow root 是"边界"，不是"省略"**：采集器不进入任何 shadow root，因此 Web Components 页面以前会被读成"空的"且毫无提示。现在只要存在 open shadow root，摘要就会显式输出 `Note: N shadow root(s) are outside this digest …`；内容本身留给调用方用自己的有界脚本读（`host.shadowRoot`）——这属于能力层与个性化层的分界，而不是插件该猜的领域知识。
 - 不设置 `Primary`：需要"当前关注区域"的调用方，自己用 `target`/`ref`/`selector` 指定。
 
 ### 2.2 省略与展开（必须成对出现）
@@ -82,6 +83,8 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
 > 一处已知回退：DOM 语义回退路径（Chromium AX 不可用时）不报 `omitted.nodes`——它不继续遍历候选就无法给出精确丢弃数，只报 `truncated` 与 `maxNodes`/`maxChars`。这是"宁可不报也不报错数字"的选择：省略计数必须是精确的，否则比没有更糟。
 >
 > **选择性读法**（`logMatch`、`tail`）遵守同一条原则：`truncated` 只表示"答案不完整"。日志本身比 `maxChars` 长**不算**截断（那正是请求），只有匹配行被裁（`matchTruncated`）或 iframe 文本被裁才算；同时选择性读法**不报** `omitted.characters`。因此一个 0 匹配的 `logMatch` 读法会返回 `truncated` 缺失 + 空 `text`，而不是一个巨大的、与答案无关的省略量。
+>
+> **自动作用域必须可审计**：`scope: "primary"` / `scope: "log"` 是调用方显式请求的便利功能，内部按固定权重在候选容器中选择（因此不是"插件偷偷决定哪块重要"，而是"调用方要求的定位"）。为了让这个选择可见且可纠正，`browser_extract` 的结果会带 `resolvedScope` 与 `resolvedRoot`（`#id` / `[data-testid=…]` / `tag[role=…]`），以及该根内自己的 `shadowRoots` 计数；选择不对时改用 `scope: "selector"` 即可。分值相同时候选保持文档顺序（排序稳定），因此同一 DOM 仍得到同一结果。
 >
 > **失败也要可执行**：语义目标解析失败必须点名下一步。`AX_NODE_NOT_FOUND` 现在带 `nextAction`/`recommendation`，并区分成因——`frame_incomplete`（树还没加载完 → 重新观察后重试）、`tree_truncated`（解析预算用尽 → 收窄或加 `scopeSelector`）、`target_not_found`（树是完整的但没有该节点 → 改用 `target.selector`/CSS，或先读页面结构）。`retryable` 语义保持"同一请求重试是否有意义"，不承担引导职责。
 

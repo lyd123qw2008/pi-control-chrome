@@ -4124,6 +4124,18 @@ function collectSnapshot(options = {}) {
       .filter(Boolean)
       .slice(0, PAGE_MAP_LIMITS.statusRegions);
     const metadata = collectMetadata(root, PAGE_MAP_LIMITS.values);
+    const shadowRootCount = (() => {
+      try {
+        let count = 0;
+        for (const element of root.querySelectorAll("*")) {
+          if (element.shadowRoot) count += 1;
+          if (count >= 64) break;
+        }
+        return count;
+      } catch {
+        return 0;
+      }
+    })();
     const omitted = {
       regions: Math.max(0, listed.length - regions.length),
       controls: budget.controlsOmitted,
@@ -4139,6 +4151,10 @@ function collectSnapshot(options = {}) {
       regions,
       ...(status.length > 0 ? { status } : {}),
       ...(metadata.length > 0 ? { metadata } : {}),
+      // Shadow DOM is a boundary, not an omission: the collector never enters a shadow root, so a
+      // Web-Components page would otherwise read as empty with no signal at all. Report the hosts so
+      // the caller can read that content with its own bounded script instead of trusting an empty map.
+      ...(shadowRootCount > 0 ? { shadowRoots: shadowRootCount } : {}),
       ...(truncated ? { omitted, truncated: true } : {}),
     };
   };
@@ -4295,6 +4311,35 @@ function extractPage(options = {}) {
     };
     return candidates.sort((left, right) => score(right) - score(left))[0];
   };
+  // An automatic root choice (`scope: "primary"`/`"log"`) is a scored convenience the caller asked
+  // for, so it must be auditable: report which element was chosen, not just its text.
+  const rootAddress = (element) => {
+    try {
+      if (!element || element === document.body || element === document.documentElement) return undefined;
+      const testId = element.getAttribute?.("data-testid");
+      if (testId) return `[data-testid=${JSON.stringify(testId)}]`;
+      if (element.id && /^[A-Za-z][\w:.-]*$/.test(element.id)) return `#${element.id}`;
+      const role = element.getAttribute?.("role");
+      if (role) return `${element.tagName.toLowerCase()}[role=${JSON.stringify(role)}]`;
+      const label = element.getAttribute?.("aria-label");
+      if (label) return `${element.tagName.toLowerCase()}[aria-label=${JSON.stringify(String(label).slice(0, 60))}]`;
+      return element.tagName.toLowerCase();
+    } catch {
+      return undefined;
+    }
+  };
+  const shadowRootCountIn = (element) => {
+    try {
+      let count = 0;
+      for (const candidate of (element || document).querySelectorAll("*")) {
+        if (candidate.shadowRoot) count += 1;
+        if (count >= 64) break;
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  };
   const rootResolution = (() => {
     if (options.selector !== undefined && !(typeof options.selector === "string" && options.selector.trim().length === 0)) {
       try {
@@ -4376,6 +4421,10 @@ function extractPage(options = {}) {
   // document: in both cases the source being longer is the request, so only a cut match set or a
   // cut frame set makes the answer incomplete.
   const selectiveRead = logMatch !== undefined || tail;
+  // Scored only for the automatic scopes; an explicit selector already is the address it chose.
+  const automaticScope = rootResolution.scope === "primary" || rootResolution.scope === "log" ? rootResolution.scope : undefined;
+  const resolvedRootAddress = automaticScope === undefined ? undefined : rootAddress(root);
+  const resolvedShadowRoots = shadowRootCountIn(root);
   return {
     title: clean(document.title).slice(0, 240),
     url: location.href,
@@ -4384,6 +4433,10 @@ function extractPage(options = {}) {
     text,
     markdown: markdownText,
     maxChars,
+    // Which element the automatic scope picked, so a surprising choice is visible and correctable
+    // (`scope: "selector"` addresses the decision explicitly).
+    ...(resolvedRootAddress === undefined ? {} : { resolvedScope: automaticScope, resolvedRoot: resolvedRootAddress }),
+    ...(resolvedShadowRoots > 0 ? { shadowRoots: resolvedShadowRoots } : {}),
     // The pre-budget size of this read, reported so a host can publish an omission count instead
     // of only a truncation flag (the value is the whole point of a bounded read's retrieval path).
     sourceCharacters: selectedText.text.length,

@@ -598,6 +598,44 @@ test("Pi accessibility and evaluate reads report their dropped detail", () => {
   assert.equal(complete.omitted, undefined);
 });
 
+test("Pi reports a shadow-root boundary instead of an empty-looking page", () => {
+  const digest = compactSnapshotResult({
+    snapshot: {
+      title: "Shadow host",
+      url: "https://example.test/shadow",
+      pageMap: {
+        version: 2,
+        order: "document",
+        title: "Shadow host",
+        url: "https://example.test/shadow",
+        regions: [{ kind: "content", role: "content", name: "host", ref: "e1", counts: { controls: 0 }, text: "host" }],
+        metadata: [],
+        omitted: {},
+        truncated: false,
+        shadowRoots: 3,
+      },
+    },
+  });
+  assert.match(digest.snapshot.state, /3 shadow root\(s\) are outside this digest/);
+  assert.match(digest.snapshot.state, /shadowRoot/);
+
+  const clean = compactSnapshotResult({
+    snapshot: { pageMap: { version: 2, order: "document", title: "Plain", url: "https://example.test", regions: [], metadata: [], omitted: {}, truncated: false } },
+  });
+  assert.doesNotMatch(clean.snapshot.state, /shadow root/);
+});
+
+test("Pi extract reports which automatic scope root it chose", () => {
+  const automatic = compactExtractResult({ content: { scope: "log", text: "line", resolvedScope: "log", resolvedRoot: "#build-log", shadowRoots: 2 } }, 200);
+  assert.equal(automatic.content.resolvedScope, "log");
+  assert.equal(automatic.content.resolvedRoot, "#build-log");
+  assert.equal(automatic.content.shadowRoots, 2);
+
+  const explicit = compactExtractResult({ content: { scope: "selector", text: "line" } }, 200);
+  assert.equal(explicit.content.resolvedScope, undefined);
+  assert.equal(explicit.content.resolvedRoot, undefined);
+});
+
 const extensionCapabilities = { turnCleanup: true, tabIncarnationFence: true, waitTerminalStates: true, extractLogMatch: true };
 const bridgeHealthFixture = () => ({
   ok: true,

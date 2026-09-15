@@ -330,7 +330,7 @@ const regionsPage = [
 // changed digest rule fails on the class it breaks instead of on one site's fixture. The set is the
 // executable form of docs/COMPACT-READ-CONTRACT.zh-CN.md section 5, and the vocabulary is generic on
 // purpose — no product or CI field names appear here.
-const ARCHETYPE_KINDS = ["landmark", "wrapper", "data", "secrets", "bulk", "hostile"];
+const ARCHETYPE_KINDS = ["landmark", "wrapper", "data", "secrets", "bulk", "hostile", "shadow"];
 const archetypePage = (kind) => {
   const body = {
     landmark: [
@@ -379,6 +379,10 @@ const archetypePage = (kind) => {
       `<div id="hostile-text">${"x".repeat(20_000)}</div>`,
       "<div id=\"hostile-empty\"></div>",
       "</main>",
+    ].join(""),
+    shadow: [
+      "<main id=\"shadow-main\"><h1>Shadow boundary</h1><p>Light text</p><div id=\"shadow-host\"></div></main>",
+      "<script>const shadowHost = document.getElementById('shadow-host'); shadowHost.attachShadow({ mode: 'open' }).innerHTML = '<p>SHADOW_ONLY_7c1</p><button>Shadow action</button>';</script>",
     ].join(""),
   }[kind];
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Archetype ${kind}</title></head><body>${body ?? "<main><h1>Unknown archetype</h1></main>"}</body></html>`;
@@ -931,6 +935,15 @@ try {
     const state = archetypeStates.get("hostile");
     assert.ok(state.length <= 9_000, `a hostile page must stay bounded, saw ${state.length}`);
     assert.equal(archetypeSnapshots.get("hostile").snapshot.truncated, true);
+  }
+
+  {
+    // shadow: a shadow root is a boundary the collector does not cross. The digest must say so
+    // instead of looking empty, and must not pretend the shadow content is page text.
+    const state = archetypeStates.get("shadow");
+    assert.match(state, /shadow root\(s\) are outside this digest/);
+    assert.match(state, /Light text/);
+    assert.doesNotMatch(state, /SHADOW_ONLY_7c1/);
   }
 
   for (const kind of ARCHETYPE_KINDS) {

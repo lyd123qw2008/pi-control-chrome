@@ -273,6 +273,12 @@ function pageMapState(pageMap, maxChars, maxNodes) {
     }
     sections.push(`Regions (document order):\n${lines.join("\n")}`);
   }
+  // A boundary the collector never crosses is reported as a boundary, not as an omission: on a
+  // Web-Components page the digest can otherwise look empty with no hint that content exists.
+  const shadowRoots = Number.isInteger(pageMap.shadowRoots) ? pageMap.shadowRoots : 0;
+  if (shadowRoots > 0) {
+    sections.push(`Note: ${shadowRoots} shadow root(s) are outside this digest (the collector does not enter shadow roots). Read that content with a bounded script on the host's shadowRoot, or address it with the page's own selector.`);
+  }
   const omitted = isRecord(pageMap.omitted) ? pageMap.omitted : undefined;
   const omittedParts = omitted === undefined
     ? []
@@ -518,6 +524,11 @@ export function compactExtractResult(value, maxChars = EXTRACT_MAX_CHARS, params
       text: contentText,
       markdown: contentMarkdown,
       ...(Number.isInteger(content.sourceCharacters) ? { sourceCharacters: content.sourceCharacters } : {}),
+      // The automatic scope choice stays auditable: a caller that gets the wrong root switches to
+      // scope: "selector" with the reported address instead of guessing.
+      ...(typeof content.resolvedScope === "string" ? { resolvedScope: content.resolvedScope } : {}),
+      ...(typeof content.resolvedRoot === "string" && content.resolvedRoot.length > 0 ? { resolvedRoot: bounded(content.resolvedRoot, FIELD_MAX_CHARS) } : {}),
+      ...(Number.isInteger(content.shadowRoots) && content.shadowRoots > 0 ? { shadowRoots: content.shadowRoots } : {}),
       ...(truncated ? { truncated: true } : {}),
       ...frameProjectionFields(content),
     },
