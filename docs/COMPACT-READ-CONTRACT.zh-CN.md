@@ -86,6 +86,10 @@ Omitted: 1 region, 222 controls, 0 fields → narrow with browser_snapshot({ tar
 >
 > **自动作用域必须可审计**：`scope: "primary"` / `scope: "log"` 是调用方显式请求的便利功能，内部按固定权重在候选容器中选择（因此不是"插件偷偷决定哪块重要"，而是"调用方要求的定位"）。为了让这个选择可见且可纠正，`browser_extract` 的结果会带 `resolvedScope` 与 `resolvedRoot`（`#id` / `[data-testid=…]` / `tag[role=…]`），以及该根内自己的 `shadowRoots` 计数；选择不对时改用 `scope: "selector"` 即可。分值相同时候选保持文档顺序（排序稳定），因此同一 DOM 仍得到同一结果。
 >
+> **`truncated` 的在场即信号**：`truncated` 只在"这次答案是残缺的"时出现；完整的读取**不带**该字段（不是 `truncated: false`）。所有有界读取统一如此，调用方按真值判断即可，不要断言 `=== false`。
+>
+> **二次投影必须保留第一次的结论**：同一次读取会被投影多次——Bridge 投影出 compact 响应，宿主（DSH/Pi/Codex）或内置 CLI 又对这份"已投影"的结果再投影一次。后一次投影不得重算自己的省略集合而把前一次的结论抹掉：真实现场是 Jenkins `#701` 摘要变成 `truncated: true` + `omitted: {}`——"答案不完整，但不说什么缺了"，这比没有计数更糟。规则是**顺延**：前一次的 `omitted` 计数、`nextAction`/`recommendation`/`recovery` 原样带过；若后一次预算更紧又裁了一刀，两次裁切是**顺序**发生的（第一次量的是"源 → 它的输出"，第二次量的是"那个输出 → 它自己的输出"），因此计数相加即为精确总量。修复后同一页面的实读结果：`omitted {"characters":6886,"controls":225,"regions":1}` + `nextAction: browser_snapshot` + `recovery`，而不是 `{}`。
+>
 > **失败也要可执行**：语义目标解析失败必须点名下一步。`AX_NODE_NOT_FOUND` 现在带 `nextAction`/`recommendation`，并区分成因——`frame_incomplete`（树还没加载完 → 重新观察后重试）、`tree_truncated`（解析预算用尽 → 收窄或加 `scopeSelector`）、`target_not_found`（树是完整的但没有该节点 → 改用 `target.selector`/CSS，或先读页面结构）。`retryable` 语义保持"同一请求重试是否有意义"，不承担引导职责。
 
 展开路径（同一契约递归适用）：

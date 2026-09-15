@@ -70,7 +70,10 @@ describe('browser output projections', () => {
         elements: [{ ref: 'e1', role: 'button', name: 'Submit' }],
       },
     }))
-    expect(record(result.snapshot).truncated).toBe(false)
+    // `truncated` marks an incomplete answer, so a complete read does not carry the field at all —
+    // the same shape every other bounded read publishes.
+    expect(record(result.snapshot).truncated).toBeUndefined()
+    expect(record(result.snapshot).omitted).toBeUndefined()
   })
   it('projects accessibility revisions without exposing the raw tree', () => {
     const result = record(compactAccessibilityResult({

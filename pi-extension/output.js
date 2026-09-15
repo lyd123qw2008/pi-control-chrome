@@ -111,21 +111,64 @@ function compactResultEnvelope(value, currentSessionId) {
   return result;
 }
 
+/**
+ * The same read can be projected more than once: the Bridge projects a compact response and a host
+ * (or the bundled CLI) projects that already compacted payload again. A later hop must not erase
+ * what an earlier hop reported — `truncated: true` with no counts tells a caller that something is
+ * missing without saying what, and an `omitted: {}` is worse than useless. Carry the upstream
+ * omission counts and the guidance that came with them forward.
+ */
+function carriedOmission(value) {
+  const source = isRecord(value) ? value : {};
+  return {
+    omitted: isRecord(source.omitted) ? source.omitted : {},
+    nextAction: typeof source.nextAction === "string" ? source.nextAction : undefined,
+    recommendation: typeof source.recommendation === "string" ? source.recommendation : undefined,
+    recovery: typeof source.recovery === "string" ? source.recovery : undefined,
+  };
+}
+
+/**
+ * Counts from sequential cuts of one read add up exactly: hop one measured the drop from the source
+ * to its output, hop two measures the drop from that output to its own. Report the total, so a
+ * bounded read stays honest about how much of the original was dropped no matter how many times it
+ * was projected.
+ */
+function addedCounts(carried, dropped) {
+  const counted = {};
+  for (const [key, value] of Object.entries(isRecord(carried) ? carried : {})) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) counted[key] = value;
+  }
+  for (const [key, value] of Object.entries(dropped || {})) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) continue;
+    counted[key] = (counted[key] || 0) + value;
+  }
+  return counted;
+}
+
 function compactStateSnapshot(snapshot, maxChars, maxNodes) {
   if (typeof snapshot.state !== "string" || Array.isArray(snapshot.elements) || isRecord(snapshot.accessibility)) return undefined;
   const sourceState = text(snapshot.state);
   const state = bounded(sourceState, maxChars);
   const sourceNodeCount = typeof snapshot.nodeCount === "number" && Number.isFinite(snapshot.nodeCount) ? Math.max(0, snapshot.nodeCount) : 0;
   const truncated = snapshot.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars;
+  const carried = carriedOmission(snapshot);
   return {
     state,
     nodeCount: Math.min(sourceNodeCount, maxNodes),
     charCount: state.length,
-    truncated,
     // The contract wants an omission count, not just a flag: say how much text and how many nodes
     // the budget dropped, and keep the source size for the same reason.
-    ...(truncated ? { omitted: { ...(sourceNodeCount > maxNodes ? { nodes: sourceNodeCount - Math.min(sourceNodeCount, maxNodes) } : {}), ...(sourceState.length > maxChars ? { characters: sourceState.length - state.length } : {}) } } : {}),
-    ...(truncated ? { nextAction: "browser_snapshot", recommendation: "narrow_read" } : {}),
+    ...omissionEnvelope({
+      truncated,
+      omitted: addedCounts(carried.omitted, {
+        nodes: sourceNodeCount > maxNodes ? sourceNodeCount - Math.min(sourceNodeCount, maxNodes) : undefined,
+        characters: sourceState.length > maxChars ? sourceState.length - state.length : undefined,
+      }),
+      nextAction: carried.nextAction ?? "browser_snapshot",
+      recommendation: carried.recommendation ?? "narrow_read",
+      recovery: carried.recovery ?? "Narrow with browser_snapshot({ target }) on a listed region, browser_extract({ selector, maxChars }), or browser_locator({ target, action }).",
+    }),
     ...(Number.isInteger(snapshot.sourceCharacters) ? { sourceCharacters: snapshot.sourceCharacters } : {}),
   };
 }
@@ -139,12 +182,13 @@ function compactAccessibilityState(value, maxChars, maxNodes) {
   const droppedNodes = capturedNodeCount === undefined ? undefined : capturedNodeCount - Math.min(sourceNodeCount, maxNodes);
   const droppedChars = sourceState.length > maxChars ? sourceState.length - state.length : undefined;
   const truncated = value.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars;
+  const carried = carriedOmission(value);
   const envelope = omissionEnvelope({
     truncated,
-    omitted: { nodes: droppedNodes, characters: droppedChars },
-    nextAction: "browser_accessibility_snapshot",
-    recommendation: "narrow_read",
-    recovery: "Narrow the same read with a selector or scopeSelector, a smaller maxNodes/maxChars, or disableDiffing: true for a full tree of the region you need.",
+    omitted: addedCounts(carried.omitted, { nodes: droppedNodes, characters: droppedChars }),
+    nextAction: carried.nextAction ?? "browser_accessibility_snapshot",
+    recommendation: carried.recommendation ?? "narrow_read",
+    recovery: carried.recovery ?? "Narrow the same read with a selector or scopeSelector, a smaller maxNodes/maxChars, or disableDiffing: true for a full tree of the region you need.",
   });
   return {
     state,
@@ -162,11 +206,24 @@ function compactDomState(dom, maxChars, maxNodes) {
   const sourceState = text(dom.state);
   const state = bounded(sourceState, maxChars);
   const sourceNodeCount = typeof dom.nodeCount === "number" && Number.isFinite(dom.nodeCount) ? Math.max(0, dom.nodeCount) : 0;
+  const truncated = dom.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars;
+  const carried = carriedOmission(dom);
   return {
     state,
     nodeCount: Math.min(sourceNodeCount, maxNodes),
     charCount: state.length,
-    truncated: dom.truncated === true || sourceNodeCount > maxNodes || sourceState.length > maxChars,
+    // A visible-DOM read reports what it dropped and the narrower call that gets it back, exactly
+    // like the other bounded reads, instead of only flagging that something is missing.
+    ...omissionEnvelope({
+      truncated,
+      omitted: addedCounts(carried.omitted, {
+        nodes: sourceNodeCount > maxNodes ? sourceNodeCount - Math.min(sourceNodeCount, maxNodes) : undefined,
+        characters: sourceState.length > maxChars ? sourceState.length - state.length : undefined,
+      }),
+      nextAction: carried.nextAction ?? "browser_dom_cua",
+      recommendation: carried.recommendation ?? "narrow_read",
+      recovery: carried.recovery ?? "Re-read the region you need with browser_dom_cua({ action: \"get_visible_dom\", selector }), or take a semantic view with browser_snapshot({ target }).",
+    }),
   };
 }
 
@@ -328,10 +385,25 @@ function snapshotState(snapshot, maxChars, maxNodes) {
     || stateSource.length > maxChars
     || (snapshot.truncated === true && (!semanticState || typeof snapshot.elementCharCount === "number" && snapshot.elementCharCount >= maxChars));
   const pageTextTruncated = pageTextIncluded && (snapshot.textTruncated === true || rawText.length > pageTextLimit);
+  const carried = carriedOmission(snapshot);
   return {
     state,
     nodeCount: elements.length > 0 ? elements.length : Math.min(allChildren.length, maxNodes),
-    truncated: semanticTruncated || pageTextTruncated,
+    // A truncated semantic snapshot names what the budget dropped and the call that retrieves it,
+    // rather than leaving the reader with a bare flag.
+    ...omissionEnvelope({
+      truncated: semanticTruncated || pageTextTruncated,
+      omitted: addedCounts(carried.omitted, {
+        nodes: elements.length > 0
+          ? Math.max(0, allElements.length - elements.length)
+          : Math.max(0, allChildren.length - maxNodes),
+        characters: (stateSource.length > maxChars ? stateSource.length - state.length : 0)
+          + (pageTextTruncated ? Math.max(0, rawText.length - pageText.length) : 0),
+      }),
+      nextAction: carried.nextAction ?? "browser_snapshot",
+      recommendation: carried.recommendation ?? "narrow_read",
+      recovery: carried.recovery ?? "Narrow with browser_snapshot({ target }) on a listed region, browser_extract({ selector, maxChars }), or browser_locator({ target, action }).",
+    }),
   };
 }
 
@@ -355,12 +427,15 @@ export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxN
       state,
       nodeCount: projected.nodeCount,
       charCount: state.length,
-      truncated: projected.truncated || combinedState.length > maxChars,
-       ...(projected.stateTruncated === true || combinedState.length > maxChars ? { stateTruncated: true } : {}),
-       ...(isRecord(projected.omitted) ? { omitted: projected.omitted } : {}),
-       ...(projected.nextAction === undefined ? {} : { nextAction: projected.nextAction }),
-       ...(projected.recommendation === undefined ? {} : { recommendation: projected.recommendation }),
-       ...(projected.recovery === undefined ? {} : { recovery: projected.recovery }),
+      ...omissionEnvelope({
+        // Keep the projector's own envelope, and count the extra cut this shared frame step made.
+        truncated: projected.truncated === true || combinedState.length > maxChars,
+        omitted: addedCounts(projected.omitted, { characters: combinedState.length > maxChars ? combinedState.length - state.length : undefined }),
+        nextAction: projected.nextAction ?? "browser_snapshot",
+        recommendation: projected.recommendation ?? "narrow_read",
+        recovery: projected.recovery,
+      }),
+      ...(projected.stateTruncated === true || combinedState.length > maxChars ? { stateTruncated: true } : {}),
       ...(snapshot.viewport === undefined ? {} : { viewport: snapshot.viewport }),
       ...frameProjectionFields(snapshot),
     },
@@ -404,6 +479,7 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
   const embeddedFrameText = frameTextState(accessibility.frameSummaries || snapshot?.frameSummaries, maxChars);
   const combinedState = [sourceState, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
   const state = bounded(combinedState, maxChars);
+  const carried = carriedOmission(accessibility);
   return {
     ...compactResultEnvelope(value),
     snapshotId: typeof snapshot?.snapshotId === "string" ? snapshot.snapshotId : accessibility.snapshotId,
@@ -415,7 +491,16 @@ export function compactAccessibilityResult(value, maxChars = SNAPSHOT_MAX_CHARS,
     nodeCount: typeof accessibility.nodeCount === "number" ? Math.min(accessibility.nodeCount, maxNodes) : children.length,
     ...(typeof accessibility.changedNodeCount === "number" ? { changedNodeCount: accessibility.changedNodeCount } : {}),
     charCount: state.length,
-    truncated: accessibility.truncated === true || allChildren.length > maxNodes || combinedState.length > maxChars,
+    ...omissionEnvelope({
+      truncated: accessibility.truncated === true || allChildren.length > maxNodes || combinedState.length > maxChars,
+      omitted: addedCounts(carried.omitted, {
+        nodes: allChildren.length > maxNodes ? allChildren.length - children.length : undefined,
+        characters: combinedState.length > maxChars ? combinedState.length - state.length : undefined,
+      }),
+      nextAction: carried.nextAction ?? "browser_accessibility_snapshot",
+      recommendation: carried.recommendation ?? "narrow_read",
+      recovery: carried.recovery ?? "Narrow the same read with a selector or scopeSelector, a smaller maxNodes/maxChars, or disableDiffing: true for a full tree of the region you need.",
+    }),
     ...frameProjectionFields(accessibility.frameSummaries ? accessibility : snapshot),
   };
 }
@@ -439,7 +524,13 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
         state,
         nodeCount: precompact.nodeCount,
         charCount: state.length,
-        truncated: precompact.truncated || combinedState.length > maxChars,
+        ...omissionEnvelope({
+          truncated: precompact.truncated === true || combinedState.length > maxChars,
+          omitted: addedCounts(precompact.omitted, { characters: combinedState.length > maxChars ? combinedState.length - state.length : undefined }),
+          nextAction: precompact.nextAction ?? "browser_dom_cua",
+          recommendation: precompact.recommendation ?? "narrow_read",
+          recovery: precompact.recovery,
+        }),
         ...frameProjectionFields(dom),
       },
     };
@@ -456,6 +547,7 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
   const embeddedFrameText = frameTextState(dom.frameSummaries, maxChars);
   const combinedState = [stateSource, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
   const state = bounded(combinedState, maxChars);
+  const carried = carriedOmission(dom);
   return {
     ...compactResultEnvelope(value),
     dom: {
@@ -464,7 +556,16 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
       state,
       nodeCount: typeof dom.nodeCount === "number" ? Math.min(dom.nodeCount, maxNodes) : nodes.length,
       charCount: state.length,
-      truncated: dom.truncated === true || allNodes.length > maxNodes || combinedState.length > maxChars,
+      ...omissionEnvelope({
+        truncated: dom.truncated === true || allNodes.length > maxNodes || combinedState.length > maxChars,
+        omitted: addedCounts(carried.omitted, {
+          nodes: allNodes.length > maxNodes ? allNodes.length - nodes.length : undefined,
+          characters: combinedState.length > maxChars ? combinedState.length - state.length : undefined,
+        }),
+        nextAction: carried.nextAction ?? "browser_dom_cua",
+        recommendation: carried.recommendation ?? "narrow_read",
+        recovery: carried.recovery ?? "Re-read the region you need with browser_dom_cua({ action: \"get_visible_dom\", selector }), or take a semantic view with browser_snapshot({ target }).",
+      }),
       ...frameProjectionFields(dom),
     },
   };

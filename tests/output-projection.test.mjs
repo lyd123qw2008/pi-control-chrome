@@ -131,7 +131,9 @@ test("Pi Page Map projection keeps a listed region addressable when nothing is o
   assert.match(result.snapshot.state, /- main "Order A-1001"/);
   assert.equal(result.snapshot.omitted, undefined);
   assert.equal(result.snapshot.nextAction, undefined);
-  assert.equal(result.snapshot.truncated, false);
+  // Absent, not false: every other bounded read uses `truncated` to mean "this answer is
+  // incomplete", so its presence is the signal and a complete read does not carry the field.
+  assert.equal(result.snapshot.truncated, undefined);
 });
 
 test("Pi Page Map projection reports state truncation with a next step", () => {
@@ -182,7 +184,8 @@ test("Pi snapshot projection does not mark semantic state truncated for omitted 
       elements: [{ ref: "e1", role: "button", name: "Submit" }],
     },
   });
-  assert.equal(result.snapshot.truncated, false);
+  assert.equal(result.snapshot.truncated, undefined);
+  assert.equal(result.snapshot.omitted, undefined);
 });
 
 test("Pi accessibility projection preserves diff metadata", () => {
@@ -596,6 +599,82 @@ test("Pi accessibility and evaluate reads report their dropped detail", () => {
   const complete = compactBrowserResult("browser_evaluate", {}, { tabId: 1, result: { result: { type: "number", value: 3 } } });
   assert.equal(complete.truncated, undefined);
   assert.equal(complete.omitted, undefined);
+});
+
+test("Pi keeps what a first projection reported when the payload is projected again", () => {
+  // Real path: the Bridge projects a compact snapshot, then a host (or the bundled CLI) projects
+  // that already compacted payload again. The second hop used to recompute its own omission set, so
+  // a bounded digest came back as `truncated: true` with `omitted: {}` — incomplete, and silent
+  // about what was missing. The upstream counts and guidance must survive the second hop.
+  const bridge = compactSnapshotResult({
+    snapshot: {
+      snapshotId: "snapshot-hop-1",
+      pageMap: {
+        version: 2,
+        order: "document",
+        title: "Build #701",
+        url: "https://ci.example/job/demo/701/",
+        regions: [{ kind: "main", role: "main", name: "Build #701", counts: { controls: 2 }, controls: [{ role: "link", name: "Console", ref: "e1" }] }],
+        omitted: { regions: 3, controls: 41, characters: 900 },
+        truncated: true,
+      },
+    },
+  });
+  assert.equal(bridge.snapshot.truncated, true);
+  assert.deepEqual(bridge.snapshot.omitted, { regions: 3, controls: 41, characters: 900 });
+
+  const host = compactSnapshotResult({ ...bridge });
+  assert.equal(host.snapshot.truncated, true);
+  assert.deepEqual(host.snapshot.omitted, { regions: 3, controls: 41, characters: 900 });
+  assert.equal(host.snapshot.nextAction, "browser_snapshot");
+  assert.equal(host.snapshot.recommendation, "narrow_read");
+  assert.match(host.snapshot.recovery, /browser_snapshot/);
+  assert.equal(host.snapshot.state, bridge.snapshot.state);
+
+  // A tighter budget on the second hop adds its own cut to the total instead of replacing it.
+  const narrowed = compactSnapshotResult({ ...bridge }, 40);
+  assert.equal(narrowed.snapshot.truncated, true);
+  assert.ok(narrowed.snapshot.omitted.characters > 900, `expected the second cut to add up, got ${narrowed.snapshot.omitted.characters}`);
+  assert.equal(narrowed.snapshot.omitted.regions, 3);
+  assert.equal(narrowed.snapshot.omitted.controls, 41);
+
+  // Truncated without an omission count must never surface as an empty object.
+  const silent = compactSnapshotResult({ snapshot: { snapshotId: "snapshot-silent", state: "- button \"Save\"", nodeCount: 1, truncated: true } });
+  assert.equal(silent.snapshot.truncated, true);
+  assert.equal(silent.snapshot.omitted, undefined);
+  assert.equal(silent.snapshot.nextAction, "browser_snapshot");
+});
+
+test("Pi visible-DOM and AX reads name what they dropped", () => {
+  // A truncated visible-DOM read used to return a bare `truncated: true`.
+  const dom = compactBrowserResult("browser_dom_cua", { action: "get_visible_dom", maxNodes: 2 }, {
+    tabId: 1,
+    dom: {
+      snapshotId: "dom-1",
+      viewport: { width: 800, height: 600 },
+      nodes: [{ node_id: "n1", tag: "div", text: "one" }, { node_id: "n2", tag: "div", text: "two" }, { node_id: "n3", tag: "div", text: "three" }],
+      nodeCount: 3,
+    },
+  });
+  assert.equal(dom.dom.truncated, true);
+  assert.equal(dom.dom.omitted.nodes, 1);
+  assert.equal(dom.dom.nextAction, "browser_dom_cua");
+  assert.match(dom.dom.recovery, /browser_dom_cua/);
+
+  // The same read projected twice keeps the count.
+  const again = compactBrowserResult("browser_dom_cua", { action: "get_visible_dom", maxNodes: 2 }, { ...dom });
+  assert.equal(again.dom.truncated, true);
+  assert.equal(again.dom.omitted.nodes, 1);
+
+  // The children path of an AX read reports its own cut too.
+  const ax = compactAccessibilityResult({ snapshot: { snapshotId: "ax-1", accessibility: {
+    mode: "full",
+    nodeCount: 3,
+    children: [{ role: "button", name: "One" }, { role: "button", name: "Two" }, { role: "button", name: "Three" }],
+  } } }, 8_000, 2);
+  assert.equal(ax.truncated, true);
+  assert.equal(ax.omitted.nodes, 1);
+  assert.equal(ax.nextAction, "browser_accessibility_snapshot");
 });
 
 test("Pi reports a shadow-root boundary instead of an empty-looking page", () => {
