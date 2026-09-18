@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 - 2026-09-18
 
 - Treat the document, rather than its URL, as the incarnation boundary. The identity was composed from `location.href`, `performance.timeOrigin` and a per-document token, and `tabs.onUpdated({ url })` is emitted for `history.pushState()`/`replaceState()` just as it is for a cross-document navigation — so a same-document history update read as a new document and invalidated everything bound to the old incarnation: complete handles, live snapshot refs, claimed-tab ownership refreshes and accessibility revisions. Measured on a real page, after an in-app route change: the URL differed while `performance.timeOrigin` was byte-identical, a `browser_snapshot` was accepted, and `browser_evaluate` refused the very same handle with `Tab handle is stale: URL changed` (the read path skipped the URL comparison, the script path did not). The identity is now `document-v2\u0000<timeOrigin>\u0000<token>`; the version prefix lets an incarnation persisted by an earlier runtime read as legacy rather than as a mismatch against a document that never changed, and the URL is compared only for fence-only handles — the same guard the title comparison already used. A real navigation, reload, tab-fence change, close or unverifiable identity still fails closed, and the `pageGeneration()` fallback no longer derives its token from the URL either. The same URL-as-identity term is gone from `getTab`'s claimed-tab check, `listTabs` staleness and `refreshOwnedTabDocument`.
 
