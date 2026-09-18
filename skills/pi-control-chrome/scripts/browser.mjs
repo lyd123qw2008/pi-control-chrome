@@ -10,6 +10,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { compactBrowserResult } from "../../../pi-extension/output.js";
+import { isResponseMode } from "../../../bridge/response-modes.mjs";
 
 const BRIDGE_HOST = process.env.PI_CONTROL_CHROME_BRIDGE_HOST || "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.PI_CONTROL_CHROME_BRIDGE_PORT || 17318);
@@ -411,10 +412,10 @@ class BridgeClient {
     }
     if (previous === undefined) this.acknowledgedTarget = target;
     const responseTool = compactToolName(method, params);
-    // Every mode the Bridge accepts has to be named here as well: this list decides what
-    // reaches the wire, and a value it does not know is dropped silently, so the read
-    // comes back unprojected with no error to explain why.
-    const requestedMode = ["compact", "structured", "raw"].includes(params.responseMode) ? params.responseMode : undefined;
+    // Every mode the Bridge accepts has to be accepted here too: whatever this rejects is
+    // dropped before the wire, so the read comes back unprojected with no error to explain
+    // why. Asking the Bridge's own vocabulary keeps the two from drifting apart.
+    const requestedMode = isResponseMode(params.responseMode) ? params.responseMode : undefined;
     const { responseMode: _requestedMode, ...baseParams } = params;
     const negotiatedMode = this.bridgeCapabilities.compactResponses === true && requestedMode !== undefined ? requestedMode : undefined;
     const wireParams = negotiatedMode === undefined ? baseParams : { ...baseParams, responseMode: negotiatedMode };

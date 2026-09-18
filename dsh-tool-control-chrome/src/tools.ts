@@ -37,6 +37,9 @@ const LOG_MATCH: ParameterPropertySpec = { type: 'string', description: 'For sco
 const LOG_MAX_MATCHES: ParameterPropertySpec = { type: 'integer', description: 'For scope=log with logMatch, maximum matching lines to return.' }
 const TEXT_ANY: ParameterPropertySpec = { type: 'array', items: { type: 'string' }, description: 'For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState.' }
 const FAILURE_TEXT_ANY: ParameterPropertySpec = { type: 'array', items: { type: 'string' }, description: 'For state=text waits, return immediately with failed=true when any listed failure literal is present.' }
+// A deliberate subset, not a copy of the Bridge vocabulary (bridge/response-modes.mjs): this
+// facade decides for its caller and offers the prose read and the diagnostic escape hatch
+// only. Adding a mode here means deciding this host should offer it — not tracking upstream.
 const RESPONSE_MODE: ParameterPropertySpec = { type: 'string', enum: ['compact', 'raw'], description: 'Output mode. Compact is the default semantic Page Map; use raw only to diagnose a page abstraction or inspect whole-page detail.' }
 const EXTRACT_SCOPE: ParameterPropertySpec = { type: 'string', enum: ['primary', 'log', 'body'], description: 'Extraction region. Compact reads select primary content by default; use log for a log/pre region or body only for raw whole-page diagnostics.' }
 const OUTPUT_MAX_CHARS: ParameterPropertySpec = { type: 'integer', description: 'Optional output character budget. The extension caps this at 100000; compact model reads default to a smaller budget and can be increased explicitly.' }

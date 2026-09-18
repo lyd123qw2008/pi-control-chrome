@@ -6,6 +6,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { WebSocketServer } from "ws";
 import { compactBrowserResult } from "../pi-extension/output.js";
+import { RESPONSE_MODES_SENTENCE, isResponseMode } from "./response-modes.mjs";
 
 const DEFAULT_PORT = 17318;
 const DEFAULT_TOKEN_FILE = join(
@@ -38,7 +39,6 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   interactionDiagnostics: true,
   incrementalConsole: true,
 });
-const RESPONSE_MODES = new Set(["compact", "structured", "raw"]);
 const COMPACT_MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100 });
 const TAB_INCARNATION_METHODS = new Set([
   "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
@@ -701,15 +701,27 @@ function structuredBrowserResult(value) {
   return { ...rest, snapshot: kept };
 }
 
+/**
+ * How each mode renders the result it decorates. Keying this by mode is what keeps the
+ * dispatch honest: the alternative — a `mode !== "compact" && mode !== "structured"` chain —
+ * is a second, unnamed copy of the vocabulary, and a mode added to one copy and not the
+ * other is silently not projected.
+ *
+ * Only methods with a bounded read projection appear here; anything else is passed through
+ * unprojected whatever the mode says.
+ */
+const RESPONSE_PROJECTIONS = new Map([
+  ["compact", (toolName, params, decorated) => compactBrowserResult(toolName, params, decorated)],
+  ["structured", (_toolName, _params, decorated) => structuredBrowserResult(decorated)],
+]);
+
 function responseForClient(entry, value) {
   const decorated = decorateTargetResult(value, entry.target);
-  const mode = entry.params.responseMode;
-  if (mode !== "compact" && mode !== "structured") return decorated;
+  const projection = RESPONSE_PROJECTIONS.get(entry.params.responseMode);
+  if (projection === undefined) return decorated;
   const toolName = compactResponseToolName(entry.method, entry.params);
   if (toolName === undefined) return decorated;
-  return mode === "structured"
-    ? structuredBrowserResult(decorated)
-    : compactBrowserResult(toolName, entry.params, decorated);
+  return projection(toolName, entry.params, decorated);
 }
 
 function isSideEffectingRequest(method, params = {}) {
@@ -984,9 +996,9 @@ function handleMessage(client, message) {
       return;
     }
     const params = compactRequestParams(message.method, requestParams(message));
-    if (params.responseMode !== undefined && (typeof params.responseMode !== "string" || !RESPONSE_MODES.has(params.responseMode))) {
+    if (params.responseMode !== undefined && !isResponseMode(params.responseMode)) {
       metrics.requestErrors += 1;
-      sendError(client, id, "INVALID_REQUEST", "request.params.responseMode must be compact, structured or raw.");
+      sendError(client, id, "INVALID_REQUEST", `request.params.responseMode must be ${RESPONSE_MODES_SENTENCE}.`);
       return;
     }
     if (params.responseMode === "compact" && compactResponseToolName(message.method, params) === undefined) {

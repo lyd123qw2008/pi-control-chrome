@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compactBrowserResult } from "../pi-extension/output.js";
 import { createClient } from "../skills/pi-control-chrome/scripts/browser.mjs";
+import { RESPONSE_MODES } from "../bridge/response-modes.mjs";
 
 const SERVER_NAME = "pi-control-chrome";
 const SERVER_VERSION = (() => {
@@ -75,7 +76,7 @@ const PAGE_TARGET_FIELDS = { ...PAGE_FIELDS, snapshotId: string(), ref: string()
 const WAIT_STATE = { type: "string", enum: ["load", "url", "text", "text_gone", "visible", "hidden", "enabled"] };
 const TEXT_ANY = { type: "array", items: string("Literal text to match."), minItems: 1, maxItems: 20, description: "For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState." };
 const FAILURE_TEXT_ANY = { type: "array", items: string("Literal failure text to match."), minItems: 1, maxItems: 20, description: "For state=text waits, return immediately with failed=true when any listed failure literal is present." };
-const RESPONSE_MODE = { type: "string", enum: ["compact", "structured", "raw"], description: "compact renders the page as prose for a model reading the result directly; structured returns the same semantic model as data (elements with refs) without the prose rendering or the duplicated accessibility/frame trees, for a caller that works with the page; raw passes the unprojected Bridge result through for diagnostics." };
+const RESPONSE_MODE = { type: "string", enum: [...RESPONSE_MODES], description: "compact renders the page as prose for a model reading the result directly; structured returns the same semantic model as data (elements with refs) without the prose rendering or the duplicated accessibility/frame trees, for a caller that works with the page; raw passes the unprojected Bridge result through for diagnostics." };
 const COORDINATE = object({ x: number(), y: number() }, ["x", "y"]);
 
 function schema(properties, required = []) {
