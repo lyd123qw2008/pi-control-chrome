@@ -1477,6 +1477,7 @@ try {
   const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
   const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
   assert.ok(domButton?.node_id);
+  assert.ok(visibleDom.dom.nodes.some((node) => typeof node.ref === "string" && /^e\d+$/.test(node.ref)), "a visible-DOM node carries the document-scoped ref of an element a snapshot already named");
   await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domButton.node_id, snapshotId: visibleDom.dom.snapshotId });
   const freshDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
   const freshButton = freshDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));

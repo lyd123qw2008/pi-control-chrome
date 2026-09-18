@@ -5266,6 +5266,13 @@ function collectVisibleDom(options = {}) {
       const rect = element.getBoundingClientRect();
       const text = bound(element.innerText || element.textContent || "");
       node = { node_id: id, parent_id: parentId, tag: element.tagName.toLowerCase(), role: bound(element.getAttribute("role") || "", 64) || undefined, text, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, children: [] };
+      // DOM-CUA node ids are observation-scoped, so publish the document-scoped ref
+      // alongside when a page snapshot already named this element: that is the address a
+      // caller can keep using after re-observing.
+      if (typeof pageAgent?.refOf === "function") {
+        const durableRef = pageAgent.refOf(element);
+        if (durableRef !== undefined) node.ref = durableRef;
+      }
       const cost = JSON.stringify(node).length + (nodes.length > 0 ? 1 : 0);
       if (nodes.length >= maxNodes || charCount + cost > maxChars) {
         truncated = true;

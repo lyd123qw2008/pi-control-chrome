@@ -215,6 +215,8 @@ test("Pi accessibility projection preserves AX refs and states", () => {
 test("Pi DOM CUA projection emits bounded node lines", () => {
   const result = compactDomCuaResult({ dom: { snapshotId: "dom-1", nodes: [{ node_id: "d1", tag: "button", text: "Submit" }] } });
   assert.match(result.dom.state, /node_id=d1/);
+  const withDurableRef = compactDomCuaResult({ dom: { snapshotId: "dom-1", nodes: [{ node_id: "d1", tag: "button", text: "Submit", ref: "e4" }] } });
+  assert.match(withDurableRef.dom.state, /node_id=d1 ref=e4/, "a DOM-CUA node names its document-scoped ref when one exists");
   assert.equal(result.dom.nodes, undefined);
 });
 

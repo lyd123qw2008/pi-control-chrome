@@ -541,8 +541,9 @@ export function compactDomCuaResult(value, maxChars = DOM_MAX_CHARS, maxNodes = 
     const id = text(node.node_id);
     const tag = text(node.tag || "element");
     const role = node.role === undefined ? "" : ` role=${quote(bounded(node.role, 64))}`;
+    const ref = node.ref === undefined ? "" : ` ref=${text(node.ref)}`;
     const parent = node.parent_id === undefined ? "" : ` parent=${text(node.parent_id)}`;
-    return `<${tag} node_id=${id}${parent}${role}>${bounded(node.text, 160)}</${tag}>`;
+    return `<${tag} node_id=${id}${parent}${role}${ref}>${bounded(node.text, 160)}</${tag}>`;
   }).join("\n");
   const embeddedFrameText = frameTextState(dom.frameSummaries, maxChars);
   const combinedState = [stateSource, embeddedFrameText ? `Embedded frames:\n${embeddedFrameText}` : ""].filter(Boolean).join("\n\n");
