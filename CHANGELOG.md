@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1 - 2026-09-19
+
+- Correct the published executable metadata: npm normalizes `bin` paths without a leading `./`; 0.8.1 publishes both `pi-control-chrome-mcp` and its legacy `pi-control-chrome-codex` compatibility executable instead of allowing npm to silently discard them during package publication.
+
 ## 0.8.0 - 2026-09-19
 
 - Rename the local MCP adapter directory from `codex/` to `mcp/`, publish `pi-control-chrome-mcp`, and keep the old `pi-control-chrome-codex` executable plus the `./codex/mcp-server.mjs` package export as compatibility aliases. The checked-in Codex manifest now names `mcp/mcp-server.mjs`, so an installed 0.8.0 package contains exactly one implementation rather than a copied adapter.

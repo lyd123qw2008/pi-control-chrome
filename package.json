@@ -1,6 +1,6 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Codex-aligned Chrome and Edge browser control for Pi, Codex and DSH",
   "type": "module",
   "exports": {
@@ -17,7 +17,7 @@
   "author": "lyd123qw2008",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lyd123qw2008/pi-control-chrome.git"
+    "url": "git+https://github.com/lyd123qw2008/pi-control-chrome.git"
   },
   "homepage": "https://github.com/lyd123qw2008/pi-control-chrome",
   "bugs": {
@@ -64,8 +64,8 @@
     "access": "public"
   },
   "bin": {
-    "pi-control-chrome-codex": "./mcp/mcp-server.mjs",
-    "pi-control-chrome-mcp": "./mcp/mcp-server.mjs"
+    "pi-control-chrome-codex": "mcp/mcp-server.mjs",
+    "pi-control-chrome-mcp": "mcp/mcp-server.mjs"
   },
   "scripts": {
     "check": "node --check bridge/server.mjs && node --check mcp/mcp-server.mjs && node --check extension/background.js && node --check extension/page-agent.js && node --check pi-extension/index.ts && node --check pi-extension/activation.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json','.codex-plugin/plugin.json','.mcp.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",

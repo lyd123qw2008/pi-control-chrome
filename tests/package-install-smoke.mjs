@@ -12,6 +12,10 @@ const npmArgs = process.platform === "win32"
   : [];
 const runNpm = (args, options) => execFileSync(npm, [...npmArgs, ...args], options);
 const rootManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+assert.deepEqual(rootManifest.bin, {
+  "pi-control-chrome-codex": "mcp/mcp-server.mjs",
+  "pi-control-chrome-mcp": "mcp/mcp-server.mjs",
+}, "npm strips invalid leading ./ bin paths while publishing, so the manifest must use normalized package-relative paths");
 const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-package-smoke-"));
 const installRoot = join(temp, "install");
 mkdirSync(installRoot);
