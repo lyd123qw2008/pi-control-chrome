@@ -1789,7 +1789,7 @@ test("read-only extract retries once when a user tab document changes", async ()
   const result = await fixture.api.handleRequest("extract", { tabId: 317, sessionId: "session-test" });
   assert.equal(result.tabId, 317);
   assert.equal(result.content.text, "stable");
-  assert.equal(result.incarnation, "https://example.test/changing\u00001\u0000two");
+  assert.equal(result.incarnation, "document-v2\u00001\u0000two");
 });
 
 test("read-only extract reports a changing page after the bounded retry", async () => {
@@ -1812,7 +1812,7 @@ test("side-effecting requests keep strict document fencing after read-only re-ob
   const listed = await fixture.api.handleRequest("list_tabs", {});
   const current = listed.tabs.find((entry) => entry.id === 320);
   assert.ok(current);
-  const handle = { ...current.handle, incarnation: "https://example.test/fenced\u00001\u0000old-document-token" };
+  const handle = { ...current.handle, incarnation: "document-v2\u00001\u0000old-document-token" };
   await assert.rejects(
     () => fixture.api.handleRequest("evaluate", { tabId: 320, handle, sessionId: "session-test", expression: "window.location.href" }),
     /Tab handle is stale: document incarnation changed/,
@@ -2192,13 +2192,51 @@ test("internal ownership snapshots tolerate title-only changes but retain window
   assert.equal(fixture.api.tabSnapshotMatches(before, { ...before, windowId: 13 }), false);
 });
 
+test("same-document history URL updates retain complete handles, claimed ownership and observations", async () => {
+  // A document keeps its identity across history.pushState()/replaceState(): the URL is
+  // location metadata, not document identity. Before this, a complete handle, its
+  // ownership record and its live observations were all invalidated by an in-app route
+  // change that never replaced the document.
+  const fixture = loadExtension();
+  const tabId = 341;
+  const startUrl = "https://example.test/chat";
+  const historyUrl = "https://example.test/chat?conversation=next";
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "chat", url: startUrl, status: "complete", active: true });
+
+  const claimed = await fixture.api.handleRequest("claim_tab", {
+    tabId,
+    title: "chat",
+    url: startUrl,
+    sessionId: "session-test",
+  });
+  const handle = claimed.claimed.handle;
+  assert.equal(handle?.incarnation, "document-v2\u00001\u0000fixture-document-token");
+
+  const observation = { url: startUrl, timeOrigin: 1, token: "fixture-document-token" };
+  fixture.api.pageSnapshotStates.set("test-extension::341", { snapshotId: "chat-observation", observations: new Map([["chat-observation", observation]]) });
+  fixture.tabs.get(tabId).url = historyUrl;
+  await fixture.emitTabUpdated(tabId, { url: historyUrl }, fixture.tabs.get(tabId));
+
+  assert.equal(observation.invalidated, undefined);
+  const evaluated = await fixture.api.handleRequest("evaluate", {
+    tabId,
+    handle,
+    sessionId: "session-test",
+    expression: "document.title",
+  });
+  assert.equal(evaluated.tabId, tabId);
+  const selected = await fixture.api.handleRequest("selected_tab", { tabId, sessionId: "session-test" });
+  assert.equal(selected.tab.url, historyUrl);
+  assert.equal(selected.tab.stale, false);
+});
+
 test("complete document handles tolerate title-only updates", async () => {
   const fixture = loadExtension();
   fixture.tabs.set(312, { id: 312, windowId: 1, title: "initial", url: "https://example.test/title", status: "complete", active: true });
   const listed = await fixture.api.handleRequest("list_tabs", {});
   const current = listed.tabs.find((entry) => entry.id === 312);
   assert.ok(current);
-  const handle = { ...current.handle, incarnation: "https://example.test/title\u00001\u0000fixture-document-token" };
+  const handle = { ...current.handle, incarnation: "document-v2\u00001\u0000fixture-document-token" };
   fixture.tabs.get(312).title = "updated";
   const selected = await fixture.api.handleRequest("selected_tab", { tabId: 312, handle });
   assert.equal(selected.tab.title, "updated");

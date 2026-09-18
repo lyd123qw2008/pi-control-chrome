@@ -813,12 +813,15 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo = {}) => {
   if (!Number.isInteger(id) || id < 0) return;
   const key = runtimeStateKey(id);
   observeDocumentTransition(id, changeInfo);
-  // Metadata, focus, and title changes do not replace a document or invalidate its live refs.
+  // Metadata, focus, title, and same-document history URL changes do not replace a
+  // document or invalidate its live refs. `tabs.onUpdated({ url })` is emitted for
+  // history.pushState()/replaceState() as well as for cross-document navigation, so URL
+  // alone is location metadata, not evidence of a new document.
   // PageAgent owns live refs per document. The background keeps bounded provenance
-  // across document changes, but marks it non-actionable as soon as navigation starts
-  // so an old ref reports document_changed rather than becoming an arbitrary stale snapshot.
-  const documentMayHaveChanged = changeInfo.url !== undefined
-    || changeInfo.status === "loading"
+  // across actual document changes, marking it non-actionable as soon as Chromium reports
+  // loading or discard so an old ref reports document_changed rather than becoming an
+  // arbitrary stale snapshot.
+  const documentMayHaveChanged = changeInfo.status === "loading"
     || changeInfo.discarded === true;
   if (!documentMayHaveChanged) return;
   // Keep the provenance record so a late old ref produces a precise
@@ -2102,7 +2105,11 @@ async function refreshOwnedTabDocument(tabId, expectedFence, sessionId, options 
     const incarnation = await readTabIncarnation(tabId, expectedFence);
     const latestTab = await chrome.tabs.get(Number(tabId));
     await assertTabFence(tabId, expectedFence, "document refresh");
-    if (!tabSnapshotMatches(currentTab, latestTab)) throw uncertainBrowserOperationError("document refresh", { tabId: Number(tabId), pageChanged: true });
+    // URL can change through same-document history updates while a page action is in
+    // flight. Window identity and a verified document incarnation are the hard fence; URL
+    // is only the conservative fallback when the page is not scriptable and identity is
+    // unavailable (the incarnation comparison on the next line covers that case).
+    if (Number(currentTab.windowId) !== Number(latestTab.windowId)) throw uncertainBrowserOperationError("document refresh", { tabId: Number(tabId), pageChanged: true });
     const latestIncarnation = await readTabIncarnation(tabId, expectedFence);
     if (incarnation !== latestIncarnation || (incarnation === undefined && latestIncarnation === undefined && String(currentTab.url || "") !== String(latestTab.url || ""))) throw uncertainBrowserOperationError("document refresh", { tabId: Number(tabId), pageChanged: true });
     return mutateOwnedTabs((owned) => {
@@ -2432,7 +2439,10 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (tabHandle.expectedUrl !== undefined && String(tabHandle.expectedUrl) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.windowId !== undefined && Number(tabHandle.windowId) !== Number(tab.windowId)) throw new Error("Tab handle is stale: window changed; take a new browser_tabs snapshot");
   if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && !allowBlockedPageDocumentCheck && String(tabHandle.title) !== String(tab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
-  if (tabHandle.url !== undefined && !allowBlockedPageDocumentCheck && String(tabHandle.url) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
+  // A complete handle's verified document incarnation, not its mutable history/location
+  // URL, is the safety boundary: SPAs change URL with pushState/replaceState while keeping
+  // the same document and its live controls. A fence-only handle still compares URL.
+  if (tabHandle.url !== undefined && !hasHandleDocumentIdentity && !allowBlockedPageDocumentCheck && String(tabHandle.url) !== String(tab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.tabFence !== undefined && fenceAfterVerification !== String(tabHandle.tabFence)) throw new Error("Tab handle is stale: tab incarnation changed; take a new browser_tabs snapshot");
   if (tabHandle.incarnation !== undefined && !allowBlockedPageDocumentCheck) {
     const incarnation = await readTabIncarnation(tab.id, fenceAfterVerification);
@@ -2453,9 +2463,10 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
     if (record.sessionId !== sessionKey(requestSessionId) && !allowCrossSessionRead) throw new Error(`Cannot use tab ${tab.id}; it belongs to another Agent session`);
     if (!inherited) await assertOwnedTabFence(record, "use");
     if (explicitTabId !== undefined && !allowRecordedSnapshotChange && !hasCompleteNestedHandle && record.owner === "claimed") {
-      // A claimed tab's title is user-visible metadata, not document identity. Users and
-      // sites commonly update it while Agent work continues in the same document.
-      if (Number(record.windowId) !== Number(tab.windowId) || String(record.url ?? "") !== String(tab.url ?? "")) {
+      // A claimed tab's title and history/location URL are user-visible metadata, not
+      // document identity. Users and SPAs commonly update both while Agent work continues
+      // in the same document; the verified incarnation below is the real fence.
+      if (Number(record.windowId) !== Number(tab.windowId)) {
         throw new Error("Owned tab changed since it was recorded; take a new browser_tabs snapshot");
       }
       const incarnation = await readTabIncarnation(tab.id, fenceAfterVerification);
@@ -2471,7 +2482,7 @@ async function getTab(tabId, handle = {}, allowOtherSession = false, allowRecord
   if (tabHandle.expectedUrl !== undefined && String(tabHandle.expectedUrl) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.windowId !== undefined && Number(tabHandle.windowId) !== Number(finalTab.windowId)) throw new Error("Tab handle is stale: window changed; take a new browser_tabs snapshot");
   if (tabHandle.title !== undefined && !hasHandleDocumentIdentity && !allowBlockedPageDocumentCheck && String(tabHandle.title) !== String(finalTab.title || "")) throw new Error("Tab handle is stale: title changed; take a new browser_tabs snapshot");
-  if (tabHandle.url !== undefined && !allowBlockedPageDocumentCheck && String(tabHandle.url) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
+  if (tabHandle.url !== undefined && !hasHandleDocumentIdentity && !allowBlockedPageDocumentCheck && String(tabHandle.url) !== String(finalTab.url || "")) throw new Error("Tab handle is stale: URL changed; take a new browser_tabs snapshot");
   if (tabHandle.incarnation !== undefined && !allowBlockedPageDocumentCheck) {
     const incarnation = await readTabIncarnation(finalTab.id, finalFence);
     if (typeof incarnation !== "string") throw documentIdentityUnavailableError(tab.id, "use");
@@ -2600,7 +2611,7 @@ async function listTabs(params = {}) {
   }
   for (const candidate of listed) {
     const { entry, record, checksDocument, transitionPending, currentFence } = candidate;
-    entry.stale = transitionPending || (record !== undefined && (record.runtimeId !== runtimeInstanceIdentity || Number(record.windowId) !== Number(entry.windowId) || record.tabFence !== currentFence || (checksDocument && (record.url !== (entry.url || "") || record.incarnation === undefined || entry.handle.incarnation !== record.incarnation))));
+    entry.stale = transitionPending || (record !== undefined && (record.runtimeId !== runtimeInstanceIdentity || Number(record.windowId) !== Number(entry.windowId) || record.tabFence !== currentFence || (checksDocument && (record.incarnation === undefined || entry.handle.incarnation !== record.incarnation))));
   }
   return {
     browserId: identity.browserId,
@@ -6984,17 +6995,20 @@ async function executeDomCuaOperation(tabId, params, signal, expectedFence) {
   }
 }
 
+// The identity of a *document*, not of a location: `location.href` is mutable inside a
+// single document (`history.pushState()`/`replaceState()`, hash and query updates), and
+// `tabs.onUpdated({ url })` fires for those too. A per-document token plus
+// `performance.timeOrigin` survives a same-document history update and still changes on
+// every real navigation, reload or replacement. The `document-v2` prefix marks the format,
+// so an incarnation persisted by an earlier runtime reads as legacy rather than as a
+// mismatch against a document that never changed.
 function pageGenerationIdentity(generation) {
-  if (!generation || typeof generation.url !== "string" || typeof generation.timeOrigin !== "number" || typeof generation.token !== "string") return undefined;
-  return `${generation.url}\u0000${generation.timeOrigin}\u0000${generation.token}`;
+  if (!generation || !Number.isFinite(generation.timeOrigin) || typeof generation.token !== "string" || generation.token.length === 0) return undefined;
+  return `document-v2\u0000${generation.timeOrigin}\u0000${generation.token}`;
 }
 function pageGenerationsMatch(left, right) {
-  return Boolean(left && right
-    && left.url === right.url
-    && left.timeOrigin === right.timeOrigin
-    && typeof left.token === "string"
-    && typeof right.token === "string"
-    && left.token === right.token);
+  const leftIdentity = pageGenerationIdentity(left);
+  return leftIdentity !== undefined && leftIdentity === pageGenerationIdentity(right);
 }
 
 async function executePageOperation(tabId, params, signal, expectedFence) {
@@ -7063,7 +7077,16 @@ function pageGeneration() {
   if (typeof pageAgent?.documentIdentity === "function") return pageAgent.documentIdentity();
   const url = location.href;
   const timeOrigin = typeof performance?.timeOrigin === "number" ? performance.timeOrigin : undefined;
-  return { url, timeOrigin, token: `${url}\u0000${timeOrigin ?? ""}` };
+  // Without the PageAgent the token must still identify the document rather than the
+  // location, so mint it once per document and keep it on the page. Deriving it from
+  // `url` would make every same-document history update look like a new document, which
+  // is the bug this fallback would otherwise inherit.
+  let token = globalThis["__piControlChromeFallbackDocumentToken"];
+  if (typeof token !== "string" || token.length === 0) {
+    token = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${timeOrigin ?? Date.now()}-${Math.random()}`;
+    try { Object.defineProperty(globalThis, "__piControlChromeFallbackDocumentToken", { configurable: false, enumerable: false, value: token }); } catch { globalThis["__piControlChromeFallbackDocumentToken"] = token; }
+  }
+  return { url, timeOrigin, token };
 }
 
 function isRestrictedPageError(error) {
