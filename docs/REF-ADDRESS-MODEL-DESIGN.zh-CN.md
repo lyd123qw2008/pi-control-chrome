@@ -93,7 +93,7 @@
 **非目标**
 
 - 不 vendor Playwright 的 injected script；不做 CDP relay / Node driver。
-- 不改 Codex / DSH 的工具面与数量（与 0.8.0 的 `codex/` → `mcp/` 批次解耦）。
+- 不改 Codex / DSH 的工具面与数量（与已发布的 0.8.0 `codex/` → `mcp/` 批次解耦）。
 - 不改 tab fence / handle 语义（本次只动页面内元素地址）。
 
 ---
@@ -208,8 +208,8 @@ Playwright 用 `f1e3`/`f2e3` 把文档纪元编进 token。**我们不跟**：
 | `ARCHITECTURE.md:64` / `ARCHITECTURE.zh-CN.md:242` | "snapshot ref … bounded live observations within their originating document" | ref 为文档级派生短名；解析不依赖 observation 缓存 |
 | `README.md:25` / `README-zh-CN.md:69` | 同上 | 同上 |
 | `dsh-tool-control-chrome/README.md:60` | 同上 | 同上 |
-| `codex/mcp-server.mjs:872`（instructions 字符串） | "Preserve browserId, tabFence, incarnation and **snapshotId**" | snapshotId 不再是使用 ref 的前提；改为"ref 在本文档内稳定，跨文档必须重新观察" |
-| `codex/README.md:28` | 同上期望 | 同上 |
+| `mcp/mcp-server.mjs:872`（instructions 字符串） | "Preserve browserId, tabFence, incarnation and **snapshotId**" | snapshotId 不再是使用 ref 的前提；改为"ref 在本文档内稳定，跨文档必须重新观察" |
+| `mcp/README.md:28` | 同上期望 | 同上 |
 | `skills/pi-control-chrome/references/recovery.md:95,97,117`（两份拷贝） | "take a fresh snapshot and narrow the semantic target" | 明确"谓词优先；ref 失效时先试谓词，不要靠重拍快照" |
 | `skills/pi-control-chrome/SKILL.md:18`、`:33` | 声明 ref 为 document-scoped，却要求 "Use the matching `snapshotId`" | 去掉"ref 必须与 snapshotId 成对记忆"这半句；文档边界仍是硬边界 |
 | `.dsh/skills/pi-control-chrome/SKILL.md:69-70`（kernel 版，发布时同步） | 同上（"Pass the matching `snapshotId` with the ref"） | 同上 |
@@ -268,7 +268,7 @@ Playwright 用 `f1e3`/`f2e3` 把文档纪元编进 token。**我们不跟**：
 | `byRef` 的内存 | 强引用会阻止 GC | 用 `WeakRef` + 容量上限；上限只影响速度 |
 | 缓存未命中时的回退查找成本 | 元素标记回退需要遍历 | 先测成本；必要时仅对"最近 N 个 ref"启用 |
 | 错误码不可达但保留 | 消费者可能仍在分支处理 | 不删除，仅使正常路径不可达；文档标注 legacy |
-| 与 0.8.0 批次的关系 | `codex/` → `mcp/` 重命名、默认面变更需原子落地 | **本分支独立**，可先合并；两批互不依赖 |
+| 与 0.8.0 批次的关系 | `codex/` → `mcp/` 重命名、默认面变更需原子落地 | 已随 0.8.0 原子落地；本设计记录不依赖其实现 |
 | 未提交改动的去留 | (a) 回退、(b) 保留 | 见 §5 |
 
 ---

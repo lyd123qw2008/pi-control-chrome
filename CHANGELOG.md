@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0 - 2026-09-19
+
+- Rename the local MCP adapter directory from `codex/` to `mcp/`, publish `pi-control-chrome-mcp`, and keep the old `pi-control-chrome-codex` executable plus the `./codex/mcp-server.mjs` package export as compatibility aliases. The checked-in Codex manifest now names `mcp/mcp-server.mjs`, so an installed 0.8.0 package contains exactly one implementation rather than a copied adapter.
+
+- Make the generic MCP adapter complete by default: an unset `PI_CONTROL_CHROME_TOOLS` now exposes all 44 Bridge operations. Preserve Codex's intentional 13-tool catalog by adding the named `PI_CONTROL_CHROME_TOOLS=codex` mode and setting it in `.mcp.json`; this prevents a Codex install from silently gaining the entire catalog during the rename. `all`, `*`, and an explicit comma-separated subset remain supported.
+
+- Sample an untargeted snapshot briefly while its top-level document is still loading. If it settles, publish the newest settled read with `settleSamples`; if it does not, return the newest coherent read marked `unsettled: true` instead of treating a useful read as a page-changing failure. Selector-scoped snapshots retain caller-owned readiness and do not use this heuristic. The behavior is unit-tested; the isolated real Edge browser suite also remains green against the changed extension.
+
+- Keep the root and bundled DSH Skills byte-for-byte aligned, including the new unsettled-snapshot contract, and update the local MCP documentation and historical design references to the `mcp/` location.
+
 ## 0.7.2 - 2026-09-18
 
 - Make a snapshot ref an address in the document instead of a slot in one observation, which is what the Skill already promised. Ref numbering lived in the page-side snapshot builder, so its `elementRefs` WeakMap and counter were rebuilt on every observation and the same element came back as a different `eN`; resolution then depended on a 16-entry observation history living in the MV3 service worker and dropped on document change. Numbering now lives in the page agent, which survives re-injection for the life of the document: `refFor` mints once per element per document, `refOf` answers without minting for the budget preview that must not publish refs for truncated entries, and `elementForRef` is a droppable accelerator (WeakRef cache plus an element-side marker) that repairs a cold cache instead of failing. Numbers are never reused inside a document, a detached element stops answering, and an in-place agent upgrade keeps its numbering because renumbering a live document would strand every ref a caller holds.

@@ -13,7 +13,7 @@ dsh plugin --profile web add @lyd123qw2008/dsh-tool-control-chrome
 Or install it with pnpm directly:
 
 ```powershell
-corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.6.0
+corepack pnpm --dir <DSH_HOME>/profiles/web add @lyd123qw2008/dsh-tool-control-chrome@0.8.0
 ```
 
 Alternatively add it to the Profile's `package.json`:
@@ -21,7 +21,7 @@ Alternatively add it to the Profile's `package.json`:
 ```json
 {
   "dependencies": {
-    "@lyd123qw2008/dsh-tool-control-chrome": "0.6.0"
+    "@lyd123qw2008/dsh-tool-control-chrome": "0.8.0"
   }
 }
 ```

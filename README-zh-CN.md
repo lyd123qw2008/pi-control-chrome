@@ -150,7 +150,7 @@ npm install --global pi-control-chrome
 codex mcp add pi-control-chrome -- pi-control-chrome-codex
 ```
 
-也可以直接指向 checkout 中的 `codex/mcp-server.mjs`。MCP adapter 不监听新的端口，只通过 stdin/stdout 与 Codex 通信，再连接已有的 `127.0.0.1:17318` Bridge；如果 Bridge 尚未运行，adapter 只会启动一个新的 Bridge，不会重载扩展。CLI 和桌面端共享 `~/.codex/config.toml` 中的 MCP 配置。第一次浏览器操作必须是 `browser_status`；多个 Chrome/Edge 或 Profile 同时连接时，必须显式选择并确认 `browserId`。完整安装说明见 [`codex/README.md`](./codex/README.md)。
+也可以直接指向 checkout 中的 `mcp/mcp-server.mjs`。MCP adapter 不监听新的端口，只通过 stdin/stdout 与 Codex 通信，再连接已有的 `127.0.0.1:17318` Bridge；如果 Bridge 尚未运行，adapter 只会启动一个新的 Bridge，不会重载扩展。通用 MCP adapter 默认暴露完整工具面；仓库内的 Codex 配置显式选择受限的 `codex` 模式。CLI 和桌面端共享 `~/.codex/config.toml` 中的 MCP 配置。第一次浏览器操作必须是 `browser_status`；多个 Chrome/Edge 或 Profile 同时连接时，必须显式选择并确认 `browserId`。完整安装说明见 [`mcp/README.md`](./mcp/README.md)。
 
 加载 Chrome/Edge 扩展：
 

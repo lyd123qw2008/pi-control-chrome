@@ -27,7 +27,7 @@ const RESTATED_VOCABULARY = /\[(?:\s*["'](?:compact|structured|raw)["']\s*,){2,}
 
 const RELAY_CONSUMERS = [
   "bridge/server.mjs",
-  "codex/mcp-server.mjs",
+  "mcp/mcp-server.mjs",
   "skills/pi-control-chrome/scripts/browser.mjs",
 ];
 

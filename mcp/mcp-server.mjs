@@ -247,17 +247,15 @@ const ALL_TOOLS = [
   tool("browser_mark_handoff", "Mark an Agent-owned tab to survive cleanup for manual user handoff; repeat the mark in a later turn.", "mark_handoff", schema({ tabId: number() }, ["tabId"])),
   tool("browser_mark_deliverable", "Mark an Agent-owned tab to survive cleanup as a user-facing deliverable; repeat the mark in a later turn.", "mark_deliverable", schema({ tabId: number() }, ["tabId"])),
   tool("browser_cleanup", "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims and recover stale ownership only when explicitly requested.", "cleanup", schema({ recoverStale: boolean() })),
-  tool("browser_context_reset", "Only after the user explicitly asks to reset or clear browser context: finalize this Codex browser session while keeping the shared Bridge alive.", "cleanup", schema(), () => ({ mode: "context" })),
+  tool("browser_context_reset", "Only after the user explicitly asks to reset or clear browser context: finalize this MCP browser session while keeping the shared Bridge alive.", "cleanup", schema(), () => ({ mode: "context" })),
 ];
-// The Codex-aligned default: operations that work on tabs the user already has,
-// kept small because this server's tool list is the caller's model-visible
-// catalog. A node_repl-shaped client instead reads the list once at startup and
-// projects it into a kernel, so it wants the complete surface; an explicit
-// comma-separated list selects any other subset.
+// Generic MCP consumers receive the complete catalog by default. Codex keeps its
+// intentionally smaller model-visible surface by selecting the named `codex` mode
+// in .mcp.json. An explicit comma-separated list selects any other subset.
 //
 // Exposure is decided once, here, so a session's catalog never changes while it
 // runs — the invariant every consumer of this server relies on.
-const DEFAULT_EXPOSED_TOOL_NAMES = new Set([
+const CODEX_EXPOSED_TOOL_NAMES = new Set([
   "browser_status",
   "browser_targets",
   "browser_target_lease",
@@ -275,8 +273,8 @@ const DEFAULT_EXPOSED_TOOL_NAMES = new Set([
 
 function selectExposedTools(requested) {
   const want = typeof requested === "string" ? requested.trim() : "";
-  if (want === "") return ALL_TOOLS.filter(({ name }) => DEFAULT_EXPOSED_TOOL_NAMES.has(name));
-  if (want === "all" || want === "*") return ALL_TOOLS;
+  if (want === "" || want === "all" || want === "*") return ALL_TOOLS;
+  if (want === "codex") return ALL_TOOLS.filter(({ name }) => CODEX_EXPOSED_TOOL_NAMES.has(name));
   const names = want.split(",").map((entry) => entry.trim()).filter(Boolean);
   const known = new Set(ALL_TOOLS.map(({ name }) => name));
   const unknown = names.filter((name) => !known.has(name));

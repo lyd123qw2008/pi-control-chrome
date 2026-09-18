@@ -119,7 +119,7 @@ Agent 必须在报告中区分：已实际复现、只观察到静态状态、�
 实现入口：
 
 - `extension/background.js` — Bridge 侧 Console 事件、有界 cursor 和探针编排；
-- `pi-extension/index.ts`、`dsh-tool-control-chrome/src/tools.ts`、`codex/mcp-server.mjs` — Pi、DSH 和 Codex 工具面；
+- `pi-extension/index.ts`、`dsh-tool-control-chrome/src/tools.ts`、`mcp/mcp-server.mjs` — Pi、DSH 和 Codex 工具面；
 - `tests/e2e-browser.mjs` — 独立真实浏览器 fixture；
 - `tests/extension-lifecycle.test.mjs`、`dsh-tool-control-chrome/tests/tools.test.ts` — 单元和协议回归。
 

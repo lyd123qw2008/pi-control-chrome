@@ -15,6 +15,15 @@ test("Pi snapshot projection keeps refs and drops duplicate raw fields", () => {
   assert.equal(result.tab.favicon, undefined);
 });
 
+test("Pi snapshot projection retains an unsettled observation signal", () => {
+  const result = compactSnapshotResult({
+    tab: { id: 1, title: "Loading", url: "https://example.test/loading" },
+    snapshot: { snapshotId: "snapshot-loading", unsettled: true, settleSamples: 8, elements: [{ ref: "e1", role: "button", name: "Save" }] },
+  });
+  assert.equal(result.snapshot.unsettled, true);
+  assert.equal(result.snapshot.settleSamples, 8);
+});
+
 test("Pi snapshot projection avoids repeating page text for interactive pages", () => {
   const result = compactSnapshotResult({
     tab: { id: 1, title: "Orders", url: "https://example.test/orders" },
