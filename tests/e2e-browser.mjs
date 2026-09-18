@@ -694,6 +694,37 @@ try {
   const staleSnapshot = await request("snapshot", { tabId: selected.tab.id });
   const staleNameInput = staleSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
   assert.ok(staleNameInput?.ref);
+  // A ref is an address inside the document, not a slot in one snapshot: observing an
+  // unchanged page again must name the same elements the same way, and a carried-over ref
+  // must resolve against the newer observation as well as the one it came from.
+  const secondSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  assert.notEqual(secondSnapshot.snapshot.snapshotId, staleSnapshot.snapshot.snapshotId);
+  const secondNameInput = secondSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  const firstButton = staleSnapshot.snapshot.elements.find((element) => element.tag === "button");
+  const secondButton = secondSnapshot.snapshot.elements.find((element) => element.tag === "button");
+  assert.ok(secondNameInput?.ref && firstButton?.ref && secondButton?.ref);
+  assert.equal(secondNameInput.ref, staleNameInput.ref, "re-observing must not renumber an unchanged field");
+  assert.equal(secondButton.ref, firstButton.ref, "re-observing must not renumber an unchanged control");
+  await request("wait", {
+    tabId: selected.tab.id,
+    state: "visible",
+    target: { ref: staleNameInput.ref },
+    snapshotId: secondSnapshot.snapshot.snapshotId,
+    timeoutMs: 2000,
+  });
+  // The observation is an accelerator, not the address: a ref carried into an observation
+  // that never listed it must still resolve, because the document registry owns the number.
+  // Before the registry this pairing failed with STALE_SNAPSHOT/ref_not_found.
+  const narrowSnapshot = await request("snapshot", { tabId: selected.tab.id, maxChars: 100, maxNodes: 1 });
+  assert.notEqual(narrowSnapshot.snapshot.snapshotId, staleSnapshot.snapshot.snapshotId);
+  assert.equal(narrowSnapshot.snapshot.elements.some((element) => element.ref === staleNameInput.ref), false);
+  await request("locator", {
+    tabId: selected.tab.id,
+    target: { ref: staleNameInput.ref },
+    snapshotId: narrowSnapshot.snapshot.snapshotId,
+    action: "getAttribute",
+    attribute: "placeholder",
+  });
   const compactWireSnapshot = await request("snapshot", { tabId: selected.tab.id, responseMode: "compact" });
   assert.equal(compactWireSnapshot.snapshot.elements, undefined);
   assert.equal(compactWireSnapshot.snapshot.accessibility, undefined);
@@ -1446,6 +1477,7 @@ try {
   const visibleDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
   const domButton = visibleDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));
   assert.ok(domButton?.node_id);
+  assert.ok(visibleDom.dom.nodes.some((node) => typeof node.ref === "string" && /^e\d+$/.test(node.ref)), "a visible-DOM node carries the document-scoped ref of an element a snapshot already named");
   await request("dom_cua", { tabId: selected.tab.id, action: "click", nodeId: domButton.node_id, snapshotId: visibleDom.dom.snapshotId });
   const freshDom = await request("dom_cua", { tabId: selected.tab.id, action: "get_visible_dom" });
   const freshButton = freshDom.dom.nodes.find((node) => node.tag === "button" && node.text.includes("Submit"));

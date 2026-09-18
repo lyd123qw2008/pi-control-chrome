@@ -271,7 +271,7 @@ function loadExtension(options = {}) {
     }
     return originalExecuteScript(details);
   };
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions, isUnresolvedTargetError, UNRESOLVED_TARGET_RETRY_MS, UNRESOLVED_TARGET_SAMPLE_MS, executePageOperation };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
     chrome,
@@ -316,7 +316,7 @@ test("Page Agent injection is idempotent, upgrades in place, and resolves bounde
 
   vm.runInContext(source, context, { filename: pageAgentPath });
   const agent = vm.runInContext("globalThis.__piControlChromePageAgent", context);
-  assert.equal(agent.version, 4);
+  assert.equal(agent.version, 5);
   const identity = agent.documentIdentity();
   assert.equal(identity.url, "https://example.test/page");
   assert.equal(identity.timeOrigin, 123);
@@ -368,11 +368,85 @@ test("Page Agent injection is idempotent, upgrades in place, and resolves bounde
   vm.runInContext(source, context, { filename: pageAgentPath });
   const upgraded = vm.runInContext("globalThis.__piControlChromePageAgent", context);
   assert.notEqual(upgraded, agent);
-  assert.equal(upgraded.version, 4);
+  assert.equal(upgraded.version, 5);
   assert.equal(upgraded.lookup("snapshot", "snapshot-19")?.value, 19);
 
   vm.runInContext(source, context, { filename: pageAgentPath });
   assert.equal(vm.runInContext("globalThis.__piControlChromePageAgent", context), upgraded);
+});
+
+test("Page Agent numbers refs for the life of the document, not for one snapshot", () => {
+  const elements = [];
+  const document = { querySelectorAll: () => elements };
+  const addElement = () => {
+    const element = { nodeType: 1, isConnected: true, ownerDocument: document };
+    elements.push(element);
+    return element;
+  };
+  const first = addElement();
+  const second = addElement();
+  const context = vm.createContext({
+    crypto: { randomUUID: () => "document-token" },
+    document,
+    location: { href: "https://example.test/page" },
+    performance: { timeOrigin: 123 },
+  });
+  const source = readFileSync(pageAgentPath, "utf8");
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  const agent = vm.runInContext("globalThis.__piControlChromePageAgent", context);
+
+  // The bug this replaces: a ref was a slot in one snapshot's WeakMap, so the same
+  // element was renumbered by every snapshot and the model had to remember which
+  // snapshotId a ref came from.
+  assert.equal(agent.refFor(first), "e1");
+  assert.equal(agent.refFor(second), "e2");
+  assert.equal(agent.refFor(first), "e1");
+  assert.equal(agent.refOf(first), "e1");
+  assert.equal(agent.refOf({ nodeType: 1 }), undefined);
+  // refOf never mints, because a snapshot inspects far more candidates than it publishes.
+  assert.equal(agent.refRegistry.counter, 2);
+
+  // The ref -> element map is an accelerator: dropping it must not lose the address,
+  // because the element itself carries the marker.
+  assert.equal(agent.elementForRef("e2"), second);
+  agent.refRegistry.nodes.clear();
+  assert.equal(agent.elementForRef("e2"), second);
+  assert.equal(agent.elementForRef("e404"), undefined);
+
+  // A retired element never answers again, and its number is never handed to another one.
+  first.isConnected = false;
+  agent.refRegistry.nodes.delete("e1");
+  assert.equal(agent.elementForRef("e1"), undefined);
+  assert.equal(agent.refFor(addElement()), "e3");
+
+  // An in-place upgrade must keep numbering: renumbering a live document would strand
+  // every ref the caller is already holding.
+  agent.version = 4;
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  const upgraded = vm.runInContext("globalThis.__piControlChromePageAgent", context);
+  assert.equal(upgraded.version, 5);
+  assert.equal(upgraded.refOf(second), "e2");
+  assert.equal(upgraded.refFor(addElement()), "e4");
+});
+
+test("the page snapshot mints refs through the document-scoped registry", () => {
+  // Source guard: the snapshot builder runs inside the page on every observation, so a
+  // per-execution WeakMap silently renumbers every element. Minting must go through the
+  // page agent, with the local map kept only for a page whose injected agent predates it.
+  const source = readFileSync(backgroundPath, "utf8");
+  const start = source.indexOf("const refFor = (element) => {");
+  assert.notEqual(start, -1);
+  const minting = source.slice(start, start + 700);
+  assert.match(minting, /const existing = refOfElement \? refOfElement\(element\) : elementRefs\.get\(element\);/);
+  assert.match(minting, /const ref = existing \?\? \(refForElement \? refForElement\(element\) : `e\$\{\+\+counter\}`\);/);
+  assert.match(minting, /if \(!existing && !refForElement\) elementRefs\.set\(element, ref\);/);
+  // A carried-over number must still publish its record into this snapshot, otherwise the
+  // observation holds a ref it cannot resolve.
+  assert.doesNotMatch(minting, /if \(existing\) return existing;/);
+  const pageMapStart = source.indexOf("const previewRef = existingRef");
+  const pageMap = source.slice(pageMapStart, source.indexOf("elements.push(entry);", pageMapStart));
+  assert.match(pageMap, /\n    entry\.ref = refFor\(element\);/);
+  assert.doesNotMatch(pageMap, /if \(existingRef === undefined\)/);
 });
 
 test("Page Agent summarizes readable and cross-origin embedded frames", () => {
@@ -2236,6 +2310,65 @@ test("same-document history URL updates retain complete handles, claimed ownersh
   const selected = await fixture.api.handleRequest("selected_tab", { tabId, sessionId: "session-test" });
   assert.equal(selected.tab.url, historyUrl);
   assert.equal(selected.tab.stale, false);
+});
+
+test("only pre-dispatch resolution failures are retryable, and never an uncertain effect", () => {
+  // A target that is not resolvable *yet* is not a target that does not exist, so a late
+  // target is sampled again within a bound. Everything else — above all an operation
+  // that may already have had an effect — must never be replayed.
+  const fixture = loadExtension();
+  const retryable = (code) => fixture.api.isUnresolvedTargetError(Object.assign(new Error("resolution failed"), { code }));
+  // STALE_SNAPSHOT is not a readiness signal: the address is unrecoverable, so it must
+  // fail fast instead of spending the sampling bound.
+  assert.equal(retryable("STALE_SNAPSHOT"), false);
+  assert.equal(retryable("ELEMENT_TARGET_NOT_FOUND"), true);
+  assert.equal(retryable("ELEMENT_TARGET_DETACHED"), true);
+  assert.equal(retryable("BROWSER_OPERATION_UNCERTAIN"), false);
+  assert.equal(retryable("BROWSER_DOCUMENT_CHANGED"), false);
+  assert.equal(retryable("ELEMENT_TARGET_AMBIGUOUS"), false);
+  assert.equal(retryable(undefined), false);
+  assert.ok(fixture.api.UNRESOLVED_TARGET_RETRY_MS > 0 && fixture.api.UNRESOLVED_TARGET_RETRY_MS <= 5000, "the sampling bound must be finite and small");
+  assert.ok(fixture.api.UNRESOLVED_TARGET_SAMPLE_MS > 0 && fixture.api.UNRESOLVED_TARGET_SAMPLE_MS < fixture.api.UNRESOLVED_TARGET_RETRY_MS, "the interval must fit inside the bound");
+});
+
+test("a read-only page operation samples an unresolved target instead of reporting it missing", async () => {
+  const fixture = loadExtension();
+  const tabId = 343;
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "rendering", url: "https://example.test/rendering", status: "complete", active: true });
+  const original = fixture.chrome.scripting.executeScript;
+  let pageOperationCalls = 0;
+  fixture.chrome.scripting.executeScript = async (details) => {
+    if (details?.func?.name === "pageOperation") {
+      pageOperationCalls += 1;
+      if (pageOperationCalls === 1) throw Object.assign(new Error("No element matched the requested target yet"), { code: "ELEMENT_TARGET_NOT_FOUND" });
+      return [{ result: { resolved: true } }];
+    }
+    return original(details);
+  };
+  await fixture.api.executePageOperation(tabId, {}, undefined, undefined);
+  // The retry is what this test is about. The shape of a branch's own return value is that
+  // branch's business, so it is deliberately not asserted here.
+  assert.equal(pageOperationCalls, 2, "an unresolved target must be looked at again, not reported missing");
+});
+
+test("a side-effecting page operation is never retried once its effect is uncertain", async () => {
+  // The safety boundary is the *code*, not whether the operation has side effects: a click
+  // whose target was not resolvable yet is retried, while a click that may already have
+  // happened reports BROWSER_OPERATION_UNCERTAIN and must never be replayed.
+  const fixture = loadExtension();
+  const tabId = 344;
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "rendering", url: "https://example.test/rendering", status: "complete", active: true });
+  const original = fixture.chrome.scripting.executeScript;
+  let pageOperationCalls = 0;
+  fixture.chrome.scripting.executeScript = async (details) => {
+    if (details?.func?.name === "pageOperation") {
+      pageOperationCalls += 1;
+      throw Object.assign(new Error("The click was dispatched but its effect could not be confirmed"), { code: "BROWSER_OPERATION_UNCERTAIN" });
+    }
+    return original(details);
+  };
+  await assert.rejects(() => fixture.api.executePageOperation(tabId, { operation: "click" }, undefined, undefined));
+  assert.equal(pageOperationCalls, 1, "an effect that may already have happened must never be replayed");
 });
 
 test("complete document handles tolerate title-only updates", async () => {

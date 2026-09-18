@@ -3212,7 +3212,9 @@ function collectDomAccessibilitySnapshot(options = {}) {
     }
   })();
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  // Capability check, not a version literal: executeInTab re-injects the agent before
+  // every page function, so bumping the agent version must not read as an outage.
+  if (typeof pageAgent?.documentIdentity !== "function" || typeof pageAgent?.sameDocument !== "function" || typeof pageAgent?.resolveObservedElement !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const frameInfo = typeof pageAgent?.collectFrames === "function"
     ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
     : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
@@ -3748,6 +3750,11 @@ function collectSnapshot(options = {}) {
   const retainElement = typeof pageAgent?.retain === "function" ? (element) => pageAgent.retain(element) : (element) => element;
   const rememberObservation = typeof pageAgent?.remember === "function" ? (...args) => pageAgent.remember(...args) : () => undefined;
   const refsAvailable = typeof pageAgent?.retain === "function" && typeof pageAgent?.remember === "function";
+  // The page agent owns ref numbering for the life of the document, so the same element
+  // keeps its ref across snapshots. The local WeakMap and counter below only back a page
+  // whose injected agent predates that API (an extension update mid-document).
+  const refForElement = typeof pageAgent?.refFor === "function" ? (element) => pageAgent.refFor(element) : null;
+  const refOfElement = typeof pageAgent?.refOf === "function" ? (element) => pageAgent.refOf(element) : null;
   const isContentEditableHost = (element) => {
     const attr = element.getAttribute("contenteditable");
     return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
@@ -3848,10 +3855,15 @@ function collectSnapshot(options = {}) {
   let counter = 0;
   const refFor = (element) => {
     if (!refsAvailable || !element) return undefined;
-    const existing = elementRefs.get(element);
-    if (existing) return existing;
-    const ref = `e${++counter}`;
-    elementRefs.set(element, ref);
+    // Prefer the document-scoped registry so a ref keeps its number across snapshots;
+    // fall back to the per-execution WeakMap only for a page whose agent predates it.
+    const existing = refOfElement ? refOfElement(element) : elementRefs.get(element);
+    const ref = existing ?? (refForElement ? refForElement(element) : `e${++counter}`);
+    if (!ref) return undefined;
+    if (!existing && !refForElement) elementRefs.set(element, ref);
+    // The record is published for every snapshot that shows this element, whether the
+    // number was minted now or carried over from the document registry: a snapshot whose
+    // refs are missing an element it just published is unusable for that ref.
     refRecords.set(ref, {
       // Keep the original node without retaining removed application subtrees forever.
       element: retainElement(element),
@@ -4243,7 +4255,9 @@ function collectSnapshot(options = {}) {
     // entries, estimate the next ref before budgeting but only retain it after
     // the entry is actually published; otherwise hidden/truncated candidates
     // become guessable live refs and needlessly retain DOM nodes.
-    const existingRef = elementRefs.get(element);
+    const existingRef = refOfElement ? refOfElement(element) : elementRefs.get(element);
+    // Cost estimation only: the published ref now comes from the document-scoped registry
+    // at refFor() time, so a same-shaped guess is enough to budget the entry.
     const previewRef = existingRef ?? (refsAvailable ? `e${counter + 1}` : undefined);
     const entry = {
       ref: previewRef,
@@ -4261,7 +4275,10 @@ function collectSnapshot(options = {}) {
       elementsTruncated = true;
       break;
     }
-    if (existingRef === undefined) entry.ref = refFor(element);
+    // Publish through refFor even when the number is already known: the document registry
+    // owns numbering, but every snapshot still needs a record for each ref it shows, or
+    // that ref cannot resolve against this observation.
+    entry.ref = refFor(element);
     elements.push(entry);
     elementCharCount += cost;
   }
@@ -4837,7 +4854,9 @@ async function pageOperation(params = {}) {
     return matches(pageVisibleText(), text, false);
   };
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  // Capability check, not a version literal: executeInTab re-injects the agent before
+  // every page function, so bumping the agent version must not read as an outage.
+  if (typeof pageAgent?.documentIdentity !== "function" || typeof pageAgent?.sameDocument !== "function" || typeof pageAgent?.resolveObservedElement !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const { documentIdentity, sameDocument, resolveObservedElement } = pageAgent;
   const refResolution = new WeakMap();
   const staleSnapshotError = (reason = "observation_unavailable") => {
@@ -4935,8 +4954,25 @@ async function pageOperation(params = {}) {
       findCandidates: (descriptor) => rebindCandidates(descriptor, candidateRoot),
     });
     if (resolution.state === "document_changed") throw documentChangedError();
-    if (resolution.state === "observation_unavailable") throw staleSnapshotError();
-    if (resolution.state === "record_unavailable") throw staleSnapshotError("ref_not_found");
+    if (resolution.state === "observation_unavailable" || resolution.state === "record_unavailable") {
+      // The observation record is an accelerator, not the address. A ref minted in this
+      // document still names its element when the record was evicted by the history limit
+      // or when the caller paired the ref with a different observation, so consult the
+      // document registry before reporting the address as lost. The document gate is what
+      // stops a same-numbered element from another document answering in its place, and a
+      // node that is gone (a re-rendered replacement) still reports not-found.
+      const expectedDocumentMatches = !hasExpectedDocument
+        || typeof pageAgent.matchesDocument !== "function"
+        || pageAgent.matchesDocument(expectedDocument, documentIdentity());
+      if (typeof pageAgent.elementForRef === "function" && expectedDocumentMatches) {
+        const recovered = pageAgent.elementForRef(ref);
+        if (recovered?.isConnected && recovered.ownerDocument === document) {
+          refResolution.set(recovered, { resolvedBy: "document_registry", rebound: false });
+          return recovered;
+        }
+      }
+      throw resolution.state === "record_unavailable" ? staleSnapshotError("ref_not_found") : staleSnapshotError();
+    }
     if (resolution.state === "changed") throw changedSnapshotRefError(resolution.rebound);
     if (resolution.state === "detached") throw detachedSnapshotRefError(resolution.reason, resolution.rebound);
     if (resolution.state === "ambiguous") {
@@ -5230,6 +5266,13 @@ function collectVisibleDom(options = {}) {
       const rect = element.getBoundingClientRect();
       const text = bound(element.innerText || element.textContent || "");
       node = { node_id: id, parent_id: parentId, tag: element.tagName.toLowerCase(), role: bound(element.getAttribute("role") || "", 64) || undefined, text, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, children: [] };
+      // DOM-CUA node ids are observation-scoped, so publish the document-scoped ref
+      // alongside when a page snapshot already named this element: that is the address a
+      // caller can keep using after re-observing.
+      if (typeof pageAgent?.refOf === "function") {
+        const durableRef = pageAgent.refOf(element);
+        if (durableRef !== undefined) node.ref = durableRef;
+      }
       const cost = JSON.stringify(node).length + (nodes.length > 0 ? 1 : 0);
       if (nodes.length >= maxNodes || charCount + cost > maxChars) {
         truncated = true;
@@ -5307,7 +5350,9 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
   try {
   if (!["get_visible_dom", "click", "double_click", "type", "keypress", "scroll"].includes(action)) throw new Error("DOM CUA action must be get_visible_dom, click, double_click, type, keypress or scroll");
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  // Capability check, not a version literal: executeInTab re-injects the agent before
+  // every page function, so bumping the agent version must not read as an outage.
+  if (typeof pageAgent?.documentIdentity !== "function" || typeof pageAgent?.sameDocument !== "function" || typeof pageAgent?.resolveObservedElement !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const { documentIdentity, sameDocument, resolveObservedElement } = pageAgent;
   const currentDocument = documentIdentity();
   const expectedActionDocument = {
@@ -6816,7 +6861,7 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
       }
       const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
       if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
-      const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
+      const value = (await runPageOperationResolvingTargets(tabId, params, pageOperationParams(tabId, params, before), signal, expectedFence)).value;
       const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
       const fencedValue = pageActionResultAfterDocumentFence(params, value, before, after);
       assertRequestActive(signal);
@@ -7020,6 +7065,44 @@ function pageGenerationsMatch(left, right) {
   return leftIdentity !== undefined && leftIdentity === pageGenerationIdentity(right);
 }
 
+// A target that is not resolvable *yet* is not the same as a target that does not exist: a
+// page can still be rendering when an operation looks for it, and the element the caller
+// wants may arrive while the page as a whole never stops loading. So readiness is decided
+// per requested target, by sampling, within a hard bound — never by guessing that the page
+// finished. Only pre-dispatch resolution failures are retried, and only for read-only
+// operations: a side effect is never replayed.
+const UNRESOLVED_TARGET_RETRY_MS = 2_000;
+const UNRESOLVED_TARGET_SAMPLE_MS = 100;
+function isUnresolvedTargetError(error) {
+  const code = error && typeof error === "object" ? error.code : undefined;
+  // STALE_SNAPSHOT is deliberately absent: it reports that the address could not be
+  // recovered at all — the observation is gone and the document registry cannot name the
+  // element either — and sampling cannot improve that. Waiting on it would only turn a typed
+  // failure into a slow one.
+  return code === "ELEMENT_TARGET_NOT_FOUND" || code === "ELEMENT_TARGET_DETACHED";
+}
+
+// One definition, called from every branch that runs a page operation: an unresolved target
+// is sampled again within the bound instead of being reported as missing, and a
+// side-effecting operation is never replayed. The caller sees how many samples it took.
+async function runPageOperationResolvingTargets(tabId, params, pageParams, signal, expectedFence) {
+  // Retrying a side-effecting operation is safe here for the same reason it is unsafe
+  // everywhere else in this file: the three codes below are raised while *resolving* the
+  // target, before anything is dispatched, and a failure that may already have had an
+  // effect is reported as BROWSER_OPERATION_UNCERTAIN instead — which is never retried.
+  const deadline = Date.now() + UNRESOLVED_TARGET_RETRY_MS;
+  let resolutionSamples = 0;
+  for (;;) {
+    resolutionSamples += 1;
+    try {
+      return { value: await executeInTab(tabId, pageOperation, [pageParams], expectedFence), resolutionSamples };
+    } catch (error) {
+      if (Date.now() >= deadline || !isUnresolvedTargetError(error)) throw error;
+      await waitWithSignal(UNRESOLVED_TARGET_SAMPLE_MS, signal);
+    }
+  }
+}
+
 async function executePageOperation(tabId, params, signal, expectedFence) {
   try {
     let value;
@@ -7034,7 +7117,7 @@ async function executePageOperation(tabId, params, signal, expectedFence) {
     } else {
       const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
       if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
-      value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
+      value = (await runPageOperationResolvingTargets(tabId, params, pageOperationParams(tabId, params, before), signal, expectedFence)).value;
       const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
       value = pageActionResultAfterDocumentFence(params, value, before, after);
     }
@@ -7067,10 +7150,12 @@ async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence
   }
   try {
     const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);
+    const resolvedPageOperation = await runPageOperationResolvingTargets(tabId, params, pageOperationParams(tabId, params), signal, expectedFence);
+    const value = resolvedPageOperation.value;
+    const resolutionSamples = resolvedPageOperation.resolutionSamples;
     const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
     if (!before || !after || !pageGenerationsMatch(before, after)) return undefined;
-    return { value, generation: after };
+    return resolutionSamples > 1 ? { value, generation: after, resolutionSamples } : { value, generation: after };
   } catch (error) {
     if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
     if (isLostExecutionContext(error)) {
