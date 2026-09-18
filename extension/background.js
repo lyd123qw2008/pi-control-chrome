@@ -4854,8 +4854,9 @@ async function pageOperation(params = {}) {
     timeOrigin: params.__expectedActionTimeOrigin,
     token: params.__expectedActionToken,
   };
-  const hasExpectedActionDocument = expectedActionDocument.url !== undefined
-    || expectedActionDocument.timeOrigin !== undefined
+  // A document is identified by its execution-context token and time origin; the URL is
+  // mutable inside one document (history.pushState/replaceState).
+  const hasExpectedActionDocument = expectedActionDocument.timeOrigin !== undefined
     || expectedActionDocument.token !== undefined;
   const actionDocumentChangedError = () => {
     const error = new Error("The tab document changed before the page operation could execute; inspect the current page before retrying");
@@ -4912,8 +4913,7 @@ async function pageOperation(params = {}) {
       timeOrigin: params.__expectedSnapshotTimeOrigin,
       token: params.__expectedSnapshotToken,
     };
-    const hasExpectedDocument = typeof expectedDocument.url === "string"
-      || typeof expectedDocument.timeOrigin === "number"
+    const hasExpectedDocument = typeof expectedDocument.timeOrigin === "number"
       || typeof expectedDocument.token === "string";
     const resolution = resolveObservedElement({
       kind: "snapshot",
@@ -5306,8 +5306,7 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
     timeOrigin: __expectedActionTimeOrigin,
     token: __expectedActionToken,
   };
-  const hasExpectedActionDocument = expectedActionDocument.url !== undefined
-    || expectedActionDocument.timeOrigin !== undefined
+  const hasExpectedActionDocument = expectedActionDocument.timeOrigin !== undefined
     || expectedActionDocument.token !== undefined;
   const actionDocumentChanged = () => {
     const error = new Error("The tab document changed before the DOM action could execute; inspect the current page before retrying");
@@ -5560,7 +5559,8 @@ function accessibilityRevision(tabId, snapshot, accessibility, diffRequested, re
     && !incomplete
     && previous.source === source
     && previous.frameIdentity === frameIdentity
-    && previous.url === generation.url
+    // History API URL updates stay inside one document; only the execution-context token
+    // and time origin fence an accessibility revision across documents.
     && previous.timeOrigin === generation.timeOrigin
     && previous.token === generation.token;
   const currentByKey = new Map(rawNodes.map((node, index) => [String(node.key || `${node.role || "generic"}:${index}`), node]));
@@ -7060,7 +7060,7 @@ async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence
     const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
     const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);
     const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    if (!before || !after || before.url !== after.url || before.timeOrigin !== after.timeOrigin || typeof before.token !== "string" || typeof after.token !== "string" || before.token !== after.token) return undefined;
+    if (!before || !after || !pageGenerationsMatch(before, after)) return undefined;
     return { value, generation: after };
   } catch (error) {
     if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
@@ -7138,7 +7138,7 @@ async function assertPageGenerationStable(tabId, expectedFence, generation, acti
   }
   const current = await executeInTab(tabId, pageGeneration, [], expectedFence);
   await assertTabFence(tabId, expectedFence, action);
-  if (!current || current.url !== generation.url || current.timeOrigin !== generation.timeOrigin || typeof generation.token !== "string" || typeof current.token !== "string" || current.token !== generation.token) {
+  if (!current || !pageGenerationsMatch(generation, current)) {
     throw readOnly ? pageChangingDuringReadError(action, { tabId: Number(tabId), pageChanged: true }) : uncertainBrowserOperationError(action, { tabId: Number(tabId), pageChanged: true });
   }
 }
@@ -7249,11 +7249,7 @@ async function waitForPageCondition(tabId, params = {}, signal, expectedFence, e
         }
         assertRequestActive(signal);
         const urlStable = observedUrl === String(currentTab.url || "");
-        const generationStable = observedPage?.generation?.url === currentGeneration?.url
-          && observedPage?.generation?.timeOrigin === currentGeneration?.timeOrigin
-          && typeof observedPage?.generation?.token === "string"
-          && typeof currentGeneration?.token === "string"
-          && observedPage.generation.token === currentGeneration.token;
+        const generationStable = pageGenerationsMatch(observedPage?.generation, currentGeneration);
         if (urlStable && generationStable && tabUrlMatches(currentTab, params)) {
           const currentTransition = pendingDocumentTransition(tabId, expectedFence);
           // A page-condition read has already proved a stable current document
