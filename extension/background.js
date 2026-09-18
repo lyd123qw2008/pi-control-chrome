@@ -3212,7 +3212,9 @@ function collectDomAccessibilitySnapshot(options = {}) {
     }
   })();
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  // Capability check, not a version literal: executeInTab re-injects the agent before
+  // every page function, so bumping the agent version must not read as an outage.
+  if (typeof pageAgent?.documentIdentity !== "function" || typeof pageAgent?.sameDocument !== "function" || typeof pageAgent?.resolveObservedElement !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const frameInfo = typeof pageAgent?.collectFrames === "function"
     ? pageAgent.collectFrames({ includeFrames: options.includeFrames !== false, root })
     : { frames: [], frameCount: 0, frameFailures: 0, frameLoading: 0, truncated: false };
@@ -3748,6 +3750,11 @@ function collectSnapshot(options = {}) {
   const retainElement = typeof pageAgent?.retain === "function" ? (element) => pageAgent.retain(element) : (element) => element;
   const rememberObservation = typeof pageAgent?.remember === "function" ? (...args) => pageAgent.remember(...args) : () => undefined;
   const refsAvailable = typeof pageAgent?.retain === "function" && typeof pageAgent?.remember === "function";
+  // The page agent owns ref numbering for the life of the document, so the same element
+  // keeps its ref across snapshots. The local WeakMap and counter below only back a page
+  // whose injected agent predates that API (an extension update mid-document).
+  const refForElement = typeof pageAgent?.refFor === "function" ? (element) => pageAgent.refFor(element) : null;
+  const refOfElement = typeof pageAgent?.refOf === "function" ? (element) => pageAgent.refOf(element) : null;
   const isContentEditableHost = (element) => {
     const attr = element.getAttribute("contenteditable");
     return attr !== null && ["", "true", "plaintext-only"].includes(attr.trim().toLowerCase());
@@ -3848,10 +3855,15 @@ function collectSnapshot(options = {}) {
   let counter = 0;
   const refFor = (element) => {
     if (!refsAvailable || !element) return undefined;
-    const existing = elementRefs.get(element);
-    if (existing) return existing;
-    const ref = `e${++counter}`;
-    elementRefs.set(element, ref);
+    // Prefer the document-scoped registry so a ref keeps its number across snapshots;
+    // fall back to the per-execution WeakMap only for a page whose agent predates it.
+    const existing = refOfElement ? refOfElement(element) : elementRefs.get(element);
+    const ref = existing ?? (refForElement ? refForElement(element) : `e${++counter}`);
+    if (!ref) return undefined;
+    if (!existing && !refForElement) elementRefs.set(element, ref);
+    // The record is published for every snapshot that shows this element, whether the
+    // number was minted now or carried over from the document registry: a snapshot whose
+    // refs are missing an element it just published is unusable for that ref.
     refRecords.set(ref, {
       // Keep the original node without retaining removed application subtrees forever.
       element: retainElement(element),
@@ -4243,7 +4255,9 @@ function collectSnapshot(options = {}) {
     // entries, estimate the next ref before budgeting but only retain it after
     // the entry is actually published; otherwise hidden/truncated candidates
     // become guessable live refs and needlessly retain DOM nodes.
-    const existingRef = elementRefs.get(element);
+    const existingRef = refOfElement ? refOfElement(element) : elementRefs.get(element);
+    // Cost estimation only: the published ref now comes from the document-scoped registry
+    // at refFor() time, so a same-shaped guess is enough to budget the entry.
     const previewRef = existingRef ?? (refsAvailable ? `e${counter + 1}` : undefined);
     const entry = {
       ref: previewRef,
@@ -4261,7 +4275,10 @@ function collectSnapshot(options = {}) {
       elementsTruncated = true;
       break;
     }
-    if (existingRef === undefined) entry.ref = refFor(element);
+    // Publish through refFor even when the number is already known: the document registry
+    // owns numbering, but every snapshot still needs a record for each ref it shows, or
+    // that ref cannot resolve against this observation.
+    entry.ref = refFor(element);
     elements.push(entry);
     elementCharCount += cost;
   }
@@ -4837,7 +4854,9 @@ async function pageOperation(params = {}) {
     return matches(pageVisibleText(), text, false);
   };
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  // Capability check, not a version literal: executeInTab re-injects the agent before
+  // every page function, so bumping the agent version must not read as an outage.
+  if (typeof pageAgent?.documentIdentity !== "function" || typeof pageAgent?.sameDocument !== "function" || typeof pageAgent?.resolveObservedElement !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const { documentIdentity, sameDocument, resolveObservedElement } = pageAgent;
   const refResolution = new WeakMap();
   const staleSnapshotError = (reason = "observation_unavailable") => {
@@ -5307,7 +5326,9 @@ function runDomCua({ action, nodeId, snapshotId, value, key, deltaX, deltaY, __d
   try {
   if (!["get_visible_dom", "click", "double_click", "type", "keypress", "scroll"].includes(action)) throw new Error("DOM CUA action must be get_visible_dom, click, double_click, type, keypress or scroll");
   const pageAgent = globalThis["__piControlChromePageAgent"];
-  if (pageAgent?.version !== 4) throw new Error("Pi page agent is unavailable; retry the operation");
+  // Capability check, not a version literal: executeInTab re-injects the agent before
+  // every page function, so bumping the agent version must not read as an outage.
+  if (typeof pageAgent?.documentIdentity !== "function" || typeof pageAgent?.sameDocument !== "function" || typeof pageAgent?.resolveObservedElement !== "function") throw new Error("Pi page agent is unavailable; retry the operation");
   const { documentIdentity, sameDocument, resolveObservedElement } = pageAgent;
   const currentDocument = documentIdentity();
   const expectedActionDocument = {

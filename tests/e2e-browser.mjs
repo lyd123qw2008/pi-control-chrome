@@ -694,6 +694,24 @@ try {
   const staleSnapshot = await request("snapshot", { tabId: selected.tab.id });
   const staleNameInput = staleSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
   assert.ok(staleNameInput?.ref);
+  // A ref is an address inside the document, not a slot in one snapshot: observing an
+  // unchanged page again must name the same elements the same way, and a carried-over ref
+  // must resolve against the newer observation as well as the one it came from.
+  const secondSnapshot = await request("snapshot", { tabId: selected.tab.id });
+  assert.notEqual(secondSnapshot.snapshot.snapshotId, staleSnapshot.snapshot.snapshotId);
+  const secondNameInput = secondSnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  const firstButton = staleSnapshot.snapshot.elements.find((element) => element.tag === "button");
+  const secondButton = secondSnapshot.snapshot.elements.find((element) => element.tag === "button");
+  assert.ok(secondNameInput?.ref && firstButton?.ref && secondButton?.ref);
+  assert.equal(secondNameInput.ref, staleNameInput.ref, "re-observing must not renumber an unchanged field");
+  assert.equal(secondButton.ref, firstButton.ref, "re-observing must not renumber an unchanged control");
+  await request("wait", {
+    tabId: selected.tab.id,
+    state: "visible",
+    target: { ref: staleNameInput.ref },
+    snapshotId: secondSnapshot.snapshot.snapshotId,
+    timeoutMs: 2000,
+  });
   const compactWireSnapshot = await request("snapshot", { tabId: selected.tab.id, responseMode: "compact" });
   assert.equal(compactWireSnapshot.snapshot.elements, undefined);
   assert.equal(compactWireSnapshot.snapshot.accessibility, undefined);

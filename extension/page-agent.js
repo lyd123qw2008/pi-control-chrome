@@ -147,7 +147,7 @@
   const existing = globalThis[RUNTIME_KEY];
 
   if (existing
-    && existing.version === 4
+    && existing.version === 5
     && isMapLike(existing.observations)
     && isMapLike(existing.domObservations)
     && typeof existing.remember === "function"
@@ -158,7 +158,10 @@
     && typeof existing.retain === "function"
     && typeof existing.dereference === "function"
     && typeof existing.collectFrames === "function"
-    && typeof existing.resolveObservedElement === "function") return;
+    && typeof existing.resolveObservedElement === "function"
+    && typeof existing.refFor === "function"
+    && typeof existing.refOf === "function"
+    && typeof existing.elementForRef === "function") return;
 
   const observations = isMapLike(existing?.observations) ? existing.observations : new Map();
   const domObservations = isMapLike(existing?.domObservations) ? existing.domObservations : new Map();
@@ -185,6 +188,59 @@
     const bucket = bucketFor(kind);
     prune(bucket);
     return bucket.get(observationId);
+  };
+  // Document-scoped ref registry. A ref is an address *inside the current document*,
+  // not a slot in one observation: the same element must keep the same number across
+  // snapshots, and a dropped observation must not renumber anything. `minted`
+  // (element -> ref) is the authority, `nodes` (ref -> WeakRef) is a droppable
+  // accelerator, and the element-side marker lets a cold cache be repaired without
+  // consulting any observation bucket.
+  const REF_NODE_CACHE_LIMIT = 512;
+  const refRegistry = {
+    version: 1,
+    minted: existing?.refRegistry?.minted instanceof WeakMap ? existing.refRegistry.minted : new WeakMap(),
+    nodes: isMapLike(existing?.refRegistry?.nodes) ? existing.refRegistry.nodes : new Map(),
+    counter: Number.isInteger(existing?.refRegistry?.counter) && existing.refRegistry.counter >= 0
+      ? existing.refRegistry.counter
+      : 0,
+  };
+  const pruneRefNodes = () => {
+    while (refRegistry.nodes.size > REF_NODE_CACHE_LIMIT) refRegistry.nodes.delete(refRegistry.nodes.keys().next().value);
+  };
+  const refOf = (element) => (element && typeof element === "object" ? refRegistry.minted.get(element) : undefined);
+  const refFor = (element) => {
+    if (!element || element.nodeType !== 1) return undefined;
+    const known = refRegistry.minted.get(element);
+    if (known) return known;
+    const ref = `e${++refRegistry.counter}`;
+    refRegistry.minted.set(element, ref);
+    refRegistry.nodes.set(ref, retain(element));
+    try {
+      element.__piControlChromeRef = ref;
+    } catch {
+      // A frozen or exotic node cannot carry the marker; the registry still answers.
+    }
+    pruneRefNodes();
+    return ref;
+  };
+  const elementForRef = (ref) => {
+    if (typeof ref !== "string" || ref.length === 0) return undefined;
+    const cached = dereference(refRegistry.nodes.get(ref));
+    if (cached) {
+      if (cached.isConnected && cached.ownerDocument === document) return cached;
+      refRegistry.nodes.delete(ref);
+    }
+    // Cold cache: rebuild from the element-side marker instead of failing outright.
+    // Refs only ever exist for elements a snapshot published, so this stays a repair
+    // path rather than an ordinary lookup.
+    if (typeof document.querySelectorAll !== "function") return undefined;
+    for (const element of document.querySelectorAll("*")) {
+      if (element.__piControlChromeRef !== ref) continue;
+      if (!element.isConnected) return undefined;
+      refRegistry.nodes.set(ref, retain(element));
+      return element;
+    }
+    return undefined;
   };
   // Both snapshot refs and DOM-CUA nodes have the same provenance lifecycle.
   // Callers provide their own descriptor policy and translate these states into
@@ -232,7 +288,7 @@
   };
 
   const runtime = {
-    version: 4,
+    version: 5,
     limit,
     ttlMs,
     observations,
@@ -246,6 +302,10 @@
     dereference,
     collectFrames,
     resolveObservedElement,
+    refRegistry,
+    refFor,
+    refOf,
+    elementForRef,
   };
 
   try {

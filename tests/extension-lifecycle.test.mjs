@@ -316,7 +316,7 @@ test("Page Agent injection is idempotent, upgrades in place, and resolves bounde
 
   vm.runInContext(source, context, { filename: pageAgentPath });
   const agent = vm.runInContext("globalThis.__piControlChromePageAgent", context);
-  assert.equal(agent.version, 4);
+  assert.equal(agent.version, 5);
   const identity = agent.documentIdentity();
   assert.equal(identity.url, "https://example.test/page");
   assert.equal(identity.timeOrigin, 123);
@@ -368,11 +368,85 @@ test("Page Agent injection is idempotent, upgrades in place, and resolves bounde
   vm.runInContext(source, context, { filename: pageAgentPath });
   const upgraded = vm.runInContext("globalThis.__piControlChromePageAgent", context);
   assert.notEqual(upgraded, agent);
-  assert.equal(upgraded.version, 4);
+  assert.equal(upgraded.version, 5);
   assert.equal(upgraded.lookup("snapshot", "snapshot-19")?.value, 19);
 
   vm.runInContext(source, context, { filename: pageAgentPath });
   assert.equal(vm.runInContext("globalThis.__piControlChromePageAgent", context), upgraded);
+});
+
+test("Page Agent numbers refs for the life of the document, not for one snapshot", () => {
+  const elements = [];
+  const document = { querySelectorAll: () => elements };
+  const addElement = () => {
+    const element = { nodeType: 1, isConnected: true, ownerDocument: document };
+    elements.push(element);
+    return element;
+  };
+  const first = addElement();
+  const second = addElement();
+  const context = vm.createContext({
+    crypto: { randomUUID: () => "document-token" },
+    document,
+    location: { href: "https://example.test/page" },
+    performance: { timeOrigin: 123 },
+  });
+  const source = readFileSync(pageAgentPath, "utf8");
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  const agent = vm.runInContext("globalThis.__piControlChromePageAgent", context);
+
+  // The bug this replaces: a ref was a slot in one snapshot's WeakMap, so the same
+  // element was renumbered by every snapshot and the model had to remember which
+  // snapshotId a ref came from.
+  assert.equal(agent.refFor(first), "e1");
+  assert.equal(agent.refFor(second), "e2");
+  assert.equal(agent.refFor(first), "e1");
+  assert.equal(agent.refOf(first), "e1");
+  assert.equal(agent.refOf({ nodeType: 1 }), undefined);
+  // refOf never mints, because a snapshot inspects far more candidates than it publishes.
+  assert.equal(agent.refRegistry.counter, 2);
+
+  // The ref -> element map is an accelerator: dropping it must not lose the address,
+  // because the element itself carries the marker.
+  assert.equal(agent.elementForRef("e2"), second);
+  agent.refRegistry.nodes.clear();
+  assert.equal(agent.elementForRef("e2"), second);
+  assert.equal(agent.elementForRef("e404"), undefined);
+
+  // A retired element never answers again, and its number is never handed to another one.
+  first.isConnected = false;
+  agent.refRegistry.nodes.delete("e1");
+  assert.equal(agent.elementForRef("e1"), undefined);
+  assert.equal(agent.refFor(addElement()), "e3");
+
+  // An in-place upgrade must keep numbering: renumbering a live document would strand
+  // every ref the caller is already holding.
+  agent.version = 4;
+  vm.runInContext(source, context, { filename: pageAgentPath });
+  const upgraded = vm.runInContext("globalThis.__piControlChromePageAgent", context);
+  assert.equal(upgraded.version, 5);
+  assert.equal(upgraded.refOf(second), "e2");
+  assert.equal(upgraded.refFor(addElement()), "e4");
+});
+
+test("the page snapshot mints refs through the document-scoped registry", () => {
+  // Source guard: the snapshot builder runs inside the page on every observation, so a
+  // per-execution WeakMap silently renumbers every element. Minting must go through the
+  // page agent, with the local map kept only for a page whose injected agent predates it.
+  const source = readFileSync(backgroundPath, "utf8");
+  const start = source.indexOf("const refFor = (element) => {");
+  assert.notEqual(start, -1);
+  const minting = source.slice(start, start + 700);
+  assert.match(minting, /const existing = refOfElement \? refOfElement\(element\) : elementRefs\.get\(element\);/);
+  assert.match(minting, /const ref = existing \?\? \(refForElement \? refForElement\(element\) : `e\$\{\+\+counter\}`\);/);
+  assert.match(minting, /if \(!existing && !refForElement\) elementRefs\.set\(element, ref\);/);
+  // A carried-over number must still publish its record into this snapshot, otherwise the
+  // observation holds a ref it cannot resolve.
+  assert.doesNotMatch(minting, /if \(existing\) return existing;/);
+  const pageMapStart = source.indexOf("const previewRef = existingRef");
+  const pageMap = source.slice(pageMapStart, source.indexOf("elements.push(entry);", pageMapStart));
+  assert.match(pageMap, /\n    entry\.ref = refFor\(element\);/);
+  assert.doesNotMatch(pageMap, /if \(existingRef === undefined\)/);
 });
 
 test("Page Agent summarizes readable and cross-origin embedded frames", () => {
