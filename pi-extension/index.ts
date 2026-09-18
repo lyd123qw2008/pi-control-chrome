@@ -178,6 +178,9 @@ const INCLUDE_FRAMES = Type.Optional(Type.Boolean({ description: "Include same-o
 const TAIL = Type.Optional(Type.Boolean({ description: "For browser_extract, keep the end of the selected visible text/Markdown instead of the beginning. Useful for logs." }));
 const LOG_MATCH = Type.Optional(Type.String({ description: "For scope=log, keep only lines containing this case-insensitive literal." }));
 const LOG_MAX_MATCHES = Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "For scope=log with logMatch, maximum matching lines to return." }));
+// A deliberate subset, not a copy of the Bridge vocabulary (bridge/response-modes.mjs): the
+// extension decides for its caller and offers the prose read and the diagnostic escape hatch
+// only. Adding a mode here means deciding this host should offer it — not tracking upstream.
 const RESPONSE_MODE = Type.Optional(Type.Union([
   Type.Literal("compact"),
   Type.Literal("raw"),

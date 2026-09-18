@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compactBrowserResult } from "../pi-extension/output.js";
 import { createClient } from "../skills/pi-control-chrome/scripts/browser.mjs";
+import { RESPONSE_MODES } from "../bridge/response-modes.mjs";
 
 const SERVER_NAME = "pi-control-chrome";
 const SERVER_VERSION = (() => {
@@ -75,7 +76,7 @@ const PAGE_TARGET_FIELDS = { ...PAGE_FIELDS, snapshotId: string(), ref: string()
 const WAIT_STATE = { type: "string", enum: ["load", "url", "text", "text_gone", "visible", "hidden", "enabled"] };
 const TEXT_ANY = { type: "array", items: string("Literal text to match."), minItems: 1, maxItems: 20, description: "For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState." };
 const FAILURE_TEXT_ANY = { type: "array", items: string("Literal failure text to match."), minItems: 1, maxItems: 20, description: "For state=text waits, return immediately with failed=true when any listed failure literal is present." };
-const RESPONSE_MODE = { type: "string", enum: ["compact", "raw"], description: "Compact semantic Page Map is the default; use raw only for page-abstraction diagnostics." };
+const RESPONSE_MODE = { type: "string", enum: [...RESPONSE_MODES], description: "compact renders the page as prose for a model reading the result directly; structured returns the same semantic model as data (elements with refs) without the prose rendering or the duplicated accessibility/frame trees, for a caller that works with the page; raw passes the unprojected Bridge result through for diagnostics." };
 const COORDINATE = object({ x: number(), y: number() }, ["x", "y"]);
 
 function schema(properties, required = []) {
@@ -248,7 +249,15 @@ const ALL_TOOLS = [
   tool("browser_cleanup", "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims and recover stale ownership only when explicitly requested.", "cleanup", schema({ recoverStale: boolean() })),
   tool("browser_context_reset", "Only after the user explicitly asks to reset or clear browser context: finalize this Codex browser session while keeping the shared Bridge alive.", "cleanup", schema(), () => ({ mode: "context" })),
 ];
-const EXPOSED_TOOL_NAMES = new Set([
+// The Codex-aligned default: operations that work on tabs the user already has,
+// kept small because this server's tool list is the caller's model-visible
+// catalog. A node_repl-shaped client instead reads the list once at startup and
+// projects it into a kernel, so it wants the complete surface; an explicit
+// comma-separated list selects any other subset.
+//
+// Exposure is decided once, here, so a session's catalog never changes while it
+// runs — the invariant every consumer of this server relies on.
+const DEFAULT_EXPOSED_TOOL_NAMES = new Set([
   "browser_status",
   "browser_targets",
   "browser_target_lease",
@@ -263,9 +272,195 @@ const EXPOSED_TOOL_NAMES = new Set([
   "browser_click",
   "browser_fill",
 ]);
-const TOOLS = ALL_TOOLS.filter(({ name }) => EXPOSED_TOOL_NAMES.has(name));
+
+function selectExposedTools(requested) {
+  const want = typeof requested === "string" ? requested.trim() : "";
+  if (want === "") return ALL_TOOLS.filter(({ name }) => DEFAULT_EXPOSED_TOOL_NAMES.has(name));
+  if (want === "all" || want === "*") return ALL_TOOLS;
+  const names = want.split(",").map((entry) => entry.trim()).filter(Boolean);
+  const known = new Set(ALL_TOOLS.map(({ name }) => name));
+  const unknown = names.filter((name) => !known.has(name));
+  if (unknown.length > 0) throw new Error(`PI_CONTROL_CHROME_TOOLS lists unknown tools: ${unknown.join(", ")}`);
+  return ALL_TOOLS.filter(({ name }) => names.includes(name));
+}
+
+// Every bridge operation answers with a decorated JSON object, so each tool can
+// declare `outputSchema` and answer with `structuredContent` as well as the text
+// block. Without it a caller can only guess whether a result carries `tabs`,
+// `items` or `files`, and must JSON.parse a string out of a text block to find
+// out.
+//
+// `additionalProperties: true` is deliberate: the bridge's per-operation payload
+// grows over time, and an output schema stricter than reality would reject valid
+// results in clients that validate. The fields named here are the ones this
+// server can state from the bridge's own contract; anything else a caller needs
+// it can read off the object at runtime.
+const RESULT_ENVELOPE = {
+  browserId: string("Connected browser target this result came from."),
+  profile: string("Browser profile id."),
+  connectionId: string(),
+  connectionGeneration: integer(),
+};
+const outputObject = (properties, description) => ({
+  type: "object",
+  ...(description ? { description } : {}),
+  properties: { ...RESULT_ENVELOPE, ...properties },
+  additionalProperties: true,
+});
+
+// Field types below are MEASURED against real responses from this Bridge, never
+// inferred: a declared schema is enforced by validating clients — the SDK rejects a
+// `structuredContent` that does not match — so a wrong guess fails the call instead of
+// merely documenting it badly. Two from the first pass: `browser_console`'s `baseline`
+// is an object (declared as a string, which broke the call outright) and
+// `browser_close_tab`'s `closed` is a number (declared as a boolean). A field absent
+// from a given response is fine, because nothing here is `required`.
+const TOOL_OUTPUT_SCHEMAS = Object.freeze({
+  browser_status: outputObject({
+    connected: boolean("Whether a browser target is connected."),
+    state: string(),
+    browser: string('Browser family, e.g. "edge".'),
+    extensionVersion: string(),
+    connectedAt: integer(),
+    capabilityRevision: integer("Revision of the advertised capability set."),
+    bridge: openObject("Bridge health: ok, version, port, extensionConnected, readyTargets."),
+    targetStability: openObject("Target stability: stable, changed, acknowledged, requiresAcknowledgement, competition."),
+  }, "One small connection read; per-request metrics and recovery detail live in browser_doctor."),
+  browser_tabs: outputObject({
+    tabs: array(openObject(), "Tab rows: id, browserId, windowId, index, active, pinned, title, url, status, groupId, owner, stale, handle, sessionScope."),
+    totalTabs: integer(),
+    matchedTabs: integer("Rows matched before the limit applied."),
+    omittedTabs: integer("Rows dropped by the limit or the hard cap."),
+    nextAction: string(),
+    recommendation: string(),
+    groups: array(openObject(), "Tab groups."),
+  }, "The complete tab listing unless query, owner or limit narrowed it."),
+  browser_snapshot: outputObject({
+    tabId: number(),
+    tab: openObject("The tab this snapshot came from."),
+    snapshot: openObject("Bounded semantic Page Map: title, url, snapshotId, nodes and eN refs."),
+  }, "Active page title and bounded semantic Page Map."),
+  browser_accessibility_snapshot: outputObject({
+    tabId: number(),
+    tab: openObject(),
+    snapshotId: string(),
+    mode: string("full, diff or unchanged."),
+    state: string(),
+    nodeCount: integer(),
+    changedNodeCount: integer(),
+    charCount: integer(),
+    truncated: boolean(),
+    nextAction: string(),
+    recommendation: string(),
+    recovery: string(),
+  }),
+  browser_extract: outputObject({
+    tabId: number(),
+    tab: openObject(),
+    content: openObject("Extracted content plus any bound that applied."),
+    truncated: boolean(),
+    omitted: openObject(),
+    nextAction: string(),
+    recommendation: string(),
+    recovery: string(),
+  }),
+  browser_wait: outputObject({
+    tab: openObject(),
+    condition: string(),
+    matched: boolean(),
+    matchedText: string(),
+    terminalState: string(),
+  }, "Wait outcome. Text waits also report matchedText and terminalState."),
+  browser_targets: outputObject({
+    state: string(),
+    targets: array(openObject(), "Connected browser targets, each with browserId, browser and profile."),
+    bridgeHealth: openObject(),
+  }),
+  browser_target_lease: outputObject({
+    ok: boolean(),
+    action: string(),
+    leases: array(openObject(), "Current target leases."),
+    observability: openObject(),
+  }),
+  browser_doctor: outputObject({
+    ok: boolean(),
+    state: string(),
+    recommendation: string(),
+    bridgeHealth: openObject(),
+    targets: array(openObject()),
+    issues: array(openObject()),
+    notices: array(openObject()),
+  }, "Diagnosis rather than a page read; it changes no tabs."),
+  browser_selected: outputObject({
+    tab: openObject("The currently selected tab."),
+  }),
+  browser_navigate: outputObject({
+    tab: openObject("The navigated tab, including any transitionPending marker."),
+  }),
+  browser_new_tab: outputObject({
+    tab: openObject("The created Agent-owned tab."),
+    currentAgentSessionId: string(),
+    groupId: number(),
+    tabFence: string(),
+  }),
+  browser_download: outputObject({
+    downloads: array(openObject(), "Download entries."),
+  }),
+  browser_close_tab: outputObject({
+    closed: number("How many tabs the call closed."),
+  }),
+  browser_console: outputObject({
+    tabId: number(),
+    logs: array(openObject(), "Console entries: level, text and timestamp."),
+    logCount: integer(),
+    logTotalCount: integer(),
+    logCharCount: integer(),
+    logTruncated: boolean(),
+    maxLogChars: integer(),
+    maxLogs: integer(),
+    only: string(),
+    baseline: openObject("Revision marker for incremental reads; an object, not a string."),
+    nextSince: string("Cursor for the next incremental read."),
+  }, "Debugger-backed read; enable first when the listing is empty."),
+  browser_network: outputObject({
+    tabId: number(),
+    requests: array(openObject(), "Request entries, each with requestId and loaderId."),
+    requestCount: integer(),
+    requestTotalCount: integer(),
+    requestCharCount: integer(),
+    requestTruncated: boolean(),
+    maxRequestChars: integer(),
+    maxRequests: integer(),
+  }, "Debugger-backed read; pass both requestId and its loaderId to fetch a response body."),
+  browser_screenshot: outputObject({
+    tabId: number(),
+    mimeType: string(),
+    path: string("Written when the call supplied path; the image data itself is a content block."),
+  }),
+});
+
+const TOOLS = selectExposedTools(process.env.PI_CONTROL_CHROME_TOOLS)
+  .map((entry) => Object.freeze({
+    ...entry,
+    outputSchema: TOOL_OUTPUT_SCHEMAS[entry.name]
+      ?? outputObject({}, "The bridge operation's JSON result, decorated with the envelope below."),
+  }));
 const TOOL_MAP = new Map(TOOLS.map((entry) => [entry.name, entry]));
 const COMPACT_READS = new Set(["browser_snapshot", "browser_extract", "browser_accessibility_snapshot", "browser_tabs", "browser_selected"]);
+// Who decides the shape and size of a read?
+//
+// `provider` (default): this server bounds every read and hands back the rendered prose,
+// because a direct client drops tool results straight into a model's context.
+//
+// `caller`: the client absorbs the payload itself — a node_repl-style runtime passes it
+// into a JavaScript kernel where the cell filters and aggregates before anything reaches
+// a model. A provider-side bound then only removes information the caller could have used,
+// and the prose rendering only costs it the structure it needs. Set
+// PI_CONTROL_CHROME_READ_POLICY=caller for that kind of client: no budgets are injected,
+// reads default to `structured`, and a call can still ask for `compact` or `raw` itself.
+const READ_POLICY = (process.env.PI_CONTROL_CHROME_READ_POLICY || "provider").trim().toLowerCase() === "caller"
+  ? "caller"
+  : "provider";
 const MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100, consoleChars: 4_000, consoleEvents: 40 });
 let bridgeClient;
 let bridgeClientPromise;
@@ -278,7 +473,22 @@ function requestKey(id) {
   return `${typeof id}:${String(id)}`;
 }
 
+/**
+ * The one place that decides how a read is rendered, so the mode sent to the Bridge and
+ * the projection applied to its answer can never disagree.
+ */
+function effectiveResponseMode(name, args) {
+  if (typeof args?.responseMode === "string" && args.responseMode.length > 0) return args.responseMode;
+  if (COMPACT_READS.has(name) || (name === "browser_dom_cua" && args?.action === "get_visible_dom")) {
+    return READ_POLICY === "caller" ? "structured" : "compact";
+  }
+  return undefined;
+}
+
 function applyModelReadBudget(toolName, params) {
+  // A caller that pays for its own payload gets exactly what it asked for; the extension's
+  // own collection ceilings remain the only bound.
+  if (READ_POLICY === "caller") return params;
   if (params.responseMode === "raw") return params;
   const budgeted = { ...params };
   if (toolName === "browser_snapshot" || toolName === "browser_accessibility_snapshot") {
@@ -470,7 +680,10 @@ async function invokeTool(spec, args, signal) {
   if (spec.name === "browser_accessibility_snapshot") params.accessibilityOnly = true;
   if (spec.name === "browser_mark_handoff" || spec.name === "browser_mark_deliverable") params.turnId = TURN_ID;
   params = applyModelReadBudget(spec.name, params);
-  if ((COMPACT_READS.has(spec.name) || (spec.name === "browser_dom_cua" && params.action === "get_visible_dom")) && params.responseMode === undefined) params.responseMode = "compact";
+  if (params.responseMode === undefined) {
+    const mode = effectiveResponseMode(spec.name, params);
+    if (mode !== undefined) params.responseMode = mode;
+  }
   params = withSession(params);
   assertRequestActive(signal);
 
@@ -545,11 +758,35 @@ function jsonText(value) {
   try { return JSON.stringify(value ?? null); } catch { return "null"; }
 }
 
+/** MCP `structuredContent` must be an object; arrays and scalars stay text-only. */
+function structuredResult(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
 function toolResult(name, value, args) {
-  if (name !== "browser_screenshot") return { content: [{ type: "text", text: jsonText(compactBrowserResult(name, { ...args, sessionId: SESSION_ID }, value)) }] };
+  if (name !== "browser_screenshot") {
+    // The text block and the structured form carry the same projection, so a
+    // caller that reads `structuredContent` sees exactly what it sees in the text.
+    // A `structured` read already arrives as data from the Bridge: projecting it here would
+    // flatten it back into the prose the caller asked to avoid.
+    const projected = effectiveResponseMode(name, args) === "structured"
+      ? value
+      : compactBrowserResult(name, { ...args, sessionId: SESSION_ID }, value);
+    const structured = structuredResult(projected);
+    return {
+      content: [{ type: "text", text: jsonText(projected) }],
+      ...(structured === undefined ? {} : { structuredContent: structured }),
+    };
+  }
   const result = value && typeof value === "object" ? value : {};
   const { data, ...metadata } = result;
-  if (typeof data !== "string" || data.length === 0) return { content: [{ type: "text", text: jsonText(value) }] };
+  if (typeof data !== "string" || data.length === 0) {
+    const structured = structuredResult(value);
+    return {
+      content: [{ type: "text", text: jsonText(value) }],
+      ...(structured === undefined ? {} : { structuredContent: structured }),
+    };
+  }
   if (typeof args.path === "string" && args.path.length > 0) {
     const path = resolve(args.path);
     mkdirSync(dirname(path), { recursive: true });
@@ -561,6 +798,7 @@ function toolResult(name, value, args) {
       { type: "text", text: jsonText(metadata) },
       { type: "image", data, mimeType: typeof result.mimeType === "string" ? result.mimeType : "image/png" },
     ],
+    structuredContent: metadata,
   };
 }
 
@@ -637,7 +875,7 @@ async function handleMessage(message) {
   }
   if (message.method === "tools/list") {
     if (message.id === undefined) return;
-    response(message.id, { tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
+    response(message.id, { tools: TOOLS.map(({ name, description, inputSchema, outputSchema }) => ({ name, description, inputSchema, outputSchema })) });
     return;
   }
   if (message.method !== "tools/call") {

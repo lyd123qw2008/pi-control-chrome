@@ -1,6 +1,6 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Codex-aligned Chrome and Edge browser control for Pi, Codex and DSH",
   "type": "module",
   "exports": {
@@ -75,9 +75,10 @@
     "test:skill": "node --test tests/skill-script.test.mjs",
     "test:codex": "node --test tests/codex-mcp.test.mjs",
     "test:output": "node --test tests/output-projection.test.mjs",
+    "test:vocabulary": "node --test tests/response-mode-vocabulary.test.mjs",
     "test:stability": "node tests/bridge-stability.mjs",
     "test:package-install": "node tests/package-install-smoke.mjs",
-    "test:ci": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:codex && npm run test:output && npm run test:stability",
+    "test:ci": "npm test && npm run test:activation && npm run test:extension && npm run test:pi:lifecycle && npm run test:skill:lifecycle && npm run test:codex && npm run test:output && npm run test:vocabulary && npm run test:stability",
     "test:all": "npm run test:ci && npm run test:skill",
     "bridge": "node bridge/server.mjs",
     "smoke:e2e": "node tests/e2e-browser.mjs",

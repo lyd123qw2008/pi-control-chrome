@@ -27,6 +27,12 @@ Load the repository or installed package's `extension/` directory once through `
 
 The first browser operation must be `browser_status`. When Chrome and Edge, or multiple profiles, are connected, choose the intended `browserId` explicitly and acknowledge it before continuing. Keep returned tab handles and snapshot IDs; never replay `BROWSER_OPERATION_UNCERTAIN` without inspecting the current page.
 
-The first adapter release exposes eight `browser_*` tools: status, tabs, snapshot, accessibility snapshot, extract, wait, click and fill. It keeps one isolated browser session per MCP process and cleans that session on normal adapter shutdown. A process crash or forced termination still requires the normal Bridge/extension recovery flow.
+The adapter exposes thirteen `browser_*` tools by default — status, targets, target lease, tabs, snapshot, accessibility snapshot, extract, wait, probe interaction, click, fill, restart and extension reload — chosen to work on tabs the user already has. Set `PI_CONTROL_CHROME_TOOLS=all` to expose every Bridge operation (44), or give a comma-separated list to choose your own subset; an unknown name fails the server at startup rather than silently exposing a narrower face. Whichever you pick, the catalog is decided once at startup, so a session's tool list never changes while it runs.
+
+Every tool declares an `outputSchema` and answers with `structuredContent` next to its text block, so a caller reads `result.tabs` instead of parsing a JSON string out of the text.
+
+Where a read's shape and size are decided: the extension bounds collection (`maxChars`/`maxNodes`, hard caps at 20,000 chars and 1,000 nodes); the Bridge owns `responseMode`, and `compact` is the only mode that adds budgets of its own; this server adds the defaults a direct client needs. A client that absorbs the payload itself — a node_repl-style kernel, where a cell filters before anything reaches a model — sets `PI_CONTROL_CHROME_READ_POLICY=caller`: no budgets are injected, reads default to `structured` (the semantic model as data — elements with `ref`s — without the prose rendering or the duplicated accessibility and frame trees) and it can still name `compact` or `raw` per call.
+
+It keeps one isolated browser session per MCP process and cleans that session on normal adapter shutdown. A process crash or forced termination still requires the normal Bridge/extension recovery flow.
 
 Set `PI_CONTROL_CHROME_BRIDGE_PORT` if the Bridge is configured on another loopback port. The extension must be rebuilt with a matching CSP allowlist before using a non-default port.
