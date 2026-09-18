@@ -192,12 +192,12 @@ Playwright 用 `f1e3`/`f2e3` 把文档纪元编进 token。**我们不跟**：
 | 10 | `tests/e2e-browser.mjs` | 改 | `:1203`/`:1215`/`:1226`/`:1238`/`:1256` 的 rebind 断言按新契约校准 |
 | 11 | 文档面（§6） | 改 | 8 处模型描述与提示词 |
 
-**回退项（当前工作区未提交的改动）**：`git diff` 显示它做了两件事 ——
+**并入的未提交改动**：把 `git diff` 读全之后，它是一次完整改动，不是可拆的两半 ——
 
-- (a) 把 `STALE_SNAPSHOT`/`ELEMENT_TARGET_DETACHED` 加入 `executeWithLocatorWait` 的可重试集；
-- (b) 新增 `runPageOperationResolvingTargets`，为三条 `executePageOperation` 路径补上有界等待。
+- `isUnresolvedTargetError`、`UNRESOLVED_TARGET_RETRY_MS`/`UNRESOLVED_TARGET_SAMPLE_MS`、`runPageOperationResolvingTargets`，以及四个调用点（`executeWithLocatorWait`、`executePageOperation`、`executeReadOnlyPageOperation`）；
+- 唯一调整：把 `STALE_SNAPSHOT` 从可重试集里**去掉**。它表示"地址完全无法恢复"（观察没了，注册表也叫不出元素），采样改善不了它，留着只会把类型化失败变成一个慢的失败 —— 正是 §4.3 的禁止项。
 
-**判定：(b) 保留并合并；(a) 回退** —— 在新模型下"记录没了"不再需要等待，而是立即走注册表回退路径；把它放进重试集正是 §4.3 的禁止项。
+**判定：整体保留，重试谓词收窄为 `ELEMENT_TARGET_NOT_FOUND` / `ELEMENT_TARGET_DETACHED`。**
 
 ---
 

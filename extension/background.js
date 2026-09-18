@@ -6854,7 +6854,7 @@ async function executeWithLocatorWait(tabId, params, signal, expectedFence) {
       }
       const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
       if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
-      const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
+      const value = (await runPageOperationResolvingTargets(tabId, params, pageOperationParams(tabId, params, before), signal, expectedFence)).value;
       const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
       const fencedValue = pageActionResultAfterDocumentFence(params, value, before, after);
       assertRequestActive(signal);
@@ -7058,6 +7058,44 @@ function pageGenerationsMatch(left, right) {
   return leftIdentity !== undefined && leftIdentity === pageGenerationIdentity(right);
 }
 
+// A target that is not resolvable *yet* is not the same as a target that does not exist: a
+// page can still be rendering when an operation looks for it, and the element the caller
+// wants may arrive while the page as a whole never stops loading. So readiness is decided
+// per requested target, by sampling, within a hard bound — never by guessing that the page
+// finished. Only pre-dispatch resolution failures are retried, and only for read-only
+// operations: a side effect is never replayed.
+const UNRESOLVED_TARGET_RETRY_MS = 2_000;
+const UNRESOLVED_TARGET_SAMPLE_MS = 100;
+function isUnresolvedTargetError(error) {
+  const code = error && typeof error === "object" ? error.code : undefined;
+  // STALE_SNAPSHOT is deliberately absent: it reports that the address could not be
+  // recovered at all — the observation is gone and the document registry cannot name the
+  // element either — and sampling cannot improve that. Waiting on it would only turn a typed
+  // failure into a slow one.
+  return code === "ELEMENT_TARGET_NOT_FOUND" || code === "ELEMENT_TARGET_DETACHED";
+}
+
+// One definition, called from every branch that runs a page operation: an unresolved target
+// is sampled again within the bound instead of being reported as missing, and a
+// side-effecting operation is never replayed. The caller sees how many samples it took.
+async function runPageOperationResolvingTargets(tabId, params, pageParams, signal, expectedFence) {
+  // Retrying a side-effecting operation is safe here for the same reason it is unsafe
+  // everywhere else in this file: the three codes below are raised while *resolving* the
+  // target, before anything is dispatched, and a failure that may already have had an
+  // effect is reported as BROWSER_OPERATION_UNCERTAIN instead — which is never retried.
+  const deadline = Date.now() + UNRESOLVED_TARGET_RETRY_MS;
+  let resolutionSamples = 0;
+  for (;;) {
+    resolutionSamples += 1;
+    try {
+      return { value: await executeInTab(tabId, pageOperation, [pageParams], expectedFence), resolutionSamples };
+    } catch (error) {
+      if (Date.now() >= deadline || !isUnresolvedTargetError(error)) throw error;
+      await waitWithSignal(UNRESOLVED_TARGET_SAMPLE_MS, signal);
+    }
+  }
+}
+
 async function executePageOperation(tabId, params, signal, expectedFence) {
   try {
     let value;
@@ -7072,7 +7110,7 @@ async function executePageOperation(tabId, params, signal, expectedFence) {
     } else {
       const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
       if (isSideEffectingPageOperation(params) && pageGenerationIdentity(before) === undefined) throw uncertainPageOperationError();
-      value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params, before)], expectedFence);
+      value = (await runPageOperationResolvingTargets(tabId, params, pageOperationParams(tabId, params, before), signal, expectedFence)).value;
       const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
       value = pageActionResultAfterDocumentFence(params, value, before, after);
     }
@@ -7105,10 +7143,12 @@ async function executeReadOnlyPageOperation(tabId, params, signal, expectedFence
   }
   try {
     const before = await executeInTab(tabId, pageGeneration, [], expectedFence);
-    const value = await executeInTab(tabId, pageOperation, [pageOperationParams(tabId, params)], expectedFence);
+    const resolvedPageOperation = await runPageOperationResolvingTargets(tabId, params, pageOperationParams(tabId, params), signal, expectedFence);
+    const value = resolvedPageOperation.value;
+    const resolutionSamples = resolvedPageOperation.resolutionSamples;
     const after = await executeInTab(tabId, pageGeneration, [], expectedFence);
     if (!before || !after || !pageGenerationsMatch(before, after)) return undefined;
-    return { value, generation: after };
+    return resolutionSamples > 1 ? { value, generation: after, resolutionSamples } : { value, generation: after };
   } catch (error) {
     if (isTabFenceError(error) || error?.code === "BROWSER_OPERATION_UNCERTAIN") throw error;
     if (isLostExecutionContext(error)) {

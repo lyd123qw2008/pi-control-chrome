@@ -271,7 +271,7 @@ function loadExtension(options = {}) {
     }
     return originalExecuteScript(details);
   };
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions };", context, { filename: backgroundPath });
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions, isUnresolvedTargetError, UNRESOLVED_TARGET_RETRY_MS, UNRESOLVED_TARGET_SAMPLE_MS, executePageOperation };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
     chrome,
@@ -2310,6 +2310,65 @@ test("same-document history URL updates retain complete handles, claimed ownersh
   const selected = await fixture.api.handleRequest("selected_tab", { tabId, sessionId: "session-test" });
   assert.equal(selected.tab.url, historyUrl);
   assert.equal(selected.tab.stale, false);
+});
+
+test("only pre-dispatch resolution failures are retryable, and never an uncertain effect", () => {
+  // A target that is not resolvable *yet* is not a target that does not exist, so a late
+  // target is sampled again within a bound. Everything else — above all an operation
+  // that may already have had an effect — must never be replayed.
+  const fixture = loadExtension();
+  const retryable = (code) => fixture.api.isUnresolvedTargetError(Object.assign(new Error("resolution failed"), { code }));
+  // STALE_SNAPSHOT is not a readiness signal: the address is unrecoverable, so it must
+  // fail fast instead of spending the sampling bound.
+  assert.equal(retryable("STALE_SNAPSHOT"), false);
+  assert.equal(retryable("ELEMENT_TARGET_NOT_FOUND"), true);
+  assert.equal(retryable("ELEMENT_TARGET_DETACHED"), true);
+  assert.equal(retryable("BROWSER_OPERATION_UNCERTAIN"), false);
+  assert.equal(retryable("BROWSER_DOCUMENT_CHANGED"), false);
+  assert.equal(retryable("ELEMENT_TARGET_AMBIGUOUS"), false);
+  assert.equal(retryable(undefined), false);
+  assert.ok(fixture.api.UNRESOLVED_TARGET_RETRY_MS > 0 && fixture.api.UNRESOLVED_TARGET_RETRY_MS <= 5000, "the sampling bound must be finite and small");
+  assert.ok(fixture.api.UNRESOLVED_TARGET_SAMPLE_MS > 0 && fixture.api.UNRESOLVED_TARGET_SAMPLE_MS < fixture.api.UNRESOLVED_TARGET_RETRY_MS, "the interval must fit inside the bound");
+});
+
+test("a read-only page operation samples an unresolved target instead of reporting it missing", async () => {
+  const fixture = loadExtension();
+  const tabId = 343;
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "rendering", url: "https://example.test/rendering", status: "complete", active: true });
+  const original = fixture.chrome.scripting.executeScript;
+  let pageOperationCalls = 0;
+  fixture.chrome.scripting.executeScript = async (details) => {
+    if (details?.func?.name === "pageOperation") {
+      pageOperationCalls += 1;
+      if (pageOperationCalls === 1) throw Object.assign(new Error("No element matched the requested target yet"), { code: "ELEMENT_TARGET_NOT_FOUND" });
+      return [{ result: { resolved: true } }];
+    }
+    return original(details);
+  };
+  await fixture.api.executePageOperation(tabId, {}, undefined, undefined);
+  // The retry is what this test is about. The shape of a branch's own return value is that
+  // branch's business, so it is deliberately not asserted here.
+  assert.equal(pageOperationCalls, 2, "an unresolved target must be looked at again, not reported missing");
+});
+
+test("a side-effecting page operation is never retried once its effect is uncertain", async () => {
+  // The safety boundary is the *code*, not whether the operation has side effects: a click
+  // whose target was not resolvable yet is retried, while a click that may already have
+  // happened reports BROWSER_OPERATION_UNCERTAIN and must never be replayed.
+  const fixture = loadExtension();
+  const tabId = 344;
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "rendering", url: "https://example.test/rendering", status: "complete", active: true });
+  const original = fixture.chrome.scripting.executeScript;
+  let pageOperationCalls = 0;
+  fixture.chrome.scripting.executeScript = async (details) => {
+    if (details?.func?.name === "pageOperation") {
+      pageOperationCalls += 1;
+      throw Object.assign(new Error("The click was dispatched but its effect could not be confirmed"), { code: "BROWSER_OPERATION_UNCERTAIN" });
+    }
+    return original(details);
+  };
+  await assert.rejects(() => fixture.api.executePageOperation(tabId, { operation: "click" }, undefined, undefined));
+  assert.equal(pageOperationCalls, 1, "an effect that may already have happened must never be replayed");
 });
 
 test("complete document handles tolerate title-only updates", async () => {
