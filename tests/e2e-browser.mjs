@@ -712,6 +712,19 @@ try {
     snapshotId: secondSnapshot.snapshot.snapshotId,
     timeoutMs: 2000,
   });
+  // The observation is an accelerator, not the address: a ref carried into an observation
+  // that never listed it must still resolve, because the document registry owns the number.
+  // Before the registry this pairing failed with STALE_SNAPSHOT/ref_not_found.
+  const narrowSnapshot = await request("snapshot", { tabId: selected.tab.id, maxChars: 100, maxNodes: 1 });
+  assert.notEqual(narrowSnapshot.snapshot.snapshotId, staleSnapshot.snapshot.snapshotId);
+  assert.equal(narrowSnapshot.snapshot.elements.some((element) => element.ref === staleNameInput.ref), false);
+  await request("locator", {
+    tabId: selected.tab.id,
+    target: { ref: staleNameInput.ref },
+    snapshotId: narrowSnapshot.snapshot.snapshotId,
+    action: "getAttribute",
+    attribute: "placeholder",
+  });
   const compactWireSnapshot = await request("snapshot", { tabId: selected.tab.id, responseMode: "compact" });
   assert.equal(compactWireSnapshot.snapshot.elements, undefined);
   assert.equal(compactWireSnapshot.snapshot.accessibility, undefined);

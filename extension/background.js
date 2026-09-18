@@ -4954,8 +4954,25 @@ async function pageOperation(params = {}) {
       findCandidates: (descriptor) => rebindCandidates(descriptor, candidateRoot),
     });
     if (resolution.state === "document_changed") throw documentChangedError();
-    if (resolution.state === "observation_unavailable") throw staleSnapshotError();
-    if (resolution.state === "record_unavailable") throw staleSnapshotError("ref_not_found");
+    if (resolution.state === "observation_unavailable" || resolution.state === "record_unavailable") {
+      // The observation record is an accelerator, not the address. A ref minted in this
+      // document still names its element when the record was evicted by the history limit
+      // or when the caller paired the ref with a different observation, so consult the
+      // document registry before reporting the address as lost. The document gate is what
+      // stops a same-numbered element from another document answering in its place, and a
+      // node that is gone (a re-rendered replacement) still reports not-found.
+      const expectedDocumentMatches = !hasExpectedDocument
+        || typeof pageAgent.matchesDocument !== "function"
+        || pageAgent.matchesDocument(expectedDocument, documentIdentity());
+      if (typeof pageAgent.elementForRef === "function" && expectedDocumentMatches) {
+        const recovered = pageAgent.elementForRef(ref);
+        if (recovered?.isConnected && recovered.ownerDocument === document) {
+          refResolution.set(recovered, { resolvedBy: "document_registry", rebound: false });
+          return recovered;
+        }
+      }
+      throw resolution.state === "record_unavailable" ? staleSnapshotError("ref_not_found") : staleSnapshotError();
+    }
     if (resolution.state === "changed") throw changedSnapshotRefError(resolution.rebound);
     if (resolution.state === "detached") throw detachedSnapshotRefError(resolution.reason, resolution.rebound);
     if (resolution.state === "ambiguous") {
