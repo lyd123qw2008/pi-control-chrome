@@ -271,7 +271,7 @@ function loadExtension(options = {}) {
     }
     return originalExecuteScript(details);
   };
-  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions, isUnresolvedTargetError, UNRESOLVED_TARGET_RETRY_MS, UNRESOLVED_TARGET_SAMPLE_MS, executePageOperation };", context, { filename: backgroundPath });
+  vm.runInContext(source + "\nglobalThis.__testApi = { handleRequest, attachDebugger, detachDebugger, enqueueBridgeRequest, persistentDebuggers, orphanedDebuggerAttaches, tabRemovalTombstones, retiredTabRemovalTombstones, browserIdentity, waitForTabState, abortActiveWaits, activeRequestControllers, activeRequestDetails, ownedTabs, ensureProfileIdentity, reserveTabWait, trackDownloadWait, downloadState, pageSnapshotStates, domSnapshotStates, accessibilitySnapshotStates, accessibilitySnapshotObservations, resolveAccessibilityNode, devtoolsState, capturePageObservationState, invalidatePageObservationStateAfterDocumentTransition, pageOperationParams, domCuaOperationParams, tabSnapshotMatches, executeInTab, pageGeneration, refreshOwnedTabDocument, pendingDocumentTransitions, isUnresolvedTargetError, UNRESOLVED_TARGET_RETRY_MS, UNRESOLVED_TARGET_SAMPLE_MS, executePageOperation, executeObservationWithFrameSettling, collectSnapshot, FRAME_TREE_STABILITY_TIMEOUT_MS, FRAME_TREE_STABILITY_INTERVAL_MS };", context, { filename: backgroundPath });
   return {
     api: context.__testApi,
     chrome,
@@ -2349,6 +2349,45 @@ test("a read-only page operation samples an unresolved target instead of reporti
   // The retry is what this test is about. The shape of a branch's own return value is that
   // branch's business, so it is deliberately not asserted here.
   assert.equal(pageOperationCalls, 2, "an unresolved target must be looked at again, not reported missing");
+});
+
+test("an unsettled unscoped snapshot is sampled until its document settles", async () => {
+  const fixture = loadExtension();
+  const tabId = 345;
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "loading", url: "https://example.test/loading", status: "loading", active: true });
+  const original = fixture.chrome.scripting.executeScript;
+  let snapshotCalls = 0;
+  fixture.chrome.scripting.executeScript = async (details) => {
+    if (details?.func?.name === "collectSnapshot") {
+      snapshotCalls += 1;
+      return [{ result: snapshotCalls === 1 ? { snapshotId: "early", unsettled: true } : { snapshotId: "settled" } }];
+    }
+    return original(details);
+  };
+  const result = await fixture.api.executeObservationWithFrameSettling(tabId, fixture.api.collectSnapshot, [{}], undefined, undefined, "snapshot");
+  assert.equal(snapshotCalls, 2, "an unscoped loading document must be sampled again");
+  assert.equal(result.snapshotId, "settled");
+  assert.equal(result.unsettled, undefined);
+  assert.equal(result.settleSamples, 2);
+});
+
+test("a selector-scoped snapshot is not retried on an unsettled marker", async () => {
+  const fixture = loadExtension();
+  const tabId = 346;
+  fixture.tabs.set(tabId, { id: tabId, windowId: 1, title: "scoped", url: "https://example.test/scoped", status: "complete", active: true });
+  const original = fixture.chrome.scripting.executeScript;
+  let snapshotCalls = 0;
+  fixture.chrome.scripting.executeScript = async (details) => {
+    if (details?.func?.name === "collectSnapshot") {
+      snapshotCalls += 1;
+      return [{ result: { snapshotId: "scoped", unsettled: true } }];
+    }
+    return original(details);
+  };
+  const result = await fixture.api.executeObservationWithFrameSettling(tabId, fixture.api.collectSnapshot, [{ selector: "main" }], undefined, undefined, "snapshot");
+  assert.equal(snapshotCalls, 1, "the caller owns readiness for a selector-scoped snapshot");
+  assert.equal(result.snapshotId, "scoped");
+  assert.equal(result.settleSamples, undefined);
 });
 
 test("a side-effecting page operation is never retried once its effect is uncertain", async () => {

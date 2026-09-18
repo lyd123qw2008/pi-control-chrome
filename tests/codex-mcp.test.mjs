@@ -10,7 +10,7 @@ import WebSocket from "ws";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const lifecycleContract = JSON.parse(readFileSync(new URL("./fixtures/browser-lifecycle-contract.json", import.meta.url), "utf8"));
-const serverPath = join(root, "codex", "mcp-server.mjs");
+const serverPath = join(root, "mcp", "mcp-server.mjs");
 const bridgePath = join(root, "bridge", "server.mjs");
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -82,11 +82,12 @@ function stopProcess(child) {
 function startMcp(port, extraEnv = {}) {
   const child = spawn(process.execPath, [serverPath], {
     cwd: root,
-    env: { ...process.env, ...extraEnv, PI_CONTROL_CHROME_BRIDGE_PORT: String(port) },
+    env: { ...process.env, PI_CONTROL_CHROME_TOOLS: "", ...extraEnv, PI_CONTROL_CHROME_BRIDGE_PORT: String(port) },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
   let buffer = "";
+  let stderr = "";
   const waiters = [];
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
@@ -101,13 +102,17 @@ function startMcp(port, extraEnv = {}) {
       if (waiter) waiter(JSON.parse(line));
     }
   });
-  child.stderr.resume();
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
   return {
     child,
     nextMessage() {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return Promise.reject(new Error(`MCP server exited before responding${stderr ? `: ${stderr.trim()}` : ""}`));
+      }
       return new Promise((resolve, reject) => {
         waiters.push(resolve);
-        child.once("exit", () => reject(new Error("MCP server exited before responding")));
+        child.once("exit", () => reject(new Error(`MCP server exited before responding${stderr ? `: ${stderr.trim()}` : ""}`)));
       });
     },
     send(message) { child.stdin.write(`${JSON.stringify(message)}\n`); },
@@ -121,11 +126,30 @@ test("Codex plugin manifest points at the shared Skill and stdio MCP server", ()
   assert.equal(manifest.skills, "./skills/pi-control-chrome/");
   assert.equal(manifest.mcpServers, "./.mcp.json");
   assert.equal(mcp.mcpServers["pi-control-chrome"].command, "node");
-  assert.deepEqual(mcp.mcpServers["pi-control-chrome"].args, ["codex/mcp-server.mjs"]);
+  assert.deepEqual(mcp.mcpServers["pi-control-chrome"].args, ["mcp/mcp-server.mjs"]);
+  assert.deepEqual(mcp.mcpServers["pi-control-chrome"].env, { PI_CONTROL_CHROME_TOOLS: "codex" });
 });
 
-test("Codex MCP adapter exposes the initial browser tool catalog over stdio", async () => {
+test("MCP adapter exposes the complete browser tool catalog by default", async () => {
   const mcp = startMcp(await findFreePort());
+  try {
+    mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+    await mcp.nextMessage();
+    mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const listed = await mcp.nextMessage();
+    const names = listed.result.tools.map((tool) => tool.name);
+    assert.equal(names.length, 44);
+    for (const name of ["browser_navigate", "browser_new_tab", "browser_close_tab", "browser_screenshot", "browser_console", "browser_network", "browser_claim_tab"]) {
+      assert.ok(names.includes(name), `the default MCP catalog must expose ${name}`);
+    }
+  } finally {
+    mcp.child.stdin.end();
+    await stopProcess(mcp.child);
+  }
+});
+
+test("Codex mode exposes the bounded browser tool catalog over stdio", async () => {
+  const mcp = startMcp(await findFreePort(), { PI_CONTROL_CHROME_TOOLS: "codex" });
   try {
     mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
     const initialized = await mcp.nextMessage();

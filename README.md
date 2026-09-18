@@ -82,7 +82,7 @@ The DSH package reuses this project's Bridge and Manifest V3 extension. Its defa
 
 ### Codex CLI and Desktop
 
-The repository includes a Codex plugin manifest and a local MCP `stdio` adapter. After installing a package version containing this adapter, register it with `codex mcp add pi-control-chrome -- pi-control-chrome-codex`, or point `codex mcp add` at `codex/mcp-server.mjs` in this checkout. The adapter reuses the existing Bridge and exposes the bounded Codex browser tool set, including `browser_restart` after explicit user confirmation; it does not open an additional MCP port. See [`codex/README.md`](./codex/README.md) for setup and safety rules.
+The repository includes a Codex plugin manifest and a local MCP `stdio` adapter. After installing a package version containing this adapter, register it with `codex mcp add pi-control-chrome -- pi-control-chrome-codex`, or point `codex mcp add` at `mcp/mcp-server.mjs` in this checkout. The generic MCP adapter exposes the complete browser tool catalog by default; the checked-in Codex configuration explicitly selects its bounded `codex` mode, including `browser_restart` after explicit user confirmation. It does not open an additional MCP port. See [`mcp/README.md`](./mcp/README.md) for setup, modes, and safety rules.
 
 ## Load the browser extension
 

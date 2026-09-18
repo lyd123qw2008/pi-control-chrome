@@ -40,10 +40,12 @@ try {
   const installedManifest = JSON.parse(readFileSync(join(installedRoot, "package.json"), "utf8"));
   assert.equal(installedManifest.name, rootManifest.name);
   assert.equal(installedManifest.version, rootManifest.version);
+  assert.equal(installedManifest.exports["./mcp/mcp-server.mjs"], "./mcp/mcp-server.mjs");
+  assert.equal(installedManifest.exports["./codex/mcp-server.mjs"], "./mcp/mcp-server.mjs", "the legacy Codex export must remain an alias");
 
   for (const relativePath of [
     "bridge/server.mjs",
-    "codex/mcp-server.mjs",
+    "mcp/mcp-server.mjs",
     "extension/manifest.json",
     "pi-extension/output.js",
     "skills/pi-control-chrome/SKILL.md",
@@ -52,9 +54,11 @@ try {
     assert.equal(existsSync(join(installedRoot, relativePath)), true, `installed package is missing ${relativePath}`);
   }
 
-  const binPath = join(installRoot, "node_modules", ".bin", "pi-control-chrome-codex");
-  const windowsBinPath = `${binPath}.cmd`;
-  assert.equal(existsSync(binPath) || existsSync(windowsBinPath), true, "installed package bin link is missing");
+  for (const bin of ["pi-control-chrome-mcp", "pi-control-chrome-codex"]) {
+    const binPath = join(installRoot, "node_modules", ".bin", bin);
+    const windowsBinPath = `${binPath}.cmd`;
+    assert.equal(existsSync(binPath) || existsSync(windowsBinPath), true, `installed package bin link is missing: ${bin}`);
+  }
 
   execFileSync(process.execPath, [
     "--input-type=module",

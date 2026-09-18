@@ -437,6 +437,11 @@ export function compactSnapshotResult(value, maxChars = SNAPSHOT_MAX_CHARS, maxN
       }),
       ...(projected.stateTruncated === true || combinedState.length > maxChars ? { stateTruncated: true } : {}),
       ...(snapshot.viewport === undefined ? {} : { viewport: snapshot.viewport }),
+      // An unscoped snapshot taken while the document was still loading is coherent but
+      // provisional. Preserve both its status and bounded sampling count for a model-facing
+      // compact projection instead of silently turning it into a settled observation.
+      ...(snapshot.unsettled === true ? { unsettled: true } : {}),
+      ...(Number.isInteger(snapshot.settleSamples) && snapshot.settleSamples > 1 ? { settleSamples: snapshot.settleSamples } : {}),
       ...frameProjectionFields(snapshot),
     },
   };

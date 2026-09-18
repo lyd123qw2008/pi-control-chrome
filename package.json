@@ -1,11 +1,12 @@
 {
   "name": "pi-control-chrome",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "Codex-aligned Chrome and Edge browser control for Pi, Codex and DSH",
   "type": "module",
   "exports": {
     "./bridge/server.mjs": "./bridge/server.mjs",
-    "./codex/mcp-server.mjs": "./codex/mcp-server.mjs",
+    "./mcp/mcp-server.mjs": "./mcp/mcp-server.mjs",
+    "./codex/mcp-server.mjs": "./mcp/mcp-server.mjs",
     "./pi-extension/output.js": {
       "types": "./pi-extension/output.d.ts",
       "default": "./pi-extension/output.js"
@@ -54,7 +55,7 @@
     "SECURITY.md",
     "docs/*.md",
     "bridge",
-    "codex",
+    "mcp",
     "extension",
     "pi-extension",
     "skills"
@@ -63,10 +64,11 @@
     "access": "public"
   },
   "bin": {
-    "pi-control-chrome-codex": "./codex/mcp-server.mjs"
+    "pi-control-chrome-codex": "./mcp/mcp-server.mjs",
+    "pi-control-chrome-mcp": "./mcp/mcp-server.mjs"
   },
   "scripts": {
-    "check": "node --check bridge/server.mjs && node --check codex/mcp-server.mjs && node --check extension/background.js && node --check extension/page-agent.js && node --check pi-extension/index.ts && node --check pi-extension/activation.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json','.codex-plugin/plugin.json','.mcp.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
+    "check": "node --check bridge/server.mjs && node --check mcp/mcp-server.mjs && node --check extension/background.js && node --check extension/page-agent.js && node --check pi-extension/index.ts && node --check pi-extension/activation.js && node --check skills/pi-control-chrome/scripts/browser.mjs && node -e \"const fs=require('fs'); for (const p of ['package.json','package-lock.json','extension/manifest.json','.codex-plugin/plugin.json','.mcp.json']) JSON.parse(fs.readFileSync(p,'utf8')); console.log('JSON OK')\"",
     "test": "node --test tests/bridge.test.mjs",
     "test:activation": "node --test tests/pi-activation.test.mjs",
     "test:extension": "node --test tests/extension-lifecycle.test.mjs",

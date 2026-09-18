@@ -3829,8 +3829,12 @@ function collectSnapshot(options = {}) {
   };
   const disabled = (element) => Boolean(element.matches?.(":disabled") || element.disabled || String(element.getAttribute("aria-disabled") || "").toLowerCase() === "true");
   const snapshotId = typeof globalThis?.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  // A caller that names a selector owns that target's readiness decision. An unscoped
+  // snapshot has no such target, so mark a document still loading as unsettled and let the
+  // background take a few bounded samples before publishing the observation.
+  const unscopedSnapshot = options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0);
   const root = (() => {
-    if (options.selector === undefined || (typeof options.selector === "string" && options.selector.trim().length === 0)) return document.body || document.documentElement;
+    if (unscopedSnapshot) return document.body || document.documentElement;
     try {
       const selected = document.querySelector(String(options.selector));
       if (!selected) throw new Error(`Snapshot selector did not match any element: ${String(options.selector)}`);
@@ -4318,6 +4322,7 @@ function collectSnapshot(options = {}) {
     ...(frameInfo.frameFailures > 0 ? { frameFailures: frameInfo.frameFailures } : {}),
     ...(frameInfo.frameLoading > 0 ? { frameLoading: frameInfo.frameLoading } : {}),
     ...(framesTruncated ? { framesTruncated: true } : {}),
+    ...(unscopedSnapshot && document.readyState === "loading" ? { unsettled: true } : {}),
     ...(pageMap === undefined ? {} : { pageMap }),
     accessibility: undefined,
   };
@@ -6391,21 +6396,43 @@ async function readFrameObservation(tabId, options, expectedFence, signal, actio
 async function executeObservationWithFrameSettling(tabId, func, args, expectedFence, signal, action) {
   const deadline = Date.now() + FRAME_TREE_STABILITY_TIMEOUT_MS;
   let last;
+  let samples = 0;
+  let sampledUnsettledSnapshot = false;
   while (Date.now() < deadline) {
     assertRequestActive(signal);
     last = await executeInTab(tabId, func, args, expectedFence);
+    samples += 1;
     const frameLoading = Number(last?.frameLoading || 0);
-    if (frameLoading <= 0) return last;
+    // An unscoped snapshot has no caller-supplied target that can decide readiness. The page
+    // collector marks a still-loading document as `unsettled`; sample it within the same small
+    // bound and publish the newest valid observation if it never settles. This is deliberately
+    // not a retry of a failed operation, and it never applies to selector-scoped snapshots.
+    const unscopedSnapshot = action === "snapshot" && (args[0]?.selector === undefined || (typeof args[0]?.selector === "string" && args[0].selector.trim().length === 0));
+    const unsettledSnapshot = unscopedSnapshot && last?.unsettled === true;
+    sampledUnsettledSnapshot ||= unsettledSnapshot;
+    if (frameLoading <= 0 && !unsettledSnapshot) {
+      return action === "snapshot" && sampledUnsettledSnapshot
+        ? { ...last, settleSamples: samples }
+        : last;
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await waitWithSignal(Math.min(FRAME_TREE_STABILITY_INTERVAL_MS * 2, remaining), signal);
   }
-  throw pageChangingDuringReadError(action, {
-    tabId: Number(tabId),
-    frameChanged: true,
-    frameLoading: Number(last?.frameLoading || 0),
-    frameStabilityTimedOut: true,
-  });
+  const frameLoading = Number(last?.frameLoading || 0);
+  if (frameLoading > 0) {
+    throw pageChangingDuringReadError(action, {
+      tabId: Number(tabId),
+      frameChanged: true,
+      frameLoading,
+      frameStabilityTimedOut: true,
+    });
+  }
+  // A loading top-level document is still a coherent same-document observation, unlike a
+  // changing frame tree. Preserve the final snapshot's explicit signal instead of turning a
+  // useful read into a generic page-changing failure.
+  if (action === "snapshot" && last?.unsettled === true) return { ...last, settleSamples: samples };
+  return last;
 }
 
 async function readOnlyWithRetry(method, tabId, signal, operation) {
