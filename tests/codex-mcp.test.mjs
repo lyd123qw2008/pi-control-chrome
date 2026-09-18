@@ -397,3 +397,96 @@ test("Codex MCP cancellation reaches the Bridge without replaying the browser wa
     rmSync(temp, { recursive: true, force: true });
   }
 });
+
+test("PI_CONTROL_CHROME_TOOLS=all exposes every bridge operation, each with an output schema", async () => {
+  const mcp = startMcp(await findFreePort(), { PI_CONTROL_CHROME_TOOLS: "all" });
+  try {
+    mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+    await mcp.nextMessage();
+    mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const listed = await mcp.nextMessage();
+    const names = listed.result.tools.map((tool) => tool.name);
+    assert.equal(names.length, 44);
+    // Operations the Codex-aligned default leaves out, and that a node_repl-shaped
+    // client needs for ordinary work: opening a tab, navigating, reading the console.
+    for (const name of ["browser_navigate", "browser_new_tab", "browser_close_tab", "browser_screenshot", "browser_console", "browser_network", "browser_claim_tab"]) {
+      assert.ok(names.includes(name), `PI_CONTROL_CHROME_TOOLS=all must expose ${name}`);
+    }
+  } finally {
+    mcp.child.stdin.end();
+    await stopProcess(mcp.child);
+  }
+});
+
+test("PI_CONTROL_CHROME_TOOLS rejects an unknown tool name at startup", async () => {
+  const mcp = startMcp(await findFreePort(), { PI_CONTROL_CHROME_TOOLS: "browser_not_a_tool" });
+  if (mcp.child.exitCode === null) {
+    await new Promise((resolve) => mcp.child.once("exit", resolve));
+  }
+  assert.notEqual(mcp.child.exitCode, 0, "a typo in the exposure list must fail the server, not silently expose nothing");
+  await stopProcess(mcp.child);
+});
+
+test("Codex MCP tools declare an output schema and answer with matching structuredContent", async () => {
+  const bridgePort = await findFreePort();
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-output-schema-test-"));
+  const tokenFile = join(temp, "token");
+  const bridge = spawn(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let extension;
+  const mcp = startMcp(bridgePort, { PI_CONTROL_CHROME_TOKEN_FILE: tokenFile });
+  const identity = {
+    browser: "edge",
+    browserId: "edge:output-schema-test",
+    profile: "output-schema-test",
+    capabilities: { pageWaitStates: true, tabIncarnationFence: true },
+  };
+  const tabRow = {
+    id: 7, windowId: 1, index: 0, active: true, pinned: false, title: "Example", url: "https://example.test/",
+    status: "complete", groupId: -1, owner: "user", stale: false, handle: { tabId: 7, tabFence: "tab:output-schema" },
+  };
+  try {
+    await waitHealth(bridgePort);
+    const token = readFileSync(tokenFile, "utf8").trim();
+    extension = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=extension&token=${encodeURIComponent(token)}`);
+    await new Promise((resolve, reject) => { extension.once("open", resolve); extension.once("error", reject); });
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, ...identity }));
+    await sleep(30);
+    extension.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type !== "request") return;
+      if (message.method === "status") extension.send(JSON.stringify({ type: "response", id: message.id, result: identity }));
+      if (message.method === "list_tabs") extension.send(JSON.stringify({ type: "response", id: message.id, result: { tabs: [tabRow], totalTabs: 1 } }));
+    });
+
+    mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+    await mcp.nextMessage();
+    mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const listed = await mcp.nextMessage();
+    for (const tool of listed.result.tools) {
+      assert.equal(tool.outputSchema?.type, "object", `${tool.name} must declare an object outputSchema`);
+    }
+
+    mcp.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
+      name: "browser_status",
+      arguments: { browserId: identity.browserId, acknowledgeBrowserId: identity.browserId },
+    } });
+    assert.equal((await mcp.nextMessage()).result.isError, undefined);
+
+    mcp.send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "browser_tabs", arguments: {} } });
+    const result = (await mcp.nextMessage()).result;
+    assert.equal(result.isError, undefined);
+    // A caller reads `structuredContent` instead of parsing a JSON string out of a
+    // text block; both carry the same projection, so neither can drift.
+    assert.equal(typeof result.structuredContent, "object");
+    assert.deepEqual(result.structuredContent, JSON.parse(result.content[0].text));
+    assert.equal(result.structuredContent.tabs.length, 1);
+    assert.equal(result.structuredContent.tabs[0].url, tabRow.url);
+  } finally {
+    mcp.child.stdin.end();
+    await stopProcess(mcp.child);
+    extension?.close();
+    await stopProcess(bridge);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+

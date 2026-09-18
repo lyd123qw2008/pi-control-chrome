@@ -248,7 +248,15 @@ const ALL_TOOLS = [
   tool("browser_cleanup", "Only after the user explicitly asks for browser cleanup: close allowed Agent tabs, release claims and recover stale ownership only when explicitly requested.", "cleanup", schema({ recoverStale: boolean() })),
   tool("browser_context_reset", "Only after the user explicitly asks to reset or clear browser context: finalize this Codex browser session while keeping the shared Bridge alive.", "cleanup", schema(), () => ({ mode: "context" })),
 ];
-const EXPOSED_TOOL_NAMES = new Set([
+// The Codex-aligned default: operations that work on tabs the user already has,
+// kept small because this server's tool list is the caller's model-visible
+// catalog. A node_repl-shaped client instead reads the list once at startup and
+// projects it into a kernel, so it wants the complete surface; an explicit
+// comma-separated list selects any other subset.
+//
+// Exposure is decided once, here, so a session's catalog never changes while it
+// runs — the invariant every consumer of this server relies on.
+const DEFAULT_EXPOSED_TOOL_NAMES = new Set([
   "browser_status",
   "browser_targets",
   "browser_target_lease",
@@ -263,7 +271,179 @@ const EXPOSED_TOOL_NAMES = new Set([
   "browser_click",
   "browser_fill",
 ]);
-const TOOLS = ALL_TOOLS.filter(({ name }) => EXPOSED_TOOL_NAMES.has(name));
+
+function selectExposedTools(requested) {
+  const want = typeof requested === "string" ? requested.trim() : "";
+  if (want === "") return ALL_TOOLS.filter(({ name }) => DEFAULT_EXPOSED_TOOL_NAMES.has(name));
+  if (want === "all" || want === "*") return ALL_TOOLS;
+  const names = want.split(",").map((entry) => entry.trim()).filter(Boolean);
+  const known = new Set(ALL_TOOLS.map(({ name }) => name));
+  const unknown = names.filter((name) => !known.has(name));
+  if (unknown.length > 0) throw new Error(`PI_CONTROL_CHROME_TOOLS lists unknown tools: ${unknown.join(", ")}`);
+  return ALL_TOOLS.filter(({ name }) => names.includes(name));
+}
+
+// Every bridge operation answers with a decorated JSON object, so each tool can
+// declare `outputSchema` and answer with `structuredContent` as well as the text
+// block. Without it a caller can only guess whether a result carries `tabs`,
+// `items` or `files`, and must JSON.parse a string out of a text block to find
+// out.
+//
+// `additionalProperties: true` is deliberate: the bridge's per-operation payload
+// grows over time, and an output schema stricter than reality would reject valid
+// results in clients that validate. The fields named here are the ones this
+// server can state from the bridge's own contract; anything else a caller needs
+// it can read off the object at runtime.
+const RESULT_ENVELOPE = {
+  browserId: string("Connected browser target this result came from."),
+  profile: string("Browser profile id."),
+  connectionId: string(),
+  connectionGeneration: integer(),
+};
+const outputObject = (properties, description) => ({
+  type: "object",
+  ...(description ? { description } : {}),
+  properties: { ...RESULT_ENVELOPE, ...properties },
+  additionalProperties: true,
+});
+
+// Field types below are MEASURED against real responses from this Bridge, never
+// inferred: a declared schema is enforced by validating clients — the SDK rejects a
+// `structuredContent` that does not match — so a wrong guess fails the call instead of
+// merely documenting it badly. Two from the first pass: `browser_console`'s `baseline`
+// is an object (declared as a string, which broke the call outright) and
+// `browser_close_tab`'s `closed` is a number (declared as a boolean). A field absent
+// from a given response is fine, because nothing here is `required`.
+const TOOL_OUTPUT_SCHEMAS = Object.freeze({
+  browser_status: outputObject({
+    connected: boolean("Whether a browser target is connected."),
+    state: string(),
+    browser: string('Browser family, e.g. "edge".'),
+    extensionVersion: string(),
+    connectedAt: integer(),
+    capabilityRevision: integer("Revision of the advertised capability set."),
+    bridge: openObject("Bridge health: ok, version, port, extensionConnected, readyTargets."),
+    targetStability: openObject("Target stability: stable, changed, acknowledged, requiresAcknowledgement, competition."),
+  }, "One small connection read; per-request metrics and recovery detail live in browser_doctor."),
+  browser_tabs: outputObject({
+    tabs: array(openObject(), "Tab rows: id, browserId, windowId, index, active, pinned, title, url, status, groupId, owner, stale, handle, sessionScope."),
+    totalTabs: integer(),
+    matchedTabs: integer("Rows matched before the limit applied."),
+    omittedTabs: integer("Rows dropped by the limit or the hard cap."),
+    nextAction: string(),
+    recommendation: string(),
+    groups: array(openObject(), "Tab groups."),
+  }, "The complete tab listing unless query, owner or limit narrowed it."),
+  browser_snapshot: outputObject({
+    tabId: number(),
+    tab: openObject("The tab this snapshot came from."),
+    snapshot: openObject("Bounded semantic Page Map: title, url, snapshotId, nodes and eN refs."),
+  }, "Active page title and bounded semantic Page Map."),
+  browser_accessibility_snapshot: outputObject({
+    tabId: number(),
+    tab: openObject(),
+    snapshotId: string(),
+    mode: string("full, diff or unchanged."),
+    state: string(),
+    nodeCount: integer(),
+    changedNodeCount: integer(),
+    charCount: integer(),
+    truncated: boolean(),
+    nextAction: string(),
+    recommendation: string(),
+    recovery: string(),
+  }),
+  browser_extract: outputObject({
+    tabId: number(),
+    tab: openObject(),
+    content: openObject("Extracted content plus any bound that applied."),
+    truncated: boolean(),
+    omitted: openObject(),
+    nextAction: string(),
+    recommendation: string(),
+    recovery: string(),
+  }),
+  browser_wait: outputObject({
+    tab: openObject(),
+    condition: string(),
+    matched: boolean(),
+    matchedText: string(),
+    terminalState: string(),
+  }, "Wait outcome. Text waits also report matchedText and terminalState."),
+  browser_targets: outputObject({
+    state: string(),
+    targets: array(openObject(), "Connected browser targets, each with browserId, browser and profile."),
+    bridgeHealth: openObject(),
+  }),
+  browser_target_lease: outputObject({
+    ok: boolean(),
+    action: string(),
+    leases: array(openObject(), "Current target leases."),
+    observability: openObject(),
+  }),
+  browser_doctor: outputObject({
+    ok: boolean(),
+    state: string(),
+    recommendation: string(),
+    bridgeHealth: openObject(),
+    targets: array(openObject()),
+    issues: array(openObject()),
+    notices: array(openObject()),
+  }, "Diagnosis rather than a page read; it changes no tabs."),
+  browser_selected: outputObject({
+    tab: openObject("The currently selected tab."),
+  }),
+  browser_navigate: outputObject({
+    tab: openObject("The navigated tab, including any transitionPending marker."),
+  }),
+  browser_new_tab: outputObject({
+    tab: openObject("The created Agent-owned tab."),
+    currentAgentSessionId: string(),
+    groupId: number(),
+    tabFence: string(),
+  }),
+  browser_download: outputObject({
+    downloads: array(openObject(), "Download entries."),
+  }),
+  browser_close_tab: outputObject({
+    closed: number("How many tabs the call closed."),
+  }),
+  browser_console: outputObject({
+    tabId: number(),
+    logs: array(openObject(), "Console entries: level, text and timestamp."),
+    logCount: integer(),
+    logTotalCount: integer(),
+    logCharCount: integer(),
+    logTruncated: boolean(),
+    maxLogChars: integer(),
+    maxLogs: integer(),
+    only: string(),
+    baseline: openObject("Revision marker for incremental reads; an object, not a string."),
+    nextSince: string("Cursor for the next incremental read."),
+  }, "Debugger-backed read; enable first when the listing is empty."),
+  browser_network: outputObject({
+    tabId: number(),
+    requests: array(openObject(), "Request entries, each with requestId and loaderId."),
+    requestCount: integer(),
+    requestTotalCount: integer(),
+    requestCharCount: integer(),
+    requestTruncated: boolean(),
+    maxRequestChars: integer(),
+    maxRequests: integer(),
+  }, "Debugger-backed read; pass both requestId and its loaderId to fetch a response body."),
+  browser_screenshot: outputObject({
+    tabId: number(),
+    mimeType: string(),
+    path: string("Written when the call supplied path; the image data itself is a content block."),
+  }),
+});
+
+const TOOLS = selectExposedTools(process.env.PI_CONTROL_CHROME_TOOLS)
+  .map((entry) => Object.freeze({
+    ...entry,
+    outputSchema: TOOL_OUTPUT_SCHEMAS[entry.name]
+      ?? outputObject({}, "The bridge operation's JSON result, decorated with the envelope below."),
+  }));
 const TOOL_MAP = new Map(TOOLS.map((entry) => [entry.name, entry]));
 const COMPACT_READS = new Set(["browser_snapshot", "browser_extract", "browser_accessibility_snapshot", "browser_tabs", "browser_selected"]);
 const MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100, consoleChars: 4_000, consoleEvents: 40 });
@@ -545,11 +725,31 @@ function jsonText(value) {
   try { return JSON.stringify(value ?? null); } catch { return "null"; }
 }
 
+/** MCP `structuredContent` must be an object; arrays and scalars stay text-only. */
+function structuredResult(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
 function toolResult(name, value, args) {
-  if (name !== "browser_screenshot") return { content: [{ type: "text", text: jsonText(compactBrowserResult(name, { ...args, sessionId: SESSION_ID }, value)) }] };
+  if (name !== "browser_screenshot") {
+    // The text block and the structured form carry the same projection, so a
+    // caller that reads `structuredContent` sees exactly what it sees in the text.
+    const projected = compactBrowserResult(name, { ...args, sessionId: SESSION_ID }, value);
+    const structured = structuredResult(projected);
+    return {
+      content: [{ type: "text", text: jsonText(projected) }],
+      ...(structured === undefined ? {} : { structuredContent: structured }),
+    };
+  }
   const result = value && typeof value === "object" ? value : {};
   const { data, ...metadata } = result;
-  if (typeof data !== "string" || data.length === 0) return { content: [{ type: "text", text: jsonText(value) }] };
+  if (typeof data !== "string" || data.length === 0) {
+    const structured = structuredResult(value);
+    return {
+      content: [{ type: "text", text: jsonText(value) }],
+      ...(structured === undefined ? {} : { structuredContent: structured }),
+    };
+  }
   if (typeof args.path === "string" && args.path.length > 0) {
     const path = resolve(args.path);
     mkdirSync(dirname(path), { recursive: true });
@@ -561,6 +761,7 @@ function toolResult(name, value, args) {
       { type: "text", text: jsonText(metadata) },
       { type: "image", data, mimeType: typeof result.mimeType === "string" ? result.mimeType : "image/png" },
     ],
+    structuredContent: metadata,
   };
 }
 
@@ -637,7 +838,7 @@ async function handleMessage(message) {
   }
   if (message.method === "tools/list") {
     if (message.id === undefined) return;
-    response(message.id, { tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
+    response(message.id, { tools: TOOLS.map(({ name, description, inputSchema, outputSchema }) => ({ name, description, inputSchema, outputSchema })) });
     return;
   }
   if (message.method !== "tools/call") {
