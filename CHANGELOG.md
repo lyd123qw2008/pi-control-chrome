@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add a cache-clean progressive DSH browser exposure mode with a fixed three-tool core facade (`browser_capabilities`, `browser_call`, `browser_status`), shared operation registry/executor, per-operation capability discovery, and legacy `lazy-full` compatibility. All operations, including confirmation-protected lifecycle operations, dispatch through `browser_call`; discovery and dispatch do not mutate the model-visible tool set.
+- Bump the progressive host API revision to `browser-api-v2` and require `arguments.confirmed: true` for confirmation-protected lifecycle operations dispatched through the progressive facade.
+
 ## 0.6.2 - 2026-09-15
 
 - Finish what 0.6.1 started for inherited tabs. 0.6.1 let close, release and cleanup cross an extension-runtime generation, but they still compared the live tab fence against the fence stored in the record — and a replaced runtime cannot reproduce that fence by definition. A real leftover tab therefore answered `BROWSER_TAB_FENCE_CHANGED` and stayed unclosable, the same wall one check deeper (observed live: the record carried `tab:bb6803dd…` while the new runtime reported `tab:d0f05bd3…`). Closing, releasing or cleaning up an inherited **Agent** record now identifies the tab by its tabId plus this session's own ownership record and uses the fence the current runtime actually observes; a `claimed` user tab keeps the stricter treatment, and document-bound work still refuses with `BROWSER_TAB_RUNTIME_INHERITED` and the exit that works. Verified live: the tab left behind by an earlier runtime closed cleanly.

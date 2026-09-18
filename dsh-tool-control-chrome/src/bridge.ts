@@ -46,6 +46,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
   const bridgePort = config.bridgePort ?? DEFAULT_PORT
   const requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS
   const extensionReadyTimeoutMs = config.extensionReadyTimeoutMs ?? DEFAULT_EXTENSION_READY_TIMEOUT_MS
+  const exposureMode = config.exposureMode ?? 'lazy-full'
+  if (exposureMode !== 'lazy-full' && exposureMode !== 'progressive') throw new Error(`control-chrome exposureMode must be lazy-full or progressive: ${exposureMode}`)
   if (!LOOPBACK_HOSTS.has(bridgeHost)) throw new Error(`control-chrome bridgeHost must be loopback: ${bridgeHost}`)
   if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65_535) {
     throw new Error(`control-chrome bridgePort must be an integer from 1 to 65535: ${bridgePort}`)
@@ -64,6 +66,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     requestTimeoutMs,
     extensionReadyTimeoutMs,
     lazyTools: config.lazyTools ?? true,
+    exposureMode,
     ...(config.bridgeScript === undefined ? {} : { bridgeScript: config.bridgeScript }),
   }
 }

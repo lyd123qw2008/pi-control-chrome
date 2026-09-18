@@ -11,6 +11,23 @@ import * as controlChrome from '../src/index.js'
 
 const readSkill = (path: string): string => readFileSync(path, 'utf8').replace(/\r\n?/gu, '\n')
 
+async function installSettings(ctx: Context, resolved: Record<string, unknown> = {}): Promise<void> {
+  const settings = {
+    register(_namespace: string, _schema: unknown, options: { base?: Record<string, unknown> }) {
+      return {
+        get: () => ({ ...options.base, ...resolved }),
+        watch: () => () => {},
+      }
+    },
+  }
+  await ctx.plugin({
+    name: 'test-settings-service',
+    apply(context) {
+      context.provide('settings', settings as never)
+    },
+  })
+}
+
 describe('dsh-tool-control-chrome real load path', () => {
   it('keeps the function-plugin namespace through Loader unwrapping', () => {
     expect('default' in controlChrome).toBe(false)
@@ -36,6 +53,66 @@ describe('dsh-tool-control-chrome real load path', () => {
     expect(tools.schemas().filter(schema => schema.name.startsWith('browser_'))).toHaveLength(0)
     await fiber.dispose()
     expect(tools.schemas()).toHaveLength(0)
+  })
+
+  it('registers the fixed progressive facade from plugin startup without raw schemas', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(CommandRuntime)
+    await installSettings(ctx)
+    const loader = Object.create(Loader.prototype) as Loader
+    const unwrapped = loader.unwrapExports(controlChrome) as Parameters<Context['plugin']>[0]
+    const fiber = await ctx.plugin(unwrapped, { autoStartBridge: false, exposureMode: 'progressive' })
+    const tools = ctx.get('tools') as { schemas(): readonly { name: string }[] }
+    const names = tools.schemas().map(schema => schema.name)
+    expect(names).toEqual([...controlChrome.PROGRESSIVE_BROWSER_TOOL_NAMES])
+    expect(names).not.toEqual(expect.arrayContaining(controlChrome.BROWSER_TOOL_NAMES))
+    await fiber.dispose()
+    expect(tools.schemas()).toHaveLength(0)
+  })
+
+  it('waits for delayed settings instead of permanently capturing lazy-full', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(CommandRuntime)
+    const loader = Object.create(Loader.prototype) as Loader
+    const unwrapped = loader.unwrapExports(controlChrome) as Parameters<Context['plugin']>[0]
+    const fiber = await ctx.plugin(unwrapped, { autoStartBridge: false })
+    const tools = ctx.get('tools') as { schemas(): readonly { name: string }[] }
+    expect(tools.schemas()).toHaveLength(0)
+    await installSettings(ctx, { exposureMode: 'progressive' })
+    expect(tools.schemas().map(schema => schema.name)).toEqual([...controlChrome.PROGRESSIVE_BROWSER_TOOL_NAMES])
+    await fiber.dispose()
+    expect(tools.schemas()).toHaveLength(0)
+  })
+
+  it('uses the resolved settings section before choosing the progressive catalog', async () => {
+    const settings = {
+      register(_namespace: string, _schema: unknown, options: { base?: Record<string, unknown> }) {
+        return {
+          get: () => ({ ...options.base, exposureMode: 'progressive' }),
+          watch: () => () => {},
+        }
+      },
+    }
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(CommandRuntime)
+    await ctx.plugin({
+      name: 'test-settings-service',
+      apply(context) {
+        context.provide('settings', settings as never)
+      },
+    })
+    const loader = Object.create(Loader.prototype) as Loader
+    const unwrapped = loader.unwrapExports(controlChrome) as Parameters<Context['plugin']>[0]
+    const fiber = await ctx.plugin(unwrapped, { autoStartBridge: false })
+    const tools = ctx.get('tools') as { schemas(): readonly { name: string }[] }
+    expect(tools.schemas().map(schema => schema.name)).toEqual([...controlChrome.PROGRESSIVE_BROWSER_TOOL_NAMES])
+    await fiber.dispose()
   })
 
   it('registers and lazily loads the bundled Skill when the provider service is present', async () => {
@@ -152,6 +229,7 @@ describe('dsh-tool-control-chrome real load path', () => {
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(CommandRuntime)
+    await installSettings(ctx)
     const loader = Object.create(Loader.prototype) as Loader
     const unwrapped = loader.unwrapExports(controlChrome) as Parameters<Context['plugin']>[0]
     const fiber = await ctx.plugin(unwrapped, { autoStartBridge: false, lazyTools: false })

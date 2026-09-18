@@ -3,6 +3,8 @@
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 
 /** Plugin configuration accepted by Cordis and the settings section. */
+export type BrowserExposureMode = 'lazy-full' | 'progressive'
+
 export interface Config {
   /** Loopback host where the local Bridge listens. The checked-in extension uses `127.0.0.1`; custom hosts require a matching extension build. Defaults to `127.0.0.1`. */
   bridgeHost?: string
@@ -12,8 +14,10 @@ export interface Config {
   tokenFile?: string
   /** Start the bundled Bridge when no healthy Bridge is running. Defaults to true. */
   autoStartBridge?: boolean
-  /** Register browser tools only after the pi-control-chrome Skill loads. Defaults to true. */
+  /** Register browser tools only after the pi-control-chrome Skill loads. Defaults to true for lazy-full mode. */
   lazyTools?: boolean
+  /** Keep a fixed browser facade from session start and discover operations through tool results. */
+  exposureMode?: BrowserExposureMode
   /** Per-request Bridge timeout in milliseconds. Defaults to 120000. */
   requestTimeoutMs?: number
   /** Time to wait for the extension's background reconnect before reporting a disconnected state. Defaults to 6000. */
@@ -31,6 +35,7 @@ export interface ResolvedConfig {
   readonly requestTimeoutMs: number
   readonly extensionReadyTimeoutMs: number
   readonly lazyTools: boolean
+  readonly exposureMode: BrowserExposureMode
   readonly bridgeScript?: string
 }
 

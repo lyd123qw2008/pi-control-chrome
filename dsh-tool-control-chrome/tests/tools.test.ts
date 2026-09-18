@@ -6,7 +6,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { BrowserBridgeClient } from '../src/bridge.js'
 import { BROWSER_SKILL_NAME } from '../src/skill.js'
-import { BROWSER_TOOL_NAMES, browserToolCatalog, registerBrowserTools } from '../src/tools.js'
+import { BROWSER_API_REVISION, BROWSER_TOOL_NAMES, PROGRESSIVE_BROWSER_TOOL_NAMES, browserCapabilityCatalog, browserOperationRegistry, browserToolCatalog, registerBrowserTools } from '../src/tools.js'
 
 const lifecycleContract = JSON.parse(readFileSync(new URL('../../tests/fixtures/browser-lifecycle-contract.json', import.meta.url), 'utf8')) as {
   readonly restart: {
@@ -53,7 +53,7 @@ function agentContext(tools: Map<string, ToolDefinition>): Context {
 function setup(
   bridge: Pick<BrowserBridgeClient, 'request' | 'health'> & Partial<Pick<BrowserBridgeClient, 'start' | 'restart'>>,
   attachments?: AttachmentStore,
-  options: { lazyTools?: boolean; activate?: boolean; extensionReadyTimeoutMs?: number } = {},
+  options: { lazyTools?: boolean; activate?: boolean; exposureMode?: 'lazy-full' | 'progressive'; extensionReadyTimeoutMs?: number } = {},
 ): Harness {
   const globalTools = new Map<string, ToolDefinition>()
   const perAgentTools = new Map<Agent['session'], Map<string, ToolDefinition>>()
@@ -98,6 +98,7 @@ function setup(
     requestTimeoutMs: 120_000,
     extensionReadyTimeoutMs: options.extensionReadyTimeoutMs ?? 0,
     lazyTools,
+    exposureMode: options.exposureMode ?? 'lazy-full',
   })
   const bridgeClient = { start: vi.fn(async () => {}), ...bridge } as unknown as BrowserBridgeClient
   const disposePlugin = registerBrowserTools(rootContext, bridgeClient, attachments, resolveSettings)
@@ -195,6 +196,89 @@ describe('DSH browser tool catalog', () => {
     expect(accessibility?.prepare).toBeUndefined()
     expect(network?.parameters).not.toHaveProperty('timeoutMs')
     expect(download?.parameters).not.toHaveProperty('tabId')
+  })
+
+  it('publishes every raw tool through one stable operation registry and capability group', () => {
+    expect([...browserOperationRegistry.keys()]).toEqual(BROWSER_TOOL_NAMES)
+    expect(browserOperationRegistry.size).toBe(BROWSER_TOOL_NAMES.length)
+    expect(browserCapabilityCatalog.map(group => group.id)).toEqual(['bootstrap', 'observe', 'navigate', 'interact', 'advanced', 'lifecycle'])
+    expect(browserCapabilityCatalog.reduce((count, group) => count + group.operations.length, 0)).toBe(BROWSER_TOOL_NAMES.length)
+    for (const name of BROWSER_TOOL_NAMES) {
+      const operation = browserOperationRegistry.get(name)
+      expect(operation).toBeDefined()
+      expect(operation?.description.length).toBeGreaterThan(0)
+      expect(operation?.group).toBeDefined()
+      expect(operation?.safety).toBeDefined()
+    }
+  })
+
+  it('registers a fixed progressive facade before Skill and never changes it after discovery or calls', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true } }
+      : { ok: true })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { exposureMode: 'progressive', activate: false })
+    const initialNames = [...harness.globalTools.keys()]
+    expect(initialNames).toEqual([...PROGRESSIVE_BROWSER_TOOL_NAMES])
+    expect(initialNames).not.toEqual(expect.arrayContaining(BROWSER_TOOL_NAMES))
+    await harness.invokeUserSkill(harness.agent)
+    expect([...harness.globalTools.keys()]).toEqual(initialNames)
+
+    const capabilities = await harness.globalTools.get('browser_capabilities')?.execute({ group: 'observe' }, execution(harness.agent))
+    expect(capabilities).toMatchObject({ apiRevision: BROWSER_API_REVISION, group: { id: 'observe' } })
+    expect(request).not.toHaveBeenCalled()
+
+    const schema = await harness.globalTools.get('browser_capabilities')?.execute({ operation: 'browser_snapshot', detail: 'schema' }, execution(harness.agent))
+    expect(schema).toMatchObject({ apiRevision: BROWSER_API_REVISION, operation: 'browser_snapshot', schema: { properties: expect.objectContaining({ responseMode: expect.anything() }) } })
+    expect(health).not.toHaveBeenCalled()
+
+    const cleanupSchema = await harness.globalTools.get('browser_capabilities')?.execute({ operation: 'browser_cleanup', detail: 'schema' }, execution(harness.agent))
+    expect(cleanupSchema).toMatchObject({
+      apiRevision: BROWSER_API_REVISION,
+      operation: 'browser_cleanup',
+      safety: 'confirmation_required',
+      dispatchable: true,
+      requiredParameters: ['confirmed'],
+      schema: { properties: expect.objectContaining({ confirmed: expect.objectContaining({ type: 'boolean' }) }) },
+    })
+    expect(health).not.toHaveBeenCalled()
+
+    const status = await harness.globalTools.get('browser_call')?.execute({ operation: 'browser_status', arguments: {}, apiRevision: BROWSER_API_REVISION }, execution(harness.agent))
+    expect(status).toMatchObject({ apiRevision: BROWSER_API_REVISION, operation: 'browser_status', result: expect.objectContaining({ browserId: 'edge:test' }) })
+    expect([...harness.globalTools.keys()]).toEqual(initialNames)
+  })
+
+  it('fails closed for unknown, stale and unconfirmed progressive operations', async () => {
+    const request = vi.fn(async () => ({ connected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { exposureMode: 'progressive', activate: false })
+    const call = harness.globalTools.get('browser_call')
+    await expect(call?.execute({ operation: 'browser_missing', arguments: {} }, execution(harness.agent))).rejects.toMatchObject({ code: 'BROWSER_UNKNOWN_OPERATION' })
+    await expect(call?.execute({ operation: 'browser_status', arguments: {}, apiRevision: 'browser-api-v0' }, execution(harness.agent))).rejects.toMatchObject({ code: 'BROWSER_CAPABILITY_REVISION_MISMATCH' })
+    await expect(call?.execute({ operation: 'browser_cleanup', arguments: {} }, execution(harness.agent))).rejects.toMatchObject({ code: 'BROWSER_INVALID_OPERATION_ARGUMENTS' })
+    await expect(call?.execute({ operation: 'browser_cleanup', arguments: { confirmed: false } }, execution(harness.agent))).rejects.toMatchObject({ code: 'BROWSER_OPERATION_CONFIRMATION_REQUIRED' })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('dispatches confirmation-protected lifecycle operations through browser_call after explicit confirmation', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current' }
+      : { ok: true, retained: [] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { exposureMode: 'progressive', activate: false })
+    const call = harness.globalTools.get('browser_call')
+    const result = await call?.execute({ operation: 'browser_cleanup', arguments: { confirmed: true }, apiRevision: BROWSER_API_REVISION }, execution(harness.agent))
+    expect(result).toMatchObject({ apiRevision: BROWSER_API_REVISION, operation: 'browser_cleanup' })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('validates progressive operation arguments with the raw operation schema', async () => {
+    const request = vi.fn(async () => ({ connected: true }))
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { exposureMode: 'progressive', activate: false })
+    const call = harness.globalTools.get('browser_call')
+    await expect(call?.execute({ operation: 'browser_navigate', arguments: {} }, execution(harness.agent))).rejects.toMatchObject({ code: 'BROWSER_INVALID_OPERATION_ARGUMENTS' })
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('hides the full browser catalog until the named Skill succeeds, then scopes it to one Agent', () => {
@@ -1620,6 +1704,26 @@ describe('DSH browser tool catalog', () => {
     expect(request.mock.calls.filter(([method]) => method === 'cleanup')).toHaveLength(1)
   })
 
+  it('keeps the progressive facade after cleanup and context reset', async () => {
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.3.7', capabilities: { turnCleanup: true, turnScopedMarks: true, retainedCleanup: true, debuggerLeaseRecovery: true, tabIncarnationFence: true } }
+      : { removed: [7], released: [8], retained: [] })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test' }))
+    const harness = setup({ request, health }, undefined, { exposureMode: 'progressive', activate: false })
+    const initialNames = [...harness.globalTools.keys()]
+    await harness.globalTools.get('browser_status')?.execute({}, execution(harness.agent))
+    const cleanupExec = execution(harness.agent)
+    await harness.globalTools.get('browser_cleanup')?.execute({}, cleanupExec)
+    harness.complete(harness.agent, 'browser_cleanup', false, cleanupExec)
+    await Promise.resolve()
+    expect([...harness.globalTools.keys()]).toEqual(initialNames)
+    const resetExec = execution(harness.agent)
+    await harness.globalTools.get('browser_context_reset')?.execute({}, resetExec)
+    harness.complete(harness.agent, 'browser_context_reset', false, resetExec)
+    await Promise.resolve()
+    expect([...harness.globalTools.keys()]).toEqual(initialNames)
+  })
+
   it('keeps automatic turn cleanup retryable when the extension reports failed tabs', async () => {
     let cleanupCalls = 0
     const request = vi.fn(async (method: string) => {
@@ -2008,6 +2112,23 @@ describe('DSH browser tool catalog', () => {
     const tool = harness.tools.get('browser_screenshot')
     const value = await tool?.execute({ tabId: 7 }, execution(harness.agent))
     expect(value).toEqual({ tabId: 7, mimeType: 'image/png', attachment: ref })
+    expect(saveImage).toHaveBeenCalledOnce()
+    const content = tool?.output.render({}, value as never)
+    expect(content?.[1]).toEqual({ type: 'image', attachment: ref })
+  })
+
+  it('preserves screenshot attachments through the progressive dispatcher envelope', async () => {
+    const ref = { attachmentId: 'progressive-attachment-1', mediaType: 'image/png', bytes: 3, width: 1, height: 1 } as unknown as ImageAttachmentRef
+    const saveImage = vi.fn(async () => ref)
+    const attachments = { saveImage } as unknown as AttachmentStore
+    const request = vi.fn(async (method: string) => method === 'status'
+      ? { connected: true, browser: 'edge', browserId: 'edge:test', profile: 'current', extensionVersion: '0.2.4', capabilities: { tabIncarnationFence: true } }
+      : { tabId: 7, data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' })
+    const health = vi.fn(async () => ({ ok: true, extensionConnected: true, browserId: 'edge:test', capabilities: { tabIncarnationFence: true } }))
+    const harness = setup({ request, health }, attachments, { exposureMode: 'progressive', activate: false })
+    const tool = harness.globalTools.get('browser_call')
+    const value = await tool?.execute({ operation: 'browser_screenshot', arguments: { tabId: 7 }, apiRevision: BROWSER_API_REVISION }, execution(harness.agent))
+    expect(value).toEqual({ apiRevision: BROWSER_API_REVISION, operation: 'browser_screenshot', result: { tabId: 7, mimeType: 'image/png', attachment: ref } })
     expect(saveImage).toHaveBeenCalledOnce()
     const content = tool?.output.render({}, value as never)
     expect(content?.[1]).toEqual({ type: 'image', attachment: ref })

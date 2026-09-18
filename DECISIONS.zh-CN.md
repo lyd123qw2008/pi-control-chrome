@@ -248,3 +248,15 @@ browser_cleanup
 6. 能力声明（如 `waitTerminalStates`、`extractLogMatch`）是强制点：插件不识别产品终态字符串，陈旧运行时被拒绝而非静默降级。
 
 详细背景与示例见 [`ARCHITECTURE.zh-CN.md`](./ARCHITECTURE.zh-CN.md) 的"六点五、能力层与个性化层边界"，模型侧调用约定见 [`skills/pi-control-chrome/references/workflows.md`](./skills/pi-control-chrome/references/workflows.md)。
+
+## 11. DSH 渐进式工具暴露
+
+DSH 的 cache-clean 浏览器模式使用固定 facade，而不是在会话中途注册或注销 raw browser tools：
+
+```text
+browser_capabilities → 返回能力组/单 operation schema
+browser_call         → 按固定 schema 派发已登记 operation
+browser_status       → 在第一次真实浏览器操作前检查 Bridge/target
+```
+
+三个核心工具从 progressive 会话开始就存在，能力说明通过 tool result/message 传递，因此不会改变 provider prefix 中的 `tools`。raw `browser_*` 工具与 dispatcher 共享 operation registry 和 executor；unknown operation、过期 host API revision 和不合法参数均 fail closed。确认型 lifecycle operation 通过 `browser_call.arguments.confirmed: true` 保持显式用户确认语义，host API revision 为 `browser-api-v2`。`lazy-full` 仍作为 Pi/兼容路径保留，progressive 不改变 Bridge 协议、target fence、tab lease、cleanup、确认和不自动重放的安全语义。

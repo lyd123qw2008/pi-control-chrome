@@ -8,6 +8,8 @@ import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deeps
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
   defineTool,
+  parameterSchemaSpecToJsonSchema,
+  validateArgs,
   type JsonValue,
   type ParameterPropertySpec,
   type ParameterSchemaSpec,
@@ -271,7 +273,7 @@ class BrowserTargetTracker {
   }
 }
 
-interface BrowserToolSpec {
+export interface BrowserToolSpec {
   readonly name: string
   readonly description: string
   readonly parameters: ParameterSchemaSpec
@@ -620,7 +622,7 @@ const CORE_TOOLS: readonly BrowserToolSpec[] = [
   },
   {
     name: 'browser_context_reset',
-    description: 'Only after the user explicitly asks to reset or clear browser context: finalize resources and deactivate lazy browser tools without stopping the shared Bridge.',
+    description: 'Only after the user explicitly asks to reset or clear browser context: finalize resources and deactivate the lazy-full raw browser catalog without stopping the shared Bridge. The fixed progressive facade, when configured, remains available.',
     parameters: EMPTY_PARAMETERS,
     method: 'context_reset',
   },
@@ -767,8 +769,244 @@ const ADVANCED_TOOLS: readonly BrowserToolSpec[] = [
 /** All browser tools exposed by the package. */
 export const BROWSER_TOOL_NAMES = [...CORE_TOOLS, ...ADVANCED_TOOLS].map(tool => tool.name)
 
+export type BrowserCapabilityGroup = 'bootstrap' | 'observe' | 'navigate' | 'interact' | 'advanced' | 'lifecycle'
+export type BrowserCapabilitySafety = 'read' | 'side_effect' | 'confirmation_required'
+
+export interface BrowserOperationSpec extends BrowserToolSpec {
+  readonly group: BrowserCapabilityGroup
+  readonly safety: BrowserCapabilitySafety
+  readonly dispatchable: boolean
+}
+
+export interface BrowserCapabilityOperation {
+  readonly name: string
+  readonly group: BrowserCapabilityGroup
+  readonly safety: BrowserCapabilitySafety
+  readonly dispatchable: boolean
+  readonly description: string
+  readonly requiredParameters: readonly string[]
+}
+
+export interface BrowserCapabilityGroupDescriptor {
+  readonly id: BrowserCapabilityGroup
+  readonly description: string
+  readonly operations: readonly string[]
+}
+
+/** Stable host-side revision for the progressive browser operation contract. */
+export const BROWSER_API_REVISION = 'browser-api-v2'
+
+/** Core tools that remain fixed in the cache-clean DSH progressive exposure mode. */
+export const PROGRESSIVE_BROWSER_TOOL_NAMES = [
+  'browser_capabilities',
+  'browser_call',
+  'browser_status',
+] as const
+
+const CAPABILITY_GROUP_ORDER: readonly BrowserCapabilityGroup[] = ['bootstrap', 'observe', 'navigate', 'interact', 'advanced', 'lifecycle']
+const CAPABILITY_GROUP_DESCRIPTIONS: Readonly<Record<BrowserCapabilityGroup, string>> = {
+  bootstrap: 'Inspect Bridge readiness, browser targets and diagnostics.',
+  observe: 'Read tabs and bounded semantic page state.',
+  navigate: 'Navigate tabs and wait for page state transitions.',
+  interact: 'Perform semantic, DOM and coordinate page interactions.',
+  advanced: 'Use diagnostics, native CDP and browser integration surfaces.',
+  lifecycle: 'Claim, create, select, release and mark session-owned tabs.',
+}
+const BOOTSTRAP_OPERATION_NAMES = new Set(['browser_doctor', 'browser_status', 'browser_targets'])
+const OBSERVE_OPERATION_NAMES = new Set(['browser_tabs', 'browser_selected', 'browser_snapshot', 'browser_extract', 'browser_accessibility_snapshot'])
+const NAVIGATE_OPERATION_NAMES = new Set(['browser_navigate', 'browser_wait', 'browser_back', 'browser_forward', 'browser_reload'])
+const INTERACT_OPERATION_NAMES = new Set([
+  'browser_probe_interaction',
+  'browser_click',
+  'browser_double_click',
+  'browser_fill',
+  'browser_type',
+  'browser_press_key',
+  'browser_scroll',
+  'browser_screenshot',
+])
+const CONFIRMATION_OPERATION_NAMES = new Set(['browser_restart', 'browser_reload_extension', 'browser_cleanup', 'browser_context_reset'])
+
+function capabilityGroupFor(spec: BrowserToolSpec): BrowserCapabilityGroup {
+  if (BOOTSTRAP_OPERATION_NAMES.has(spec.name)) return 'bootstrap'
+  if (OBSERVE_OPERATION_NAMES.has(spec.name)) return 'observe'
+  if (NAVIGATE_OPERATION_NAMES.has(spec.name)) return 'navigate'
+  if (INTERACT_OPERATION_NAMES.has(spec.name)) return 'interact'
+  if (ADVANCED_TOOLS.some(candidate => candidate.name === spec.name)) return 'advanced'
+  return 'lifecycle'
+}
+
+function capabilitySafetyFor(spec: BrowserToolSpec): BrowserCapabilitySafety {
+  if (CONFIRMATION_OPERATION_NAMES.has(spec.name)) return 'confirmation_required'
+  if (['browser_doctor', 'browser_status', 'browser_targets', 'browser_tabs', 'browser_selected', 'browser_snapshot', 'browser_extract', 'browser_accessibility_snapshot', 'browser_screenshot'].includes(spec.name)) return 'read'
+  return 'side_effect'
+}
+
+function capabilityDispatchableFor(_spec: BrowserToolSpec): boolean {
+  // The progressive catalog exposes only the three fixed core tools. Every
+  // operation, including confirmation-protected lifecycle operations, is
+  // dispatched through browser_call after its capability schema is discovered.
+  return true
+}
+
+const ALL_BROWSER_SPECS: readonly BrowserToolSpec[] = [...CORE_TOOLS, ...ADVANCED_TOOLS]
+const operationEntries = ALL_BROWSER_SPECS.map(spec => [
+  spec.name,
+  {
+    ...spec,
+    group: capabilityGroupFor(spec),
+    safety: capabilitySafetyFor(spec),
+    dispatchable: capabilityDispatchableFor(spec),
+  },
+] as const)
+
+if (new Set(operationEntries.map(([name]) => name)).size !== operationEntries.length) throw new Error('Browser operation names must be unique')
+
+/** Shared operation registry used by raw tools and the progressive facade. */
+export const browserOperationRegistry: ReadonlyMap<string, BrowserOperationSpec> = new Map(operationEntries)
+
+/** Stable capability group catalog; operation parameters remain lazy. */
+export const browserCapabilityCatalog: readonly BrowserCapabilityGroupDescriptor[] = CAPABILITY_GROUP_ORDER.map(id => ({
+  id,
+  description: CAPABILITY_GROUP_DESCRIPTIONS[id],
+  operations: operationEntries.filter(([, spec]) => spec.group === id).map(([name]) => name),
+}))
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parametersForSpec(spec: BrowserToolSpec): ParameterSchemaSpec {
+  return TAB_HANDLE_METHODS.has(spec.method)
+    ? { ...spec.parameters, handle: spec.name === 'browser_locator' ? LOCATOR_TAB_HANDLE : TAB_HANDLE }
+    : spec.parameters
+}
+
+/** Progressive-only confirmation input for lifecycle operations routed through browser_call. */
+function progressiveParametersForSpec(spec: BrowserToolSpec): ParameterSchemaSpec {
+  const parameters = parametersForSpec(spec)
+  if (!CONFIRMATION_OPERATION_NAMES.has(spec.name) || parameters.confirmed !== undefined) return parameters
+  return {
+    ...parameters,
+    confirmed: {
+      type: 'boolean',
+      required: true,
+      description: 'Must be true only after the user explicitly confirms this lifecycle operation.',
+    },
+  }
+}
+
+function compactCapabilityDescription(value: string): string {
+  const compact = value.replace(/\s+/gu, ' ').trim()
+  return compact.length <= 180 ? compact : `${compact.slice(0, 177)}...`
+}
+
+function requiredParametersFor(spec: BrowserToolSpec, parameters = parametersForSpec(spec)): readonly string[] {
+  return Object.entries(parameters)
+    .filter(([, property]) => property.required === true)
+    .map(([name]) => name)
+}
+
+function capabilityOperationFor(spec: BrowserOperationSpec): BrowserCapabilityOperation {
+  return {
+    name: spec.name,
+    group: spec.group,
+    safety: spec.safety,
+    dispatchable: spec.dispatchable,
+    description: compactCapabilityDescription(spec.description),
+    requiredParameters: requiredParametersFor(spec, progressiveParametersForSpec(spec)),
+  }
+}
+
+function capabilityError(code: string, message: string, details: Record<string, JsonValue> = {}): Error & { readonly code: string; readonly details: JsonValue } {
+  const error = new Error(message) as Error & { code: string; details: JsonValue }
+  error.code = code
+  error.details = asJsonValue(details)
+  return error
+}
+
+function capabilityRevisionError(received: string): Error & { readonly code: string; readonly details: JsonValue } {
+  return capabilityError(
+    'BROWSER_CAPABILITY_REVISION_MISMATCH',
+    `Browser capability revision ${received} is not supported; refresh browser_capabilities before calling an operation.`,
+    { expected: BROWSER_API_REVISION, received, nextAction: 'browser_capabilities' },
+  )
+}
+
+function capabilityOperationError(operation: string): Error & { readonly code: string; readonly details: JsonValue } {
+  return capabilityError(
+    'BROWSER_UNKNOWN_OPERATION',
+    `Unknown browser operation ${operation}; call browser_capabilities to discover the current operation registry.`,
+    { operation, nextAction: 'browser_capabilities' },
+  )
+}
+
+function capabilityGroupError(group: string): Error & { readonly code: string; readonly details: JsonValue } {
+  return capabilityError(
+    'BROWSER_UNKNOWN_CAPABILITY_GROUP',
+    `Unknown browser capability group ${group}; call browser_capabilities without a group to list groups.`,
+    { group, nextAction: 'browser_capabilities' },
+  )
+}
+
+function browserCapabilitiesResult(args: Record<string, JsonValue>): JsonValue {
+  const requestedRevision = typeof args.apiRevision === 'string' && args.apiRevision.length > 0 ? args.apiRevision : undefined
+  if (requestedRevision !== undefined && requestedRevision !== BROWSER_API_REVISION) throw capabilityRevisionError(requestedRevision)
+  const detail = args.detail === undefined ? 'summary' : args.detail
+  if (detail !== 'summary' && detail !== 'schema') throw capabilityError('BROWSER_INVALID_CAPABILITY_DETAIL', 'Capability detail must be summary or schema.', { detail: asJsonValue(detail) })
+  const group = typeof args.group === 'string' && args.group.trim().length > 0 ? args.group.trim() : undefined
+  const operation = typeof args.operation === 'string' && args.operation.trim().length > 0 ? args.operation.trim() : undefined
+  if (operation !== undefined) {
+    const spec = browserOperationRegistry.get(operation)
+    if (spec === undefined) throw capabilityOperationError(operation)
+    if (group !== undefined && spec.group !== group) throw capabilityError('BROWSER_CAPABILITY_OPERATION_GROUP_MISMATCH', `Browser operation ${operation} belongs to ${spec.group}, not ${group}.`, { operation, group, actualGroup: spec.group, nextAction: 'browser_capabilities' })
+    const summary = capabilityOperationFor(spec)
+    if (detail === 'schema') {
+      return asJsonValue({
+        apiRevision: BROWSER_API_REVISION,
+        operation: summary.name,
+        group: summary.group,
+        safety: summary.safety,
+        dispatchable: summary.dispatchable,
+        description: spec.description,
+        requiredParameters: summary.requiredParameters,
+        schema: parameterSchemaSpecToJsonSchema(progressiveParametersForSpec(spec)),
+      })
+    }
+    return asJsonValue({ apiRevision: BROWSER_API_REVISION, operation: summary })
+  }
+  if (group !== undefined) {
+    if (!CAPABILITY_GROUP_ORDER.includes(group as BrowserCapabilityGroup)) throw capabilityGroupError(group)
+    const descriptor = browserCapabilityCatalog.find(candidate => candidate.id === group)
+    if (descriptor === undefined) throw capabilityGroupError(group)
+    const operations = descriptor.operations
+      .map(name => browserOperationRegistry.get(name))
+      .filter((spec): spec is BrowserOperationSpec => spec !== undefined)
+      .map(capabilityOperationFor)
+    return asJsonValue({ apiRevision: BROWSER_API_REVISION, group: { id: descriptor.id, description: descriptor.description, operations } })
+  }
+  return asJsonValue({
+    apiRevision: BROWSER_API_REVISION,
+    groups: browserCapabilityCatalog.map(descriptor => ({
+      id: descriptor.id,
+      description: descriptor.description,
+      operationCount: descriptor.operations.length,
+      operations: descriptor.operations,
+    })),
+    nextAction: 'call browser_capabilities with group or operation and detail=schema',
+  })
+}
+
+const PROGRESSIVE_CAPABILITIES_PARAMETERS: ParameterSchemaSpec = {
+  group: OPTIONAL_STRING,
+  operation: OPTIONAL_STRING,
+  detail: { type: 'string', enum: ['summary', 'schema'], description: 'Return compact operation summaries or one operation schema.' },
+  apiRevision: OPTIONAL_STRING,
+}
+const PROGRESSIVE_CALL_PARAMETERS: ParameterSchemaSpec = {
+  operation: requiredString('Operation name returned by browser_capabilities.'),
+  arguments: { type: 'object', additionalProperties: true, required: true, description: 'Arguments matching the selected operation schema.' },
+  apiRevision: OPTIONAL_STRING,
 }
 
 const TAB_HANDLE_KEYS = new Set([
@@ -960,9 +1198,11 @@ function resultText(value: JsonValue): string {
 
 function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
   const blocks: ContentBlock[] = [{ type: 'text', text: resultText(value) }]
-  if (isRecord(value) && isRecord(value.attachment)) {
-    blocks.push({ type: 'image', attachment: value.attachment as unknown as ImageAttachmentRef })
-  }
+  const directAttachment = isRecord(value) && isRecord(value.attachment) ? value.attachment : undefined
+  const nestedResult = isRecord(value) && isRecord(value.result) ? value.result : undefined
+  const nestedAttachment = nestedResult !== undefined && isRecord(nestedResult.attachment) ? nestedResult.attachment : undefined
+  const attachment = directAttachment ?? nestedAttachment
+  if (attachment !== undefined) blocks.push({ type: 'image', attachment: attachment as unknown as ImageAttachmentRef })
   return blocks
 }
 
@@ -1111,6 +1351,14 @@ function bridgeRestartConfirmationError(): Error & { readonly code: string; read
   error.code = 'BRIDGE_RESTART_CONFIRMATION_REQUIRED'
   error.details = asJsonValue({ requiresUserConfirmation: true })
   return error
+}
+
+function progressiveConfirmationError(operation: string): Error & { readonly code: string; readonly details: JsonValue } {
+  return capabilityError(
+    'BROWSER_OPERATION_CONFIRMATION_REQUIRED',
+    `${operation} requires explicit user confirmation; ask the user before retrying with confirmed=true`,
+    { operation, requiresUserConfirmation: true, nextAction: 'browser_call' },
+  )
 }
 
 function bridgeRestartCancellationError(): Error & { readonly code: string; readonly details: JsonValue } {
@@ -2013,7 +2261,10 @@ export function registerBrowserTools(
   const activeWaitControllers = new Map<AgentSession, Set<AbortController>>()
   const wireBarriers = new Map<string, Promise<void>>()
   const pendingCleanups = new WeakMap<Readonly<ToolExecution>, PendingCleanup>()
-  const lazyTools = resolveSettings().lazyTools
+  const initialSettings = resolveSettings()
+  const lazyTools = initialSettings.lazyTools
+  const progressiveMode = initialSettings.exposureMode === 'progressive'
+  const activationRequired = lazyTools && !progressiveMode
   let closed = false
   let disposePromise: Promise<void> | undefined
   let globalDisposers: (() => void)[] = []
@@ -2454,144 +2705,208 @@ export function registerBrowserTools(
     })()
     return disposePromise
   }
-  const toolFor = (spec: BrowserToolSpec): ReturnType<typeof defineTool> => defineTool({
+  const executeBrowserSpec = async (
+    spec: BrowserOperationSpec,
+    args: Record<string, JsonValue>,
+    exec: ToolRunContext,
+    options: { readonly requireProgressiveConfirmation?: boolean } = {},
+  ): Promise<JsonValue> => {
+    const sessionId = requireAgentSession(exec)
+    const session = requireAgent(exec).session
+    if (closed) throw inactiveBrowserError()
+    const isWaitTool = spec.name === 'browser_wait'
+      || spec.name === 'browser_probe_interaction'
+      || (spec.name === 'browser_navigate' && args.wait !== false)
+      || (spec.name === 'browser_download' && (args.action === 'wait' || (args.action === 'start' && args.wait !== false)))
+      || (spec.name === 'browser_locator' && args.action === 'waitFor')
+    const isRecoveryCleanup = spec.name === 'browser_cleanup' && args.recoverStale === true
+    const waitController = isWaitTool ? new AbortController() : undefined
+    const operationSignal = waitController?.signal ?? exec.signal
+    let removeExecutionAbort = (): void => {}
+    if (waitController !== undefined) {
+      trackWaitController(session, waitController)
+      const onAbort = (): void => { waitController.abort(exec.signal.reason) }
+      if (exec.signal.aborted) onAbort()
+      else {
+        exec.signal.addEventListener('abort', onAbort, { once: true })
+        removeExecutionAbort = () => exec.signal.removeEventListener('abort', onAbort)
+      }
+    }
+    let releaseOperation: (() => void) | undefined
+    try {
+      if (!isWaitTool) releaseOperation = await acquireOperation(session, operationSignal)
+      if (!isRecoveryCleanup) await waitForRetirement(session, operationSignal)
+      if (retiredSessions.has(session)) throw inactiveBrowserError()
+      const activation = activationRequired ? activations.get(session) : undefined
+      if (activationRequired && activation === undefined) throw inactiveBrowserError()
+      await waitForWireBarrier(session, operationSignal)
+      let params = normalizeBrowserToolArgs(spec.name, { ...args, sessionId })
+      if (spec.name === 'browser_mark_handoff' || spec.name === 'browser_mark_deliverable') params.turnId = turnNumberFor(session)
+      validateRequestNumbers(params)
+      if (spec.name === 'browser_wait') validateWaitRequest(params)
+      if (spec.name === 'browser_locator') validateLocatorRequest(params)
+      if (spec.prepare !== undefined) params = spec.prepare(params)
+      if (options.requireProgressiveConfirmation && CONFIRMATION_OPERATION_NAMES.has(spec.name) && params.confirmed !== true) {
+        if (spec.name === 'browser_restart') throw bridgeRestartConfirmationError()
+        throw progressiveConfirmationError(spec.name)
+      }
+
+      const tracker = trackerFor(session)
+      if (spec.name === 'browser_restart') {
+        if (params.confirmed !== true) throw bridgeRestartConfirmationError()
+        return restartBrowser(bridge, tracker, operationSignal, resolveSettings().extensionReadyTimeoutMs)
+      }
+      if (spec.name === 'browser_targets') {
+        const bridgeHealth = await bridge.health()
+        return asJsonValue({
+          state: bridgeHealth.extensionConnected === true ? 'connected' : 'bridge_only',
+          targets: targetRecords(bridgeHealth),
+          bridgeHealth: compactBridgeHealth(bridgeHealth),
+        })
+      }
+      if (spec.name === 'browser_target_lease') {
+        const result = await bridge.request('target_lease', params, operationSignal)
+        if (params.action === 'acquire' && isRecord(result) && result.acquired === true && typeof params.browserId === 'string') {
+          const leases = sessionTargetLeases.get(session) ?? new Set<string>()
+          leases.add(params.browserId)
+          sessionTargetLeases.set(session, leases)
+        } else if (params.action === 'release' && isRecord(result) && result.released === true && typeof params.browserId === 'string') {
+          const leases = sessionTargetLeases.get(session)
+          leases?.delete(params.browserId)
+          if (leases?.size === 0) sessionTargetLeases.delete(session)
+        } else if (params.action === 'release_session' && isRecord(result) && result.ok === true) {
+          sessionTargetLeases.delete(session)
+        }
+        return asJsonValue(result)
+      }
+      if (spec.name === 'browser_cleanup' || spec.name === 'browser_context_reset') {
+        const mode = spec.name === 'browser_context_reset' ? 'context' : 'task'
+        const result = await cleanupSession(session, mode, exec.signal, undefined, false, { recoverStale: spec.name === 'browser_cleanup' && args.recoverStale === true })
+        if (!result.ok) throw result.error
+        pendingCleanups.set(exec, { session, mode, activation, generation: generationFor(session), clearTurnCleanup: mode === 'context' || !cleanupRetainsTabs(result.value) })
+        return compactBrowserResult(spec.name, params, result.value)
+      }
+
+      if (tracker.requiresExplicitSelection() && spec.name !== 'browser_status') throw targetSelectionRequiredError()
+      if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, operationSignal)
+      if (spec.name === 'browser_status') {
+        const acknowledgeBrowserId = optionalBrowserId(args.acknowledgeBrowserId)
+        const requestedBrowserId = optionalBrowserId(args.browserId)
+        const status = await browserStatus(bridge, tracker, sessionId, operationSignal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId, requestedBrowserId, hasTargetUsage(session))
+        if (statusCanArmCleanup(status)) markBrowserUsed(session, false)
+        return compactStatusResult(status)
+      }
+      const connection = await readBrowserConnection(bridge, sessionId, operationSignal, resolveSettings().extensionReadyTimeoutMs, tracker.route())
+      if (connection.state !== 'connected') return connectionResult(connection)
+      const target = await assertStableBrowserTarget(bridge, tracker, connection)
+      const targetRoute = tracker.fencedRoute()
+      markBrowserUsed(session)
+      params = { ...params, expectedBrowserId: target.browserId }
+      let method = spec.method
+      if (spec.name === 'browser_accessibility_snapshot') {
+        const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
+        assertBridgeRequestCapabilities('snapshot', wireParams, connection.bridgeHealth, connection.status)
+        const result = await requestBrowserOperationWithReadRecovery(bridge, 'snapshot', { ...wireParams, accessibilityOnly: true }, operationSignal, targetRoute)
+        if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
+        return prepareAccessibility(result.value, params)
+      }
+      if (spec.name === 'browser_console') {
+        method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
+      }
+      if (spec.name === 'browser_network') {
+        const network = prepareNetwork(params)
+        method = network.method
+        params = network.params
+      }
+      const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
+      assertBridgeRequestCapabilities(method, wireParams, connection.bridgeHealth, connection.status)
+      if (spec.name === 'browser_screenshot') {
+        const result = await requestBrowserOperationWithReadRecovery(bridge, method, wireParams, operationSignal, targetRoute)
+        if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
+        return prepareScreenshot(result.value, params, attachments)
+      }
+      const result = await requestBrowserOperationWithReadRecovery(bridge, method, wireParams, operationSignal, targetRoute)
+      if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
+      return compactBrowserResult(spec.name, params, result.value)
+    } finally {
+      releaseOperation?.()
+      if (waitController !== undefined) {
+        removeExecutionAbort()
+        untrackWaitController(session, waitController)
+      }
+    }
+  }
+
+  const toolFor = (spec: BrowserOperationSpec): ReturnType<typeof defineTool> => defineTool({
     name: spec.name,
     description: spec.description,
-    parameters: TAB_HANDLE_METHODS.has(spec.method)
-      ? { ...spec.parameters, handle: spec.name === 'browser_locator' ? LOCATOR_TAB_HANDLE : TAB_HANDLE }
-      : spec.parameters,
+    parameters: parametersForSpec(spec),
     output: {
       schema: { type: 'json' },
       render: renderResult,
     },
     timeoutMs: resolveSettings().requestTimeoutMs,
     async execute(args: Record<string, JsonValue>, exec: ToolRunContext): Promise<JsonValue> {
-      const sessionId = requireAgentSession(exec)
-      const session = requireAgent(exec).session
-      if (closed) throw inactiveBrowserError()
-      const isWaitTool = spec.name === 'browser_wait'
-        || spec.name === 'browser_probe_interaction'
-        || (spec.name === 'browser_navigate' && args.wait !== false)
-        || (spec.name === 'browser_download' && (args.action === 'wait' || (args.action === 'start' && args.wait !== false)))
-        || (spec.name === 'browser_locator' && args.action === 'waitFor')
-      const isRecoveryCleanup = spec.name === 'browser_cleanup' && args.recoverStale === true
-      const waitController = isWaitTool ? new AbortController() : undefined
-      const operationSignal = waitController?.signal ?? exec.signal
-      let removeExecutionAbort = (): void => {}
-      if (waitController !== undefined) {
-        trackWaitController(session, waitController)
-        const onAbort = (): void => { waitController.abort(exec.signal.reason) }
-        if (exec.signal.aborted) onAbort()
-        else {
-          exec.signal.addEventListener('abort', onAbort, { once: true })
-          removeExecutionAbort = () => exec.signal.removeEventListener('abort', onAbort)
-        }
-      }
-      let releaseOperation: (() => void) | undefined
-      try {
-        if (!isWaitTool) releaseOperation = await acquireOperation(session, operationSignal)
-        if (!isRecoveryCleanup) await waitForRetirement(session, operationSignal)
-        if (retiredSessions.has(session)) throw inactiveBrowserError()
-        const activation = lazyTools ? activations.get(session) : undefined
-        if (lazyTools && activation === undefined) throw inactiveBrowserError()
-        await waitForWireBarrier(session, operationSignal)
-        let params = normalizeBrowserToolArgs(spec.name, { ...args, sessionId })
-        if (spec.name === 'browser_mark_handoff' || spec.name === 'browser_mark_deliverable') params.turnId = turnNumberFor(session)
-        validateRequestNumbers(params)
-        if (spec.name === 'browser_wait') validateWaitRequest(params)
-        if (spec.name === 'browser_locator') validateLocatorRequest(params)
-        if (spec.prepare !== undefined) params = spec.prepare(params)
-
-        const tracker = trackerFor(session)
-        if (spec.name === 'browser_restart') {
-          if (params.confirmed !== true) throw bridgeRestartConfirmationError()
-          return restartBrowser(bridge, tracker, operationSignal, resolveSettings().extensionReadyTimeoutMs)
-        }
-        if (spec.name === 'browser_targets') {
-          const bridgeHealth = await bridge.health()
-          return asJsonValue({
-            state: bridgeHealth.extensionConnected === true ? 'connected' : 'bridge_only',
-            targets: targetRecords(bridgeHealth),
-            bridgeHealth: compactBridgeHealth(bridgeHealth),
-          })
-        }
-        if (spec.name === 'browser_target_lease') {
-          const result = await bridge.request('target_lease', params, operationSignal)
-          if (params.action === 'acquire' && isRecord(result) && result.acquired === true && typeof params.browserId === 'string') {
-            const leases = sessionTargetLeases.get(session) ?? new Set<string>()
-            leases.add(params.browserId)
-            sessionTargetLeases.set(session, leases)
-          } else if (params.action === 'release' && isRecord(result) && result.released === true && typeof params.browserId === 'string') {
-            const leases = sessionTargetLeases.get(session)
-            leases?.delete(params.browserId)
-            if (leases?.size === 0) sessionTargetLeases.delete(session)
-          } else if (params.action === 'release_session' && isRecord(result) && result.ok === true) {
-            sessionTargetLeases.delete(session)
-          }
-          return asJsonValue(result)
-        }
-        if (spec.name === 'browser_cleanup' || spec.name === 'browser_context_reset') {
-          const mode = spec.name === 'browser_context_reset' ? 'context' : 'task'
-          const result = await cleanupSession(session, mode, exec.signal, undefined, false, { recoverStale: spec.name === 'browser_cleanup' && args.recoverStale === true })
-          if (!result.ok) throw result.error
-          pendingCleanups.set(exec, { session, mode, activation, generation: generationFor(session), clearTurnCleanup: mode === 'context' || !cleanupRetainsTabs(result.value) })
-          return compactBrowserResult(spec.name, params, result.value)
-        }
-
-        if (tracker.requiresExplicitSelection() && spec.name !== 'browser_status') throw targetSelectionRequiredError()
-        if (spec.name === 'browser_doctor') return await browserDoctor(bridge, tracker, sessionId, operationSignal)
-        if (spec.name === 'browser_status') {
-          const acknowledgeBrowserId = optionalBrowserId(args.acknowledgeBrowserId)
-          const requestedBrowserId = optionalBrowserId(args.browserId)
-          const status = await browserStatus(bridge, tracker, sessionId, operationSignal, resolveSettings().extensionReadyTimeoutMs, acknowledgeBrowserId, requestedBrowserId, hasTargetUsage(session))
-          if (statusCanArmCleanup(status)) markBrowserUsed(session, false)
-          return compactStatusResult(status)
-        }
-        const connection = await readBrowserConnection(bridge, sessionId, operationSignal, resolveSettings().extensionReadyTimeoutMs, tracker.route())
-        if (connection.state !== 'connected') return connectionResult(connection)
-        const target = await assertStableBrowserTarget(bridge, tracker, connection)
-        const targetRoute = tracker.fencedRoute()
-        markBrowserUsed(session)
-        params = { ...params, expectedBrowserId: target.browserId }
-        let method = spec.method
-        if (spec.name === 'browser_accessibility_snapshot') {
-          const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
-          assertBridgeRequestCapabilities('snapshot', wireParams, connection.bridgeHealth, connection.status)
-          const result = await requestBrowserOperationWithReadRecovery(bridge, 'snapshot', { ...wireParams, accessibilityOnly: true }, operationSignal, targetRoute)
-          if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
-          return prepareAccessibility(result.value, params)
-        }
-        if (spec.name === 'browser_console') {
-          method = params.action === 'enable' ? 'devtools_enable' : 'console_logs'
-        }
-        if (spec.name === 'browser_network') {
-          const network = prepareNetwork(params)
-          method = network.method
-          params = network.params
-        }
-        const wireParams = compactResponseParams(spec.name, params, connection.bridgeHealth)
-        assertBridgeRequestCapabilities(method, wireParams, connection.bridgeHealth, connection.status)
-        if (spec.name === 'browser_screenshot') {
-          const result = await requestBrowserOperationWithReadRecovery(bridge, method, wireParams, operationSignal, targetRoute)
-          if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
-          return prepareScreenshot(result.value, params, attachments)
-        }
-        const result = await requestBrowserOperationWithReadRecovery(bridge, method, wireParams, operationSignal, targetRoute)
-        if (!result.ok) return await operationDisconnectedResult(bridge, result.code, result.details, result.message)
-        return compactBrowserResult(spec.name, params, result.value)
-      } finally {
-        releaseOperation?.()
-        if (waitController !== undefined) {
-          removeExecutionAbort()
-          untrackWaitController(session, waitController)
-        }
-      }
+      return executeBrowserSpec(spec, args, exec)
     },
   })
+  const browserCapabilitiesTool = defineTool({
+    name: 'browser_capabilities',
+    description: 'Discover the fixed browser API groups and request one operation schema without changing the available tool set or contacting the local Bridge.',
+    parameters: PROGRESSIVE_CAPABILITIES_PARAMETERS,
+    output: {
+      schema: { type: 'json' },
+      render: renderResult,
+    },
+    timeoutMs: resolveSettings().requestTimeoutMs,
+    async execute(args: Record<string, JsonValue>): Promise<JsonValue> {
+      return browserCapabilitiesResult(args)
+    },
+  })
+  const browserCallTool = defineTool({
+    name: 'browser_call',
+    description: 'Call one operation discovered by browser_capabilities. The operation registry validates arguments and preserves the same browser target, lease, confirmation, recovery and cleanup rules as the named browser_* tools. Confirmation-protected lifecycle operations require arguments.confirmed=true only after explicit user confirmation.',
+    parameters: PROGRESSIVE_CALL_PARAMETERS,
+    output: {
+      schema: { type: 'json' },
+      render: renderResult,
+    },
+    timeoutMs: resolveSettings().requestTimeoutMs,
+    async execute(args: { readonly operation: string; readonly arguments: Record<string, JsonValue>; readonly apiRevision?: string }, exec: ToolRunContext): Promise<JsonValue> {
+      if (args.apiRevision !== undefined && args.apiRevision !== BROWSER_API_REVISION) throw capabilityRevisionError(args.apiRevision)
+      const spec = browserOperationRegistry.get(args.operation)
+      if (spec === undefined) throw capabilityOperationError(args.operation)
+      const progressiveParameters = progressiveParametersForSpec(spec)
+      const violations = validateArgs(progressiveParameters, args.arguments)
+      if (violations.length > 0) throw capabilityError(
+        'BROWSER_INVALID_OPERATION_ARGUMENTS',
+        `Invalid arguments for ${args.operation}: ${violations.join('; ')}`,
+        { operation: args.operation, violations: violations as unknown as JsonValue, nextAction: 'browser_capabilities' },
+      )
+      const result = await executeBrowserSpec(spec, args.arguments, exec, { requireProgressiveConfirmation: true })
+      return asJsonValue({ apiRevision: BROWSER_API_REVISION, operation: args.operation, result })
+    },
+  })
+  const registerProgressiveFor = (scope: Context): (() => void)[] => {
+    const disposers: (() => void)[] = []
+    try {
+      disposers.push(scope.tools.register(browserCapabilitiesTool))
+      disposers.push(scope.tools.register(browserCallTool))
+      for (const name of PROGRESSIVE_BROWSER_TOOL_NAMES.slice(2)) {
+        const spec = browserOperationRegistry.get(name)
+        if (spec === undefined) throw new Error(`Progressive browser tool is missing from the operation registry: ${name}`)
+        disposers.push(scope.tools.register(toolFor(spec)))
+      }
+      return disposers
+    } catch (error) {
+      for (const dispose of disposers.reverse()) dispose()
+      throw error
+    }
+  }
   const registerFor = (scope: Context): (() => void)[] => {
     const disposers: (() => void)[] = []
     try {
-      for (const spec of [...CORE_TOOLS, ...ADVANCED_TOOLS]) disposers.push(scope.tools.register(toolFor(spec)))
+      for (const spec of browserOperationRegistry.values()) disposers.push(scope.tools.register(toolFor(spec)))
       return disposers
     } catch (error) {
       for (const dispose of disposers.reverse()) dispose()
@@ -2601,14 +2916,14 @@ export function registerBrowserTools(
   const activate = (agent: Agent): void => {
     const session = agent.session
     const recovery = recoveryRecords.get(sessionId(session))
-    if (closed || !lazyTools || activations.has(session) || retiredSessions.has(session) || retirementTails.has(sessionId(session)) || (recovery !== undefined && recovery.owner !== session)) return
+    if (closed || !activationRequired || activations.has(session) || retiredSessions.has(session) || retirementTails.has(sessionId(session)) || (recovery !== undefined && recovery.owner !== session)) return
     const disposers = registerFor(agent.ctx)
     bumpGeneration(session)
     activations.set(session, { agent, disposers, usedBrowser: false, cleanupRequired: false })
   }
-  if (!lazyTools) {
+  if (progressiveMode || !lazyTools) {
     ctx.effect(() => {
-      globalDisposers = registerFor(ctx)
+      globalDisposers = progressiveMode ? registerProgressiveFor(ctx) : registerFor(ctx)
       return () => {
         const disposers = globalDisposers
         globalDisposers = []
@@ -2620,7 +2935,7 @@ export function registerBrowserTools(
           }
         }
       }
-    }, 'control-chrome: register browser tools')
+    }, progressiveMode ? 'control-chrome: register progressive browser facade' : 'control-chrome: register browser tools')
   }
   ctx.on('tools/result', (exec, result) => {
     const pending = pendingCleanups.get(exec)
@@ -2628,15 +2943,15 @@ export function registerBrowserTools(
       pendingCleanups.delete(exec)
       if (!result.isError) queueMicrotask(() => {
         if (generationFor(pending.session) !== pending.generation) return
-        if (lazyTools && activations.get(pending.session) !== pending.activation) return
+        if (activationRequired && activations.get(pending.session) !== pending.activation) return
         resetSessionUsage(pending.session, pending.clearTurnCleanup)
         clearRecovery(pending.session)
-        if (pending.mode === 'context' && lazyTools && activations.get(pending.session) === pending.activation && !hasBrowserUsage(pending.session)) {
+        if (pending.mode === 'context' && activationRequired && activations.get(pending.session) === pending.activation && !hasBrowserUsage(pending.session)) {
           deactivate(pending.session)
         }
       })
     }
-    if (!lazyTools || result.isError || exec.name !== 'skill' || exec.agent === undefined) return
+    if (!activationRequired || result.isError || exec.name !== 'skill' || exec.agent === undefined) return
     if (isBrowserSkillArguments(exec.arguments)) activate(exec.agent)
   })
 
@@ -2688,7 +3003,7 @@ export function registerBrowserTools(
     await waitForRetirement(agent.session, signal)
     await waitForWireBarrier(agent.session, signal)
     const decision = await next()
-    if (lazyTools && decision.kind === 'enter' && hasBrowserSkillInvocation(decision.messages)) activate(agent)
+    if (activationRequired && decision.kind === 'enter' && hasBrowserSkillInvocation(decision.messages)) activate(agent)
     return decision
   }, { prepend: true })
   ctx.on('agent/disposed', ({ agent }) => {

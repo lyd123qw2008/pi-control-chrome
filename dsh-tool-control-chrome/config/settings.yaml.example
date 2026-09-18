@@ -9,6 +9,8 @@ control-chrome:
   requestTimeoutMs: 120000
   # Wait for the extension's background reconnect before returning bridge_only.
   extensionReadyTimeoutMs: 6000
-  # Register browser_* tools only after the pi-control-chrome Skill loads.
+  # Register browser_* tools only after the pi-control-chrome Skill loads in the legacy lazy-full mode.
   lazyTools: true
-  # Set false temporarily for legacy eager tool visibility.
+  # progressive registers a fixed facade from startup and discovers operations through tool results without changing tools.
+  # exposureMode: progressive
+  # Set lazyTools: false temporarily for legacy eager raw-tool visibility.
