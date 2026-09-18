@@ -23,14 +23,17 @@
       token,
     };
   };
+  // location.href is mutable inside a single document: history.pushState() and
+  // replaceState() must not invalidate a live reference. The isolated-world token plus
+  // performance.timeOrigin identify a document; the URL stays observation metadata.
   const sameDocument = (left, right) => Boolean(left && right
-    && left.url === right.url
     && left.timeOrigin === right.timeOrigin
     && typeof left.token === "string"
     && typeof right.token === "string"
     && left.token === right.token);
-  const matchesDocument = (expected, current) => (expected.url === undefined || expected.url === current.url)
-    && (expected.timeOrigin === undefined || expected.timeOrigin === current.timeOrigin)
+  // Partial expectation: only the fields the caller actually supplied are compared, and
+  // a URL history update inside one document is not a document change.
+  const matchesDocument = (expected, current) => (expected.timeOrigin === undefined || expected.timeOrigin === current.timeOrigin)
     && (expected.token === undefined || expected.token === current.token);
   const retain = (element) => typeof WeakRef === "function" ? new WeakRef(element) : element;
   const dereference = (reference) => typeof reference?.deref === "function" ? reference.deref() : reference;

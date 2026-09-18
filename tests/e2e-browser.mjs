@@ -1144,17 +1144,33 @@ try {
   const after = await request("snapshot", { tabId: selected.tab.id });
   assert.match(after.snapshot.text, /Hello Pi/);
 
-  // The click result is known once the injected page action returns. A valid
-  // post-action document identity (including a history URL transition) must
-  // therefore preserve success rather than misreporting an uncertain effect.
+  // History API updates change the tab URL but do not replace its document. A live ref
+  // and a complete handle must therefore stay usable after pushState, while a real
+  // navigation is still fenced by the incarnation check further down.
+  const historySnapshot = await request("snapshot", { tabId: selected.tab.id });
+  const historyInput = historySnapshot.snapshot.elements.find((element) => element.tag === "input" && element.name === "Name");
+  assert.ok(historyInput?.ref);
+  const historyHandle = historySnapshot.tab?.handle;
+  assert.ok(historyHandle?.incarnation, "snapshot must return a complete handle");
   const historyAction = await request("interaction", {
     tabId: selected.tab.id,
     operation: "click",
     target: { role: "button", name: "History action", exact: true },
   });
   assert.equal(historyAction.result?.ok, true);
-  assert.equal(historyAction.result?.postActionDocumentChanged, true);
+  // The URL changed, the document did not: reporting a document change here was the bug.
+  assert.equal(historyAction.result?.postActionDocumentChanged, undefined);
   await request("wait", { tabId: selected.tab.id, state: "url", urlIncludes: "marker=History%20action", timeoutMs: 5000 });
+  const historyFill = await request("interaction", {
+    tabId: selected.tab.id,
+    handle: historyHandle,
+    operation: "fill",
+    ref: historyInput.ref,
+    snapshotId: historySnapshot.snapshot.snapshotId,
+    value: "Still same document",
+  });
+  assert.equal(historyFill.result?.ok, true);
+  assert.equal(historyFill.result?.resolvedBy, "original_ref");
   await request("navigate", { tabId: selected.tab.id, url: `http://127.0.0.1:${pagePort}/`, wait: true });
 
   // A known-dispatched click is successful when it returns before a later real
