@@ -93,9 +93,12 @@ async function waitHealthTarget(port, browserId, state = "ready") {
   throw new Error(`bridge did not expose browser target ${browserId} in state ${state}`);
 }
 
-test("extension manifest omits the unused webNavigation permission", () => {
+test("extension manifest declares the webNavigation permission the document fence needs", () => {
   const manifest = JSON.parse(readFileSync(join(root, "extension", "manifest.json"), "utf8"));
-  assert.equal(manifest.permissions.includes("webNavigation"), false);
+  // `tabs.onUpdated` reports `status: "loading"` for a same-document history update as well
+  // as for a document load, so the document-change fence reads `webNavigation.onCommitted`,
+  // which a `history.pushState()` route change does not fire.
+  assert.equal(manifest.permissions.includes("webNavigation"), true);
 });
 
 test("bridge exposes health/pair endpoints and routes Pi requests to extension", async () => {

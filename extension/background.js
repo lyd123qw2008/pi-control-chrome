@@ -815,21 +815,30 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo = {}) => {
   observeDocumentTransition(id, changeInfo);
   // Metadata, focus, title, and same-document history URL changes do not replace a
   // document or invalidate its live refs. `tabs.onUpdated({ url })` is emitted for
-  // history.pushState()/replaceState() as well as for cross-document navigation, so URL
-  // alone is location metadata, not evidence of a new document.
-  // PageAgent owns live refs per document. The background keeps bounded provenance
-  // across actual document changes, marking it non-actionable as soon as Chromium reports
-  // loading or discard so an old ref reports document_changed rather than becoming an
-  // arbitrary stale snapshot.
-  const documentMayHaveChanged = changeInfo.status === "loading"
-    || changeInfo.discarded === true;
-  if (!documentMayHaveChanged) return;
-  // Keep the provenance record so a late old ref produces a precise
-  // BROWSER_DOCUMENT_CHANGED diagnostic, but prevent an action during the
-  // short interval between Chrome's loading event and old-document unload.
+  // history.pushState()/replaceState() as well as for cross-document navigation, and
+  // Chromium also reports `status: "loading"` for a same-document history update — so this
+  // listener cannot be the document-change fence. `webNavigation.onCommitted` below is: a
+  // same-document update fires `onHistoryStateUpdated` instead of committing a document.
+  // A discarded tab has no live document at all, so that signal still poisons what it had.
+  if (changeInfo.discarded !== true) return;
   invalidatePageObservationState(id);
   const state = devtoolsState.get(key) || (persistentDebuggers.has(key) ? stateForTab(id) : undefined);
   if (state) resetDebuggerDocumentState(state, state.mainFrameId);
+});
+
+// A new document committed, so every observation, handle and live ref bound to the previous
+// one is stale and must report document_changed rather than resolve against the replacement.
+// This is the discriminator `tabs.onUpdated` cannot provide. A same-document
+// `history.pushState()` route change deliberately does nothing here: the document did not
+// change, and neither did anything observed against it.
+chrome.webNavigation?.onCommitted?.addListener((details) => {
+  if (details.frameId !== 0) return;
+  const tabId = Number(details.tabId);
+  if (!Number.isFinite(tabId)) return;
+  invalidatePageObservationState(tabId);
+  const committedKey = runtimeStateKey(tabId);
+  const committedState = devtoolsState.get(committedKey) || (persistentDebuggers.has(committedKey) ? stateForTab(tabId) : undefined);
+  if (committedState) resetDebuggerDocumentState(committedState, committedState.mainFrameId);
 });
 
 chrome.tabs?.onCreated?.addListener((tab) => {

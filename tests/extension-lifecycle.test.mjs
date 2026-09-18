@@ -45,6 +45,7 @@ function loadExtension(options = {}) {
   const runtimeInstalled = eventSource();
   const tabRemoved = eventSource();
   const tabUpdated = eventSource();
+  const tabCommitted = eventSource();
   const tabReplaced = eventSource();
   const tabCreated = eventSource();
   const debuggerEvent = eventSource();
@@ -81,6 +82,10 @@ function loadExtension(options = {}) {
         async set(values) { Object.assign(sessionStorage, clone(values)); },
       },
     },
+    // The document-change fence: a same-document history update fires
+    // `onHistoryStateUpdated` instead of committing a document, which is exactly why
+    // `tabs.onUpdated`'s `status: "loading"` cannot be used for it.
+    webNavigation: { onCommitted: tabCommitted },
     tabs: {
       onRemoved: tabRemoved,
       onUpdated: tabUpdated,
@@ -280,6 +285,7 @@ function loadExtension(options = {}) {
     emitTabRemoved(tabId) { return tabRemoved.emit(tabId); },
     emitTabReplaced(addedTabId, removedTabId) { return tabReplaced.emit(addedTabId, removedTabId); },
     emitTabUpdated(tabId, changeInfo, tab) { return tabUpdated.emit(tabId, changeInfo, tab); },
+    emitTabCommitted(tabId, details = {}) { return tabCommitted.emit({ frameId: 0, ...details, tabId }); },
     emitSocketOpen() { latestSocket?.emit("open"); },
     async emitSocketMessage(message) {
       const listeners = latestSocket?.listeners.get("message") || [];
@@ -2150,7 +2156,9 @@ test("document lifecycle tab updates retain bounded provenance for a precise sta
   fixture.api.domSnapshotStates.set("test-extension::322", { snapshotId: "dom-observation-1", observations: new Map([["dom-observation-1", { url: "https://example.test/live-ref", timeOrigin: 1, token: "fixture-document-token" }]]) });
   fixture.api.accessibilitySnapshotStates.set("test-extension::322", { snapshotId: "accessibility-1", nodes: [] });
 
-  await fixture.emitTabUpdated(322, { status: "loading" }, fixture.tabs.get(322));
+  // A committed document is what poisons provenance; the `loading` status that
+  // `tabs.onUpdated` reports for a same-document history update must not.
+  await fixture.emitTabCommitted(322);
 
   assert.equal(fixture.api.pageSnapshotStates.get("test-extension::322")?.observations?.has("observation-1"), true);
   assert.equal(fixture.api.pageSnapshotStates.get("test-extension::322")?.observations?.get("observation-1")?.invalidated, true);

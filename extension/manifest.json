@@ -12,7 +12,8 @@
     "downloads",
     "clipboardRead",
     "clipboardWrite",
-    "alarms"
+    "alarms",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"
