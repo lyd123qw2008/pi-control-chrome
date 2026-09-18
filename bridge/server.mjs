@@ -38,7 +38,7 @@ const BRIDGE_CAPABILITIES = Object.freeze({
   interactionDiagnostics: true,
   incrementalConsole: true,
 });
-const RESPONSE_MODES = new Set(["compact", "raw"]);
+const RESPONSE_MODES = new Set(["compact", "structured", "raw"]);
 const COMPACT_MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100 });
 const TAB_INCARNATION_METHODS = new Set([
   "list_tabs", "selected_tab", "select_tab", "new_tab", "navigate", "snapshot", "extract", "wait", "back", "forward", "reload",
@@ -676,11 +676,40 @@ function compactResponseToolName(method, params = {}) {
   return undefined;
 }
 
+/**
+ * The semantic model as data, for a caller that works with the page instead of reading a
+ * rendering of it.
+ *
+ * `snapshot.text` is the same information as `snapshot.elements`, written out as prose —
+ * the shape a model wants when the result lands in its context, and the wrong shape for a
+ * caller that has to address a node by `ref`. `snapshot.accessibility` and `frameTree`
+ * duplicate trees that have their own reads. So this mode drops exactly those three and
+ * passes everything else through untouched: the elements with their refs, the counts,
+ * `snapshotId`, `viewport`, the truncation flags, and whatever else the operation
+ * returned.
+ *
+ * A caller that chooses this mode pays for what it gets: the Bridge adds no budget of its
+ * own, and the extension's collection ceilings remain the only bound.
+ */
+function structuredBrowserResult(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const { frameTree, snapshot, ...rest } = value;
+  if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) return rest;
+  const kept = { ...snapshot };
+  delete kept.text;
+  delete kept.accessibility;
+  return { ...rest, snapshot: kept };
+}
+
 function responseForClient(entry, value) {
   const decorated = decorateTargetResult(value, entry.target);
-  if (entry.params.responseMode !== "compact") return decorated;
+  const mode = entry.params.responseMode;
+  if (mode !== "compact" && mode !== "structured") return decorated;
   const toolName = compactResponseToolName(entry.method, entry.params);
-  return toolName === undefined ? decorated : compactBrowserResult(toolName, entry.params, decorated);
+  if (toolName === undefined) return decorated;
+  return mode === "structured"
+    ? structuredBrowserResult(decorated)
+    : compactBrowserResult(toolName, entry.params, decorated);
 }
 
 function isSideEffectingRequest(method, params = {}) {
@@ -957,7 +986,7 @@ function handleMessage(client, message) {
     const params = compactRequestParams(message.method, requestParams(message));
     if (params.responseMode !== undefined && (typeof params.responseMode !== "string" || !RESPONSE_MODES.has(params.responseMode))) {
       metrics.requestErrors += 1;
-      sendError(client, id, "INVALID_REQUEST", "request.params.responseMode must be compact or raw.");
+      sendError(client, id, "INVALID_REQUEST", "request.params.responseMode must be compact, structured or raw.");
       return;
     }
     if (params.responseMode === "compact" && compactResponseToolName(message.method, params) === undefined) {

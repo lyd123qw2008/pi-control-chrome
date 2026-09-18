@@ -411,7 +411,10 @@ class BridgeClient {
     }
     if (previous === undefined) this.acknowledgedTarget = target;
     const responseTool = compactToolName(method, params);
-    const requestedMode = params.responseMode === "raw" || params.responseMode === "compact" ? params.responseMode : undefined;
+    // Every mode the Bridge accepts has to be named here as well: this list decides what
+    // reaches the wire, and a value it does not know is dropped silently, so the read
+    // comes back unprojected with no error to explain why.
+    const requestedMode = ["compact", "structured", "raw"].includes(params.responseMode) ? params.responseMode : undefined;
     const { responseMode: _requestedMode, ...baseParams } = params;
     const negotiatedMode = this.bridgeCapabilities.compactResponses === true && requestedMode !== undefined ? requestedMode : undefined;
     const wireParams = negotiatedMode === undefined ? baseParams : { ...baseParams, responseMode: negotiatedMode };

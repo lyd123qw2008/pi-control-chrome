@@ -490,3 +490,79 @@ test("Codex MCP tools declare an output schema and answer with matching structur
   }
 });
 
+
+test("PI_CONTROL_CHROME_READ_POLICY=caller leaves budgets to the caller and reads the model as data", async () => {
+  const bridgePort = await findFreePort();
+  const temp = mkdtempSync(join(tmpdir(), "pi-control-chrome-read-policy-test-"));
+  const tokenFile = join(temp, "token");
+  const bridge = spawn(process.execPath, [bridgePath, "--port", String(bridgePort), "--token-file", tokenFile], { stdio: "ignore", windowsHide: true });
+  let extension;
+  let seen = {};
+  const mcp = startMcp(bridgePort, { PI_CONTROL_CHROME_TOKEN_FILE: tokenFile, PI_CONTROL_CHROME_READ_POLICY: "caller" });
+  const identity = { browser: "edge", browserId: "edge:read-policy", profile: "read-policy", capabilities: { pageWaitStates: true, tabIncarnationFence: true } };
+  const tab = {
+    id: 7, windowId: 1, index: 0, active: true, pinned: false, title: "Example", url: "https://example.test/",
+    status: "complete", groupId: -1, owner: "user", stale: false, handle: { tabId: 7, tabFence: "tab:read-policy" },
+  };
+  try {
+    await waitHealth(bridgePort);
+    const token = readFileSync(tokenFile, "utf8").trim();
+    extension = new WebSocket(`ws://127.0.0.1:${bridgePort}/ws?role=extension&token=${encodeURIComponent(token)}`);
+    await new Promise((resolve, reject) => { extension.once("open", resolve); extension.once("error", reject); });
+    extension.send(JSON.stringify({ type: "hello", role: "extension", protocol: 1, ...identity }));
+    await sleep(30);
+    extension.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type !== "request") return;
+      if (message.method === "status") extension.send(JSON.stringify({ type: "response", id: message.id, result: identity }));
+      if (message.method === "snapshot") {
+        seen = message.params ?? {};
+        extension.send(JSON.stringify({ type: "response", id: message.id, result: {
+          tabId: tab.id, tab, frameTree: { frames: [] },
+          snapshot: {
+            snapshotId: "snap-1", url: tab.url, title: "Example", viewport: { width: 800, height: 600 },
+            elements: [{ ref: "e1", role: "link", tag: "a", name: "Learn more", href: "https://example.test/", rect: { x: 1, y: 2, width: 3, height: 4 }, disabled: false }],
+            elementCount: 1, elementCharCount: 24, truncated: false,
+            text: 'Page: Example\n- link "Learn more" [ref=e1]',
+            accessibility: { nodes: [{ nodeId: "1" }] },
+          },
+        } }));
+      }
+    });
+
+    mcp.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+    await mcp.nextMessage();
+    mcp.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "browser_status",
+      arguments: { browserId: identity.browserId, acknowledgeBrowserId: identity.browserId },
+    } });
+    await mcp.nextMessage();
+
+    // Both the deployment default and an explicit request must reach the Bridge: the client
+    // between them used to keep a two-value allowlist, which dropped `structured` silently,
+    // and an unprojected read came back with no error to explain it.
+    for (const [label, args] of [
+      ["default", { handle: tab.handle }],
+      ["explicit", { handle: tab.handle, responseMode: "structured" }],
+    ]) {
+      mcp.send({ jsonrpc: "2.0", id: label === "default" ? 3 : 4, method: "tools/call", params: { name: "browser_snapshot", arguments: args } });
+      const result = (await mcp.nextMessage()).result;
+      assert.equal(result.isError, undefined, `${label}: the read must succeed`);
+      assert.equal(seen.maxChars, undefined, `${label}: a caller-policy server must not inject maxChars`);
+      assert.equal(seen.maxNodes, undefined, `${label}: a caller-policy server must not inject maxNodes`);
+      assert.equal(seen.responseMode, undefined, `${label}: responseMode stays the Bridge vocabulary`);
+      const snapshot = result.structuredContent.snapshot;
+      assert.equal(snapshot.elements.length, 1, `${label}: the semantic model must survive as data`);
+      assert.equal(snapshot.elements[0].ref, "e1", `${label}: refs must survive`);
+      assert.equal(snapshot.text, undefined, `${label}: the prose rendering must be dropped`);
+      assert.equal(snapshot.accessibility, undefined, `${label}: the duplicated tree must be dropped`);
+      assert.equal(result.structuredContent.frameTree, undefined, `${label}: the frame tree must be dropped`);
+    }
+  } finally {
+    mcp.child.stdin.end();
+    await stopProcess(mcp.child);
+    extension?.close();
+    await stopProcess(bridge);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});

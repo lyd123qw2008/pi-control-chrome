@@ -267,6 +267,23 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
     assert.ok(raw.result.frameTree);
     assert.equal(forwardedSnapshot?.params.responseMode, undefined);
 
+    // `structured` is the read a caller wants when it works with the page instead of
+    // reading a rendering of it: the semantic model survives as data, the prose rendering
+    // and the duplicated trees do not, and no budget is imposed on it.
+    const structuredId = "structured-snapshot";
+    const structuredPending = responseFor(pi, structuredId);
+    pi.send(JSON.stringify({ type: "request", id: structuredId, method: "snapshot", params: { tabId: 7, responseMode: "structured" } }));
+    const structured = await structuredPending;
+    assert.equal(structured.error, undefined);
+    assert.equal(structured.result.snapshot.elements.length, 350);
+    assert.equal(structured.result.snapshot.elements[0].ref, "e1");
+    assert.equal(structured.result.snapshot.text, undefined, "the prose rendering must be dropped");
+    assert.equal(structured.result.snapshot.accessibility, undefined, "the duplicated tree must be dropped");
+    assert.equal(structured.result.frameTree, undefined);
+    assert.equal(forwardedSnapshot?.params.responseMode, undefined, "responseMode stays Bridge-side");
+    assert.equal(forwardedSnapshot?.params.maxChars, undefined, "a structured read invents no budget");
+    assert.equal(forwardedSnapshot?.params.maxNodes, undefined);
+
     const measuredHealth = await getJson(port, "/health");
      const measuredMetrics = measuredHealth.body.observability.metrics;
      assert.equal(measuredMetrics.modelResponses >= 2, true);
@@ -278,7 +295,7 @@ test("bridge negotiates compact page responses while retaining explicit raw comp
     pi.send(JSON.stringify({ type: "request", id: invalidId, method: "snapshot", params: { tabId: 7, responseMode: "verbose" } }));
     const invalid = await invalidPending;
     assert.equal(invalid.error.code, "INVALID_REQUEST");
-    assert.match(invalid.error.message, /compact or raw/);
+    assert.match(invalid.error.message, /compact, structured or raw/);
 
     const unsupportedId = "unsupported-compact-mode";
     const unsupportedPending = responseFor(pi, unsupportedId);

@@ -75,7 +75,7 @@ const PAGE_TARGET_FIELDS = { ...PAGE_FIELDS, snapshotId: string(), ref: string()
 const WAIT_STATE = { type: "string", enum: ["load", "url", "text", "text_gone", "visible", "hidden", "enabled"] };
 const TEXT_ANY = { type: "array", items: string("Literal text to match."), minItems: 1, maxItems: 20, description: "For text waits, succeed when any listed literal is present; the result reports matchedText and terminalState." };
 const FAILURE_TEXT_ANY = { type: "array", items: string("Literal failure text to match."), minItems: 1, maxItems: 20, description: "For state=text waits, return immediately with failed=true when any listed failure literal is present." };
-const RESPONSE_MODE = { type: "string", enum: ["compact", "raw"], description: "Compact semantic Page Map is the default; use raw only for page-abstraction diagnostics." };
+const RESPONSE_MODE = { type: "string", enum: ["compact", "structured", "raw"], description: "compact renders the page as prose for a model reading the result directly; structured returns the same semantic model as data (elements with refs) without the prose rendering or the duplicated accessibility/frame trees, for a caller that works with the page; raw passes the unprojected Bridge result through for diagnostics." };
 const COORDINATE = object({ x: number(), y: number() }, ["x", "y"]);
 
 function schema(properties, required = []) {
@@ -446,6 +446,20 @@ const TOOLS = selectExposedTools(process.env.PI_CONTROL_CHROME_TOOLS)
   }));
 const TOOL_MAP = new Map(TOOLS.map((entry) => [entry.name, entry]));
 const COMPACT_READS = new Set(["browser_snapshot", "browser_extract", "browser_accessibility_snapshot", "browser_tabs", "browser_selected"]);
+// Who decides the shape and size of a read?
+//
+// `provider` (default): this server bounds every read and hands back the rendered prose,
+// because a direct client drops tool results straight into a model's context.
+//
+// `caller`: the client absorbs the payload itself — a node_repl-style runtime passes it
+// into a JavaScript kernel where the cell filters and aggregates before anything reaches
+// a model. A provider-side bound then only removes information the caller could have used,
+// and the prose rendering only costs it the structure it needs. Set
+// PI_CONTROL_CHROME_READ_POLICY=caller for that kind of client: no budgets are injected,
+// reads default to `structured`, and a call can still ask for `compact` or `raw` itself.
+const READ_POLICY = (process.env.PI_CONTROL_CHROME_READ_POLICY || "provider").trim().toLowerCase() === "caller"
+  ? "caller"
+  : "provider";
 const MODEL_READ_BUDGETS = Object.freeze({ snapshotChars: 8_000, snapshotNodes: 100, extractChars: 6_000, domChars: 8_000, domNodes: 100, consoleChars: 4_000, consoleEvents: 40 });
 let bridgeClient;
 let bridgeClientPromise;
@@ -458,7 +472,22 @@ function requestKey(id) {
   return `${typeof id}:${String(id)}`;
 }
 
+/**
+ * The one place that decides how a read is rendered, so the mode sent to the Bridge and
+ * the projection applied to its answer can never disagree.
+ */
+function effectiveResponseMode(name, args) {
+  if (typeof args?.responseMode === "string" && args.responseMode.length > 0) return args.responseMode;
+  if (COMPACT_READS.has(name) || (name === "browser_dom_cua" && args?.action === "get_visible_dom")) {
+    return READ_POLICY === "caller" ? "structured" : "compact";
+  }
+  return undefined;
+}
+
 function applyModelReadBudget(toolName, params) {
+  // A caller that pays for its own payload gets exactly what it asked for; the extension's
+  // own collection ceilings remain the only bound.
+  if (READ_POLICY === "caller") return params;
   if (params.responseMode === "raw") return params;
   const budgeted = { ...params };
   if (toolName === "browser_snapshot" || toolName === "browser_accessibility_snapshot") {
@@ -650,7 +679,10 @@ async function invokeTool(spec, args, signal) {
   if (spec.name === "browser_accessibility_snapshot") params.accessibilityOnly = true;
   if (spec.name === "browser_mark_handoff" || spec.name === "browser_mark_deliverable") params.turnId = TURN_ID;
   params = applyModelReadBudget(spec.name, params);
-  if ((COMPACT_READS.has(spec.name) || (spec.name === "browser_dom_cua" && params.action === "get_visible_dom")) && params.responseMode === undefined) params.responseMode = "compact";
+  if (params.responseMode === undefined) {
+    const mode = effectiveResponseMode(spec.name, params);
+    if (mode !== undefined) params.responseMode = mode;
+  }
   params = withSession(params);
   assertRequestActive(signal);
 
@@ -734,7 +766,11 @@ function toolResult(name, value, args) {
   if (name !== "browser_screenshot") {
     // The text block and the structured form carry the same projection, so a
     // caller that reads `structuredContent` sees exactly what it sees in the text.
-    const projected = compactBrowserResult(name, { ...args, sessionId: SESSION_ID }, value);
+    // A `structured` read already arrives as data from the Bridge: projecting it here would
+    // flatten it back into the prose the caller asked to avoid.
+    const projected = effectiveResponseMode(name, args) === "structured"
+      ? value
+      : compactBrowserResult(name, { ...args, sessionId: SESSION_ID }, value);
     const structured = structuredResult(projected);
     return {
       content: [{ type: "text", text: jsonText(projected) }],
