@@ -869,7 +869,7 @@ async function handleMessage(message) {
       protocolVersion: typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : PROTOCOL_VERSION,
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-      instructions: "Use browser_status before browser actions. Preserve browserId, tabFence, incarnation and snapshotId; inspect before retrying BROWSER_OPERATION_UNCERTAIN. For Bridge recovery, ask the user for explicit confirmation before calling browser_restart with confirmed=true; acknowledge the new browser connection and refresh handles afterward.",
+      instructions: "Use browser_status before browser actions. Preserve browserId, tabFence and incarnation; an eN ref keeps its number inside its document, so re-observe instead of tracking snapshot IDs by hand; inspect before retrying BROWSER_OPERATION_UNCERTAIN. For Bridge recovery, ask the user for explicit confirmation before calling browser_restart with confirmed=true; acknowledge the new browser connection and refresh handles afterward.",
     });
     return;
   }

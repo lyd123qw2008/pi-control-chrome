@@ -25,7 +25,7 @@ A manual registration is stored in `~/.codex/config.toml` and is shared by Codex
 
 Load the repository or installed package's `extension/` directory once through `chrome://extensions` or `edge://extensions`, with Developer mode enabled. The adapter does not install or reload an extension automatically.
 
-The first browser operation must be `browser_status`. When Chrome and Edge, or multiple profiles, are connected, choose the intended `browserId` explicitly and acknowledge it before continuing. Keep returned tab handles and snapshot IDs; never replay `BROWSER_OPERATION_UNCERTAIN` without inspecting the current page.
+The first browser operation must be `browser_status`. When Chrome and Edge, or multiple profiles, are connected, choose the intended `browserId` explicitly and acknowledge it before continuing. Keep returned tab handles; an eN ref stays valid inside its document, so re-observe rather than tracking snapshot IDs by hand; never replay `BROWSER_OPERATION_UNCERTAIN` without inspecting the current page.
 
 The adapter exposes thirteen `browser_*` tools by default — status, targets, target lease, tabs, snapshot, accessibility snapshot, extract, wait, probe interaction, click, fill, restart and extension reload — chosen to work on tabs the user already has. Set `PI_CONTROL_CHROME_TOOLS=all` to expose every Bridge operation (44), or give a comma-separated list to choose your own subset; an unknown name fails the server at startup rather than silently exposing a narrower face. Whichever you pick, the catalog is decided once at startup, so a session's tool list never changes while it runs.
 

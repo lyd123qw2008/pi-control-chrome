@@ -114,7 +114,7 @@ latest browser_snapshot
 → narrowly scoped browser_evaluate
 ```
 
-After navigation, wait for `load` or the expected URL and take a fresh snapshot. Do not use an old ref after navigation, reload, document replacement, or `BROWSER_DOCUMENT_CHANGED`.
+After navigation, wait for `load` or the expected URL and take a fresh snapshot. Do not use an old ref after navigation, reload, document replacement, or `BROWSER_DOCUMENT_CHANGED`; inside one document a ref stays valid, so re-observing never renumbers it.
 
 ### Navigation or page timeout
 
